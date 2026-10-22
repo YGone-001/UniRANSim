@@ -19,6 +19,7 @@ namespace sctp
 
 enum class PayloadProtocolId
 {
+    S1AP = 18,
     NGAP = 60
 };
 

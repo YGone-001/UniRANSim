@@ -24,6 +24,7 @@ class SctpClient
 
   public:
     explicit SctpClient(PayloadProtocolId ppid, const std::string &address);
+    SctpClient(PayloadProtocolId ppid, const std::string &address, int maxAttempts, int initTimeoutMs);
     ~SctpClient();
 
     void bind(const std::string &address, uint16_t port);
@@ -34,6 +35,7 @@ class SctpClient
     void send(uint16_t stream, const std::vector<uint8_t> &data);
 
     void receive(ISctpHandler *handler);
+    bool receiveFor(ISctpHandler *handler, int timeoutMs);
 };
 
 } // namespace sctp

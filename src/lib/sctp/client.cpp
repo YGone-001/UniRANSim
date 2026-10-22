@@ -9,7 +9,10 @@
 #include "client.hpp"
 #include "internal.hpp"
 
-sctp::SctpClient::SctpClient(PayloadProtocolId ppid, const std::string &address) : sd(0), ppid(ppid)
+#include <cerrno>
+#include <poll.h>
+
+sctp::SctpClient::SctpClient(PayloadProtocolId ppid, const std::string &address) : sd(-1), ppid(ppid)
 {
     try
     {
@@ -19,7 +22,25 @@ sctp::SctpClient::SctpClient(PayloadProtocolId ppid, const std::string &address)
     }
     catch (const std::exception &e)
     {
-        CloseSocket(sd);
+        if (sd >= 0)
+            CloseSocket(sd);
+        throw;
+    }
+}
+
+sctp::SctpClient::SctpClient(PayloadProtocolId ppid, const std::string &address, int maxAttempts, int initTimeoutMs)
+    : sd(-1), ppid(ppid)
+{
+    try
+    {
+        sd = CreateSocket(address);
+        SetInitOptions(sd, 10, 10, maxAttempts, initTimeoutMs);
+        SetEventOptions(sd);
+    }
+    catch (const std::exception &)
+    {
+        if (sd >= 0)
+            CloseSocket(sd);
         throw;
     }
 }
@@ -52,6 +73,28 @@ void sctp::SctpClient::send(uint16_t stream, const std::vector<uint8_t> &data)
 void sctp::SctpClient::receive(ISctpHandler *handler)
 {
     ReceiveMessage(sd, static_cast<uint32_t>(ppid), handler);
+}
+
+bool sctp::SctpClient::receiveFor(ISctpHandler *handler, int timeoutMs)
+{
+    pollfd descriptor{sd, POLLIN, 0};
+    int result;
+    do
+        result = poll(&descriptor, 1, timeoutMs);
+    while (result < 0 && errno == EINTR);
+
+    if (result < 0)
+        throw SctpError("SCTP poll failure");
+    if (result == 0)
+        return false;
+    if ((descriptor.revents & POLLIN) != 0)
+    {
+        ReceiveMessage(sd, static_cast<uint32_t>(ppid), handler);
+        return true;
+    }
+    if ((descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0)
+        throw SctpError("SCTP association became unavailable");
+    return false;
 }
 
 void sctp::SctpClient::bind(const std::string &address, uint16_t port)

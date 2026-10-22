@@ -1,0 +1,23 @@
+# LTE eNB identity. These values must match the EPC served PLMN and TAC.
+mcc: '460'
+mnc: '02'
+enbId: 0x19B
+tac: 1
+enbName: UERANSIM-lte-enb
+
+# Local S1-MME bind address.
+s1apIp: 127.0.0.1
+
+mme:
+  address: 127.0.0.2
+  port: 36412
+
+# One of 32, 64, 128 or 256 radio frames.
+pagingDrx: 128
+
+sctp:
+  maxAttempts: 3
+  retryDelayMs: 2000
+  responseTimeoutMs: 10000
+  connectMaxAttempts: 2
+  connectTimeoutMs: 1000

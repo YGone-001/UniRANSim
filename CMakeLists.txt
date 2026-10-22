@@ -32,6 +32,7 @@ add_subdirectory(src/asn/ngap)
 add_subdirectory(src/lib)
 add_subdirectory(src/gnb)
 add_subdirectory(src/ue)
+add_subdirectory(src/lte)
 
 #################### GNB EXECUTABLE ####################
 
@@ -73,6 +74,11 @@ target_compile_options(nr-cli PRIVATE -Wall -Wextra -pedantic)
 
 target_link_libraries(nr-cli common-lib)
 
+#################### LTE ENB EXECUTABLE ####################
+add_executable(lte-enb src/lte_enb.cpp)
+target_compile_options(lte-enb PRIVATE -Wall -Wextra -pedantic)
+target_link_libraries(lte-enb pthread lte-enb-lib)
+
 #################### TEST EXECUTABLE ####################
 # Built by default so the tests cannot rot, but it is not part of what `make build` installs.
 option(BUILD_TESTS "Build the nr-tests executable" ON)
@@ -87,6 +93,7 @@ if (BUILD_TESTS)
     target_link_libraries(nr-tests common-lib)
     target_link_libraries(nr-tests ue)
     target_link_libraries(nr-tests ext)
+    target_link_libraries(nr-tests lte-enb-lib)
 
     enable_testing()
     # Registers each doctest test case as its own ctest test, as listed by the built binary, so a failure or a crash
