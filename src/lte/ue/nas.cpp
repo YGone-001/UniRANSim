@@ -7,6 +7,7 @@
 //
 
 #include "nas.hpp"
+#include "security.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -23,11 +24,29 @@ namespace
 constexpr uint8_t EpsEmm = 0x07;
 constexpr uint8_t Esm = 0x02;
 constexpr uint8_t AttachRequest = 0x41;
+constexpr uint8_t AttachAcceptType = 0x42;
+constexpr uint8_t AttachCompleteType = 0x43;
+constexpr uint8_t AttachRejectType = 0x44;
 constexpr uint8_t AuthenticationRequestType = 0x52;
 constexpr uint8_t AuthenticationResponseType = 0x53;
 constexpr uint8_t AuthenticationFailureType = 0x5C;
 constexpr uint8_t SecurityModeCommandType = 0x5D;
+constexpr uint8_t SecurityModeCompleteType = 0x5E;
 constexpr uint8_t PdnConnectivityRequestType = 0xD0;
+constexpr uint8_t EsmInformationRequestType = 0xD9;
+constexpr uint8_t EsmInformationResponseType = 0xDA;
+constexpr uint8_t ActivateDefaultEpsBearerRequestType = 0xC1;
+constexpr uint8_t ActivateDefaultEpsBearerAcceptType = 0xC2;
+
+constexpr uint8_t IeiImeisvRequest = 0xC0;
+constexpr uint8_t IeiHashMme = 0x4F;
+constexpr uint8_t IeiReplayedNonceUe = 0x55;
+constexpr uint8_t IeiNonceMme = 0x56;
+constexpr uint8_t IeiReplayedUeAdditionalSecurityCapability = 0x6F;
+constexpr uint8_t IeiImeisv = 0x23;
+constexpr uint8_t IeiGuti = 0x50;
+constexpr uint8_t IeiApn = 0x28;
+constexpr uint8_t IeiPco = 0x27;
 
 OctetString ToOctets(const uint8_t *data, size_t length)
 {
@@ -84,6 +103,104 @@ std::vector<uint8_t> EncodeApn(const std::string &apn)
     return out;
 }
 
+std::string DecodeApn(const uint8_t *data, size_t size)
+{
+    if (data == nullptr || size == 0)
+        throw DecodeError("Empty APN");
+    std::string apn;
+    size_t offset{};
+    while (offset < size)
+    {
+        size_t label = data[offset++];
+        if (label == 0 || label > 63 || offset + label > size)
+            throw DecodeError("Malformed APN label");
+        if (!apn.empty())
+            apn.push_back('.');
+        apn.append(reinterpret_cast<const char *>(data + offset), label);
+        offset += label;
+    }
+    return apn;
+}
+
+// TS 24.008 10.5.1.4 mobile identity, used for the synthetic IMEISV.
+// `digits` holds 16 packed BCD digits (two per octet, high nibble first).
+std::vector<uint8_t> EncodeImeisv(const std::array<uint8_t, 8> &digits)
+{
+    auto digitAt = [&](size_t index) -> uint8_t {
+        // Digits are 1-based on the wire; index 0 is digit 1.
+        const uint8_t octet = digits[index / 2U];
+        return ((index % 2U) == 0) ? static_cast<uint8_t>(octet >> 4U) : static_cast<uint8_t>(octet & 0x0FU);
+    };
+    std::vector<uint8_t> out;
+    // Octet 1: digit 1 in bits 8-5, even (0) in bit 4, type 011 (IMEISV) in bits 3-1.
+    out.push_back(static_cast<uint8_t>((digitAt(0) << 4U) | 0x03U));
+    // Octets 2..8: digit pairs (odd digit high, even digit low).
+    for (size_t i = 1; i < 15; i += 2)
+        out.push_back(static_cast<uint8_t>((digitAt(i + 1) << 4U) | digitAt(i)));
+    // Final octet: end mark 1111 in bits 8-5, last digit in bits 4-1.
+    out.push_back(static_cast<uint8_t>(0xF0U | digitAt(15)));
+    return out;
+}
+
+bool IsOptionalIei(const uint8_t *data, size_t size, size_t offset, uint8_t iei)
+{
+    return offset < size && data[offset] == iei;
+}
+
+// Parses the ESM container carried inside Attach Accept. Only the default
+// bearer activation is handled; anything else is reported as OTHER.
+void DecodeEsmContainer(const std::vector<uint8_t> &esm, DownlinkMessage &result)
+{
+    // An ESM message is at least EPS bearer identity / PD, PTI and message type.
+    if (esm.size() < 3)
+        throw DecodeError("Truncated ESM message container");
+    const uint8_t ebi = static_cast<uint8_t>(esm[0] >> 4U);
+    const uint8_t pti = esm[1];
+    const uint8_t messageType = esm[2];
+    if (messageType != ActivateDefaultEpsBearerRequestType)
+        return;
+
+    result.type = DownlinkEmm::OTHER;
+    ActivateDefaultEpsBearerContextRequest bearer{};
+    bearer.epsBearerIdentity = ebi;
+    bearer.procedureTransactionId = pti;
+    bearer.raw = esm;
+
+    size_t offset = 3;
+    // Mandatory: EPS quality of service (LV).
+    if (offset >= esm.size())
+        throw DecodeError("Activate Default EPS Bearer Context Request is missing EPS QoS");
+    const size_t qosLength = esm[offset];
+    if (qosLength < 1 || offset + 1 + qosLength > esm.size())
+        throw DecodeError("Malformed EPS QoS in Activate Default EPS Bearer Context Request");
+    if (qosLength >= 1)
+        bearer.qci = esm[offset + 1];
+    offset += 1 + qosLength;
+
+    // Mandatory: access point name (LV).
+    if (offset >= esm.size())
+        throw DecodeError("Activate Default EPS Bearer Context Request is missing the APN");
+    const size_t apnLength = esm[offset];
+    if (apnLength == 0 || offset + 1 + apnLength > esm.size())
+        throw DecodeError("Malformed APN in Activate Default EPS Bearer Context Request");
+    bearer.apn = DecodeApn(esm.data() + offset + 1, apnLength);
+    offset += 1 + apnLength;
+
+    // Mandatory: PDN address (LV).
+    if (offset >= esm.size())
+        throw DecodeError("Activate Default EPS Bearer Context Request is missing the PDN address");
+    const size_t pdnLength = esm[offset];
+    if (pdnLength < 2 || offset + 1 + pdnLength > esm.size())
+        throw DecodeError("Malformed PDN address in Activate Default EPS Bearer Context Request");
+    if (esm[offset + 1] == 1 && pdnLength >= 5)
+        std::copy(esm.begin() + static_cast<std::ptrdiff_t>(offset + 2),
+                  esm.begin() + static_cast<std::ptrdiff_t>(offset + 6), bearer.pdnAddress.begin());
+    offset += 1 + pdnLength;
+
+    result.attachAccept.bearer = bearer;
+    result.type = DownlinkEmm::ATTACH_ACCEPT;
+}
+
 } // namespace
 
 std::vector<uint8_t> EncodeImsi(const std::string &imsi)
@@ -115,7 +232,7 @@ std::vector<uint8_t> EncodeAttachRequest(const Config &config)
     if (config.apn.has_value())
     {
         auto apn = EncodeApn(*config.apn);
-        esm.push_back(0x28); // Access point name
+        esm.push_back(IeiApn); // Access point name
         esm.push_back(static_cast<uint8_t>(apn.size()));
         esm.insert(esm.end(), apn.begin(), apn.end());
     }
@@ -168,12 +285,19 @@ bool IsSecurityModeCommand(const uint8_t *data, size_t size)
         return data[1] == SecurityModeCommandType;
 
     // TS 24.301 security-protected EMM NAS: outer header, 4-byte MAC,
-    // sequence number, then the plain EMM message. Phase 1 recognizes this
-    // authoritative post-AKA signal but intentionally defers MAC verification
-    // and Security Mode Complete to Phase 2.
+    // sequence number, then the plain EMM message.
     if (securityHeaderType > 4 || size < 8)
         return false;
     return data[6] == EpsEmm && data[7] == SecurityModeCommandType;
+}
+
+bool IsEsmInformationRequest(const uint8_t *data, size_t size)
+{
+    if (data == nullptr || size < 3)
+        return false;
+    if ((data[0] & 0x0FU) != Esm)
+        return false;
+    return data[2] == EsmInformationRequestType;
 }
 
 AkaResult Authenticate(const Config &config, const AuthenticationRequest &request)
@@ -223,6 +347,245 @@ AkaResult Authenticate(const Config &config, const AuthenticationRequest &reques
         result.failure = AkaFailure::MALFORMED;
     }
     return result;
+}
+
+SecurityModeCommand DecodeSecurityModeCommand(const uint8_t *data, size_t size)
+{
+    // Plain body: EMM PD, message type, selected algorithms, KSI, replayed caps (LV),
+    // then optional IEs.
+    if (data == nullptr || size < 6 || data[0] != EpsEmm || data[1] != SecurityModeCommandType)
+        throw DecodeError("Malformed EPS Security Mode Command");
+
+    SecurityModeCommand result{};
+    // TS 24.301 9.9.3.23: bits 8-5 type of ciphering algorithm,
+    // bits 4-1 type of integrity protection algorithm.
+    const uint8_t algorithms = data[2];
+    result.integrity = static_cast<IntegrityAlgorithm>(algorithms & 0x0FU);
+    result.ciphering = static_cast<CipheringAlgorithm>((algorithms >> 4U) & 0x0FU);
+
+    // TS 24.301 9.9.3.2a: KSI is the low three bits, TSC is bit 4.
+    const uint8_t ksiOctet = data[3];
+    result.ksi = static_cast<uint8_t>(ksiOctet & 0x07U);
+    result.nativeContext = (ksiOctet & 0x08U) == 0;
+
+    const size_t capsLength = data[4];
+    if (capsLength < 2 || size < 5U + capsLength)
+        throw DecodeError("Security Mode Command has a malformed replayed UE security capability");
+    result.replayedCapabilities.assign(data + 5, data + 5 + capsLength);
+
+    size_t offset = 5U + capsLength;
+    while (offset < size)
+    {
+        const uint8_t iei = data[offset];
+        // IMEISV request is a TV IE: the high nibble is the IEI 0xC and the low
+        // nibble carries the requested flag (TS 24.301 9.9.3.25).
+        if ((iei & 0xF0U) == IeiImeisvRequest)
+        {
+            result.imeisvRequested = (iei & 0x0FU) == 0x1U;
+            ++offset;
+        }
+        else if (iei == IeiHashMme)
+        {
+            // TS 24.301 9.9.3.50: HashMME is O TLV 10, i.e. 8 value octets.
+            constexpr size_t HashMmeLength = 8;
+            if (offset + 2 > size || data[offset + 1] != HashMmeLength)
+                throw DecodeError("Malformed HASHMME in Security Mode Command");
+            if (offset + 2 + HashMmeLength > size)
+                throw DecodeError("Truncated HASHMME in Security Mode Command");
+            std::copy(data + offset + 2, data + offset + 2 + HashMmeLength, result.hashMme.begin());
+            result.hashMmePresent = true;
+            offset += 2 + HashMmeLength;
+        }
+        else if (iei == IeiReplayedNonceUe || iei == IeiNonceMme)
+        {
+            if (offset + 5 > size)
+                throw DecodeError("Truncated nonce in Security Mode Command");
+            offset += 5;
+        }
+        else if (iei == IeiReplayedUeAdditionalSecurityCapability)
+        {
+            if (offset + 1 > size)
+                throw DecodeError("Truncated additional security capability");
+            const size_t length = data[offset + 1];
+            if (offset + 2 + length > size)
+                throw DecodeError("Truncated additional security capability");
+            offset += 2 + length;
+        }
+        else
+        {
+            // Unknown optional IE: TS 24.301 6.1.1 says IEs the UE does not
+            // understand must be ignored where the criticality is not reject.
+            break;
+        }
+    }
+    return result;
+}
+
+void ValidateSecurityModeCommand(const Config &config, const SecurityModeCommand &command, SecurityContext &context)
+{
+    if (!context.valid)
+        throw DecodeError("Security Mode Command arrived before a valid EPS AKA context");
+
+    // EIA0 is never accepted for an ordinary authenticated EPS Attach.
+    if (command.integrity == IntegrityAlgorithm::EIA0)
+        throw DecodeError("Security Mode Command selected EIA0, which is not permitted for an authenticated EPS Attach");
+    if (!IsSupported(command.integrity))
+        throw DecodeError("Security Mode Command selected an unsupported integrity algorithm");
+    if (!IsSupported(command.ciphering))
+        throw DecodeError("Security Mode Command selected an unsupported ciphering algorithm");
+
+    // The selected algorithms must be among those the UE actually advertised.
+    const uint8_t integrityBit = static_cast<uint8_t>(0x80U >> static_cast<unsigned>(command.integrity));
+    const uint8_t cipheringBit = static_cast<uint8_t>(0x80U >> static_cast<unsigned>(command.ciphering));
+    if ((config.networkCapability[1] & integrityBit) == 0)
+        throw DecodeError("Security Mode Command selected an integrity algorithm the UE did not advertise");
+    if ((config.networkCapability[0] & cipheringBit) == 0)
+        throw DecodeError("Security Mode Command selected a ciphering algorithm the UE did not advertise");
+
+    // The KSI must identify a usable native EPS security context.
+    if (command.ksi == 7 && !command.nativeContext)
+        throw DecodeError("Security Mode Command selected an unusable KSI");
+
+    // TS 24.301 5.4.3.3: the replayed UE security capabilities must match the
+    // octets the UE sent in the Attach Request, bit for bit.
+    const auto &advertised = context.advertisedSecurityCapabilities;
+    if (advertised.empty())
+        throw DecodeError("No advertised UE security capabilities are available for the replay check");
+    if (command.replayedCapabilities.size() < advertised.size())
+        throw DecodeError("Security Mode Command replayed a truncated UE security capability");
+    if (!std::equal(advertised.begin(), advertised.end(), command.replayedCapabilities.begin()))
+        throw DecodeError("Security Mode Command replayed UE security capabilities do not match the UE advertisement");
+
+    context.integrity = command.integrity;
+    context.ciphering = command.ciphering;
+    context.ksi = command.ksi;
+}
+
+std::vector<uint8_t> EncodeSecurityModeComplete(const Config &config, bool includeImeisv)
+{
+    std::vector<uint8_t> out{EpsEmm, SecurityModeCompleteType};
+    if (includeImeisv)
+    {
+        auto imeisv = EncodeImeisv(config.imeisv);
+        out.push_back(IeiImeisv);
+        out.push_back(static_cast<uint8_t>(imeisv.size()));
+        out.insert(out.end(), imeisv.begin(), imeisv.end());
+    }
+    return out;
+}
+
+DownlinkMessage DecodeDownlink(const uint8_t *data, size_t size)
+{
+    if (data == nullptr || size < 2)
+        throw DecodeError("Empty NAS message");
+
+    DownlinkMessage result{};
+
+    if ((data[0] & 0x0FU) == EpsEmm)
+    {
+        result.messageType = data[1];
+        switch (data[1])
+        {
+        case SecurityModeCommandType:
+            result.type = DownlinkEmm::SECURITY_MODE_COMMAND;
+            result.securityModeCommand = DecodeSecurityModeCommand(data, size);
+            return result;
+        case AttachAcceptType:
+        {
+            result.type = DownlinkEmm::ATTACH_ACCEPT;
+            if (size < 6)
+                throw DecodeError("Truncated EPS Attach Accept");
+            result.attachAccept.attachResult = static_cast<uint8_t>(data[2] & 0x0FU);
+            result.attachAccept.t3412 = data[3];
+            const size_t taiLength = data[4];
+            if (size < 5U + taiLength + 2)
+                throw DecodeError("Truncated EPS Attach Accept TAI list");
+            result.attachAccept.taiList.assign(data + 5, data + 5 + taiLength);
+            size_t offset = 5U + taiLength;
+            const size_t esmLength = (static_cast<size_t>(data[offset]) << 8U) | data[offset + 1];
+            offset += 2;
+            if (esmLength == 0 || size < offset + esmLength)
+                throw DecodeError("Truncated EPS Attach Accept ESM container");
+            result.attachAccept.esmContainer.assign(data + offset, data + offset + esmLength);
+            offset += esmLength;
+            DecodeEsmContainer(result.attachAccept.esmContainer, result);
+            if (IsOptionalIei(data, size, offset, IeiGuti) && offset + 1 < size)
+            {
+                // TS 24.301 9.9.2.9: GUTI is 11 octets after the length.
+                constexpr size_t GutiLength = 11;
+                const size_t length = data[offset + 1];
+                if (length == GutiLength && offset + 2 + length <= size)
+                {
+                    std::array<uint8_t, 11> guti{};
+                    std::copy(data + offset + 2, data + offset + 2 + length, guti.begin());
+                    result.attachAccept.guti = guti;
+                }
+            }
+            return result;
+        }
+        case AttachRejectType:
+            result.type = DownlinkEmm::ATTACH_REJECT;
+            if (size >= 3)
+                result.emmCause = data[2];
+            return result;
+        default:
+            result.type = DownlinkEmm::OTHER;
+            return result;
+        }
+    }
+
+    if ((data[0] & 0x0FU) == Esm)
+    {
+        if (size < 3)
+            throw DecodeError("Truncated ESM message");
+        result.messageType = data[2];
+        if (data[2] == EsmInformationRequestType)
+        {
+            result.type = DownlinkEmm::ESM_INFORMATION_REQUEST;
+            result.esmInformationRequest.procedureTransactionId = data[1];
+            if (IsOptionalIei(data, size, 3, IeiApn) && size > 5)
+            {
+                const size_t apnLength = data[4];
+                if (5 + apnLength <= size)
+                    result.esmInformationRequest.apn = DecodeApn(data + 5, apnLength);
+            }
+            return result;
+        }
+        result.type = DownlinkEmm::OTHER;
+        return result;
+    }
+
+    throw DecodeError("NAS message is neither EPS mobility management nor EPS session management");
+}
+
+std::vector<uint8_t> EncodeActivateDefaultEpsBearerContextAccept(uint8_t epsBearerIdentity, uint8_t procedureTransactionId)
+{
+    return {static_cast<uint8_t>((epsBearerIdentity << 4U) | Esm), procedureTransactionId,
+            ActivateDefaultEpsBearerAcceptType};
+}
+
+std::vector<uint8_t> EncodeAttachComplete(const std::vector<uint8_t> &esmAccept)
+{
+    if (esmAccept.empty() || esmAccept.size() > 0xFFFFU)
+        throw DecodeError("Invalid ESM container for Attach Complete");
+    std::vector<uint8_t> out{EpsEmm, AttachCompleteType};
+    out.push_back(static_cast<uint8_t>(esmAccept.size() >> 8U));
+    out.push_back(static_cast<uint8_t>(esmAccept.size()));
+    out.insert(out.end(), esmAccept.begin(), esmAccept.end());
+    return out;
+}
+
+std::vector<uint8_t> EncodeEsmInformationResponse(uint8_t procedureTransactionId, const std::optional<std::string> &apn)
+{
+    std::vector<uint8_t> out{Esm, procedureTransactionId, EsmInformationResponseType};
+    if (apn.has_value())
+    {
+        auto encoded = EncodeApn(*apn);
+        out.push_back(IeiApn);
+        out.push_back(static_cast<uint8_t>(encoded.size()));
+        out.insert(out.end(), encoded.begin(), encoded.end());
+    }
+    return out;
 }
 
 } // namespace lte::ue::nas

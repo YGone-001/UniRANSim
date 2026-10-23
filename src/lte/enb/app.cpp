@@ -11,9 +11,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <sstream>
 #include <thread>
 
@@ -119,6 +121,70 @@ void LogServedGummeis(const s1ap::SetupOutcome &outcome)
     }
 }
 
+std::array<uint8_t, 4> ParseIpv4(const std::string &address)
+{
+    unsigned a = 0, b = 0, c = 0, d = 0;
+    char extra = 0;
+    if (std::sscanf(address.c_str(), "%u.%u.%u.%u%c", &a, &b, &c, &d, &extra) != 4 || a > 255 || b > 255 || c > 255 ||
+        d > 255)
+        throw std::runtime_error("S1-U address must be an IPv4 literal: " + address);
+    return {static_cast<uint8_t>(a), static_cast<uint8_t>(b), static_cast<uint8_t>(c), static_cast<uint8_t>(d)};
+}
+
+std::array<uint8_t, 4> TeidToBytes(uint32_t teid)
+{
+    return {static_cast<uint8_t>((teid >> 24U) & 0xFFU), static_cast<uint8_t>((teid >> 16U) & 0xFFU),
+            static_cast<uint8_t>((teid >> 8U) & 0xFFU), static_cast<uint8_t>(teid & 0xFFU)};
+}
+
+// One default EPS bearer's real S1-U GTP-U endpoint owned by this eNB.
+struct GtpuBearer
+{
+    std::unique_ptr<udp::UdpServer> socket;
+    std::string localAddress;
+    uint16_t localPort{};
+    uint32_t localTeid{};
+    uint8_t erabId{};
+    std::array<uint8_t, 4> sgwAddress{};
+    std::array<uint8_t, 4> sgwTeid{};
+    bool active{false};
+
+    void establish(const EnbConfig &config, const s1ap::ErabToBeSetupItem &item)
+    {
+        if (active)
+            throw std::runtime_error("A default EPS bearer is already established for this UE");
+        if (!socket)
+        {
+            localAddress = config.s1uAddress;
+            localPort = config.s1uPort;
+            socket = std::make_unique<udp::UdpServer>(localAddress, localPort);
+        }
+        // The TEID is allocated by the eNB and must be non-zero and locally owned.
+        localTeid = AllocateLocalTeid(item.erabId);
+        erabId = item.erabId;
+        sgwAddress = item.transportLayerAddress;
+        sgwTeid = item.gtpTeid;
+        active = true;
+        Log("INFO", "Established S1-U GTP-U endpoint for E-RAB " + std::to_string(erabId) + ": local=" + localAddress +
+                        ":" + std::to_string(localPort) + " TEID=" + Hex(localTeid, 8) +
+                        " sgw=" + std::to_string(sgwAddress[0]) + "." + std::to_string(sgwAddress[1]) + "." +
+                        std::to_string(sgwAddress[2]) + "." + std::to_string(sgwAddress[3]) + " sgw-TEID=" +
+                        Hex((static_cast<uint32_t>(sgwTeid[0]) << 24U) | (static_cast<uint32_t>(sgwTeid[1]) << 16U) |
+                                (static_cast<uint32_t>(sgwTeid[2]) << 8U) | sgwTeid[3],
+                            8));
+    }
+
+    void release()
+    {
+        if (!active)
+            return;
+        active = false;
+        socket.reset();
+        localTeid = 0;
+        Log("INFO", "Released S1-U GTP-U endpoint for E-RAB " + std::to_string(erabId));
+    }
+};
+
 } // namespace
 
 int Run(const EnbConfig &config, const std::atomic_bool &shutdownRequested)
@@ -202,6 +268,7 @@ int Run(const EnbConfig &config, const std::atomic_bool &shutdownRequested)
                                     std::to_string(config.ueLinkPort));
                     std::optional<InetAddress> uePeer;
                     std::optional<s1ap::UeContext> ueContext;
+                    GtpuBearer defaultBearer;
                     uint8_t radioBuffer[lte::ue::link::MaxNasPduSize + 8];
                     while (!shutdownRequested && !handler.associationLost)
                     {
@@ -211,19 +278,92 @@ int Run(const EnbConfig &config, const std::atomic_bool &shutdownRequested)
                         {
                             try
                             {
-                                auto downlink = s1ap::DecodeDownlinkNasTransport(handler.message.data(), handler.message.size());
-                                handler.message.clear();
-                                if (!ueContext.has_value() || !uePeer.has_value() ||
-                                    downlink.enbUeS1apId != ueContext->enbUeS1apId)
-                                    throw s1ap::CodecError("Downlink NAS Transport does not match the active UE context");
-                                if (ueContext->mmeUeS1apId.has_value() &&
-                                    *ueContext->mmeUeS1apId != downlink.mmeUeS1apId)
-                                    throw s1ap::CodecError("MME-UE-S1AP-ID changed for the active UE context");
-                                ueContext->mmeUeS1apId = downlink.mmeUeS1apId;
-                                auto radio = lte::ue::link::Encode({lte::ue::link::MessageType::NAS_DOWNLINK,
-                                                                    ueContext->enbUeS1apId, std::move(downlink.nasPdu)});
-                                ueLink.Send(*uePeer, radio.data(), radio.size());
-                                Log("INFO", "Forwarded Downlink NAS Transport to LTE UE");
+                                const auto *message = handler.message.data();
+                                const size_t messageLength = handler.message.size();
+                                auto pdu = s1ap::ProbeS1apPdu(message, messageLength);
+                                if (pdu.kind == s1ap::S1apPdu::Kind::INITIATING &&
+                                    pdu.procedureCode == 9)
+                                {
+                                    auto request =
+                                        s1ap::DecodeInitialContextSetupRequest(message, messageLength);
+                                    handler.message.clear();
+                                    if (!ueContext.has_value() || !uePeer.has_value() ||
+                                        request.enbUeS1apId != ueContext->enbUeS1apId)
+                                        throw s1ap::CodecError(
+                                            "Initial Context Setup Request does not match the active UE context");
+                                    if (ueContext->mmeUeS1apId.has_value() &&
+                                        *ueContext->mmeUeS1apId != request.mmeUeS1apId)
+                                        throw s1ap::CodecError("MME-UE-S1AP-ID changed for the active UE context");
+                                    ueContext->mmeUeS1apId = request.mmeUeS1apId;
+                                    if (request.erabs.size() != 1)
+                                        throw s1ap::CodecError(
+                                            "This LTE eNB establishes exactly one default EPS E-RAB");
+                                    const auto &erab = request.erabs.front();
+                                    defaultBearer.establish(config, erab);
+                                    s1ap::ErabSetupItem setup{erab.erabId, ParseIpv4(defaultBearer.localAddress),
+                                                              TeidToBytes(defaultBearer.localTeid)};
+                                    auto response = s1ap::EncodeInitialContextSetupResponse(
+                                        request.mmeUeS1apId, request.enbUeS1apId, {setup});
+                                    client.send(UeStream(handler, ueContext->enbUeS1apId), response);
+                                    Log("INFO", "Initial Context Setup Response sent with eNB S1-U TEID=" +
+                                                    Hex(defaultBearer.localTeid, 8));
+                                    if (erab.nasPduPresent)
+                                    {
+                                        auto radio = lte::ue::link::Encode(
+                                            {lte::ue::link::MessageType::NAS_DOWNLINK, ueContext->enbUeS1apId,
+                                             erab.nasPdu});
+                                        ueLink.Send(*uePeer, radio.data(), radio.size());
+                                        Log("INFO", "Forwarded Initial Context Setup NAS-PDU to LTE UE");
+                                    }
+                                }
+                                else if (pdu.kind == s1ap::S1apPdu::Kind::INITIATING &&
+                                         pdu.procedureCode == 11)
+                                {
+                                    auto downlink =
+                                        s1ap::DecodeDownlinkNasTransport(message, messageLength);
+                                    handler.message.clear();
+                                    if (!ueContext.has_value() || !uePeer.has_value() ||
+                                        downlink.enbUeS1apId != ueContext->enbUeS1apId)
+                                        throw s1ap::CodecError(
+                                            "Downlink NAS Transport does not match the active UE context");
+                                    if (ueContext->mmeUeS1apId.has_value() &&
+                                        *ueContext->mmeUeS1apId != downlink.mmeUeS1apId)
+                                        throw s1ap::CodecError("MME-UE-S1AP-ID changed for the active UE context");
+                                    ueContext->mmeUeS1apId = downlink.mmeUeS1apId;
+                                    auto radio = lte::ue::link::Encode({lte::ue::link::MessageType::NAS_DOWNLINK,
+                                                                        ueContext->enbUeS1apId,
+                                                                        std::move(downlink.nasPdu)});
+                                    ueLink.Send(*uePeer, radio.data(), radio.size());
+                                    Log("INFO", "Forwarded Downlink NAS Transport to LTE UE");
+                                }
+                                else if (pdu.kind == s1ap::S1apPdu::Kind::INITIATING &&
+                                         pdu.procedureCode == 23)
+                                {
+                                    auto command =
+                                        s1ap::DecodeUeContextReleaseCommand(message, messageLength);
+                                    handler.message.clear();
+                                    Log("INFO", "UE Context Release Command received: cause=" +
+                                                    command.causeCategory + "/" +
+                                                    std::to_string(command.causeValue));
+                                    if (ueContext.has_value() && command.enbUeS1apId.has_value() &&
+                                        *command.enbUeS1apId != ueContext->enbUeS1apId)
+                                        throw s1ap::CodecError(
+                                            "UE Context Release does not match the active UE context");
+                                    uint32_t mmeId = command.mmeUeS1apId;
+                                    uint32_t enbId = command.enbUeS1apId.value_or(
+                                        ueContext.has_value() ? ueContext->enbUeS1apId : 0U);
+                                    defaultBearer.release();
+                                    auto complete = s1ap::EncodeUeContextReleaseComplete(mmeId, enbId);
+                                    client.send(UeStream(handler, enbId), complete);
+                                    Log("INFO", "UE Context Release Complete sent");
+                                    ueContext.reset();
+                                    uePeer.reset();
+                                }
+                                else
+                                {
+                                    throw s1ap::CodecError("Unexpected S1AP procedure code " +
+                                                           std::to_string(pdu.procedureCode));
+                                }
                             }
                             catch (const std::exception &e)
                             {

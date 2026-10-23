@@ -20,14 +20,24 @@ namespace lte::enb::s1ap
 namespace
 {
 
+constexpr uint16_t PROCEDURE_INITIAL_CONTEXT_SETUP = 9;
 constexpr uint16_t PROCEDURE_S1_SETUP = 17;
 constexpr uint16_t PROCEDURE_DOWNLINK_NAS_TRANSPORT = 11;
 constexpr uint16_t PROCEDURE_INITIAL_UE_MESSAGE = 12;
 constexpr uint16_t PROCEDURE_UPLINK_NAS_TRANSPORT = 13;
+constexpr uint16_t PROCEDURE_UE_CONTEXT_RELEASE = 23;
 constexpr uint16_t IE_CAUSE = 2;
 constexpr uint16_t IE_MME_UE_S1AP_ID = 0;
 constexpr uint16_t IE_ENB_UE_S1AP_ID = 8;
+constexpr uint16_t IE_E_RAB_TO_BE_SETUP_LIST_CTXT_SU_REQ = 24;
 constexpr uint16_t IE_NAS_PDU = 26;
+constexpr uint16_t IE_E_RAB_SETUP_ITEM_CTXT_SU_RES = 50;
+constexpr uint16_t IE_E_RAB_SETUP_LIST_CTXT_SU_RES = 51;
+constexpr uint16_t IE_E_RAB_TO_BE_SETUP_ITEM_CTXT_SU_REQ = 52;
+constexpr uint16_t IE_UE_AGGREGATE_MAXIMUM_BITRATE = 66;
+constexpr uint16_t IE_SECURITY_KEY = 73;
+constexpr uint16_t IE_UE_S1AP_IDS = 99;
+constexpr uint16_t IE_UE_SECURITY_CAPABILITIES = 107;
 constexpr uint16_t IE_GLOBAL_ENB_ID = 59;
 constexpr uint16_t IE_ENB_NAME = 60;
 constexpr uint16_t IE_MME_NAME = 61;
@@ -675,6 +685,202 @@ void DecodeCause(const std::vector<uint8_t> &data, SetupOutcome &result)
     reader.requireFinished();
 }
 
+// BitRate ::= INTEGER (0..10000000000): 34-bit large-range constrained whole number.
+void WriteBitRate(BitWriter &writer, uint64_t value)
+{
+    if (value > 10000000000ULL)
+        throw CodecError("S1AP BitRate is out of range");
+    WriteConstrained(writer, static_cast<size_t>(value), 0, 10000000000ULL, true);
+}
+
+uint64_t ReadBitRate(BitReader &reader)
+{
+    return static_cast<uint64_t>(ReadConstrained(reader, 0, 10000000000ULL, true));
+}
+
+// E-RAB-ID ::= INTEGER (0..15,...): extension marker plus a 4-bit root value.
+void WriteErabId(BitWriter &writer, uint8_t erabId)
+{
+    if (erabId > 15)
+        throw CodecError("E-RAB-ID is out of the root range");
+    writer.writeBit(false);
+    writer.writeBits(erabId, 4);
+}
+
+uint8_t ReadErabId(BitReader &reader)
+{
+    if (reader.readBit())
+        throw CodecError("Extended E-RAB-ID is not supported");
+    return static_cast<uint8_t>(reader.readBits(4));
+}
+
+// TransportLayerAddress ::= BIT STRING (SIZE(1..160,...)). IPv4 is 32 bits.
+void WriteTransportLayerAddress(BitWriter &writer, const std::array<uint8_t, 4> &address)
+{
+    writer.writeBit(false); // size within the extension root
+    WriteConstrained(writer, 32, 1, 160, true);
+    writer.align();
+    writer.writeBytes(address.data(), address.size());
+}
+
+std::array<uint8_t, 4> ReadTransportLayerAddress(BitReader &reader)
+{
+    if (reader.readBit())
+        throw CodecError("Extended TransportLayerAddress size is not supported");
+    size_t lengthBits = ReadConstrained(reader, 1, 160, true);
+    if (lengthBits != 32)
+        throw CodecError("Only IPv4 TransportLayerAddress is supported");
+    auto bytes = reader.readBytes(4);
+    std::array<uint8_t, 4> result{};
+    std::copy(bytes.begin(), bytes.end(), result.begin());
+    return result;
+}
+
+// SecurityKey ::= BIT STRING (SIZE(256)): fixed 32 octets after octet alignment.
+void WriteSecurityKey(BitWriter &writer, const std::array<uint8_t, 32> &key)
+{
+    writer.align();
+    writer.writeBytes(key.data(), key.size());
+}
+
+std::array<uint8_t, 32> ReadSecurityKey(BitReader &reader)
+{
+    auto bytes = reader.readBytes(32);
+    std::array<uint8_t, 32> result{};
+    std::copy(bytes.begin(), bytes.end(), result.begin());
+    return result;
+}
+
+// UESecurityCapabilities ::= SEQUENCE of two BIT STRING (SIZE(16,...)).
+void WriteUeSecurityCapabilities(BitWriter &writer, const std::array<uint8_t, 2> &encryption,
+                                 const std::array<uint8_t, 2> &integrity)
+{
+    writer.writeBit(false); // SEQUENCE extension marker
+    writer.writeBit(false); // iE-Extensions absent
+    writer.writeBit(false); // encryptionAlgorithms size within the root
+    writer.writeBits((static_cast<uint64_t>(encryption[0]) << 8U) | encryption[1], 16);
+    writer.writeBit(false); // integrityProtectionAlgorithms size within the root
+    writer.writeBits((static_cast<uint64_t>(integrity[0]) << 8U) | integrity[1], 16);
+}
+
+void ReadUeSecurityCapabilities(BitReader &reader, std::array<uint8_t, 2> &encryption,
+                                std::array<uint8_t, 2> &integrity)
+{
+    if (reader.readBit())
+        throw CodecError("Extended UESecurityCapabilities is not supported");
+    if (reader.readBit())
+        throw CodecError("UESecurityCapabilities extensions are not supported");
+    if (reader.readBit())
+        throw CodecError("Extended EncryptionAlgorithms size is not supported");
+    uint64_t eea = reader.readBits(16);
+    if (reader.readBit())
+        throw CodecError("Extended IntegrityProtectionAlgorithms size is not supported");
+    uint64_t eia = reader.readBits(16);
+    encryption = {static_cast<uint8_t>(eea >> 8U), static_cast<uint8_t>(eea & 0xFFU)};
+    integrity = {static_cast<uint8_t>(eia >> 8U), static_cast<uint8_t>(eia & 0xFFU)};
+}
+
+// AllocationAndRetentionPriority with the non-extensible ARP enumerations.
+void WriteArp(BitWriter &writer, uint8_t priorityLevel, bool preemptionCapability, bool preemptionVulnerability)
+{
+    if (priorityLevel > 15)
+        throw CodecError("PriorityLevel is out of range");
+    writer.writeBit(false); // SEQUENCE extension marker
+    writer.writeBit(false); // iE-Extensions absent
+    writer.writeBits(priorityLevel, 4);
+    writer.writeBit(preemptionCapability);
+    writer.writeBit(preemptionVulnerability);
+}
+
+void ReadArp(BitReader &reader, ErabToBeSetupItem &item)
+{
+    if (reader.readBit() || reader.readBit())
+        throw CodecError("Unsupported AllocationAndRetentionPriority extension");
+    item.priorityLevel = static_cast<uint8_t>(reader.readBits(4));
+    item.preemptionCapability = reader.readBit();
+    item.preemptionVulnerability = reader.readBit();
+}
+
+void WriteErabLevelQos(BitWriter &writer, uint8_t qci, uint8_t priorityLevel, bool preemptionCapability,
+                       bool preemptionVulnerability)
+{
+    writer.writeBit(false); // SEQUENCE extension marker
+    writer.writeBit(false); // gbrQosInformation absent
+    writer.writeBit(false); // iE-Extensions absent
+    WriteConstrained(writer, qci, 0, 255, true);
+    WriteArp(writer, priorityLevel, preemptionCapability, preemptionVulnerability);
+}
+
+void ReadErabLevelQos(BitReader &reader, ErabToBeSetupItem &item)
+{
+    if (reader.readBit())
+        throw CodecError("Extended E-RABLevelQoSParameters is not supported");
+    bool gbrPresent = reader.readBit();
+    bool extensionsPresent = reader.readBit();
+    item.qci = static_cast<uint8_t>(ReadConstrained(reader, 0, 255, true));
+    ReadArp(reader, item);
+    if (gbrPresent)
+        throw CodecError("GBR-QosInformation is not supported for the default EPS bearer");
+    if (extensionsPresent)
+        throw CodecError("E-RABLevelQoSParameters extensions are not supported");
+}
+
+ErabToBeSetupItem ReadErabToBeSetupItem(BitReader &reader)
+{
+    ErabToBeSetupItem item{};
+    // APER SEQUENCE: extension marker, then the OPTIONAL presence bits in
+    // field order (nAS-PDU, iE-Extensions), then the fields themselves.
+    if (reader.readBit())
+        throw CodecError("Extended E-RABToBeSetupItemCtxtSUReq is not supported");
+    const bool nasPduPresent = reader.readBit();
+    const bool extensionsPresent = reader.readBit();
+    item.erabId = ReadErabId(reader);
+    ReadErabLevelQos(reader, item);
+    item.transportLayerAddress = ReadTransportLayerAddress(reader);
+    {
+        auto teid = ReadFixedOctets(reader, 4);
+        std::copy(teid.begin(), teid.end(), item.gtpTeid.begin());
+    }
+    item.nasPduPresent = nasPduPresent;
+    if (nasPduPresent)
+        item.nasPdu = reader.readBytes(reader.readLength());
+    if (extensionsPresent)
+        throw CodecError("E-RABToBeSetupItemCtxtSUReq extensions are not supported");
+    return item;
+}
+
+std::vector<uint8_t> EncodeErabSetupItem(const ErabSetupItem &item)
+{
+    BitWriter writer;
+    writer.writeBit(false); // SEQUENCE extension marker
+    writer.writeBit(false); // iE-Extensions absent
+    WriteErabId(writer, item.erabId);
+    WriteTransportLayerAddress(writer, item.transportLayerAddress);
+    WriteFixedOctets(writer, item.gtpTeid.data(), item.gtpTeid.size());
+    return writer.take();
+}
+
+std::vector<uint8_t> EncodePdu(uint8_t choice, uint16_t procedure, Criticality pduCriticality,
+                               const std::vector<std::pair<std::pair<uint16_t, Criticality>, std::vector<uint8_t>>> &ies)
+{
+    BitWriter message;
+    message.writeBit(false); // SEQUENCE extension marker
+    WriteConstrained(message, ies.size(), 0, 65535, true);
+    for (const auto &ie : ies)
+        WriteIe(message, ie.first.first, ie.first.second, ie.second);
+    auto body = message.take();
+    BitWriter pdu;
+    pdu.writeBit(false); // S1AP-PDU CHOICE extension marker
+    pdu.writeBits(choice, 2);
+    pdu.align();
+    WriteConstrained(pdu, procedure, 0, 255, true);
+    pdu.writeBits(static_cast<uint8_t>(pduCriticality), 2);
+    pdu.align();
+    pdu.writeLength(body.size());
+    pdu.writeBytes(body);
+    return pdu.take();
+}
+
 } // namespace
 
 std::array<uint8_t, 3> EncodePlmn(const Plmn &plmn)
@@ -882,6 +1088,314 @@ DownlinkNasTransport DecodeDownlinkNasTransport(const uint8_t *data, size_t leng
     if (!mmePresent || !enbPresent || !nasPresent)
         throw CodecError("Downlink NAS Transport is missing a mandatory IE");
     return result;
+}
+
+S1apPdu ProbeS1apPdu(const uint8_t *data, size_t length)
+{
+    if (data == nullptr || length == 0)
+        throw CodecError("Empty S1AP PDU");
+    BitReader reader(data, length);
+    if (reader.readBit())
+        throw CodecError("Extended S1AP PDU choice is not supported");
+    uint8_t choice = static_cast<uint8_t>(reader.readBits(2));
+    if (choice > 2)
+        throw CodecError("Invalid S1AP PDU choice");
+    reader.align();
+    auto procedure = static_cast<uint16_t>(ReadConstrained(reader, 0, 255, true));
+    S1apPdu result{};
+    result.kind = choice == 0 ? S1apPdu::Kind::INITIATING
+                             : (choice == 1 ? S1apPdu::Kind::SUCCESSFUL_OUTCOME : S1apPdu::Kind::UNSUCCESSFUL_OUTCOME);
+    result.procedureCode = procedure;
+    return result;
+}
+
+InitialContextSetupRequest DecodeInitialContextSetupRequest(const uint8_t *data, size_t length)
+{
+    auto envelope = DecodeEnvelope(data, length, PROCEDURE_INITIAL_CONTEXT_SETUP,
+                                   static_cast<int>(Criticality::REJECT));
+    if (envelope.choice != 0)
+        throw CodecError("Initial Context Setup Request is not an initiating message");
+
+    InitialContextSetupRequest result{};
+    bool mmePresent = false;
+    bool enbPresent = false;
+    bool ambrPresent = false;
+    bool erabsPresent = false;
+    bool securityCapabilitiesPresent = false;
+    bool securityKeyPresent = false;
+
+    for (const auto &ie : DecodeIeContainer(envelope.value))
+    {
+        if (ie.id == IE_MME_UE_S1AP_ID)
+        {
+            if (ie.criticality != Criticality::REJECT)
+                throw CodecError("MME-UE-S1AP-ID has invalid criticality");
+            result.mmeUeS1apId = DecodeUeId(ie.value, 0xFFFFFFFFU);
+            mmePresent = true;
+        }
+        else if (ie.id == IE_ENB_UE_S1AP_ID)
+        {
+            if (ie.criticality != Criticality::REJECT)
+                throw CodecError("eNB-UE-S1AP-ID has invalid criticality");
+            result.enbUeS1apId = DecodeUeId(ie.value, 0xFFFFFFU);
+            enbPresent = true;
+        }
+        else if (ie.id == IE_UE_AGGREGATE_MAXIMUM_BITRATE)
+        {
+            if (ie.criticality != Criticality::REJECT)
+                throw CodecError("UEAggregateMaximumBitrate has invalid criticality");
+            BitReader reader(ie.value);
+            if (reader.readBit() || reader.readBit())
+                throw CodecError("Unsupported UEAggregateMaximumBitrate extension");
+            result.ueAmbrDl = ReadBitRate(reader);
+            result.ueAmbrUl = ReadBitRate(reader);
+            reader.requireFinished();
+            ambrPresent = true;
+        }
+        else if (ie.id == IE_E_RAB_TO_BE_SETUP_LIST_CTXT_SU_REQ)
+        {
+            if (ie.criticality != Criticality::REJECT)
+                throw CodecError("E-RABToBeSetupListCtxtSUReq has invalid criticality");
+            BitReader reader(ie.value);
+            size_t count = ReadConstrained(reader, 1, 256, true);
+            result.erabs.reserve(count);
+            for (size_t i = 0; i < count; ++i)
+            {
+                auto id = static_cast<uint16_t>(ReadConstrained(reader, 0, 65535, true));
+                if (id != IE_E_RAB_TO_BE_SETUP_ITEM_CTXT_SU_REQ)
+                    throw CodecError("Unexpected E-RABToBeSetupListCtxtSUReq item identity");
+                reader.readBits(2);
+                reader.align();
+                auto value = reader.readOpenType();
+                BitReader itemReader(value);
+                result.erabs.push_back(ReadErabToBeSetupItem(itemReader));
+                itemReader.requireFinished();
+            }
+            reader.requireFinished();
+            erabsPresent = true;
+        }
+        else if (ie.id == IE_UE_SECURITY_CAPABILITIES)
+        {
+            if (ie.criticality != Criticality::REJECT)
+                throw CodecError("UESecurityCapabilities has invalid criticality");
+            BitReader reader(ie.value);
+            ReadUeSecurityCapabilities(reader, result.encryptionAlgorithms, result.integrityAlgorithms);
+            reader.requireFinished();
+            securityCapabilitiesPresent = true;
+        }
+        else if (ie.id == IE_SECURITY_KEY)
+        {
+            if (ie.criticality != Criticality::REJECT)
+                throw CodecError("SecurityKey has invalid criticality");
+            BitReader reader(ie.value);
+            result.securityKey = ReadSecurityKey(reader);
+            reader.requireFinished();
+            securityKeyPresent = true;
+        }
+        else if (ie.criticality == Criticality::REJECT)
+            throw CodecError("Unknown reject-criticality IE in Initial Context Setup Request");
+    }
+
+    if (!mmePresent || !enbPresent || !ambrPresent || !erabsPresent || !securityCapabilitiesPresent ||
+        !securityKeyPresent)
+        throw CodecError("Initial Context Setup Request is missing a mandatory IE");
+    if (result.erabs.empty())
+        throw CodecError("Initial Context Setup Request contains no E-RAB to establish");
+    return result;
+}
+
+std::vector<uint8_t> EncodeInitialContextSetupRequest(const InitialContextSetupRequest &request)
+{
+    if (request.erabs.empty() || request.erabs.size() > 256)
+        throw CodecError("Initial Context Setup Request requires 1..256 E-RABs");
+    if (request.mmeUeS1apId == 0 || request.enbUeS1apId == 0 || request.enbUeS1apId > 0xFFFFFFU)
+        throw CodecError("Initial Context Setup Request has an invalid UE S1AP identity");
+
+    BitWriter list;
+    WriteConstrained(list, request.erabs.size(), 1, 256, true);
+    for (const auto &erab : request.erabs)
+    {
+        BitWriter item;
+        item.writeBit(false); // SEQUENCE extension marker
+        item.writeBit(erab.nasPduPresent);
+        item.writeBit(false); // iE-Extensions absent
+        WriteErabId(item, erab.erabId);
+        WriteErabLevelQos(item, erab.qci, erab.priorityLevel, erab.preemptionCapability, erab.preemptionVulnerability);
+        WriteTransportLayerAddress(item, erab.transportLayerAddress);
+        WriteFixedOctets(item, erab.gtpTeid.data(), erab.gtpTeid.size());
+        if (erab.nasPduPresent)
+        {
+            item.writeLength(erab.nasPdu.size());
+            item.writeBytes(erab.nasPdu);
+        }
+        WriteIe(list, IE_E_RAB_TO_BE_SETUP_ITEM_CTXT_SU_REQ, Criticality::REJECT, item.take());
+    }
+    auto listBytes = list.take();
+
+    BitWriter ambr;
+    ambr.writeBit(false); // SEQUENCE extension marker
+    ambr.writeBit(false); // iE-Extensions absent
+    WriteBitRate(ambr, request.ueAmbrDl);
+    WriteBitRate(ambr, request.ueAmbrUl);
+
+    BitWriter securityCapabilities;
+    WriteUeSecurityCapabilities(securityCapabilities, request.encryptionAlgorithms, request.integrityAlgorithms);
+
+    BitWriter securityKey;
+    WriteSecurityKey(securityKey, request.securityKey);
+
+    std::vector<std::pair<std::pair<uint16_t, Criticality>, std::vector<uint8_t>>> ies;
+    ies.push_back({{IE_MME_UE_S1AP_ID, Criticality::REJECT}, EncodeUeId(request.mmeUeS1apId, 0xFFFFFFFFU)});
+    ies.push_back({{IE_ENB_UE_S1AP_ID, Criticality::REJECT}, EncodeUeId(request.enbUeS1apId, 0xFFFFFFU)});
+    ies.push_back({{IE_UE_AGGREGATE_MAXIMUM_BITRATE, Criticality::REJECT}, ambr.take()});
+    ies.push_back({{IE_E_RAB_TO_BE_SETUP_LIST_CTXT_SU_REQ, Criticality::REJECT}, listBytes});
+    ies.push_back({{IE_UE_SECURITY_CAPABILITIES, Criticality::REJECT}, securityCapabilities.take()});
+    ies.push_back({{IE_SECURITY_KEY, Criticality::REJECT}, securityKey.take()});
+    return EncodePdu(0, PROCEDURE_INITIAL_CONTEXT_SETUP, Criticality::REJECT, ies);
+}
+
+std::vector<uint8_t> EncodeInitialContextSetupResponse(uint32_t mmeUeS1apId, uint32_t enbUeS1apId,
+                                                       const std::vector<ErabSetupItem> &erabs)
+{
+    if (mmeUeS1apId == 0 || enbUeS1apId == 0 || enbUeS1apId > 0xFFFFFFU)
+        throw CodecError("Initial Context Setup Response has an invalid UE S1AP identity");
+    if (erabs.empty() || erabs.size() > 256)
+        throw CodecError("Initial Context Setup Response requires 1..256 established E-RABs");
+
+    BitWriter list;
+    WriteConstrained(list, erabs.size(), 1, 256, true);
+    for (const auto &item : erabs)
+        WriteIe(list, IE_E_RAB_SETUP_ITEM_CTXT_SU_RES, Criticality::IGNORE, EncodeErabSetupItem(item));
+    auto listBytes = list.take();
+
+    std::vector<std::pair<std::pair<uint16_t, Criticality>, std::vector<uint8_t>>> ies;
+    ies.push_back({{IE_MME_UE_S1AP_ID, Criticality::REJECT}, EncodeUeId(mmeUeS1apId, 0xFFFFFFFFU)});
+    ies.push_back({{IE_ENB_UE_S1AP_ID, Criticality::REJECT}, EncodeUeId(enbUeS1apId, 0xFFFFFFU)});
+    ies.push_back({{IE_E_RAB_SETUP_LIST_CTXT_SU_RES, Criticality::IGNORE}, std::move(listBytes)});
+    return EncodePdu(1, PROCEDURE_INITIAL_CONTEXT_SETUP, Criticality::REJECT, ies);
+}
+
+UeContextReleaseCommand DecodeUeContextReleaseCommand(const uint8_t *data, size_t length)
+{
+    auto envelope = DecodeEnvelope(data, length, PROCEDURE_UE_CONTEXT_RELEASE, static_cast<int>(Criticality::REJECT));
+    if (envelope.choice != 0)
+        throw CodecError("UE Context Release Command is not an initiating message");
+
+    UeContextReleaseCommand result{};
+    bool idsPresent = false;
+    bool causePresent = false;
+    for (const auto &ie : DecodeIeContainer(envelope.value))
+    {
+        if (ie.id == IE_UE_S1AP_IDS)
+        {
+            if (ie.criticality != Criticality::REJECT)
+                throw CodecError("UE-S1AP-IDs has invalid criticality");
+            BitReader reader(ie.value);
+            if (reader.readBit())
+                throw CodecError("Extended UE-S1AP-IDs is not supported");
+            uint8_t choice = static_cast<uint8_t>(reader.readBits(1));
+            if (choice == 0)
+            {
+                if (reader.readBit())
+                    throw CodecError("Extended UE-S1AP-ID-pair is not supported");
+                if (reader.readBit())
+                    throw CodecError("UE-S1AP-ID-pair extensions are not supported");
+                result.mmeUeS1apId = static_cast<uint32_t>(ReadConstrained(reader, 0, 0xFFFFFFFFU, true));
+                result.enbUeS1apId = static_cast<uint32_t>(ReadConstrained(reader, 0, 0xFFFFFFU, true));
+            }
+            else
+            {
+                result.mmeUeS1apId = static_cast<uint32_t>(ReadConstrained(reader, 0, 0xFFFFFFFFU, true));
+                result.enbUeS1apId.reset();
+            }
+            reader.requireFinished();
+            idsPresent = true;
+        }
+        else if (ie.id == IE_CAUSE)
+        {
+            if (ie.criticality != Criticality::IGNORE)
+                throw CodecError("Cause has invalid criticality");
+            BitReader reader(ie.value);
+            if (reader.readBit())
+                throw CodecError("Extended S1AP Cause category is not supported");
+            int category = static_cast<int>(reader.readBits(3));
+            static const std::array<const char *, 5> names = {"radioNetwork", "transport", "nas", "protocol", "misc"};
+            static const std::array<size_t, 5> counts = {36, 2, 4, 7, 6};
+            if (category < 0 || category >= static_cast<int>(names.size()))
+                throw CodecError("Invalid S1AP Cause category");
+            result.causeCategory = names[category];
+            result.causeValue = ReadExtensibleEnum(reader, counts[category]);
+            reader.requireFinished();
+            causePresent = true;
+        }
+        else if (ie.criticality == Criticality::REJECT)
+            throw CodecError("Unknown reject-criticality IE in UE Context Release Command");
+    }
+    if (!idsPresent || !causePresent)
+        throw CodecError("UE Context Release Command is missing a mandatory IE");
+    return result;
+}
+
+std::vector<uint8_t> EncodeUeContextReleaseCommand(uint32_t mmeUeS1apId, std::optional<uint32_t> enbUeS1apId,
+                                                   const std::string &causeCategory, int causeValue)
+{
+    if (mmeUeS1apId == 0)
+        throw CodecError("UE Context Release Command has an invalid MME-UE-S1AP-ID");
+    if (enbUeS1apId.has_value() && (*enbUeS1apId == 0 || *enbUeS1apId > 0xFFFFFFU))
+        throw CodecError("UE Context Release Command has an invalid eNB-UE-S1AP-ID");
+
+    static const std::array<const char *, 5> names = {"radioNetwork", "transport", "nas", "protocol", "misc"};
+    static const std::array<size_t, 5> counts = {36, 2, 4, 7, 6};
+    int category = -1;
+    for (size_t i = 0; i < names.size(); ++i)
+    {
+        if (causeCategory == names[i])
+        {
+            category = static_cast<int>(i);
+            break;
+        }
+    }
+    if (category < 0)
+        throw CodecError("Unknown S1AP Cause category");
+    if (causeValue < 0 || causeValue >= static_cast<int>(counts[static_cast<size_t>(category)]))
+        throw CodecError("Invalid S1AP Cause value");
+
+    BitWriter ids;
+    ids.writeBit(false); // UE-S1AP-IDs CHOICE not extended
+    if (enbUeS1apId.has_value())
+    {
+        ids.writeBits(0, 1); // uE-S1AP-ID-pair
+        ids.writeBit(false); // SEQUENCE extension marker
+        ids.writeBit(false); // iE-Extensions absent
+        WriteConstrained(ids, mmeUeS1apId, 0, 0xFFFFFFFFU, true);
+        WriteConstrained(ids, *enbUeS1apId, 0, 0xFFFFFFU, true);
+    }
+    else
+    {
+        ids.writeBits(1, 1); // mME-UE-S1AP-ID
+        WriteConstrained(ids, mmeUeS1apId, 0, 0xFFFFFFFFU, true);
+    }
+
+    BitWriter cause;
+    cause.writeBit(false); // Cause CHOICE not extended
+    cause.writeBits(static_cast<uint8_t>(category), 3);
+    cause.writeBit(false); // root enumeration
+    cause.writeBits(static_cast<uint64_t>(causeValue), BitsForRange(counts[static_cast<size_t>(category)]));
+
+    std::vector<std::pair<std::pair<uint16_t, Criticality>, std::vector<uint8_t>>> ies;
+    ies.push_back({{IE_UE_S1AP_IDS, Criticality::REJECT}, ids.take()});
+    ies.push_back({{IE_CAUSE, Criticality::IGNORE}, cause.take()});
+    return EncodePdu(0, PROCEDURE_UE_CONTEXT_RELEASE, Criticality::REJECT, ies);
+}
+
+std::vector<uint8_t> EncodeUeContextReleaseComplete(uint32_t mmeUeS1apId, uint32_t enbUeS1apId)
+{
+    if (mmeUeS1apId == 0 || enbUeS1apId == 0 || enbUeS1apId > 0xFFFFFFU)
+        throw CodecError("UE Context Release Complete has an invalid UE S1AP identity");
+    std::vector<std::pair<std::pair<uint16_t, Criticality>, std::vector<uint8_t>>> ies;
+    ies.push_back({{IE_MME_UE_S1AP_ID, Criticality::REJECT}, EncodeUeId(mmeUeS1apId, 0xFFFFFFFFU)});
+    ies.push_back({{IE_ENB_UE_S1AP_ID, Criticality::REJECT}, EncodeUeId(enbUeS1apId, 0xFFFFFFU)});
+    return EncodePdu(1, PROCEDURE_UE_CONTEXT_RELEASE, Criticality::REJECT, ies);
 }
 
 } // namespace lte::enb::s1ap

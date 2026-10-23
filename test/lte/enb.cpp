@@ -208,3 +208,227 @@ TEST_CASE("lte/enb/codec: UE-associated NAS messages use the expected S1AP proce
     CHECK_THROWS(lte::enb::s1ap::EncodeInitialUeMessage(config, 0, nas));
     CHECK_THROWS(lte::enb::s1ap::DecodeDownlinkNasTransport(nullptr, 0));
 }
+
+TEST_CASE("lte/enb/config: s1u GTP-U endpoint is configurable and defaults to the local GTP-U port")
+{
+    auto config = lte::enb::ParseConfig(ValidConfig);
+    CHECK(config.s1uAddress == "127.0.0.1");
+    CHECK(config.s1uPort == 2152);
+
+    std::string withS1u = ValidConfig;
+    withS1u += "\ns1u:\n  address: 192.0.2.10\n  port: 2153\n";
+    auto configured = lte::enb::ParseConfig(withS1u);
+    CHECK(configured.s1uAddress == "192.0.2.10");
+    CHECK(configured.s1uPort == 2153);
+}
+
+TEST_CASE("lte/enb/resource: local GTP-U TEIDs are non-zero, owned and stable per E-RAB")
+{
+    CHECK(lte::enb::AllocateLocalTeid(5) != 0U);
+    CHECK(lte::enb::AllocateLocalTeid(1) != lte::enb::AllocateLocalTeid(5));
+    CHECK(lte::enb::AllocateLocalTeid(5) == lte::enb::AllocateLocalTeid(5));
+    // The TEID embeds the E-RAB identity so two bearers never collide on one eNB.
+    CHECK((lte::enb::AllocateLocalTeid(5) & 0x0000FF00U) == 0x00000500U);
+    // Never the reserved all-zero tunnel endpoint.
+    for (uint8_t erabId = 0; erabId < 16; ++erabId)
+        CHECK(lte::enb::AllocateLocalTeid(erabId) != 0U);
+}
+
+TEST_CASE("lte/enb/codec: Initial Context Setup Request round-trips E-RAB, AMBR, capabilities and NAS-PDU")
+{
+    lte::enb::s1ap::InitialContextSetupRequest request{};
+    request.mmeUeS1apId = 0x00112233U;
+    request.enbUeS1apId = 7;
+    request.ueAmbrDl = 100000000ULL; // 100 Mbps
+    request.ueAmbrUl = 50000000ULL;
+    request.encryptionAlgorithms = {0x80, 0x20}; // EEA0 + EEA2
+    request.integrityAlgorithms = {0x00, 0x20};  // EIA2
+    for (int i = 0; i < 32; ++i)
+        request.securityKey[static_cast<size_t>(i)] = static_cast<uint8_t>(0xA0 + i);
+
+    lte::enb::s1ap::ErabToBeSetupItem erab{};
+    erab.erabId = 5;
+    erab.qci = 9;
+    erab.priorityLevel = 15;
+    erab.preemptionCapability = false;
+    erab.preemptionVulnerability = true;
+    erab.transportLayerAddress = {192, 0, 2, 1};
+    erab.gtpTeid = {0x00, 0x00, 0x00, 0x2A};
+    erab.nasPduPresent = true;
+    erab.nasPdu = {0x47, 0x33, 0xD7, 0x24, 0x55, 0x00, 0x07, 0x5E};
+    request.erabs.push_back(erab);
+
+    auto encoded = lte::enb::s1ap::EncodeInitialContextSetupRequest(request);
+    REQUIRE(!encoded.empty());
+    auto pdu = lte::enb::s1ap::ProbeS1apPdu(encoded.data(), encoded.size());
+    CHECK(pdu.kind == lte::enb::s1ap::S1apPdu::Kind::INITIATING);
+    CHECK(pdu.procedureCode == 9);
+
+    auto decoded = lte::enb::s1ap::DecodeInitialContextSetupRequest(encoded.data(), encoded.size());
+    CHECK(decoded.mmeUeS1apId == request.mmeUeS1apId);
+    CHECK(decoded.enbUeS1apId == request.enbUeS1apId);
+    CHECK(decoded.ueAmbrDl == request.ueAmbrDl);
+    CHECK(decoded.ueAmbrUl == request.ueAmbrUl);
+    CHECK(decoded.encryptionAlgorithms == request.encryptionAlgorithms);
+    CHECK(decoded.integrityAlgorithms == request.integrityAlgorithms);
+    CHECK(decoded.securityKey == request.securityKey);
+    REQUIRE(decoded.erabs.size() == 1);
+    const auto &item = decoded.erabs.front();
+    CHECK(item.erabId == 5);
+    CHECK(item.qci == 9);
+    CHECK(item.priorityLevel == 15);
+    CHECK_FALSE(item.preemptionCapability);
+    CHECK(item.preemptionVulnerability);
+    CHECK(item.transportLayerAddress == erab.transportLayerAddress);
+    CHECK(item.gtpTeid == erab.gtpTeid);
+    REQUIRE(item.nasPduPresent);
+    CHECK(item.nasPdu == erab.nasPdu);
+}
+
+TEST_CASE("lte/enb/codec: Initial Context Setup Request supports an E-RAB without an embedded NAS-PDU")
+{
+    lte::enb::s1ap::InitialContextSetupRequest request{};
+    request.mmeUeS1apId = 2;
+    request.enbUeS1apId = 3;
+    request.ueAmbrDl = 1;
+    request.ueAmbrUl = 1;
+    request.encryptionAlgorithms = {0x80, 0x00};
+    request.integrityAlgorithms = {0x00, 0x20};
+    lte::enb::s1ap::ErabToBeSetupItem erab{};
+    erab.erabId = 1;
+    erab.qci = 5;
+    erab.priorityLevel = 1;
+    erab.transportLayerAddress = {10, 0, 0, 1};
+    erab.gtpTeid = {0xDE, 0xAD, 0xBE, 0xEF};
+    request.erabs.push_back(erab);
+
+    auto encoded = lte::enb::s1ap::EncodeInitialContextSetupRequest(request);
+    auto decoded = lte::enb::s1ap::DecodeInitialContextSetupRequest(encoded.data(), encoded.size());
+    REQUIRE(decoded.erabs.size() == 1);
+    CHECK_FALSE(decoded.erabs.front().nasPduPresent);
+    CHECK(decoded.erabs.front().nasPdu.empty());
+}
+
+TEST_CASE("lte/enb/codec: Initial Context Setup Request rejects invalid identities and empty E-RAB lists")
+{
+    lte::enb::s1ap::InitialContextSetupRequest request{};
+    request.mmeUeS1apId = 1;
+    request.enbUeS1apId = 1;
+    request.ueAmbrDl = 1;
+    request.ueAmbrUl = 1;
+    CHECK_THROWS(lte::enb::s1ap::EncodeInitialContextSetupRequest(request)); // no E-RAB
+
+    request.erabs.push_back(lte::enb::s1ap::ErabToBeSetupItem{});
+    request.mmeUeS1apId = 0;
+    CHECK_THROWS(lte::enb::s1ap::EncodeInitialContextSetupRequest(request));
+    request.mmeUeS1apId = 1;
+    request.enbUeS1apId = 0;
+    CHECK_THROWS(lte::enb::s1ap::EncodeInitialContextSetupRequest(request));
+}
+
+TEST_CASE("lte/enb/codec: Initial Context Setup Response advertises the locally owned S1-U endpoint")
+{
+    // Independent field expectations: successfulOutcome of id-InitialContextSetup,
+    // E-RABSetupListCtxtSURes with one item carrying the eNB TEID and IPv4 address.
+    const uint32_t localTeid = lte::enb::AllocateLocalTeid(5);
+    const std::array<uint8_t, 4> localAddress{127, 0, 0, 1};
+    const std::array<uint8_t, 4> teidBytes{static_cast<uint8_t>((localTeid >> 24U) & 0xFFU),
+                                           static_cast<uint8_t>((localTeid >> 16U) & 0xFFU),
+                                           static_cast<uint8_t>((localTeid >> 8U) & 0xFFU),
+                                           static_cast<uint8_t>(localTeid & 0xFFU)};
+    lte::enb::s1ap::ErabSetupItem item{5, localAddress, teidBytes};
+    auto response = lte::enb::s1ap::EncodeInitialContextSetupResponse(0x11223344U, 9, {item});
+
+    REQUIRE(!response.empty());
+    auto pdu = lte::enb::s1ap::ProbeS1apPdu(response.data(), response.size());
+    CHECK(pdu.kind == lte::enb::s1ap::S1apPdu::Kind::SUCCESSFUL_OUTCOME);
+    CHECK(pdu.procedureCode == 9);
+
+    // The TEID must be present on the wire and must never be the reserved zero.
+    CHECK(localTeid != 0U);
+    CHECK(std::search(response.begin(), response.end(), teidBytes.begin(), teidBytes.end()) != response.end());
+    CHECK(std::search(response.begin(), response.end(), localAddress.begin(), localAddress.end()) != response.end());
+
+    CHECK_THROWS(lte::enb::s1ap::EncodeInitialContextSetupResponse(0, 9, {item}));
+    CHECK_THROWS(lte::enb::s1ap::EncodeInitialContextSetupResponse(1, 0, {item}));
+    CHECK_THROWS(lte::enb::s1ap::EncodeInitialContextSetupResponse(1, 9, {}));
+}
+
+TEST_CASE("lte/enb/codec: UE Context Release Command decodes the UE-S1AP-ID pair and the Cause")
+{
+    auto command = lte::enb::s1ap::EncodeUeContextReleaseCommand(0x0A0B0C0DU, 4u, "nas", 0);
+    auto pdu = lte::enb::s1ap::ProbeS1apPdu(command.data(), command.size());
+    CHECK(pdu.kind == lte::enb::s1ap::S1apPdu::Kind::INITIATING);
+    CHECK(pdu.procedureCode == 23);
+
+    auto decoded = lte::enb::s1ap::DecodeUeContextReleaseCommand(command.data(), command.size());
+    CHECK(decoded.mmeUeS1apId == 0x0A0B0C0DU);
+    REQUIRE(decoded.enbUeS1apId.has_value());
+    CHECK(*decoded.enbUeS1apId == 4U);
+    CHECK(decoded.causeCategory == "nas");
+    CHECK(decoded.causeValue == 0);
+
+    // mME-UE-S1AP-ID-only alternative leaves the eNB identity unset.
+    auto single = lte::enb::s1ap::EncodeUeContextReleaseCommand(0x55AA55AAU, std::nullopt, "radioNetwork", 20);
+    auto singleDecoded = lte::enb::s1ap::DecodeUeContextReleaseCommand(single.data(), single.size());
+    CHECK(singleDecoded.mmeUeS1apId == 0x55AA55AAU);
+    CHECK_FALSE(singleDecoded.enbUeS1apId.has_value());
+    CHECK(singleDecoded.causeCategory == "radioNetwork");
+    CHECK(singleDecoded.causeValue == 20);
+
+    // UE Context Release Complete is a successfulOutcome of the same procedure.
+    auto complete = lte::enb::s1ap::EncodeUeContextReleaseComplete(0x0A0B0C0DU, 4);
+    auto completePdu = lte::enb::s1ap::ProbeS1apPdu(complete.data(), complete.size());
+    CHECK(completePdu.kind == lte::enb::s1ap::S1apPdu::Kind::SUCCESSFUL_OUTCOME);
+    CHECK(completePdu.procedureCode == 23);
+    CHECK_THROWS(lte::enb::s1ap::EncodeUeContextReleaseComplete(0, 4));
+    CHECK_THROWS(lte::enb::s1ap::EncodeUeContextReleaseComplete(4, 0));
+}
+
+TEST_CASE("lte/enb/codec: UE Context Release Command rejects invalid identities and causes")
+{
+    CHECK_THROWS(lte::enb::s1ap::EncodeUeContextReleaseCommand(0, 4u, "nas", 0));
+    CHECK_THROWS(lte::enb::s1ap::EncodeUeContextReleaseCommand(1, 0u, "nas", 0));
+    CHECK_THROWS(lte::enb::s1ap::EncodeUeContextReleaseCommand(1, 4u, "nonsense", 0));
+    CHECK_THROWS(lte::enb::s1ap::EncodeUeContextReleaseCommand(1, 4u, "nas", 99));
+    CHECK_THROWS(lte::enb::s1ap::DecodeUeContextReleaseCommand(nullptr, 0));
+}
+
+TEST_CASE("lte/enb/codec: S1AP PDU probe routes initiating and outcome messages")
+{
+    auto config = lte::enb::ParseConfig(ValidConfig);
+    const std::vector<uint8_t> nas{0x07, 0x41, 0x71};
+    auto initial = lte::enb::s1ap::EncodeInitialUeMessage(config, 1, nas);
+    auto pdu = lte::enb::s1ap::ProbeS1apPdu(initial.data(), initial.size());
+    CHECK(pdu.kind == lte::enb::s1ap::S1apPdu::Kind::INITIATING);
+    CHECK(pdu.procedureCode == 12);
+
+    auto setup = lte::enb::s1ap::EncodeS1SetupRequest(config);
+    auto setupPdu = lte::enb::s1ap::ProbeS1apPdu(setup.data(), setup.size());
+    CHECK(setupPdu.kind == lte::enb::s1ap::S1apPdu::Kind::INITIATING);
+    CHECK(setupPdu.procedureCode == 17);
+
+    CHECK_THROWS(lte::enb::s1ap::ProbeS1apPdu(nullptr, 0));
+    const std::vector<uint8_t> empty{0x00};
+    CHECK_THROWS(lte::enb::s1ap::ProbeS1apPdu(empty.data(), 0));
+}
+
+TEST_CASE("lte/enb/codec: every truncation of an Initial Context Setup Request is rejected")
+{
+    lte::enb::s1ap::InitialContextSetupRequest request{};
+    request.mmeUeS1apId = 1;
+    request.enbUeS1apId = 1;
+    request.ueAmbrDl = 1;
+    request.ueAmbrUl = 1;
+    request.encryptionAlgorithms = {0x80, 0x00};
+    request.integrityAlgorithms = {0x00, 0x20};
+    lte::enb::s1ap::ErabToBeSetupItem erab{};
+    erab.erabId = 5;
+    erab.qci = 9;
+    erab.transportLayerAddress = {192, 0, 2, 1};
+    erab.gtpTeid = {0, 0, 0, 1};
+    request.erabs.push_back(erab);
+    auto encoded = lte::enb::s1ap::EncodeInitialContextSetupRequest(request);
+    for (size_t length = 0; length < encoded.size(); ++length)
+        CHECK_THROWS(lte::enb::s1ap::DecodeInitialContextSetupRequest(encoded.data(), length));
+}

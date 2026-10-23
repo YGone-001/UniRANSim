@@ -10,7 +10,7 @@ amf: '8000'
 initialSqn: '000000000000'
 pdnType: IPv4
 apn: internet
-networkCapability: 'E0E0'
+networkCapability: 'A020'
 
 enbLink:
   localAddress: 127.0.0.1

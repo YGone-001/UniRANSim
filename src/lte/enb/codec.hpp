@@ -94,4 +94,81 @@ struct SetupOutcome
 
 SetupOutcome DecodeS1SetupOutcome(const uint8_t *data, size_t length);
 
+// --- Phase 2: Initial Context Setup and UE Context Release -------------------
+
+// Minimal PDU probe so the eNB dispatcher can route an inbound S1AP message
+// before a full decode.
+struct S1apPdu
+{
+    enum class Kind
+    {
+        INITIATING,
+        SUCCESSFUL_OUTCOME,
+        UNSUCCESSFUL_OUTCOME
+    };
+
+    Kind kind{};
+    uint16_t procedureCode{};
+};
+
+S1apPdu ProbeS1apPdu(const uint8_t *data, size_t length);
+
+// One E-RAB item of the Initial Context Setup Request (TS 36.413 9.1.4.2).
+// The transport address and TEID identify the SGW S1-U endpoint; when the MME
+// embeds a NAS-PDU it carries the protected EPS Attach Accept.
+struct ErabToBeSetupItem
+{
+    uint8_t erabId{};
+    uint8_t qci{};
+    uint8_t priorityLevel{};
+    bool preemptionCapability{};
+    bool preemptionVulnerability{};
+    std::array<uint8_t, 4> transportLayerAddress{};
+    std::array<uint8_t, 4> gtpTeid{};
+    bool nasPduPresent{};
+    std::vector<uint8_t> nasPdu;
+};
+
+struct InitialContextSetupRequest
+{
+    uint32_t mmeUeS1apId{};
+    uint32_t enbUeS1apId{};
+    uint64_t ueAmbrUl{};
+    uint64_t ueAmbrDl{};
+    std::vector<ErabToBeSetupItem> erabs;
+    std::array<uint8_t, 2> encryptionAlgorithms{};
+    std::array<uint8_t, 2> integrityAlgorithms{};
+    std::array<uint8_t, 32> securityKey{};
+};
+
+InitialContextSetupRequest DecodeInitialContextSetupRequest(const uint8_t *data, size_t length);
+// Encoder used by the automated tests and for offline fixture generation.
+std::vector<uint8_t> EncodeInitialContextSetupRequest(const InitialContextSetupRequest &request);
+
+// E-RAB successfully established by the eNB, including the locally owned S1-U
+// GTP-U endpoint that will receive the downlink user plane.
+struct ErabSetupItem
+{
+    uint8_t erabId{};
+    std::array<uint8_t, 4> transportLayerAddress{};
+    std::array<uint8_t, 4> gtpTeid{};
+};
+
+std::vector<uint8_t> EncodeInitialContextSetupResponse(uint32_t mmeUeS1apId, uint32_t enbUeS1apId,
+                                                       const std::vector<ErabSetupItem> &erabs);
+
+struct UeContextReleaseCommand
+{
+    uint32_t mmeUeS1apId{};
+    std::optional<uint32_t> enbUeS1apId;
+    std::string causeCategory;
+    int causeValue{-1};
+};
+
+UeContextReleaseCommand DecodeUeContextReleaseCommand(const uint8_t *data, size_t length);
+// Encoder used by the automated tests and for offline fixture generation.
+std::vector<uint8_t> EncodeUeContextReleaseCommand(uint32_t mmeUeS1apId, std::optional<uint32_t> enbUeS1apId,
+                                                   const std::string &causeCategory, int causeValue);
+std::vector<uint8_t> EncodeUeContextReleaseComplete(uint32_t mmeUeS1apId, uint32_t enbUeS1apId);
+
 } // namespace lte::enb::s1ap

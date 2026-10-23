@@ -68,6 +68,15 @@ EnbConfig ParseNode(const YAML::Node &root)
         result.ueLinkPort = static_cast<uint16_t>(yaml::GetInt32(link, "port", 1, 65535));
     }
 
+    if (yaml::HasField(root, "s1u"))
+    {
+        const YAML::Node s1u = root["s1u"];
+        if (!s1u.IsMap())
+            throw std::runtime_error("Field 's1u' must be a mapping");
+        result.s1uAddress = yaml::GetIpAddress(s1u, "address");
+        result.s1uPort = static_cast<uint16_t>(yaml::GetInt32(s1u, "port", 1, 65535));
+    }
+
     if (yaml::HasField(root, "sctp"))
     {
         const YAML::Node sctp = root["sctp"];
