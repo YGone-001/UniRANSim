@@ -37,6 +37,9 @@ enum class State
     DEFAULT_BEARER_PENDING,
     ATTACH_COMPLETE_SENT,
     EPS_REGISTERED,
+    DEFAULT_BEARER_SIGNALING_COMPLETE,
+    TUN_READY,
+    USER_PLANE_ACTIVE,
     PROCEDURE_FAILED
 };
 
@@ -72,8 +75,8 @@ enum class SecurityHeaderType : uint8_t
     INTEGRITY_PROTECTED_AND_CIPHERED_WITH_NEW_CONTEXT = 4
 };
 
-// The eNB-side default E-RAB signaling status. User-plane forwarding is out of
-// scope for this phase, so SIGNALING_ESTABLISHED does not mean IP reachability.
+// The eNB-side default E-RAB signaling status. SIGNALING_ESTABLISHED remains
+// distinct from UE TUN readiness and verified bidirectional IP reachability.
 enum class BearerStatus
 {
     NOT_CREATED,
@@ -92,6 +95,15 @@ struct LinkConfig
     std::string enbAddress;
     uint16_t enbPort{};
     int timeoutMs{15000};
+};
+
+struct TunConfig
+{
+    std::string namePrefix{"uniransim-lte"};
+    int mtu{1400};
+    // No routes are installed unless explicitly listed. A default route is
+    // rejected; only validated IPv4 CIDR destinations are accepted.
+    std::vector<std::string> routes;
 };
 
 struct Config
@@ -113,6 +125,7 @@ struct Config
     // not a subscriber secret and not a real device identity.
     std::array<uint8_t, 8> imeisv{{0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88}};
     LinkConfig link;
+    TunConfig tun;
 };
 
 // In-memory EPS security context. Phase 1 fills the AKA half; Phase 2 derives

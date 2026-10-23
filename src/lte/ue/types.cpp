@@ -32,6 +32,9 @@ const char *ToString(State state)
     case State::DEFAULT_BEARER_PENDING: return "DEFAULT_BEARER_PENDING";
     case State::ATTACH_COMPLETE_SENT: return "ATTACH_COMPLETE_SENT";
     case State::EPS_REGISTERED: return "EPS_REGISTERED";
+    case State::DEFAULT_BEARER_SIGNALING_COMPLETE: return "DEFAULT_BEARER_SIGNALING_COMPLETE";
+    case State::TUN_READY: return "TUN_READY";
+    case State::USER_PLANE_ACTIVE: return "USER_PLANE_ACTIVE";
     case State::PROCEDURE_FAILED: return "PROCEDURE_FAILED";
     }
     return "UNKNOWN";

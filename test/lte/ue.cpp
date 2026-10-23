@@ -99,6 +99,25 @@ TEST_CASE("lte/ue/config: PLMN, PDN type and APN are validated before signaling"
     CHECK_THROWS(lte::ue::ParseConfig(invalidApn));
 }
 
+TEST_CASE("lte/ue/config: LTE TUN defaults install no route and explicit routes reject a default route")
+{
+    auto defaults = lte::ue::ParseConfig(ConfigText);
+    CHECK(defaults.tun.namePrefix == "uniransim-lte");
+    CHECK(defaults.tun.mtu == 1400);
+    CHECK(defaults.tun.routes.empty());
+
+    std::string selected = ConfigText;
+    selected += "\ntun:\n  namePrefix: lte-test\n  mtu: 1300\n  routes: ['10.45.0.1/32']\n";
+    auto configured = lte::ue::ParseConfig(selected);
+    CHECK(configured.tun.namePrefix == "lte-test");
+    CHECK(configured.tun.mtu == 1300);
+    CHECK(configured.tun.routes == std::vector<std::string>{"10.45.0.1/32"});
+
+    std::string unsafe = ConfigText;
+    unsafe += "\ntun:\n  routes: ['0.0.0.0/0']\n";
+    CHECK_THROWS(lte::ue::ParseConfig(unsafe));
+}
+
 TEST_CASE("lte/ue/nas: OP derivation and stale SQN handling fail or succeed independently")
 {
     std::string withOp = ConfigText;
@@ -145,7 +164,7 @@ TEST_CASE("lte/ue/radio-link: rejects malformed frames and preserves NAS payload
     auto encoded = lte::ue::link::Encode(input);
     auto decoded = lte::ue::link::Decode(encoded.data(), encoded.size());
     CHECK(decoded.ueId == 1);
-    CHECK(decoded.nas == input.nas);
+    CHECK(decoded.payload == input.payload);
     encoded[7] = static_cast<uint8_t>(encoded[7] + 1U);
     CHECK_THROWS(lte::ue::link::Decode(encoded.data(), encoded.size()));
 }

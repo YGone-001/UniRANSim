@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <stdexcept>
 
 #include <utils/yaml_utils.hpp>
@@ -42,6 +43,24 @@ void ValidateApn(const std::string &apn)
     }
     if (apn.back() == '.')
         throw std::runtime_error("Field 'apn' must not end with an empty label");
+}
+
+void ValidateTunNamePrefix(const std::string &name)
+{
+    if (name.empty() || name.size() > 14 ||
+        !std::all_of(name.begin(), name.end(), [](unsigned char c) {
+            return std::isalnum(c) != 0 || c == '-' || c == '_';
+        }))
+        throw std::runtime_error("Field 'tun.namePrefix' must be 1..14 alphanumeric, '-' or '_' characters");
+}
+
+void ValidateRoute(const std::string &route)
+{
+    unsigned a = 0, b = 0, c = 0, d = 0, prefix = 0;
+    char extra = 0;
+    if (std::sscanf(route.c_str(), "%u.%u.%u.%u/%u%c", &a, &b, &c, &d, &prefix, &extra) != 5 ||
+        a > 255 || b > 255 || c > 255 || d > 255 || prefix == 0 || prefix > 32)
+        throw std::runtime_error("Field 'tun.routes' must contain IPv4 CIDRs and must not contain a default route");
 }
 
 template <size_t N> std::array<uint8_t, N> Hex(const YAML::Node &node, const std::string &field)
@@ -91,6 +110,28 @@ Config ParseNode(const YAML::Node &root)
         ValidateApn(*config.apn);
     }
     if (yaml::HasField(root, "networkCapability")) config.networkCapability = Hex<2>(root, "networkCapability");
+
+    if (yaml::HasField(root, "tun"))
+    {
+        const auto tun = root["tun"];
+        if (!tun.IsMap()) throw std::runtime_error("Field 'tun' must be a mapping");
+        if (yaml::HasField(tun, "namePrefix"))
+            config.tun.namePrefix = yaml::GetString(tun, "namePrefix", 1, 14);
+        ValidateTunNamePrefix(config.tun.namePrefix);
+        if (yaml::HasField(tun, "mtu")) config.tun.mtu = yaml::GetInt32(tun, "mtu", 576, 2000);
+        if (yaml::HasField(tun, "routes"))
+        {
+            const auto routes = tun["routes"];
+            if (!routes.IsSequence()) throw std::runtime_error("Field 'tun.routes' must be a sequence");
+            if (routes.size() > 32) throw std::runtime_error("Field 'tun.routes' has too many entries");
+            for (const auto &routeNode : routes)
+            {
+                const std::string route = routeNode.as<std::string>();
+                ValidateRoute(route);
+                config.tun.routes.push_back(route);
+            }
+        }
+    }
 
     const auto link = root["enbLink"];
     if (!link || !link.IsMap()) throw std::runtime_error("Field 'enbLink' must be a mapping");

@@ -8,6 +8,8 @@
 
 #include "app.hpp"
 #include "codec.hpp"
+#include "gtpu.hpp"
+#include "user_plane.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -18,6 +20,8 @@
 #include <memory>
 #include <sstream>
 #include <thread>
+
+#include <lte/ip_packet.hpp>
 
 #include <lib/sctp/sctp.hpp>
 #include <lib/udp/server.hpp>
@@ -137,51 +141,216 @@ std::array<uint8_t, 4> TeidToBytes(uint32_t teid)
             static_cast<uint8_t>((teid >> 8U) & 0xFFU), static_cast<uint8_t>(teid & 0xFFU)};
 }
 
-// One default EPS bearer's real S1-U GTP-U endpoint owned by this eNB.
+// One default EPS bearer's S1-U socket, mapping and counters.
+struct UserPlaneCounters
+{
+    uint64_t simulatedUplinkPackets{};
+    uint64_t simulatedUplinkBytes{};
+    uint64_t simulatedDownlinkPackets{};
+    uint64_t simulatedDownlinkBytes{};
+    uint64_t s1uUplinkPackets{};
+    uint64_t s1uUplinkBytes{};
+    uint64_t s1uDownlinkPackets{};
+    uint64_t s1uDownlinkBytes{};
+    uint64_t malformedDrops{};
+    uint64_t invalidTeidDrops{};
+    uint64_t unexpectedPeerDrops{};
+    uint64_t bearerInactiveDrops{};
+};
+
+uint32_t TeidFromBytes(const std::array<uint8_t, 4> &value)
+{
+    return (static_cast<uint32_t>(value[0]) << 24U) | (static_cast<uint32_t>(value[1]) << 16U) |
+           (static_cast<uint32_t>(value[2]) << 8U) | value[3];
+}
+
+std::string Ipv4ToString(const std::array<uint8_t, 4> &address)
+{
+    return std::to_string(address[0]) + "." + std::to_string(address[1]) + "." +
+           std::to_string(address[2]) + "." + std::to_string(address[3]);
+}
+
+bool IsLoopback(const std::array<uint8_t, 4> &address)
+{
+    return address[0] == 127;
+}
+
 struct GtpuBearer
 {
     std::unique_ptr<udp::UdpServer> socket;
+    DefaultBearerContext context;
     std::string localAddress;
     uint16_t localPort{};
     uint32_t localTeid{};
     uint8_t erabId{};
-    std::array<uint8_t, 4> sgwAddress{};
-    std::array<uint8_t, 4> sgwTeid{};
-    bool active{false};
+    InetAddress sgwPeer;
+    UserPlaneCounters counters;
 
-    void establish(const EnbConfig &config, const s1ap::ErabToBeSetupItem &item)
+    ~GtpuBearer()
     {
-        if (active)
+        release();
+    }
+
+    void establish(const EnbConfig &config, const s1ap::ErabToBeSetupItem &item, uint32_t ueId)
+    {
+        if (context.signalingEstablished())
             throw std::runtime_error("A default EPS bearer is already established for this UE");
-        if (!socket)
-        {
-            localAddress = config.s1uAddress;
-            localPort = config.s1uPort;
-            socket = std::make_unique<udp::UdpServer>(localAddress, localPort);
-        }
-        // The TEID is allocated by the eNB and must be non-zero and locally owned.
-        localTeid = AllocateLocalTeid(item.erabId);
+        if (config.s1uAddress.empty() || config.s1uAddress == "0.0.0.0")
+            throw std::runtime_error("The advertised eNB S1-U address must be a concrete local IPv4 address");
+        if (config.s1uAddress.rfind("127.", 0) == 0 && !config.allowLoopbackS1u)
+            throw std::runtime_error(
+                "Loopback S1-U requires s1u.allowLoopback=true after verifying a shared network namespace");
+
+        localAddress = config.s1uAddress;
+        localPort = config.s1uPort;
+        socket = std::make_unique<udp::UdpServer>(localAddress, localPort);
+        localTeid = AllocateLocalTeid();
         erabId = item.erabId;
-        sgwAddress = item.transportLayerAddress;
-        sgwTeid = item.gtpTeid;
-        active = true;
-        Log("INFO", "Established S1-U GTP-U endpoint for E-RAB " + std::to_string(erabId) + ": local=" + localAddress +
-                        ":" + std::to_string(localPort) + " TEID=" + Hex(localTeid, 8) +
-                        " sgw=" + std::to_string(sgwAddress[0]) + "." + std::to_string(sgwAddress[1]) + "." +
-                        std::to_string(sgwAddress[2]) + "." + std::to_string(sgwAddress[3]) + " sgw-TEID=" +
-                        Hex((static_cast<uint32_t>(sgwTeid[0]) << 24U) | (static_cast<uint32_t>(sgwTeid[1]) << 16U) |
-                                (static_cast<uint32_t>(sgwTeid[2]) << 8U) | sgwTeid[3],
-                            8));
+        const uint32_t sgwTeid = TeidFromBytes(item.gtpTeid);
+        context.establish({item.erabId, item.qci, ueId, item.transportLayerAddress, sgwTeid, localTeid});
+        sgwPeer = InetAddress(Ipv4ToString(item.transportLayerAddress), 2152);
+
+        if (localAddress.rfind("127.", 0) == 0 && !IsLoopback(item.transportLayerAddress))
+            Log("WARN", "Explicit loopback S1-U override is active with a non-loopback SGW-U peer");
+
+        Log("INFO", "Established default bearer: E-RAB/EBI=" + std::to_string(erabId) +
+                        " QCI=" + std::to_string(item.qci) + " eNB=" + localAddress + ":" +
+                        std::to_string(localPort) + " eNB-TEID=" + Hex(localTeid, 8) +
+                        " SGW-U=" + sgwPeer.toString() + " SGW-TEID=" + Hex(sgwTeid, 8));
+    }
+
+    void activate(uint32_t ueId, const std::vector<uint8_t> &payload)
+    {
+        if (payload.size() != 5)
+            throw BearerError("Malformed bearer-ready payload");
+        std::array<uint8_t, 4> ipv4{{payload[1], payload[2], payload[3], payload[4]}};
+        context.activateUe(ueId, payload[0], ipv4);
+        Log("INFO", "S1-U user plane ready for UE IPv4 " + Ipv4ToString(ipv4));
+    }
+
+    void forwardUplink(uint32_t ueId, const std::vector<uint8_t> &packet)
+    {
+        if (!context.active())
+        {
+            ++counters.bearerInactiveDrops;
+            throw BearerError("Uplink data received before bearer readiness");
+        }
+        try
+        {
+            context.validateUplink(ueId, packet.data(), packet.size());
+        }
+        catch (const std::exception &)
+        {
+            ++counters.malformedDrops;
+            throw;
+        }
+        ++counters.simulatedUplinkPackets;
+        counters.simulatedUplinkBytes += packet.size();
+        auto datagram = gtpu::EncodeTPdu(context.parameters().sgwTeid, packet.data(), packet.size());
+        if (socket->TrySend(sgwPeer, datagram.data(), datagram.size()))
+        {
+            ++counters.s1uUplinkPackets;
+            counters.s1uUplinkBytes += packet.size();
+        }
+    }
+
+    void receiveDownlink(udp::UdpServer &ueLink, const std::optional<InetAddress> &uePeer)
+    {
+        if (!socket)
+            return;
+
+        uint8_t buffer[65536];
+        InetAddress peer;
+        const int received = socket->Receive(buffer, sizeof(buffer), 0, peer);
+        if (received <= 0)
+            return;
+        if (peer != sgwPeer)
+        {
+            ++counters.unexpectedPeerDrops;
+            Log("WARN", "Dropped S1-U datagram from unexpected peer " + peer.toString());
+            return;
+        }
+
+        gtpu::Packet packet;
+        try
+        {
+            packet = gtpu::Decode(buffer, static_cast<size_t>(received));
+        }
+        catch (const std::exception &e)
+        {
+            ++counters.malformedDrops;
+            Log("WARN", std::string("Dropped malformed S1-U datagram: ") + e.what());
+            return;
+        }
+
+        if (packet.messageType == gtpu::EchoRequest)
+        {
+            if (!packet.sequenceNumber.has_value())
+            {
+                ++counters.malformedDrops;
+                Log("WARN", "Dropped GTP-U Echo Request without a sequence number");
+                return;
+            }
+            auto response = gtpu::EncodeEchoResponse(*packet.sequenceNumber);
+            socket->TrySend(sgwPeer, response.data(), response.size());
+            return;
+        }
+        if (packet.messageType == gtpu::EchoResponse)
+            return;
+
+        if (!context.active() || !uePeer.has_value())
+        {
+            ++counters.bearerInactiveDrops;
+            return;
+        }
+        if (packet.teid != context.parameters().localTeid)
+        {
+            ++counters.invalidTeidDrops;
+            Log("WARN", "Dropped S1-U T-PDU with unknown/stale TEID " + Hex(packet.teid, 8));
+            return;
+        }
+        try
+        {
+            context.validateDownlink(packet.teid, packet.payload.data(), packet.payload.size());
+        }
+        catch (const std::exception &e)
+        {
+            ++counters.malformedDrops;
+            Log("WARN", std::string("Dropped invalid downlink IPv4 packet: ") + e.what());
+            return;
+        }
+
+        ++counters.s1uDownlinkPackets;
+        counters.s1uDownlinkBytes += packet.payload.size();
+        auto frame = lte::ue::link::Encode(
+            {lte::ue::link::MessageType::DATA_DOWNLINK, context.parameters().ueId, std::move(packet.payload)});
+        const size_t ipBytes = frame.size() - lte::ue::link::HeaderSize;
+        if (ueLink.TrySend(*uePeer, frame.data(), frame.size()))
+        {
+            ++counters.simulatedDownlinkPackets;
+            counters.simulatedDownlinkBytes += ipBytes;
+        }
     }
 
     void release()
     {
-        if (!active)
+        if (!context.signalingEstablished() && !socket)
             return;
-        active = false;
+        Log("INFO", "User-plane statistics: radio-ul=" + std::to_string(counters.simulatedUplinkPackets) +
+                        "/" + std::to_string(counters.simulatedUplinkBytes) +
+                        " radio-dl=" + std::to_string(counters.simulatedDownlinkPackets) +
+                        "/" + std::to_string(counters.simulatedDownlinkBytes) +
+                        " s1u-ul=" + std::to_string(counters.s1uUplinkPackets) +
+                        "/" + std::to_string(counters.s1uUplinkBytes) +
+                        " s1u-dl=" + std::to_string(counters.s1uDownlinkPackets) +
+                        "/" + std::to_string(counters.s1uDownlinkBytes) +
+                        " drops(malformed/teid/peer/inactive)=" + std::to_string(counters.malformedDrops) + "/" +
+                        std::to_string(counters.invalidTeidDrops) + "/" + std::to_string(counters.unexpectedPeerDrops) +
+                        "/" + std::to_string(counters.bearerInactiveDrops));
+        context.release();
         socket.reset();
         localTeid = 0;
-        Log("INFO", "Released S1-U GTP-U endpoint for E-RAB " + std::to_string(erabId));
+        Log("INFO", "Released S1-U resources for E-RAB " + std::to_string(erabId));
     }
 };
 
@@ -269,11 +438,11 @@ int Run(const EnbConfig &config, const std::atomic_bool &shutdownRequested)
                     std::optional<InetAddress> uePeer;
                     std::optional<s1ap::UeContext> ueContext;
                     GtpuBearer defaultBearer;
-                    uint8_t radioBuffer[lte::ue::link::MaxNasPduSize + 8];
+                    uint8_t radioBuffer[lte::ue::link::MaxDataPduSize + lte::ue::link::HeaderSize];
                     while (!shutdownRequested && !handler.associationLost)
                     {
                         // Keep both transports responsive without assuming SCTP stream zero for UE traffic.
-                        client.receiveFor(&handler, 50);
+                        client.receiveFor(&handler, 20);
                         if (!handler.message.empty())
                         {
                             try
@@ -299,7 +468,7 @@ int Run(const EnbConfig &config, const std::atomic_bool &shutdownRequested)
                                         throw s1ap::CodecError(
                                             "This LTE eNB establishes exactly one default EPS E-RAB");
                                     const auto &erab = request.erabs.front();
-                                    defaultBearer.establish(config, erab);
+                                    defaultBearer.establish(config, erab, ueContext->enbUeS1apId);
                                     s1ap::ErabSetupItem setup{erab.erabId, ParseIpv4(defaultBearer.localAddress),
                                                               TeidToBytes(defaultBearer.localTeid)};
                                     auto response = s1ap::EncodeInitialContextSetupResponse(
@@ -352,6 +521,13 @@ int Run(const EnbConfig &config, const std::atomic_bool &shutdownRequested)
                                     uint32_t mmeId = command.mmeUeS1apId;
                                     uint32_t enbId = command.enbUeS1apId.value_or(
                                         ueContext.has_value() ? ueContext->enbUeS1apId : 0U);
+                                    if (uePeer.has_value() && defaultBearer.context.signalingEstablished())
+                                    {
+                                        auto released = lte::ue::link::Encode(
+                                            {lte::ue::link::MessageType::BEARER_RELEASED, enbId,
+                                             {defaultBearer.erabId}});
+                                        ueLink.TrySend(*uePeer, released.data(), released.size());
+                                    }
                                     defaultBearer.release();
                                     auto complete = s1ap::EncodeUeContextReleaseComplete(mmeId, enbId);
                                     client.send(UeStream(handler, enbId), complete);
@@ -374,36 +550,48 @@ int Run(const EnbConfig &config, const std::atomic_bool &shutdownRequested)
                         }
 
                         InetAddress peer;
-                        int radioLength = ueLink.Receive(radioBuffer, sizeof(radioBuffer), 50, peer);
-                        if (radioLength <= 0)
-                            continue;
-                        try
+                        int radioLength = ueLink.Receive(radioBuffer, sizeof(radioBuffer), 20, peer);
+                        if (radioLength > 0)
                         {
-                            auto radio = lte::ue::link::Decode(radioBuffer, static_cast<size_t>(radioLength));
-                            if (radio.type != lte::ue::link::MessageType::NAS_UPLINK || radio.ueId != 1)
-                                throw lte::ue::link::DecodeError("Unsupported LTE UE radio-link identity or direction");
-                            if (!uePeer.has_value())
-                                uePeer = peer;
-                            else if (*uePeer != peer)
-                                throw lte::ue::link::DecodeError("A second LTE UE endpoint is not supported");
-                            if (!ueContext.has_value())
+                            try
                             {
-                                ueContext = s1ap::UeContext{radio.ueId, std::nullopt};
-                                auto initial = s1ap::EncodeInitialUeMessage(config, ueContext->enbUeS1apId, radio.nas);
-                                client.send(UeStream(handler, ueContext->enbUeS1apId), initial);
-                                Log("INFO", "Initial UE Message sent for LTE UE 1");
+                                auto radio = lte::ue::link::Decode(radioBuffer, static_cast<size_t>(radioLength));
+                                if (!lte::ue::link::IsUplink(radio.type) || radio.ueId != 1)
+                                    throw lte::ue::link::DecodeError("Unsupported LTE UE radio-link identity or direction");
+                                if (!uePeer.has_value())
+                                {
+                                    if (radio.type != lte::ue::link::MessageType::NAS_UPLINK)
+                                        throw lte::ue::link::DecodeError("Data arrived before an LTE UE NAS context");
+                                    uePeer = peer;
+                                }
+                                else if (*uePeer != peer)
+                                    throw lte::ue::link::DecodeError("A second LTE UE endpoint is not supported");
+
+                                if (radio.type == lte::ue::link::MessageType::BEARER_READY)
+                                    defaultBearer.activate(radio.ueId, radio.payload);
+                                else if (radio.type == lte::ue::link::MessageType::DATA_UPLINK)
+                                    defaultBearer.forwardUplink(radio.ueId, radio.payload);
+                                else if (!ueContext.has_value())
+                                {
+                                    ueContext = s1ap::UeContext{radio.ueId, std::nullopt};
+                                    auto initial =
+                                        s1ap::EncodeInitialUeMessage(config, ueContext->enbUeS1apId, radio.payload);
+                                    client.send(UeStream(handler, ueContext->enbUeS1apId), initial);
+                                    Log("INFO", "Initial UE Message sent for LTE UE 1");
+                                }
+                                else
+                                {
+                                    auto uplink = s1ap::EncodeUplinkNasTransport(config, *ueContext, radio.payload);
+                                    client.send(UeStream(handler, ueContext->enbUeS1apId), uplink);
+                                    Log("INFO", "Uplink NAS Transport sent for LTE UE 1");
+                                }
                             }
-                            else
+                            catch (const std::exception &e)
                             {
-                                auto uplink = s1ap::EncodeUplinkNasTransport(config, *ueContext, radio.nas);
-                                client.send(UeStream(handler, ueContext->enbUeS1apId), uplink);
-                                Log("INFO", "Uplink NAS Transport sent for LTE UE 1");
+                                Log("WARN", std::string("Rejected LTE UE radio-link datagram: ") + e.what());
                             }
                         }
-                        catch (const std::exception &e)
-                        {
-                            Log("WARN", std::string("Rejected LTE UE radio-link datagram: ") + e.what());
-                        }
+                        defaultBearer.receiveDownlink(ueLink, uePeer);
                     }
                     if (handler.associationLost)
                     {

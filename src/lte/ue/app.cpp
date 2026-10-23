@@ -11,9 +11,13 @@
 #include "nas.hpp"
 #include "radio_link.hpp"
 #include "security.hpp"
+#include "tun.hpp"
 
 #include <chrono>
 #include <iostream>
+#include <memory>
+
+#include <lte/ip_packet.hpp>
 
 #include <lib/udp/server.hpp>
 
@@ -67,6 +71,16 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
     SecurityContext security{};
     bool attachAcceptSeen = false;
     bool defaultBearerAccepted = false;
+    bool registered = false;
+    uint8_t activeEbi = 0;
+    std::array<uint8_t, 4> assignedIpv4{};
+    std::unique_ptr<TunDevice> tun;
+    uint64_t tunUplinkPackets = 0;
+    uint64_t tunUplinkBytes = 0;
+    uint64_t tunDownlinkPackets = 0;
+    uint64_t tunDownlinkBytes = 0;
+    uint64_t malformedDrops = 0;
+    uint64_t bearerInactiveDrops = 0;
     udp::UdpServer socket(config.link.localAddress, config.link.localPort);
     InetAddress enb(config.link.enbAddress, config.link.enbPort);
     const uint32_t ueId = 1;
@@ -80,11 +94,40 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
     LogState(state);
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(config.link.timeoutMs);
-    uint8_t buffer[link::MaxNasPduSize + 8];
-    while (!shutdownRequested && std::chrono::steady_clock::now() < deadline)
+    uint8_t buffer[link::MaxDataPduSize + link::HeaderSize];
+    while (!shutdownRequested && (registered || std::chrono::steady_clock::now() < deadline))
     {
+        if (tun)
+        {
+            // Bound each turn so continuous application traffic cannot starve
+            // downlink radio-link processing.
+            for (int packetBudget = 0; packetBudget < 16; ++packetBudget)
+            {
+                std::vector<uint8_t> packet;
+                if (!tun->readPacket(packet))
+                    break;
+                try
+                {
+                    const auto ipv4 = ip::Validate(packet.data(), packet.size(),
+                                                   static_cast<size_t>(config.tun.mtu));
+                    if (ipv4.source != assignedIpv4)
+                        throw ip::ValidationError("TUN uplink source does not match the assigned UE IPv4 address");
+                    ++tunUplinkPackets;
+                    tunUplinkBytes += packet.size();
+                    auto frame = link::Encode({link::MessageType::DATA_UPLINK, ueId, std::move(packet)});
+                    if (!socket.TrySend(enb, frame.data(), frame.size()))
+                        Log("WARN", "LTE radio-link uplink send would block; packet dropped");
+                }
+                catch (const std::exception &e)
+                {
+                    ++malformedDrops;
+                    Log("WARN", std::string("Dropped invalid LTE TUN uplink packet: ") + e.what());
+                }
+            }
+        }
+
         InetAddress peer;
-        int received = socket.Receive(buffer, sizeof(buffer), 250, peer);
+        int received = socket.Receive(buffer, sizeof(buffer), registered ? 50 : 250, peer);
         if (received <= 0)
             continue;
         if (peer != enb)
@@ -95,13 +138,44 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
         try
         {
             auto message = link::Decode(buffer, static_cast<size_t>(received));
-            if (message.type != link::MessageType::NAS_DOWNLINK || message.ueId != ueId)
+            if (!link::IsDownlink(message.type) || message.ueId != ueId)
                 throw link::DecodeError("Unexpected LTE radio-link routing fields");
 
+            if (message.type == link::MessageType::BEARER_RELEASED)
+            {
+                if (!registered || message.payload.size() != 1 || message.payload[0] != activeEbi)
+                    throw link::DecodeError("Bearer release does not match the active default bearer");
+                tun.reset();
+                state = State::EPS_REGISTERED;
+                LogState(state);
+                Log("WARN", "Default bearer released; LTE TUN resources were closed");
+                continue;
+            }
+            if (message.type == link::MessageType::DATA_DOWNLINK)
+            {
+                if (!registered || !tun)
+                {
+                    ++bearerInactiveDrops;
+                    throw link::DecodeError("Downlink data arrived before TUN readiness");
+                }
+                const auto ipv4 = ip::Validate(message.payload.data(), message.payload.size(),
+                                               static_cast<size_t>(config.tun.mtu));
+                if (ipv4.destination != assignedIpv4)
+                    throw ip::ValidationError("Downlink destination does not match the assigned UE IPv4 address");
+                if (tun->writePacket(message.payload.data(), message.payload.size()))
+                {
+                    ++tunDownlinkPackets;
+                    tunDownlinkBytes += message.payload.size();
+                }
+                continue;
+            }
+
+            if (message.type != link::MessageType::NAS_DOWNLINK)
+                throw link::DecodeError("Data/NAS direction mismatch");
             if (!security.securityActive)
             {
                 // Only a Security Mode Command may arrive before the context is active.
-                if (!nas::IsSecurityModeCommand(message.nas.data(), message.nas.size()))
+                if (!nas::IsSecurityModeCommand(message.payload.data(), message.payload.size()))
                 {
                     // Authentication Request is still plain EMM.
                     if (state == State::AUTHENTICATION_PENDING || state == State::AUTHENTICATION_RESPONSE_SENT ||
@@ -113,7 +187,7 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                     else
                         throw nas::DecodeError("Unexpected plain NAS message before security activation");
 
-                    auto request = nas::DecodeAuthenticationRequest(message.nas.data(), message.nas.size());
+                    auto request = nas::DecodeAuthenticationRequest(message.payload.data(), message.payload.size());
                     state = State::AUTHENTICATION_REQUEST_RECEIVED;
                     LogState(state);
                     auto result = nas::Authenticate(config, request);
@@ -149,7 +223,7 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 // new context and not ciphered, so the IEs are readable in the clear.
                 if (!security.valid)
                     throw nas::DecodeError("Security Mode Command received before a valid AKA response");
-                auto parsed = nas::ParseProtectedHeader(message.nas.data(), message.nas.size());
+                auto parsed = nas::ParseProtectedHeader(message.payload.data(), message.payload.size());
                 if (parsed.headerType != nas::SecurityHeaderType::INTEGRITY_PROTECTED_WITH_NEW_CONTEXT)
                     throw nas::DecodeError("Security Mode Command must use the new EPS security context header");
                 auto command = nas::DecodeSecurityModeCommand(parsed.plain.data(), parsed.plain.size());
@@ -178,7 +252,7 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
             }
 
             // Security is active: every further downlink must verify.
-            auto plain = ReceiveProtected(security, message.nas);
+            auto plain = ReceiveProtected(security, message.payload);
             auto downlink = nas::DecodeDownlink(plain.data(), plain.size());
 
             if (downlink.type == nas::DownlinkEmm::ESM_INFORMATION_REQUEST)
@@ -233,8 +307,30 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
             LogState(state);
             state = State::EPS_REGISTERED;
             LogState(state);
-            Log("INFO", "EPS Attach and default bearer signaling complete");
-            return 0;
+            registered = true;
+            state = State::DEFAULT_BEARER_SIGNALING_COMPLETE;
+            LogState(state);
+
+            activeEbi = accept.bearer->epsBearerIdentity;
+            assignedIpv4 = accept.bearer->pdnAddress;
+            if (assignedIpv4 == std::array<uint8_t, 4>{})
+                throw nas::DecodeError("Default bearer did not provide a supported non-zero IPv4 PDN address");
+            tun = std::make_unique<TunDevice>(config.tun, assignedIpv4);
+            state = State::TUN_READY;
+            LogState(state);
+            Log("INFO", "LTE TUN " + tun->name() + " configured with " + Ipv4ToString(assignedIpv4) +
+                            "/32 MTU=" + std::to_string(config.tun.mtu) +
+                            " explicit-routes=" + std::to_string(config.tun.routes.size()));
+
+            std::vector<uint8_t> ready{activeEbi, assignedIpv4[0], assignedIpv4[1], assignedIpv4[2],
+                                       assignedIpv4[3]};
+            auto readyFrame = link::Encode({link::MessageType::BEARER_READY, ueId, std::move(ready)});
+            if (!socket.TrySend(enb, readyFrame.data(), readyFrame.size()))
+                throw std::runtime_error("LTE bearer-ready frame could not be sent");
+            state = State::USER_PLANE_ACTIVE;
+            LogState(state);
+            Log("INFO", "EPS Attach complete; persistent IPv4 user plane is active");
+            continue;
         }
         catch (const nas::SecurityError &e)
         {
@@ -245,19 +341,30 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
         }
         catch (const std::exception &e)
         {
+            if (registered && state != State::DEFAULT_BEARER_SIGNALING_COMPLETE && state != State::TUN_READY)
+            {
+                ++malformedDrops;
+                Log("WARN", std::string("Dropped invalid LTE radio-link message: ") + e.what());
+                continue;
+            }
             state = State::PROCEDURE_FAILED;
             LogState(state);
             Log("ERROR", e.what());
             return 1;
         }
     }
-    if (!shutdownRequested)
+    if (!shutdownRequested && !registered)
     {
         state = State::PROCEDURE_FAILED;
         LogState(state);
         Log("ERROR", "Timed out waiting for MME EPS Attach signaling");
         return 1;
     }
+    Log("INFO", "User-plane statistics: tun-ul=" + std::to_string(tunUplinkPackets) + "/" +
+                    std::to_string(tunUplinkBytes) + " tun-dl=" + std::to_string(tunDownlinkPackets) + "/" +
+                    std::to_string(tunDownlinkBytes) + " drops(malformed/inactive)=" +
+                    std::to_string(malformedDrops) + "/" + std::to_string(bearerInactiveDrops));
+    tun.reset();
     Log("INFO", "LTE UE shutdown complete");
     return 0;
 }

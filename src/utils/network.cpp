@@ -229,13 +229,23 @@ int Socket::receive(uint8_t *buffer, size_t bufferSize, int timeoutMs, InetAddre
 
 void Socket::send(const InetAddress &address, const uint8_t *buffer, size_t size) const
 {
+    (void)trySend(address, buffer, size);
+}
+
+bool Socket::trySend(const InetAddress &address, const uint8_t *buffer, size_t size) const
+{
     ssize_t rc = sendto(fd, buffer, size, MSG_DONTWAIT, address.getSockAddr(), address.getSockLen());
     if (rc == -1)
     {
         int err = errno;
-        if (err != EAGAIN)
+        if (err == EAGAIN || err == EWOULDBLOCK)
+            return false;
+        else
             throw LibError("sendto failed: ", errno);
     }
+    if (static_cast<size_t>(rc) != size)
+        throw std::runtime_error("sendto completed a partial datagram send");
+    return true;
 }
 
 bool Socket::hasFd() const

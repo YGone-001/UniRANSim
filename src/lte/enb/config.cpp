@@ -48,6 +48,9 @@ EnbConfig ParseNode(const YAML::Node &root)
         result.enbName = yaml::GetString(root, "enbName", 1, 150);
 
     result.localAddress = yaml::GetIpAddress(root, "s1apIp");
+    // A concrete S1AP address is a safer default than loopback for the
+    // separately advertised S1-U endpoint. Deployments may override it.
+    result.s1uAddress = result.localAddress;
 
     const YAML::Node mme = root["mme"];
     if (!mme || !mme.IsMap())
@@ -75,7 +78,11 @@ EnbConfig ParseNode(const YAML::Node &root)
             throw std::runtime_error("Field 's1u' must be a mapping");
         result.s1uAddress = yaml::GetIpAddress(s1u, "address");
         result.s1uPort = static_cast<uint16_t>(yaml::GetInt32(s1u, "port", 1, 65535));
+        if (yaml::HasField(s1u, "allowLoopback"))
+            result.allowLoopbackS1u = s1u["allowLoopback"].as<bool>();
     }
+    if (result.s1uAddress == "0.0.0.0")
+        throw std::runtime_error("Field 's1u.address' must be a concrete advertised IPv4 address");
 
     if (yaml::HasField(root, "sctp"))
     {

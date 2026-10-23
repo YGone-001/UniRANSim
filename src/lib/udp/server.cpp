@@ -32,6 +32,11 @@ int UdpServer::Receive(uint8_t *buffer, size_t bufferSize, int timeoutMs, InetAd
 
 void UdpServer::Send(const InetAddress &address, const uint8_t *buffer, size_t bufferSize) const
 {
+    (void)TrySend(address, buffer, bufferSize);
+}
+
+bool UdpServer::TrySend(const InetAddress &address, const uint8_t *buffer, size_t bufferSize) const
+{
     int version = address.getIpVersion();
     if (version != 4 && version != 6)
         throw std::runtime_error{"UdpServer::Send failure: Invalid IP version"};
@@ -40,12 +45,19 @@ void UdpServer::Send(const InetAddress &address, const uint8_t *buffer, size_t b
     {
         if (s.hasFd() && s.getIpVersion() == version)
         {
-            s.send(address, buffer, bufferSize);
-            return;
+            return s.trySend(address, buffer, bufferSize);
         }
     }
 
     throw std::runtime_error{"UdpServer::Send failure: No IP socket found"};
+}
+
+InetAddress UdpServer::LocalAddress() const
+{
+    for (const Socket &s : sockets)
+        if (s.hasFd())
+            return s.getAddress();
+    return {};
 }
 
 UdpServer::~UdpServer()

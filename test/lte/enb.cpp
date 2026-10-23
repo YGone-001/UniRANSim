@@ -8,9 +8,12 @@
 
 #include <ext/doctest/doctest.h>
 
+#include <set>
+
 #include <lte/enb/codec.hpp>
 #include <lte/enb/config.hpp>
 #include <lte/enb/types.hpp>
+#include <lte/enb/user_plane.hpp>
 
 #include <algorithm>
 #include <cctype>
@@ -34,7 +37,6 @@ std::vector<uint8_t> FromHex(const std::string &hex)
     }
     return result;
 }
-
 const char *ValidConfig = R"(
 mcc: '460'
 mnc: '02'
@@ -67,7 +69,6 @@ TEST_CASE("lte/enb/config: a valid LTE eNB configuration is parsed")
     CHECK(config.pagingDrx == 128);
     CHECK(config.retry.maxAttempts == 4);
 }
-
 TEST_CASE("lte/enb/config: malformed identifiers and ports are rejected")
 {
     CHECK_THROWS(
@@ -209,7 +210,7 @@ TEST_CASE("lte/enb/codec: UE-associated NAS messages use the expected S1AP proce
     CHECK_THROWS(lte::enb::s1ap::DecodeDownlinkNasTransport(nullptr, 0));
 }
 
-TEST_CASE("lte/enb/config: s1u GTP-U endpoint is configurable and defaults to the local GTP-U port")
+TEST_CASE("lte/enb/config: s1u GTP-U endpoint is configurable and defaults to the concrete S1AP address")
 {
     auto config = lte::enb::ParseConfig(ValidConfig);
     CHECK(config.s1uAddress == "127.0.0.1");
@@ -222,16 +223,17 @@ TEST_CASE("lte/enb/config: s1u GTP-U endpoint is configurable and defaults to th
     CHECK(configured.s1uPort == 2153);
 }
 
-TEST_CASE("lte/enb/resource: local GTP-U TEIDs are non-zero, owned and stable per E-RAB")
+TEST_CASE("lte/enb/resource: local GTP-U TEIDs are non-zero and not reused across bearer contexts")
 {
-    CHECK(lte::enb::AllocateLocalTeid(5) != 0U);
-    CHECK(lte::enb::AllocateLocalTeid(1) != lte::enb::AllocateLocalTeid(5));
-    CHECK(lte::enb::AllocateLocalTeid(5) == lte::enb::AllocateLocalTeid(5));
-    // The TEID embeds the E-RAB identity so two bearers never collide on one eNB.
-    CHECK((lte::enb::AllocateLocalTeid(5) & 0x0000FF00U) == 0x00000500U);
-    // Never the reserved all-zero tunnel endpoint.
-    for (uint8_t erabId = 0; erabId < 16; ++erabId)
-        CHECK(lte::enb::AllocateLocalTeid(erabId) != 0U);
+    const uint32_t first = lte::enb::AllocateLocalTeid();
+    const uint32_t second = lte::enb::AllocateLocalTeid();
+    CHECK(first != 0U);
+    CHECK(second != 0U);
+    CHECK(first != second);
+
+    std::set<uint32_t> allocated;
+    for (int i = 0; i < 256; ++i)
+        CHECK(allocated.insert(lte::enb::AllocateLocalTeid()).second);
 }
 
 TEST_CASE("lte/enb/codec: Initial Context Setup Request round-trips E-RAB, AMBR, capabilities and NAS-PDU")
@@ -330,7 +332,7 @@ TEST_CASE("lte/enb/codec: Initial Context Setup Response advertises the locally 
 {
     // Independent field expectations: successfulOutcome of id-InitialContextSetup,
     // E-RABSetupListCtxtSURes with one item carrying the eNB TEID and IPv4 address.
-    const uint32_t localTeid = lte::enb::AllocateLocalTeid(5);
+    const uint32_t localTeid = lte::enb::AllocateLocalTeid();
     const std::array<uint8_t, 4> localAddress{127, 0, 0, 1};
     const std::array<uint8_t, 4> teidBytes{static_cast<uint8_t>((localTeid >> 24U) & 0xFFU),
                                            static_cast<uint8_t>((localTeid >> 16U) & 0xFFU),

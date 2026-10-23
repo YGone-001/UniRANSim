@@ -6,7 +6,7 @@
 // See README, LICENSE, and CONTRIBUTING files for licensing details.
 //
 
-// Minimal, LTE-specific NAS transport between the software UE and eNB.
+// Minimal, LTE-specific NAS and IPv4 transport between the software UE and eNB.
 #pragma once
 
 #include <cstddef>
@@ -18,18 +18,24 @@ namespace lte::ue::link
 {
 
 constexpr size_t MaxNasPduSize = 2048;
+constexpr size_t MaxDataPduSize = 4096;
+constexpr size_t HeaderSize = 8;
 
 enum class MessageType : uint8_t
 {
     NAS_UPLINK = 1,
-    NAS_DOWNLINK = 2
+    NAS_DOWNLINK = 2,
+    DATA_UPLINK = 3,
+    DATA_DOWNLINK = 4,
+    BEARER_READY = 5,
+    BEARER_RELEASED = 6
 };
 
 struct Message
 {
     MessageType type{};
     uint32_t ueId{};
-    std::vector<uint8_t> nas;
+    std::vector<uint8_t> payload;
 };
 
 class DecodeError : public std::runtime_error
@@ -40,5 +46,7 @@ class DecodeError : public std::runtime_error
 
 std::vector<uint8_t> Encode(const Message &message);
 Message Decode(const uint8_t *data, size_t size);
+bool IsUplink(MessageType type);
+bool IsDownlink(MessageType type);
 
 } // namespace lte::ue::link

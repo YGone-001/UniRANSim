@@ -18,3 +18,11 @@ enbLink:
   address: 127.0.0.1
   port: 4998
   timeoutMs: 15000
+
+
+# LTE TUN defaults do not alter the host default route. Add only controlled
+# test destinations to routes (IPv4 CIDR) when explicitly needed.
+tun:
+  namePrefix: uniransim-lte
+  mtu: 1400
+  routes: []
