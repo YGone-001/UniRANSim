@@ -5,15 +5,21 @@ enbId: 0x19B
 tac: 1
 enbName: UERANSIM-lte-enb
 
-# Local S1-MME bind address.
-s1apIp: 127.0.0.1
+# Laboratory S1-MME address on the Ubuntu Open5GS host.
+s1apIp: 192.168.64.128
 
 mme:
-  address: 127.0.0.2
+  address: 192.168.64.128
   port: 36412
 
 # One of 32, 64, 128 or 256 radio frames.
 pagingDrx: 128
+
+# LTE-only UDP transport for transparent UE NAS PDUs. It is intentionally
+# separate from UERANSIM's NR radio-link sessions.
+ueLink:
+  address: 127.0.0.1
+  port: 4998
 
 sctp:
   maxAttempts: 3

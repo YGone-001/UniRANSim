@@ -79,6 +79,11 @@ add_executable(lte-enb src/lte_enb.cpp)
 target_compile_options(lte-enb PRIVATE -Wall -Wextra -pedantic)
 target_link_libraries(lte-enb pthread lte-enb-lib)
 
+#################### LTE UE EXECUTABLE ####################
+add_executable(lte-ue src/lte_ue.cpp)
+target_compile_options(lte-ue PRIVATE -Wall -Wextra -pedantic)
+target_link_libraries(lte-ue pthread lte-ue-lib)
+
 #################### TEST EXECUTABLE ####################
 # Built by default so the tests cannot rot, but it is not part of what `make build` installs.
 option(BUILD_TESTS "Build the nr-tests executable" ON)
@@ -94,6 +99,7 @@ if (BUILD_TESTS)
     target_link_libraries(nr-tests ue)
     target_link_libraries(nr-tests ext)
     target_link_libraries(nr-tests lte-enb-lib)
+    target_link_libraries(nr-tests lte-ue-lib)
 
     enable_testing()
     # Registers each doctest test case as its own ctest test, as listed by the built binary, so a failure or a crash

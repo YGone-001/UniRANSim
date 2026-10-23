@@ -41,7 +41,7 @@ was copied from an external project. Encoding behavior was compared with Magma S
 `0d739923068c0c6cffdb042ddba56b70c5aaf76c` and srsRAN 4G commit
 `bef8680d5f9714f3e040e6f9cbc88d7888439b6d`. The response test fixture is attributed inline to srsRAN 4G (AGPL-3.0-or-later)
 and is protocol data rather than incorporated implementation source. Project code remains under UERANSIM's existing
-GPL-3.0 license.
+AGPL-3.0 license.
 
 LTE UE, EPS NAS, authentication, attach, bearer setup, S1-U, RRC, and radio layers are deliberately unsupported. The
 next development stage is LTE UE initial NAS signalling and EPS AKA preparation; none of that functionality is included

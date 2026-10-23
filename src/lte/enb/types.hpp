@@ -46,6 +46,8 @@ struct EnbConfig
     std::string mmeAddress;
     uint16_t mmePort{36412};
     int pagingDrx{128};
+    std::string ueLinkAddress{"127.0.0.1"};
+    uint16_t ueLinkPort{4998};
     RetryConfig retry;
 };
 

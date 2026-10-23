@@ -18,6 +18,8 @@
 #include <thread>
 
 #include <lib/sctp/sctp.hpp>
+#include <lib/udp/server.hpp>
+#include <lte/ue/radio_link.hpp>
 
 namespace lte::enb
 {
@@ -45,6 +47,7 @@ class Handler : public sctp::ISctpHandler
     void onAssociationSetup(int associationId, int inStreams, int outStreams) override
     {
         associationUp = true;
+        outboundStreams = outStreams;
         Log("INFO", "SCTP association established (association=" + std::to_string(associationId) +
                         ", inbound-streams=" + std::to_string(inStreams) +
                         ", outbound-streams=" + std::to_string(outStreams) + ")");
@@ -77,7 +80,17 @@ class Handler : public sctp::ISctpHandler
     bool associationLost{};
     std::vector<uint8_t> message;
     uint16_t messageStream{};
+    int outboundStreams{1};
 };
+
+uint16_t UeStream(const Handler &handler, uint32_t enbUeId)
+{
+    // Stream zero carries non-UE S1AP such as S1 Setup. Keep UE signalling on a
+    // negotiated non-zero stream when the peer made one available.
+    if (handler.outboundStreams <= 1)
+        return 0;
+    return static_cast<uint16_t>(1U + ((enbUeId - 1U) % static_cast<uint32_t>(handler.outboundStreams - 1)));
+}
 
 bool InterruptibleDelay(int milliseconds, const std::atomic_bool &shutdownRequested)
 {
@@ -184,14 +197,72 @@ int Run(const EnbConfig &config, const std::atomic_bool &shutdownRequested)
                     state.transition(ConnectionEvent::SETUP_ACCEPTED);
                     Log("INFO", "S1 Setup accepted, State=" + std::string(ToString(state.state())));
 
+                    udp::UdpServer ueLink(config.ueLinkAddress, config.ueLinkPort);
+                    Log("INFO", "LTE UE radio-link listening on " + config.ueLinkAddress + ":" +
+                                    std::to_string(config.ueLinkPort));
+                    std::optional<InetAddress> uePeer;
+                    std::optional<s1ap::UeContext> ueContext;
+                    uint8_t radioBuffer[lte::ue::link::MaxNasPduSize + 8];
                     while (!shutdownRequested && !handler.associationLost)
                     {
-                        client.receiveFor(&handler, 500);
+                        // Keep both transports responsive without assuming SCTP stream zero for UE traffic.
+                        client.receiveFor(&handler, 50);
                         if (!handler.message.empty())
                         {
-                            Log("WARN", "Ignoring unexpected post-setup S1AP message on stream " +
-                                            std::to_string(handler.messageStream));
-                            handler.message.clear();
+                            try
+                            {
+                                auto downlink = s1ap::DecodeDownlinkNasTransport(handler.message.data(), handler.message.size());
+                                handler.message.clear();
+                                if (!ueContext.has_value() || !uePeer.has_value() ||
+                                    downlink.enbUeS1apId != ueContext->enbUeS1apId)
+                                    throw s1ap::CodecError("Downlink NAS Transport does not match the active UE context");
+                                if (ueContext->mmeUeS1apId.has_value() &&
+                                    *ueContext->mmeUeS1apId != downlink.mmeUeS1apId)
+                                    throw s1ap::CodecError("MME-UE-S1AP-ID changed for the active UE context");
+                                ueContext->mmeUeS1apId = downlink.mmeUeS1apId;
+                                auto radio = lte::ue::link::Encode({lte::ue::link::MessageType::NAS_DOWNLINK,
+                                                                    ueContext->enbUeS1apId, std::move(downlink.nasPdu)});
+                                ueLink.Send(*uePeer, radio.data(), radio.size());
+                                Log("INFO", "Forwarded Downlink NAS Transport to LTE UE");
+                            }
+                            catch (const std::exception &e)
+                            {
+                                Log("WARN", std::string("Rejected post-setup S1AP message on stream ") +
+                                                std::to_string(handler.messageStream) + ": " + e.what());
+                                handler.message.clear();
+                            }
+                        }
+
+                        InetAddress peer;
+                        int radioLength = ueLink.Receive(radioBuffer, sizeof(radioBuffer), 50, peer);
+                        if (radioLength <= 0)
+                            continue;
+                        try
+                        {
+                            auto radio = lte::ue::link::Decode(radioBuffer, static_cast<size_t>(radioLength));
+                            if (radio.type != lte::ue::link::MessageType::NAS_UPLINK || radio.ueId != 1)
+                                throw lte::ue::link::DecodeError("Unsupported LTE UE radio-link identity or direction");
+                            if (!uePeer.has_value())
+                                uePeer = peer;
+                            else if (*uePeer != peer)
+                                throw lte::ue::link::DecodeError("A second LTE UE endpoint is not supported");
+                            if (!ueContext.has_value())
+                            {
+                                ueContext = s1ap::UeContext{radio.ueId, std::nullopt};
+                                auto initial = s1ap::EncodeInitialUeMessage(config, ueContext->enbUeS1apId, radio.nas);
+                                client.send(UeStream(handler, ueContext->enbUeS1apId), initial);
+                                Log("INFO", "Initial UE Message sent for LTE UE 1");
+                            }
+                            else
+                            {
+                                auto uplink = s1ap::EncodeUplinkNasTransport(config, *ueContext, radio.nas);
+                                client.send(UeStream(handler, ueContext->enbUeS1apId), uplink);
+                                Log("INFO", "Uplink NAS Transport sent for LTE UE 1");
+                            }
+                        }
+                        catch (const std::exception &e)
+                        {
+                            Log("WARN", std::string("Rejected LTE UE radio-link datagram: ") + e.what());
                         }
                     }
                     if (handler.associationLost)

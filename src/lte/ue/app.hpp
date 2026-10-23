@@ -1,0 +1,18 @@
+//
+// This file is a part of UERANSIM project.
+// Copyright (c) 2027 ALİ GÜNGÖR.
+//
+// https://github.com/aligungr/UERANSIM/
+// See README, LICENSE, and CONTRIBUTING files for licensing details.
+//
+
+#pragma once
+
+#include "types.hpp"
+
+#include <atomic>
+
+namespace lte::ue
+{
+int Run(const Config &config, const std::atomic_bool &shutdownRequested);
+} // namespace lte::ue

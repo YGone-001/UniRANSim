@@ -59,6 +59,15 @@ EnbConfig ParseNode(const YAML::Node &root)
     if (result.pagingDrx != 32 && result.pagingDrx != 64 && result.pagingDrx != 128 && result.pagingDrx != 256)
         throw std::runtime_error("Field 'pagingDrx' must be one of 32, 64, 128 or 256");
 
+    if (yaml::HasField(root, "ueLink"))
+    {
+        const YAML::Node link = root["ueLink"];
+        if (!link.IsMap())
+            throw std::runtime_error("Field 'ueLink' must be a mapping");
+        result.ueLinkAddress = yaml::GetIpAddress(link, "address");
+        result.ueLinkPort = static_cast<uint16_t>(yaml::GetInt32(link, "port", 1, 65535));
+    }
+
     if (yaml::HasField(root, "sctp"))
     {
         const YAML::Node sctp = root["sctp"];

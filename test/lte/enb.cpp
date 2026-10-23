@@ -12,6 +12,7 @@
 #include <lte/enb/config.hpp>
 #include <lte/enb/types.hpp>
 
+#include <algorithm>
 #include <cctype>
 #include <string>
 #include <vector>
@@ -178,4 +179,32 @@ TEST_CASE("lte/enb/state: success, failure and connection loss use explicit tran
     CHECK(state.transition(lte::enb::ConnectionEvent::SETUP_REQUEST_SENT));
     CHECK(state.transition(lte::enb::ConnectionEvent::SETUP_REJECTED));
     CHECK(state.state() == lte::enb::ConnectionState::S1_SETUP_FAILED);
+}
+
+TEST_CASE("lte/enb/codec: UE-associated NAS messages use the expected S1AP procedures and context")
+{
+    auto config = lte::enb::ParseConfig(ValidConfig);
+    const std::vector<uint8_t> nas{0x07, 0x41, 0x71};
+
+    auto initial = lte::enb::s1ap::EncodeInitialUeMessage(config, 1, nas);
+    REQUIRE(initial.size() > nas.size());
+    CHECK(initial[0] == 0x00); // initiatingMessage
+    CHECK(initial[1] == 12);   // id-InitialUEMessage
+    CHECK((initial[2] & 0xC0U) == 0x40U); // procedure criticality ignore
+    // APER large-range constrained integers carry their encoded octet count.
+    // This independent prefix is id=8, reject, open-type length=2, value=1.
+    const std::vector<uint8_t> enbUeIdIe{0x00, 0x08, 0x00, 0x02, 0x00, 0x01};
+    CHECK(std::search(initial.begin(), initial.end(), enbUeIdIe.begin(), enbUeIdIe.end()) != initial.end());
+
+    lte::enb::s1ap::UeContext incomplete{1, std::nullopt};
+    CHECK_THROWS(lte::enb::s1ap::EncodeUplinkNasTransport(config, incomplete, nas));
+    lte::enb::s1ap::UeContext complete{1, 0x1234U};
+    auto uplink = lte::enb::s1ap::EncodeUplinkNasTransport(config, complete, nas);
+    REQUIRE(uplink.size() > nas.size());
+    CHECK(uplink[0] == 0x00);
+    CHECK(uplink[1] == 13); // id-UplinkNASTransport
+    CHECK((uplink[2] & 0xC0U) == 0x40U);
+
+    CHECK_THROWS(lte::enb::s1ap::EncodeInitialUeMessage(config, 0, nas));
+    CHECK_THROWS(lte::enb::s1ap::DecodeDownlinkNasTransport(nullptr, 0));
 }

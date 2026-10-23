@@ -21,7 +21,13 @@ namespace
 {
 
 constexpr uint16_t PROCEDURE_S1_SETUP = 17;
+constexpr uint16_t PROCEDURE_DOWNLINK_NAS_TRANSPORT = 11;
+constexpr uint16_t PROCEDURE_INITIAL_UE_MESSAGE = 12;
+constexpr uint16_t PROCEDURE_UPLINK_NAS_TRANSPORT = 13;
 constexpr uint16_t IE_CAUSE = 2;
+constexpr uint16_t IE_MME_UE_S1AP_ID = 0;
+constexpr uint16_t IE_ENB_UE_S1AP_ID = 8;
+constexpr uint16_t IE_NAS_PDU = 26;
 constexpr uint16_t IE_GLOBAL_ENB_ID = 59;
 constexpr uint16_t IE_ENB_NAME = 60;
 constexpr uint16_t IE_MME_NAME = 61;
@@ -31,6 +37,9 @@ constexpr uint16_t IE_RELATIVE_MME_CAPACITY = 87;
 constexpr uint16_t IE_SERVED_GUMMEIS = 105;
 constexpr uint16_t IE_DEFAULT_PAGING_DRX = 137;
 constexpr uint16_t IE_CRITICALITY_DIAGNOSTICS = 58;
+constexpr uint16_t IE_TAI = 67;
+constexpr uint16_t IE_EUTRAN_CGI = 100;
+constexpr uint16_t IE_RRC_ESTABLISHMENT_CAUSE = 134;
 
 enum class Criticality : uint8_t
 {
@@ -215,6 +224,17 @@ void WriteConstrained(BitWriter &writer, size_t value, size_t lower, size_t uppe
         writer.writeBits(encoded, octets * 8U);
         writer.align();
     }
+    else if (aligned && range > 65536)
+    {
+        const size_t maximumOctets = (bits + 7U) / 8U;
+        size_t octets = 1;
+        while (octets < maximumOctets && encoded >= (uint64_t{1} << (octets * 8U)))
+            ++octets;
+        WriteConstrained(writer, octets, 1, maximumOctets, false);
+        writer.align();
+        writer.writeBits(encoded, octets * 8U);
+        writer.align();
+    }
     else
         writer.writeBits(encoded, bits);
 }
@@ -228,6 +248,14 @@ size_t ReadConstrained(BitReader &reader, size_t lower, size_t upper, bool align
     {
         reader.align();
         encoded = reader.readBits(((bits + 7U) / 8U) * 8U);
+        reader.align();
+    }
+    else if (aligned && range > 65536)
+    {
+        const size_t maximumOctets = (bits + 7U) / 8U;
+        const size_t octets = ReadConstrained(reader, 1, maximumOctets, false);
+        reader.align();
+        encoded = reader.readBits(octets * 8U);
         reader.align();
     }
     else
@@ -336,7 +364,7 @@ struct Envelope
     std::vector<uint8_t> value;
 };
 
-Envelope DecodeEnvelope(const uint8_t *data, size_t length)
+Envelope DecodeEnvelope(const uint8_t *data, size_t length, uint16_t expectedProcedure, int expectedCriticality)
 {
     if (data == nullptr || length == 0)
         throw CodecError("Empty S1AP PDU");
@@ -348,15 +376,106 @@ Envelope DecodeEnvelope(const uint8_t *data, size_t length)
         throw CodecError("Invalid S1AP PDU choice");
     reader.align();
     auto procedure = ReadConstrained(reader, 0, 255, true);
-    if (procedure != PROCEDURE_S1_SETUP)
-        throw CodecError("Unexpected S1AP procedure code");
+    if (procedure != expectedProcedure)
+        throw CodecError("Unexpected S1AP procedure code " + std::to_string(procedure) + " (expected " +
+                         std::to_string(expectedProcedure) + ")");
     auto criticality = reader.readBits(2);
-    if (criticality != static_cast<uint8_t>(Criticality::REJECT))
-        throw CodecError("Invalid S1 Setup procedure criticality");
+    if (criticality > static_cast<uint8_t>(Criticality::NOTIFY))
+        throw CodecError("Invalid S1AP procedure criticality");
+    if (expectedCriticality >= 0 && criticality != static_cast<uint8_t>(expectedCriticality))
+        throw CodecError("Unexpected S1AP procedure criticality");
     reader.align();
     auto value = reader.readOpenType();
     reader.requireFinished();
     return Envelope{choice, std::move(value)};
+}
+
+std::vector<uint8_t> EncodeTai(const EnbConfig &config)
+{
+    BitWriter writer;
+    writer.writeBit(false); // extension marker
+    writer.writeBit(false); // iE-Extensions absent
+    auto plmn = EncodePlmn(config.plmn);
+    WriteFixedOctets(writer, plmn.data(), plmn.size());
+    writer.writeBits(config.tac, 16);
+    return writer.take();
+}
+
+std::vector<uint8_t> EncodeEutranCgi(const EnbConfig &config)
+{
+    BitWriter writer;
+    writer.writeBit(false); // extension marker
+    writer.writeBit(false); // iE-Extensions absent
+    auto plmn = EncodePlmn(config.plmn);
+    WriteFixedOctets(writer, plmn.data(), plmn.size());
+    // E-UTRAN Cell Identifier contains the 20-bit macro eNB identifier followed
+    // by the 8-bit local cell identifier (zero for this one-cell simulator).
+    writer.writeBits((config.enbId & 0xFFFFFU) << 8U, 28);
+    return writer.take();
+}
+
+std::vector<uint8_t> EncodeUeId(uint32_t value, uint32_t maximum)
+{
+    BitWriter writer;
+    WriteConstrained(writer, value, 0, maximum, true);
+    return writer.take();
+}
+
+uint32_t DecodeUeId(const std::vector<uint8_t> &value, uint32_t maximum)
+{
+    BitReader reader(value);
+    auto result = static_cast<uint32_t>(ReadConstrained(reader, 0, maximum, true));
+    reader.requireFinished();
+    return result;
+}
+
+std::vector<uint8_t> EncodeNasPdu(const std::vector<uint8_t> &nas)
+{
+    if (nas.empty() || nas.size() > 4096)
+        throw CodecError("Invalid NAS-PDU length");
+    BitWriter writer;
+    writer.writeLength(nas.size());
+    writer.writeBytes(nas);
+    return writer.take();
+}
+
+std::vector<uint8_t> DecodeNasPdu(const std::vector<uint8_t> &value)
+{
+    BitReader reader(value);
+    auto nas = reader.readBytes(reader.readLength());
+    reader.requireFinished();
+    if (nas.empty() || nas.size() > 4096)
+        throw CodecError("Invalid NAS-PDU length");
+    return nas;
+}
+
+std::vector<uint8_t> EncodeRrcEstablishmentCause()
+{
+    BitWriter writer;
+    writer.writeBit(false); // root enumeration
+    writer.writeBits(3, 3); // mo-Signalling
+    return writer.take();
+}
+
+std::vector<uint8_t> EncodeUeMessage(uint16_t procedure, Criticality pduCriticality,
+                                     const std::vector<std::pair<std::pair<uint16_t, Criticality>, std::vector<uint8_t>>> &ies)
+{
+    BitWriter message;
+    message.writeBit(false); // SEQUENCE extension marker
+    WriteConstrained(message, ies.size(), 0, 65535, true);
+    for (const auto &ie : ies)
+        WriteIe(message, ie.first.first, ie.first.second, ie.second);
+    auto body = message.take();
+    BitWriter pdu;
+    pdu.writeBit(false); // S1AP-PDU CHOICE extension marker
+    pdu.writeBits(0, 2); // initiatingMessage
+    pdu.align();
+    WriteConstrained(pdu, procedure, 0, 255, true);
+    pdu.writeBits(static_cast<uint8_t>(pduCriticality), 2);
+    pdu.align();
+    pdu.writeLength(body.size());
+    pdu.writeBytes(body);
+    return pdu.take();
 }
 
 struct Ie
@@ -624,7 +743,7 @@ std::vector<uint8_t> EncodeS1SetupRequest(const EnbConfig &config)
 
 DecodedSetupRequest DecodeS1SetupRequest(const uint8_t *data, size_t length)
 {
-    auto envelope = DecodeEnvelope(data, length);
+    auto envelope = DecodeEnvelope(data, length, PROCEDURE_S1_SETUP, static_cast<int>(Criticality::REJECT));
     if (envelope.choice != 0)
         throw CodecError("S1AP PDU is not an initiating message");
     return DecodeRequestIes(DecodeIeContainer(envelope.value));
@@ -632,7 +751,7 @@ DecodedSetupRequest DecodeS1SetupRequest(const uint8_t *data, size_t length)
 
 SetupOutcome DecodeS1SetupOutcome(const uint8_t *data, size_t length)
 {
-    auto envelope = DecodeEnvelope(data, length);
+    auto envelope = DecodeEnvelope(data, length, PROCEDURE_S1_SETUP, static_cast<int>(Criticality::REJECT));
     if (envelope.choice != 1 && envelope.choice != 2)
         throw CodecError("S1AP PDU is not an S1 Setup outcome");
     auto ies = DecodeIeContainer(envelope.value);
@@ -697,6 +816,71 @@ SetupOutcome DecodeS1SetupOutcome(const uint8_t *data, size_t length)
         throw CodecError("S1 Setup Response is missing mandatory information");
     if (result.type == OutcomeType::FAILURE && !causePresent)
         throw CodecError("S1 Setup Failure is missing the mandatory Cause");
+    return result;
+}
+
+std::vector<uint8_t> EncodeInitialUeMessage(const EnbConfig &config, uint32_t enbUeS1apId,
+                                            const std::vector<uint8_t> &nasPdu)
+{
+    if (enbUeS1apId == 0 || enbUeS1apId > 0xFFFFFFU)
+        throw CodecError("eNB-UE-S1AP-ID is out of range");
+    std::vector<std::pair<std::pair<uint16_t, Criticality>, std::vector<uint8_t>>> ies;
+    ies.push_back({{IE_ENB_UE_S1AP_ID, Criticality::REJECT}, EncodeUeId(enbUeS1apId, 0xFFFFFFU)});
+    ies.push_back({{IE_NAS_PDU, Criticality::REJECT}, EncodeNasPdu(nasPdu)});
+    ies.push_back({{IE_TAI, Criticality::REJECT}, EncodeTai(config)});
+    ies.push_back({{IE_EUTRAN_CGI, Criticality::IGNORE}, EncodeEutranCgi(config)});
+    ies.push_back({{IE_RRC_ESTABLISHMENT_CAUSE, Criticality::IGNORE}, EncodeRrcEstablishmentCause()});
+    return EncodeUeMessage(PROCEDURE_INITIAL_UE_MESSAGE, Criticality::IGNORE, ies);
+}
+
+std::vector<uint8_t> EncodeUplinkNasTransport(const EnbConfig &config, const UeContext &context,
+                                              const std::vector<uint8_t> &nasPdu)
+{
+    if (context.enbUeS1apId == 0 || context.enbUeS1apId > 0xFFFFFFU || !context.mmeUeS1apId.has_value())
+        throw CodecError("Uplink NAS Transport has no complete UE S1AP context");
+    std::vector<std::pair<std::pair<uint16_t, Criticality>, std::vector<uint8_t>>> ies;
+    ies.push_back({{IE_MME_UE_S1AP_ID, Criticality::REJECT}, EncodeUeId(*context.mmeUeS1apId, 0xFFFFFFFFU)});
+    ies.push_back({{IE_ENB_UE_S1AP_ID, Criticality::REJECT}, EncodeUeId(context.enbUeS1apId, 0xFFFFFFU)});
+    ies.push_back({{IE_NAS_PDU, Criticality::REJECT}, EncodeNasPdu(nasPdu)});
+    ies.push_back({{IE_EUTRAN_CGI, Criticality::IGNORE}, EncodeEutranCgi(config)});
+    ies.push_back({{IE_TAI, Criticality::IGNORE}, EncodeTai(config)});
+    return EncodeUeMessage(PROCEDURE_UPLINK_NAS_TRANSPORT, Criticality::IGNORE, ies);
+}
+
+DownlinkNasTransport DecodeDownlinkNasTransport(const uint8_t *data, size_t length)
+{
+    auto envelope = DecodeEnvelope(data, length, PROCEDURE_DOWNLINK_NAS_TRANSPORT, static_cast<int>(Criticality::IGNORE));
+    if (envelope.choice != 0)
+        throw CodecError("Downlink NAS Transport is not an initiating message");
+    DownlinkNasTransport result{};
+    bool mmePresent = false;
+    bool enbPresent = false;
+    bool nasPresent = false;
+    for (const auto &ie : DecodeIeContainer(envelope.value))
+    {
+        if (ie.id == IE_MME_UE_S1AP_ID)
+        {
+            if (ie.criticality != Criticality::REJECT) throw CodecError("MME-UE-S1AP-ID has invalid criticality");
+            result.mmeUeS1apId = DecodeUeId(ie.value, 0xFFFFFFFFU);
+            mmePresent = true;
+        }
+        else if (ie.id == IE_ENB_UE_S1AP_ID)
+        {
+            if (ie.criticality != Criticality::REJECT) throw CodecError("eNB-UE-S1AP-ID has invalid criticality");
+            result.enbUeS1apId = DecodeUeId(ie.value, 0xFFFFFFU);
+            enbPresent = true;
+        }
+        else if (ie.id == IE_NAS_PDU)
+        {
+            if (ie.criticality != Criticality::REJECT) throw CodecError("NAS-PDU has invalid criticality");
+            result.nasPdu = DecodeNasPdu(ie.value);
+            nasPresent = true;
+        }
+        else if (ie.criticality == Criticality::REJECT)
+            throw CodecError("Unknown reject-criticality IE in Downlink NAS Transport");
+    }
+    if (!mmePresent || !enbPresent || !nasPresent)
+        throw CodecError("Downlink NAS Transport is missing a mandatory IE");
     return result;
 }
 

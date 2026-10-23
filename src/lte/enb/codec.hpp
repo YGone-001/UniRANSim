@@ -46,6 +46,26 @@ struct DecodedSetupRequest
 
 DecodedSetupRequest DecodeS1SetupRequest(const uint8_t *data, size_t length);
 
+// One-UE Phase 1 S1AP NAS transport. These routines intentionally expose only the
+// message subset used by the LTE UE vertical slice.
+struct UeContext
+{
+    uint32_t enbUeS1apId{};
+    std::optional<uint32_t> mmeUeS1apId;
+};
+
+std::vector<uint8_t> EncodeInitialUeMessage(const EnbConfig &config, uint32_t enbUeS1apId,
+                                            const std::vector<uint8_t> &nasPdu);
+std::vector<uint8_t> EncodeUplinkNasTransport(const EnbConfig &config, const UeContext &context,
+                                              const std::vector<uint8_t> &nasPdu);
+struct DownlinkNasTransport
+{
+    uint32_t enbUeS1apId{};
+    uint32_t mmeUeS1apId{};
+    std::vector<uint8_t> nasPdu;
+};
+DownlinkNasTransport DecodeDownlinkNasTransport(const uint8_t *data, size_t length);
+
 struct ServedGummei
 {
     std::vector<Plmn> plmns;

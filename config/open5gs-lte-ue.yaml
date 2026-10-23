@@ -1,0 +1,20 @@
+# Synthetic Phase 1 LTE UE. For a live EPC run, copy this file to the ignored
+# open5gs-lte-ue.local.yaml and put only authorized subscriber values there.
+imsi: '460020123456789'
+mcc: '460'
+mnc: '02'
+k: '00112233445566778899AABBCCDDEEFF'
+# Specify exactly one of OP or OPc. This synthetic value is not a subscriber secret.
+op: '102132435465768798A9BACBDCEDFE0F'
+amf: '8000'
+initialSqn: '000000000000'
+pdnType: IPv4
+apn: internet
+networkCapability: 'E0E0'
+
+enbLink:
+  localAddress: 127.0.0.1
+  localPort: 4999
+  address: 127.0.0.1
+  port: 4998
+  timeoutMs: 15000

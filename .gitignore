@@ -105,6 +105,8 @@ celerybeat-schedule
 
 # Environments
 .env
+# Authorized live LTE subscriber secrets belong only in this ignored file.
+config/open5gs-lte-ue.local.yaml
 .venv
 env/
 venv/
