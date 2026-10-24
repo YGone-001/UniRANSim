@@ -24,10 +24,11 @@ ueLink:
 # Real S1-U GTP-U endpoint owned by this eNB for the default EPS bearer.
 s1u:
   # Must be owned by the eNB host and reachable from the SGW-U endpoint
-  # delivered in Initial Context Setup Request. Never advertise 0.0.0.0.
-  address: 192.168.64.128
+  # delivered in Initial Context Setup Request. SGW-U owns
+  # 192.168.64.128:2152 in this namespace, so use a dedicated loopback IP.
+  address: 127.0.0.5
   port: 2152
-  allowLoopback: false
+  allowLoopback: true
 sctp:
   maxAttempts: 3
   retryDelayMs: 2000
