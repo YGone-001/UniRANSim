@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <unistd.h>
 #include <vector>
 
@@ -118,6 +119,17 @@ TEST_CASE("lte/user-plane/gtpu: local UDP peer receives the genuine encoded wire
     auto decoded = lte::enb::gtpu::Decode(wire.data(), static_cast<size_t>(received));
     CHECK(decoded.teid == 0x10203040);
     CHECK(decoded.payload == ipv4);
+}
+
+TEST_CASE("lte/user-plane/udp: zero timeout is a non-blocking poll")
+{
+    udp::UdpServer receiver("127.0.0.1", 0);
+    std::array<uint8_t, 16> wire{};
+    InetAddress peer;
+    const auto started = std::chrono::steady_clock::now();
+    CHECK(receiver.Receive(wire.data(), wire.size(), 0, peer) == 0);
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    CHECK(elapsed < std::chrono::milliseconds(500));
 }
 
 TEST_CASE("lte/user-plane/bearer: SGW TEID is uplink and eNB TEID is downlink")

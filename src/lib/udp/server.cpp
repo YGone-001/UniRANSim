@@ -24,6 +24,23 @@ UdpServer::UdpServer(const std::string &address, uint16_t port) : sockets{Socket
 
 int UdpServer::Receive(uint8_t *buffer, size_t bufferSize, int timeoutMs, InetAddress &outPeerAddress) const
 {
+    // Socket::Select uses a zero timeout to mean "wait indefinitely".  UDP
+    // users need zero to be a genuine non-blocking poll; in particular, the
+    // LTE eNB must check S1-U without stopping radio-link processing while no
+    // downlink packet is available.
+    if (timeoutMs == 0)
+    {
+        for (const auto &socket : sockets)
+        {
+            if (!socket.hasFd())
+                continue;
+            const int received = socket.receive(buffer, bufferSize, 0, outPeerAddress);
+            if (received > 0)
+                return received;
+        }
+        return 0;
+    }
+
     auto socket = Socket::Select(sockets, {}, timeoutMs);
     if (!socket.hasFd())
         return 0;

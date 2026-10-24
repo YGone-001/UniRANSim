@@ -103,6 +103,53 @@ interoperability. Acceptance requires the Echo Request to appear on the UE TUN,
 uplink GTP-U with the SGW TEID, downlink GTP-U with the eNB TEID, the Echo Reply
 on the UE TUN, and successful `ping` output.
 
+### Same-host EPC acceptance
+
+When the UE TUN and Open5GS `ogstun` are in the same network namespace, Linux
+also owns the UE's negotiated `/32` locally. An apparent successful ping can
+therefore bypass PGW-U and the downlink GTP-U path. Enabling `accept_local` alone
+does not remove this local return-path shortcut and is not sufficient evidence
+of bidirectional S1-U interoperability.
+
+For same-host acceptance, place the live UE TUN in a temporary network
+namespace (or run the UE on another host/namespace) before testing. If moving
+the live TUN clears its address, restore the same `/32` address negotiated in
+the current Attach; do not invent or retain an address from an older session.
+After the test, stop the UE before deleting the temporary namespace and restore
+any diagnostic sysctl to its original value.
+
+## Phase 3-A runtime acceptance record
+
+The 2026-10-24 acceptance run used Ubuntu 24.04.5 LTS, CMake 3.28.3, GCC 13.3.0,
+Clang 18.1.3, Open5GS on `192.168.64.128`, and an eNB S1-U endpoint at
+`127.0.0.5:2152` in the same host namespace as SGW-U
+`192.168.64.128:2152`. Loopback S1-U was explicitly enabled after confirming
+the shared namespace and a GTP-U Echo Request/Response exchange with SGW-U.
+
+The live EPC assigned `10.45.0.5/32` to `uniransim-lte0` with MTU 1400. The
+decisive test moved that TUN into an isolated UE network namespace and ran:
+
+```text
+ping -I uniransim-lte0 -c 5 -W 2 10.45.0.1
+5 packets transmitted, 5 received, 0% packet loss
+rtt min/avg/max/mdev = 56.146/56.819/58.478/0.855 ms
+```
+
+Graceful shutdown reported matching end-to-end counters:
+
+```text
+UE:  tun-ul=17/1428 tun-dl=7/588
+eNB: radio-ul=17/1428 radio-dl=7/588 s1u-ul=17/1428 s1u-dl=7/588
+eNB drops(malformed/teid/peer/inactive)=0/0/0/0
+```
+
+The reproduced runtime defect was an unintended infinite wait in
+`UdpServer::Receive(..., timeoutMs=0)`. The eNB blocked while polling an idle
+S1-U socket, so `BEARER_READY` and `DATA_UPLINK` frames accumulated on the UE
+radio-link socket. Zero-timeout UDP receive is now a genuine non-blocking poll,
+covered by a focused regression test. The complete local suite contains 146
+tests after that addition.
+
 ## Supported scope
 
 Supported: one LTE UE, one default bearer, IPv4, EEA0/EEA2 NAS security, S1-U
