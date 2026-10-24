@@ -17,6 +17,7 @@ build: FORCE
 	cp cmake-build-release/nr-ue build/
 	cp cmake-build-release/nr-cli build/
 	cp cmake-build-release/lte-enb build/
+	cp cmake-build-release/lte-ue build/
 	cp cmake-build-release/libdevbnd.so build/
 	cp tools/nr-binder build/
 

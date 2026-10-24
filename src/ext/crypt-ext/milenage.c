@@ -69,7 +69,7 @@ typedef uint32_t u32;
 
 #else /* AES_SMALL_TABLES */
 
-#define RCON(i) (rcons[(i)] << 24)
+#define RCON(i) ((u32)rcons[(i)] << 24)
 
 static inline u32 rotr(u32 val, int bits)
 {
