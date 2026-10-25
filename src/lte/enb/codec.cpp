@@ -1106,6 +1106,18 @@ DownlinkNasTransport DecodeDownlinkNasTransport(const uint8_t *data, size_t leng
     return result;
 }
 
+std::vector<uint8_t> EncodeDownlinkNasTransport(uint32_t mmeUeS1apId, uint32_t enbUeS1apId,
+                                                const std::vector<uint8_t> &nasPdu)
+{
+    if (mmeUeS1apId == 0 || enbUeS1apId == 0 || enbUeS1apId > 0xFFFFFFU || nasPdu.empty())
+        throw CodecError("Downlink NAS Transport has no complete UE S1AP context");
+    std::vector<std::pair<std::pair<uint16_t, Criticality>, std::vector<uint8_t>>> ies;
+    ies.push_back({{IE_MME_UE_S1AP_ID, Criticality::REJECT}, EncodeUeId(mmeUeS1apId, 0xFFFFFFFFU)});
+    ies.push_back({{IE_ENB_UE_S1AP_ID, Criticality::REJECT}, EncodeUeId(enbUeS1apId, 0xFFFFFFU)});
+    ies.push_back({{IE_NAS_PDU, Criticality::REJECT}, EncodeNasPdu(nasPdu)});
+    return EncodeUeMessage(PROCEDURE_DOWNLINK_NAS_TRANSPORT, Criticality::IGNORE, ies);
+}
+
 S1apPdu ProbeS1apPdu(const uint8_t *data, size_t length)
 {
     if (data == nullptr || length == 0)

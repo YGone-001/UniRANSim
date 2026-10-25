@@ -72,6 +72,9 @@ struct DownlinkNasTransport
     std::vector<uint8_t> nasPdu;
 };
 DownlinkNasTransport DecodeDownlinkNasTransport(const uint8_t *data, size_t length);
+// Encoder used by the automated tests and for offline fixture generation.
+std::vector<uint8_t> EncodeDownlinkNasTransport(uint32_t mmeUeS1apId, uint32_t enbUeS1apId,
+                                                const std::vector<uint8_t> &nasPdu);
 
 struct ServedGummei
 {

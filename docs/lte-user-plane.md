@@ -1,13 +1,47 @@
 # LTE IPv4 user plane
 
-UniRANSim's LTE path supports one UE, one IPv4 PDN connection, and one default
-EPS bearer. NAS remains on S1-MME/SCTP. User IPv4 packets use a separate LTE
-radio-link frame and GTPv1-U over S1-U/UDP.
+UniRANSim's LTE path supports multiple concurrently attached UEs, each with one
+IPv4 PDN connection and one default EPS bearer. NAS remains on S1-MME/SCTP.
+User IPv4 packets use a separate LTE radio-link frame and GTPv1-U over S1-U/UDP.
 
 ```text
-application <-> uniransim-lte0 <-> lte-ue <-> DATA_* UDP <-> lte-enb
+application <-> uniransim-lte0 <-> lte-ue(A) <-> DATA_* UDP <-> lte-enb
             <-> GTP-U T-PDU/UDP 2152 <-> Open5GS SGW-U
+application <-> uniransim-lte0 <-> lte-ue(B) <-> DATA_* UDP <-> lte-enb (same)
 ```
+
+## Multi-UE architecture
+
+One `lte-enb` process multiplexes every concurrent UE over three shared
+transports: the single S1AP SCTP association to the MME, one simulated
+radio-link UDP listener, and one shared S1-U GTP-U endpoint. Each UE is a
+separate `lte-ue` process with its own subscriber identity, NAS security
+context, TUN device, and lifecycle. The eNB never stores subscriber
+credentials; it forwards NAS transparently.
+
+Per-UE state lives in a bounded registry (`maxUes`, default 8) indexed by
+radio UE ID, verified UDP peer, eNB-UE-S1AP-ID, MME-UE-S1AP-ID, and local
+GTP-U TEID. The eNB UE S1AP ID is allocated monotonically per S1 connection,
+skips zero, and wraps without colliding with a live context. A UE Context
+Release clears that UE's S1AP IDs and TEID mapping while the registry entry
+is retained (`IDLE_RETAINED`) for a later Service Request or re-Attach; the
+other UEs and both shared sockets are untouched. Every inbound UE-associated
+S1AP message must resolve through these indexes — including the MME-ID-only
+variant of UE Context Release Command — and inconsistent identity pairs are
+rejected without falling back to "the only registered UE".
+
+UE-associated S1AP signalling is spread across the negotiated non-zero
+outbound SCTP streams by eNB-UE-S1AP-ID; stream zero stays reserved for
+non-UE procedures such as S1 Setup, and UEs share streams when the
+negotiated count is smaller than the UE count. Per-UE ordering is preserved
+because each UE's messages always use the same stream.
+
+The simulated radio identity (`ueId` in the UE YAML, default 1) is carried in
+every radio-link frame and must be unique among concurrently running `lte-ue`
+processes. The eNB rejects a duplicate radio identity, a UDP endpoint that
+claims another UE's identity, and an existing identity arriving from a new
+endpoint. Distinct radio UE IDs alone do not make two processes distinct
+subscribers; each must use its own authorized IMSI and credentials.
 
 ## S1-U addressing and TEIDs
 
@@ -22,6 +56,12 @@ are not copied from the MME address. Uplink T-PDUs use the SGW receiving TEID.
 Downlink T-PDUs must use the monotonically allocated eNB receiving TEID that was
 advertised in Initial Context Setup Response. The SGW-U UDP port is the standard
 2152. Packets from another endpoint or with an old/unknown TEID are dropped.
+
+All concurrent default bearers share the single eNB S1-U socket: downlink
+T-PDUs are demultiplexed by the locally allocated receiving TEID to exactly one
+UE bearer — never by EBI or by the most recently established bearer — and each
+release removes only that UE's TEID mapping. Two UEs may both use EBI 5; their
+bearers remain independently mapped by TEID.
 
 The decoder accepts the ordinary eight-byte T-PDU header and bounded, valid
 optional sequence, N-PDU, and supported extension-header chains. It rejects
@@ -87,14 +127,17 @@ separately report ECM-IDLE and restoration. Keep one UE/eNB pair per run.
 The UE takes its IPv4 address from Activate Default EPS Bearer Context Request,
 creates `/dev/net/tun` with `IFF_TUN|IFF_NO_PI`, assigns the address as `/32`,
 sets the configured MTU, and keeps the descriptor open until release or shutdown.
-The default prefix creates `uniransim-lte0`. `CAP_NET_ADMIN` (normally `sudo`) is
+The default prefix creates `uniransim-lte0`; concurrent UEs receive distinct
+kernel suffixes (`uniransim-lte0`, `uniransim-lte1`, ...) because allocation
+scans the interfaces that already exist. `CAP_NET_ADMIN` (normally `sudo`) is
 required. IPv6 and IPv4v6 data-plane operation are rejected because they do not
 provide a supported non-zero IPv4 address.
 
 No route is installed by default and the host default route is never replaced.
 Optional `tun.routes` entries are explicit IPv4 CIDRs only; `0.0.0.0/0` is
 rejected. The UE records routes it successfully added and removes only those
-routes at cleanup. A safe controlled test configuration is:
+routes at cleanup — closing UE A's TUN never touches UE B's interface, address,
+or routes. A safe controlled test configuration is:
 
 ```yaml
 tun:
@@ -113,12 +156,30 @@ IP packets. Such a run is not user-plane or Phase 4 continuity evidence.
 ## Build and run
 
 ```bash
-cmake -S . -B cmake-build-phase4 -DCMAKE_BUILD_TYPE=Release
-cmake --build cmake-build-phase4 --parallel 2
-ctest --test-dir cmake-build-phase4 --output-on-failure --no-tests=error
+cmake -S . -B cmake-build-phase5 -DCMAKE_BUILD_TYPE=Release
+cmake --build cmake-build-phase5 --parallel 2
+ctest --test-dir cmake-build-phase5 --output-on-failure --no-tests=error
 
-sudo ./cmake-build-phase4/lte-enb -c config/open5gs-lte-enb.yaml
-sudo ./cmake-build-phase4/lte-ue -c config/open5gs-lte-ue.local.yaml
+sudo ./cmake-build-phase5/lte-enb -c config/open5gs-lte-enb.yaml
+sudo ./cmake-build-phase5/lte-ue -c config/open5gs-lte-ue.local.yaml
+sudo ./cmake-build-phase5/lte-ue -c config/open5gs-lte-ue-b.local.yaml
+```
+
+One eNB serves every UE. Each `lte-ue` process needs its own ignored local
+YAML with a distinct authorized subscriber, a distinct `ueId` (1, 2, ...), and
+a distinct `enbLink.localPort` (4999, 5000, ...). The committed
+`config/open5gs-lte-ue.yaml` and `config/open5gs-lte-ue-b.yaml` show the
+synthetic pattern; never commit real credentials.
+
+```yaml
+# UE A (open5gs-lte-ue.local.yaml)      # UE B (open5gs-lte-ue-b.local.yaml)
+imsi: '<authorized subscriber A>'        imsi: '<authorized subscriber B>'
+ueId: 1                                  ueId: 2
+enbLink:                                 enbLink:
+  localAddress: 127.0.0.1                  localAddress: 127.0.0.1
+  localPort: 4999                          localPort: 5000
+  address: 127.0.0.1                       address: 127.0.0.1
+  port: 4998                               port: 4998
 ```
 
 Before running, verify the live topology rather than assuming all EPC functions
@@ -168,6 +229,40 @@ the current Attach; do not invent or retain an address from an older session.
 After the test, stop the UE before deleting the temporary namespace and restore
 any diagnostic sysctl to its original value.
 
+## Concurrent multi-UE acceptance
+
+With both UEs registered, move each TUN into its own isolated namespace and
+ping concurrently — not sequentially — so an overlapping active period is
+proven:
+
+```bash
+sudo ip netns add ueA && sudo ip link set uniransim-lte0 netns ueA
+sudo ip netns add ueB && sudo ip link set uniransim-lte1 netns ueB
+sudo -n ip netns exec ueA ping -I uniransim-lte0 -c 5 -W 3 10.45.0.1 &
+sudo -n ip netns exec ueB ping -I uniransim-lte1 -c 5 -W 3 10.45.0.1 &
+wait
+```
+
+Both UEs must independently receive all replies. Correlate the evidence per UE
+from the S1-U capture (`tshark -d udp.port==2152,gtp`): UE A's uplink T-PDUs
+carry SGW TEID A, UE B's carry SGW TEID B, and each downlink T-PDU uses the
+eNB TEID advertised for that UE only. The eNB logs one identity and counter
+block per UE on shutdown:
+
+```text
+User-plane statistics for LTE UE 1: radio-ul=… s1u-ul=… s1u-dl=… drops(…)=…
+User-plane statistics for LTE UE 2: radio-ul=… s1u-ul=… s1u-dl=… drops(…)=…
+Shared S1-U endpoint statistics: echo=… drops(malformed/unknown-teid)=…
+```
+
+Lifecycle isolation is verified the same way: detaching UE A (its Detach
+Request accepted, bearer released, TUN closed, TEID invalidated) must leave
+UE B registered and pinging; a Service Request from UE A must restore only
+UE A with a fresh eNB receiving TEID; and a restarted UE A must re-Attach with
+new identifiers while UE B continues. Per-UE cleanup removes only the exiting
+UE's TUN, address, and routes; the shared eNB sockets and the other UE's
+bearer remain until their own shutdown.
+
 ## Phase 3-A runtime acceptance record
 
 The 2026-10-24 acceptance run used Ubuntu 24.04.5 LTS, CMake 3.28.3, GCC 13.3.0,
@@ -202,9 +297,13 @@ tests after that addition.
 
 ## Supported scope
 
-Supported: one LTE UE, one default bearer, IPv4, EEA0/EEA2 NAS security, S1-U
-GTP-U, persistent TUN forwarding, context cleanup, and packet/drop counters.
+Supported: multiple concurrent LTE UEs (bounded by `maxUes`) through one eNB
+with independent S1AP contexts, default bearers and TEID mappings, one default
+bearer per UE, IPv4, EEA0/EEA2 NAS security, S1-U GTP-U, persistent TUN
+forwarding, per-UE lifecycle isolation (Detach, ECM-IDLE, Service Request,
+periodic TAU), per-UE context cleanup, and per-UE packet/drop counters.
 
-Not supported: multiple UEs or PDNs, dedicated bearers, paging-driven
+Not supported: additional PDN connections, dedicated bearers, paging-driven
 mobile-terminated service, inter-MME mobility, handover, IPv6/IPv4v6 forwarding,
-RF/SDR, IMS/VoLTE, QoS scheduling, or GTP-U kernel offload.
+RF/SDR, IMS/VoLTE, QoS scheduling, GTP-U kernel offload, or session persistence
+across eNB process restarts.

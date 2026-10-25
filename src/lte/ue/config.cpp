@@ -94,6 +94,8 @@ Config ParseNode(const YAML::Node &root)
         throw std::runtime_error("Field 'mnc' is out of range");
     if (config.imsi.rfind(config.plmn.mcc + config.plmn.mnc, 0) != 0)
         throw std::runtime_error("Field 'imsi' must begin with the configured MCC and MNC");
+    if (yaml::HasField(root, "ueId"))
+        config.ueId = static_cast<uint32_t>(yaml::GetInt64(root, "ueId", 1, 0xFFFFFFFF));
     config.key = Hex<16>(root, "k");
     if (yaml::HasField(root, "op")) config.op = Hex<16>(root, "op");
     if (yaml::HasField(root, "opc")) config.opc = Hex<16>(root, "opc");

@@ -1,0 +1,38 @@
+# Synthetic second LTE UE for concurrent multi-UE runs. Copy to the ignored
+# open5gs-lte-ue-b.local.yaml and put only authorized subscriber values there.
+# The radio UE identity and the enbLink.localPort must differ from every other
+# concurrently running lte-ue process; the eNB rejects duplicate identities.
+imsi: '460020123456790'
+mcc: '460'
+mnc: '02'
+ueId: 2
+k: '00112233445566778899AABBCCDDEEFF'
+# Specify exactly one of OP or OPc. This synthetic value is not a subscriber secret.
+op: '102132435465768798A9BACBDCEDFE0F'
+amf: '8000'
+initialSqn: '000000000000'
+pdnType: IPv4
+apn: internet
+networkCapability: 'A020'
+
+lifecycle:
+  scenario: attach-only
+  triggerAfterMs: 2000
+  procedureTimeoutMs: 5000
+  maxRetries: 3
+  switchOff: false
+
+enbLink:
+  localAddress: 127.0.0.1
+  localPort: 5000
+  address: 127.0.0.1
+  port: 4998
+  timeoutMs: 15000
+
+# TUN naming stays per-process; concurrent interfaces receive distinct kernel
+# suffixes, and separate network namespaces keep user-plane tests isolated.
+tun:
+  required: true
+  namePrefix: uniransim-lte
+  mtu: 1400
+  routes: []

@@ -12,6 +12,10 @@ mme:
   address: 192.168.64.128
   port: 36412
 
+# Maximum number of concurrently served simulated LTE UEs. Each UE keeps an
+# independent S1AP context and default bearer behind the shared transports.
+maxUes: 8
+
 # One of 32, 64, 128 or 256 radio frames.
 pagingDrx: 128
 

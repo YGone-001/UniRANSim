@@ -103,10 +103,11 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
     auto procedureDeadline = std::chrono::steady_clock::time_point::max();
     udp::UdpServer socket(config.link.localAddress, config.link.localPort);
     InetAddress enb(config.link.enbAddress, config.link.enbPort);
-    const uint32_t ueId = 1;
+    const uint32_t ueId = config.ueId;
     mobility.ecm = EcmState::CONNECTED;
     state = State::CONNECTED_TO_ENB;
     LogState(state);
+    Log("INFO", "LTE UE " + std::to_string(ueId) + " using subscriber IMSI ..." + config.imsi.substr(config.imsi.size() - 4));
     auto attach = nas::EncodeAttachRequest(config);
     SendNas(socket, enb, ueId, std::move(attach));
     state = State::ATTACH_REQUEST_SENT;

@@ -3,6 +3,9 @@
 imsi: '460020123456789'
 mcc: '460'
 mnc: '02'
+# Simulated radio UE identity. Must be unique among concurrently running
+# lte-ue processes against the same eNB; the eNB rejects duplicates.
+ueId: 1
 k: '00112233445566778899AABBCCDDEEFF'
 # Specify exactly one of OP or OPc. This synthetic value is not a subscriber secret.
 op: '102132435465768798A9BACBDCEDFE0F'

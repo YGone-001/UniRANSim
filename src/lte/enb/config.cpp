@@ -84,6 +84,9 @@ EnbConfig ParseNode(const YAML::Node &root)
     if (result.s1uAddress == "0.0.0.0")
         throw std::runtime_error("Field 's1u.address' must be a concrete advertised IPv4 address");
 
+    if (yaml::HasField(root, "maxUes"))
+        result.maxUes = yaml::GetInt32(root, "maxUes", 1, 64);
+
     if (yaml::HasField(root, "sctp"))
     {
         const YAML::Node sctp = root["sctp"];

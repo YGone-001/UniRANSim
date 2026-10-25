@@ -129,6 +129,10 @@ struct Config
 {
     std::string imsi;
     enb::Plmn plmn;
+    // Simulated radio UE identity carried in every radio-link frame. Unique
+    // among concurrently running lte-ue processes; defaults to the Phase 1
+    // single-UE identity.
+    uint32_t ueId{1};
     std::array<uint8_t, 16> key{};
     std::optional<std::array<uint8_t, 16>> op;
     std::optional<std::array<uint8_t, 16>> opc;

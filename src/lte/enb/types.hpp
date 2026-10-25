@@ -52,6 +52,8 @@ struct EnbConfig
     std::string s1uAddress;
     uint16_t s1uPort{2152};
     bool allowLoopbackS1u{false};
+    // Bound on concurrently served simulated radio UEs in the registry.
+    int maxUes{8};
     RetryConfig retry;
 };
 
