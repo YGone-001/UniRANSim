@@ -208,6 +208,28 @@ TEST_CASE("lte/enb/codec: UE-associated NAS messages use the expected S1AP proce
 
     CHECK_THROWS(lte::enb::s1ap::EncodeInitialUeMessage(config, 0, nas));
     CHECK_THROWS(lte::enb::s1ap::DecodeDownlinkNasTransport(nullptr, 0));
+
+    auto service = lte::enb::s1ap::EncodeInitialUeMessage(
+        config, 2, {0xC7, 0x00, 0xAA, 0xBB}, lte::enb::s1ap::STmsi{1, 0x12345678});
+    // Independently checked against Open5GS' asn1c APER decoder: the MMEC is
+    // bit-packed after the two SEQUENCE bits and the four-octet M-TMSI is
+    // aligned to the next octet boundary.
+    const std::vector<uint8_t> sTmsiIe{0x00, 0x60, 0x00, 0x06, 0x00, 0x40, 0x12, 0x34, 0x56, 0x78};
+    CHECK(std::search(service.begin(), service.end(), sTmsiIe.begin(), sTmsiIe.end()) != service.end());
+}
+
+TEST_CASE("lte/enb/codec: UE Context Release Request uses procedure 18 and a valid user-inactivity cause")
+{
+    auto wire = lte::enb::s1ap::EncodeUeContextReleaseRequest(0x12345678, 0x654321);
+    REQUIRE(wire.size() > 3);
+    CHECK(wire[0] == 0x00);
+    CHECK(wire[1] == 18);
+    auto decoded = lte::enb::s1ap::DecodeUeContextReleaseRequest(wire.data(), wire.size());
+    CHECK(decoded.mmeUeS1apId == 0x12345678);
+    CHECK(decoded.enbUeS1apId == 0x654321);
+    CHECK(decoded.causeCategory == "radioNetwork");
+    CHECK(decoded.causeValue == 20);
+    CHECK_THROWS(lte::enb::s1ap::EncodeUeContextReleaseRequest(0, 1));
 }
 
 TEST_CASE("lte/enb/config: s1u GTP-U endpoint is configurable and defaults to the concrete S1AP address")

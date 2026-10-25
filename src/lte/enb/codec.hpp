@@ -54,8 +54,15 @@ struct UeContext
     std::optional<uint32_t> mmeUeS1apId;
 };
 
+struct STmsi
+{
+    uint8_t mmeCode{};
+    uint32_t mTmsi{};
+};
+
 std::vector<uint8_t> EncodeInitialUeMessage(const EnbConfig &config, uint32_t enbUeS1apId,
-                                            const std::vector<uint8_t> &nasPdu);
+                                            const std::vector<uint8_t> &nasPdu,
+                                            std::optional<STmsi> sTmsi = std::nullopt);
 std::vector<uint8_t> EncodeUplinkNasTransport(const EnbConfig &config, const UeContext &context,
                                               const std::vector<uint8_t> &nasPdu);
 struct DownlinkNasTransport
@@ -170,5 +177,20 @@ UeContextReleaseCommand DecodeUeContextReleaseCommand(const uint8_t *data, size_
 std::vector<uint8_t> EncodeUeContextReleaseCommand(uint32_t mmeUeS1apId, std::optional<uint32_t> enbUeS1apId,
                                                    const std::string &causeCategory, int causeValue);
 std::vector<uint8_t> EncodeUeContextReleaseComplete(uint32_t mmeUeS1apId, uint32_t enbUeS1apId);
+
+struct UeContextReleaseRequest
+{
+    uint32_t mmeUeS1apId{};
+    uint32_t enbUeS1apId{};
+    std::string causeCategory;
+    int causeValue{-1};
+};
+
+// TS 36.413 UE Context Release Request, procedure code 18. The default cause
+// used by the runtime is radioNetwork/user-inactivity (20).
+std::vector<uint8_t> EncodeUeContextReleaseRequest(uint32_t mmeUeS1apId, uint32_t enbUeS1apId,
+                                                   const std::string &causeCategory = "radioNetwork",
+                                                   int causeValue = 20);
+UeContextReleaseRequest DecodeUeContextReleaseRequest(const uint8_t *data, size_t length);
 
 } // namespace lte::enb::s1ap

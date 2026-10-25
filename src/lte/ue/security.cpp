@@ -193,6 +193,40 @@ bool IsCiphered(SecurityHeaderType headerType)
     return IsCipheredHeader(headerType);
 }
 
+uint32_t EstimateServiceRequestCount(uint32_t lastCount, uint8_t shortSequence)
+{
+    if (shortSequence > 0x1FU) throw SecurityError("Invalid Service Request short sequence");
+    lastCount &= 0xFFFFFFU;
+    uint32_t candidate = (lastCount & ~0x1FU) | shortSequence;
+    if (candidate < lastCount) candidate = (candidate + 0x20U) & 0xFFFFFFU;
+    return candidate;
+}
+
+std::vector<uint8_t> EncodeServiceRequest(const SecurityContext &context)
+{
+    if (!context.valid || !context.keysDerived || !context.securityActive || context.ksi > 6 ||
+        !IsSupported(context.integrity))
+        throw SecurityError("Service Request requires an active native EPS security context");
+    const uint32_t count = context.ulNasCount & 0xFFFFFFU;
+    const uint8_t ksiSequence = static_cast<uint8_t>((context.ksi << 5U) | (count & 0x1FU));
+    const std::array<uint8_t, 2> authenticated{{0xC7, ksiSequence}};
+    const uint32_t mac = ComputeMac(context, true, count, ToOctets(authenticated));
+    return {authenticated[0], authenticated[1], static_cast<uint8_t>(mac >> 8U), static_cast<uint8_t>(mac)};
+}
+
+void VerifyServiceRequest(const SecurityContext &context, const uint8_t *data, size_t size, uint32_t lastCount)
+{
+    if (data == nullptr || size != 4 || data[0] != 0xC7)
+        throw SecurityError("Malformed compact Service Request");
+    if (!context.valid || !context.keysDerived || !context.securityActive || (data[1] >> 5U) != context.ksi)
+        throw SecurityError("Service Request security context or KSI mismatch");
+    const uint32_t count = EstimateServiceRequestCount(lastCount, static_cast<uint8_t>(data[1] & 0x1FU));
+    const uint32_t mac = ComputeMac(context, true, count, ToOctets(data, 2));
+    const uint16_t shortMac = static_cast<uint16_t>(mac & 0xFFFFU);
+    if (data[2] != static_cast<uint8_t>(shortMac >> 8U) || data[3] != static_cast<uint8_t>(shortMac))
+        throw SecurityError("Service Request short MAC verification failed");
+}
+
 std::vector<uint8_t> Protect(const SecurityContext &context, bool uplink, bool newContext,
                              const std::vector<uint8_t> &plain)
 {

@@ -12,6 +12,17 @@ pdnType: IPv4
 apn: internet
 networkCapability: 'A020'
 
+# One deterministic laboratory action is run after Attach. Keep attach-only for
+# ordinary use; select detach, service-request, tau-normal, or tau-periodic for
+# one bounded lifecycle acceptance run. tau-normal is valid only when the UE is
+# actually entering a tracking area outside its assigned TAI list.
+lifecycle:
+  scenario: attach-only
+  triggerAfterMs: 2000
+  procedureTimeoutMs: 5000
+  maxRetries: 3
+  switchOff: false
+
 enbLink:
   localAddress: 127.0.0.1
   localPort: 4999
@@ -23,6 +34,9 @@ enbLink:
 # LTE TUN defaults do not alter the host default route. Add only controlled
 # test destinations to routes (IPv4 CIDR) when explicitly needed.
 tun:
+  # Keep true for acceptance. false is only a control-plane diagnostic escape
+  # hatch when the caller lacks CAP_NET_ADMIN; it is never user-plane evidence.
+  required: true
   namePrefix: uniransim-lte
   mtu: 1400
   routes: []

@@ -35,8 +35,52 @@ The version-1 frame header contains message type, UE identity, and exact payload
 length. `NAS_UPLINK`/`NAS_DOWNLINK` retain Phase 2 signaling. `DATA_UPLINK` and
 `DATA_DOWNLINK` carry one unchanged IPv4 packet. `BEARER_READY` conveys the
 accepted EBI and assigned IPv4 address after TUN setup, allowing the eNB to bind
-the encrypted NAS result to the E-RAB. `BEARER_RELEASED` closes UE TUN resources.
-Direction, UE identity, peer endpoint, type, and length are checked before use.
+the encrypted NAS result to the E-RAB. `S1_CONTEXT_RELEASE_REQUEST`,
+`S1_CONTEXT_RELEASED`, and `S1_CONTEXT_RESTORED` distinguish an ordinary ECM
+release from bearer deletion. The legacy `BEARER_RELEASED` alone closes UE TUN
+resources. Direction, UE identity, peer endpoint, type, and length are checked
+before use.
+
+## EPS lifecycle
+
+The LTE UE tracks mobility registration, S1 connectivity, and bearer readiness
+independently. `EMM_REGISTERED` may coexist with `ECM_IDLE`; in that state the
+GUTI, NAS keys and COUNTs, assigned IPv4 address, logical default bearer, and
+TUN are retained, but no user packet is forwarded. A UE Context Release removes
+the current S1AP IDs and GTP-U TEIDs. A subsequent Service Request uses security
+header type 12, the native KSI, five-bit sequence number, and EIA2 short MAC in
+an Initial UE Message. Initial Context Setup allocates a fresh eNB S1AP ID and
+eNB TEID before forwarding resumes.
+
+Normal Detach sends a protected GUTI-based Detach Request and waits for a
+verified Detach Accept. Only then are registration, security, bearer, routes,
+and TUN cleared. Switch-off Detach is available explicitly and does not wait for
+an acknowledgement. Requests use a bounded timeout and retransmit the identical
+protected PDU, so a retry does not consume a second NAS COUNT.
+
+Normal and periodic TAU retain the Attach-assigned GUTI, TAI list, T3412 value,
+KSI, security context, EBI, and PDN address. TAU Request includes EPS bearer
+context status. Context changes are applied only after an integrity-verified TAU
+Accept; a new GUTI causes a protected TAU Complete. TAU Reject fails the scenario
+without inventing success. `tau-periodic` is an explicitly accelerated lab
+trigger, not a claim that the encoded T3412 interval elapsed. `tau-normal` must
+only be used with a real authorized TAI-change arrangement.
+
+The optional deterministic scenario block is:
+
+```yaml
+lifecycle:
+  scenario: attach-only     # detach | service-request | tau-normal | tau-periodic
+  triggerAfterMs: 2000
+  procedureTimeoutMs: 5000
+  maxRetries: 3
+  switchOff: false          # detach only; normal acknowledged Detach is preferred
+```
+
+For `service-request`, the trigger first sends a standards-valid S1AP UE Context
+Release Request with `radioNetwork/user-inactivity`; the UE waits for the MME's
+Release Command and eNB Release Complete before sending Service Request. Logs
+separately report ECM-IDLE and restoration. Keep one UE/eNB pair per run.
 
 ## TUN and route policy
 
@@ -54,21 +98,27 @@ routes at cleanup. A safe controlled test configuration is:
 
 ```yaml
 tun:
+  required: true
   namePrefix: uniransim-lte
   mtu: 1400
   routes:
     - 10.45.0.1/32       # replace with the authorized EPC test endpoint
 ```
 
+`tun.required` defaults to `true`. Setting it to `false` permits control-plane
+diagnostics on a host without `CAP_NET_ADMIN`; the UE then deliberately remains
+at `BEARER_SIGNALING_ESTABLISHED`, never emits `BEARER_READY`, and never forwards
+IP packets. Such a run is not user-plane or Phase 4 continuity evidence.
+
 ## Build and run
 
 ```bash
-cmake -S . -B cmake-build-phase3 -DCMAKE_BUILD_TYPE=Release
-cmake --build cmake-build-phase3 --parallel 2
-ctest --test-dir cmake-build-phase3 --output-on-failure
+cmake -S . -B cmake-build-phase4 -DCMAKE_BUILD_TYPE=Release
+cmake --build cmake-build-phase4 --parallel 2
+ctest --test-dir cmake-build-phase4 --output-on-failure --no-tests=error
 
-sudo ./cmake-build-phase3/lte-enb -c config/open5gs-lte-enb.yaml
-sudo ./cmake-build-phase3/lte-ue -c config/open5gs-lte-ue.local.yaml
+sudo ./cmake-build-phase4/lte-enb -c config/open5gs-lte-enb.yaml
+sudo ./cmake-build-phase4/lte-ue -c config/open5gs-lte-ue.local.yaml
 ```
 
 Before running, verify the live topology rather than assuming all EPC functions
@@ -155,6 +205,6 @@ tests after that addition.
 Supported: one LTE UE, one default bearer, IPv4, EEA0/EEA2 NAS security, S1-U
 GTP-U, persistent TUN forwarding, context cleanup, and packet/drop counters.
 
-Not supported: multiple UEs or PDNs, dedicated bearers, IPv6/IPv4v6 forwarding,
-TAU, paging, Service Request, handover, RF/SDR, IMS/VoLTE, QoS scheduling, or
-GTP-U kernel offload.
+Not supported: multiple UEs or PDNs, dedicated bearers, paging-driven
+mobile-terminated service, inter-MME mobility, handover, IPv6/IPv4v6 forwarding,
+RF/SDR, IMS/VoLTE, QoS scheduling, or GTP-U kernel offload.

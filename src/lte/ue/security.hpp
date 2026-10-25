@@ -82,4 +82,11 @@ uint32_t EstimateNasCount(uint32_t lastCount, uint8_t sequenceNumber);
 bool StartsNewContext(SecurityHeaderType headerType);
 bool IsCiphered(SecurityHeaderType headerType);
 
+// TS 24.301 Service Request uses its compact security header (type 12), not a
+// normal protected NAS envelope. COUNT is the next uplink NAS COUNT.
+std::vector<uint8_t> EncodeServiceRequest(const SecurityContext &context);
+uint32_t EstimateServiceRequestCount(uint32_t lastCount, uint8_t shortSequence);
+void VerifyServiceRequest(const SecurityContext &context, const uint8_t *data, size_t size,
+                          uint32_t lastCount);
+
 } // namespace lte::ue::nas

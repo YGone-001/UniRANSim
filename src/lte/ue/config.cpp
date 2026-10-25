@@ -111,10 +111,36 @@ Config ParseNode(const YAML::Node &root)
     }
     if (yaml::HasField(root, "networkCapability")) config.networkCapability = Hex<2>(root, "networkCapability");
 
+    if (yaml::HasField(root, "lifecycle"))
+    {
+        const auto lifecycle = root["lifecycle"];
+        if (!lifecycle.IsMap()) throw std::runtime_error("Field 'lifecycle' must be a mapping");
+        if (yaml::HasField(lifecycle, "scenario"))
+        {
+            const auto scenario = yaml::GetString(lifecycle, "scenario", 3, 32);
+            if (scenario == "attach-only") config.lifecycle.scenario = LifecycleScenario::ATTACH_ONLY;
+            else if (scenario == "detach") config.lifecycle.scenario = LifecycleScenario::DETACH;
+            else if (scenario == "service-request") config.lifecycle.scenario = LifecycleScenario::SERVICE_REQUEST;
+            else if (scenario == "tau-normal") config.lifecycle.scenario = LifecycleScenario::TAU_NORMAL;
+            else if (scenario == "tau-periodic") config.lifecycle.scenario = LifecycleScenario::TAU_PERIODIC;
+            else throw std::runtime_error("Field 'lifecycle.scenario' is not supported");
+        }
+        if (yaml::HasField(lifecycle, "triggerAfterMs"))
+            config.lifecycle.triggerAfterMs = yaml::GetInt32(lifecycle, "triggerAfterMs", 100, 3600000);
+        if (yaml::HasField(lifecycle, "procedureTimeoutMs"))
+            config.lifecycle.procedureTimeoutMs = yaml::GetInt32(lifecycle, "procedureTimeoutMs", 100, 60000);
+        if (yaml::HasField(lifecycle, "maxRetries"))
+            config.lifecycle.maxRetries = yaml::GetInt32(lifecycle, "maxRetries", 0, 10);
+        if (yaml::HasField(lifecycle, "switchOff")) config.lifecycle.switchOff = lifecycle["switchOff"].as<bool>();
+        if (config.lifecycle.switchOff && config.lifecycle.scenario != LifecycleScenario::DETACH)
+            throw std::runtime_error("Field 'lifecycle.switchOff' is valid only for the detach scenario");
+    }
+
     if (yaml::HasField(root, "tun"))
     {
         const auto tun = root["tun"];
         if (!tun.IsMap()) throw std::runtime_error("Field 'tun' must be a mapping");
+        if (yaml::HasField(tun, "required")) config.tun.required = tun["required"].as<bool>();
         if (yaml::HasField(tun, "namePrefix"))
             config.tun.namePrefix = yaml::GetString(tun, "namePrefix", 1, 14);
         ValidateTunNamePrefix(config.tun.namePrefix);

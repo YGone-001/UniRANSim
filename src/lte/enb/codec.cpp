@@ -25,6 +25,7 @@ constexpr uint16_t PROCEDURE_S1_SETUP = 17;
 constexpr uint16_t PROCEDURE_DOWNLINK_NAS_TRANSPORT = 11;
 constexpr uint16_t PROCEDURE_INITIAL_UE_MESSAGE = 12;
 constexpr uint16_t PROCEDURE_UPLINK_NAS_TRANSPORT = 13;
+constexpr uint16_t PROCEDURE_UE_CONTEXT_RELEASE_REQUEST = 18;
 constexpr uint16_t PROCEDURE_UE_CONTEXT_RELEASE = 23;
 constexpr uint16_t IE_CAUSE = 2;
 constexpr uint16_t IE_MME_UE_S1AP_ID = 0;
@@ -50,6 +51,7 @@ constexpr uint16_t IE_CRITICALITY_DIAGNOSTICS = 58;
 constexpr uint16_t IE_TAI = 67;
 constexpr uint16_t IE_EUTRAN_CGI = 100;
 constexpr uint16_t IE_RRC_ESTABLISHMENT_CAUSE = 134;
+constexpr uint16_t IE_S_TMSI = 96;
 
 enum class Criticality : uint8_t
 {
@@ -1026,7 +1028,7 @@ SetupOutcome DecodeS1SetupOutcome(const uint8_t *data, size_t length)
 }
 
 std::vector<uint8_t> EncodeInitialUeMessage(const EnbConfig &config, uint32_t enbUeS1apId,
-                                            const std::vector<uint8_t> &nasPdu)
+                                            const std::vector<uint8_t> &nasPdu, std::optional<STmsi> sTmsi)
 {
     if (enbUeS1apId == 0 || enbUeS1apId > 0xFFFFFFU)
         throw CodecError("eNB-UE-S1AP-ID is out of range");
@@ -1036,6 +1038,20 @@ std::vector<uint8_t> EncodeInitialUeMessage(const EnbConfig &config, uint32_t en
     ies.push_back({{IE_TAI, Criticality::REJECT}, EncodeTai(config)});
     ies.push_back({{IE_EUTRAN_CGI, Criticality::IGNORE}, EncodeEutranCgi(config)});
     ies.push_back({{IE_RRC_ESTABLISHMENT_CAUSE, Criticality::IGNORE}, EncodeRrcEstablishmentCause()});
+    if (sTmsi.has_value())
+    {
+        if (sTmsi->mTmsi == 0) throw CodecError("S-TMSI has an invalid M-TMSI");
+        BitWriter value;
+        value.writeBit(false);
+        value.writeBit(false);
+        value.writeBits(sTmsi->mmeCode, 8);
+        // X.691 aligned PER: the one-octet MMEC follows the SEQUENCE
+        // preamble bit-packed, while the fixed four-octet M-TMSI starts on
+        // the next octet boundary.
+        value.align();
+        value.writeBits(sTmsi->mTmsi, 32);
+        ies.push_back({{IE_S_TMSI, Criticality::REJECT}, value.take()});
+    }
     return EncodeUeMessage(PROCEDURE_INITIAL_UE_MESSAGE, Criticality::IGNORE, ies);
 }
 
@@ -1396,6 +1412,78 @@ std::vector<uint8_t> EncodeUeContextReleaseComplete(uint32_t mmeUeS1apId, uint32
     ies.push_back({{IE_MME_UE_S1AP_ID, Criticality::REJECT}, EncodeUeId(mmeUeS1apId, 0xFFFFFFFFU)});
     ies.push_back({{IE_ENB_UE_S1AP_ID, Criticality::REJECT}, EncodeUeId(enbUeS1apId, 0xFFFFFFU)});
     return EncodePdu(1, PROCEDURE_UE_CONTEXT_RELEASE, Criticality::REJECT, ies);
+}
+
+std::vector<uint8_t> EncodeUeContextReleaseRequest(uint32_t mmeUeS1apId, uint32_t enbUeS1apId,
+                                                   const std::string &causeCategory, int causeValue)
+{
+    if (mmeUeS1apId == 0 || enbUeS1apId == 0 || enbUeS1apId > 0xFFFFFFU)
+        throw CodecError("UE Context Release Request has an invalid UE S1AP identity");
+
+    static const std::array<const char *, 5> names = {"radioNetwork", "transport", "nas", "protocol", "misc"};
+    static const std::array<size_t, 5> counts = {36, 2, 4, 7, 6};
+    int category = -1;
+    for (size_t i = 0; i < names.size(); ++i)
+        if (causeCategory == names[i]) category = static_cast<int>(i);
+    if (category < 0 || causeValue < 0 || causeValue >= static_cast<int>(counts[static_cast<size_t>(category)]))
+        throw CodecError("UE Context Release Request has an invalid Cause");
+
+    BitWriter cause;
+    cause.writeBit(false); // Cause CHOICE not extended
+    cause.writeBits(static_cast<uint8_t>(category), 3);
+    cause.writeBit(false); // root enumeration
+    cause.writeBits(static_cast<uint64_t>(causeValue), BitsForRange(counts[static_cast<size_t>(category)]));
+
+    std::vector<std::pair<std::pair<uint16_t, Criticality>, std::vector<uint8_t>>> ies;
+    ies.push_back({{IE_MME_UE_S1AP_ID, Criticality::REJECT}, EncodeUeId(mmeUeS1apId, 0xFFFFFFFFU)});
+    ies.push_back({{IE_ENB_UE_S1AP_ID, Criticality::REJECT}, EncodeUeId(enbUeS1apId, 0xFFFFFFU)});
+    ies.push_back({{IE_CAUSE, Criticality::IGNORE}, cause.take()});
+    return EncodePdu(0, PROCEDURE_UE_CONTEXT_RELEASE_REQUEST, Criticality::IGNORE, ies);
+}
+
+UeContextReleaseRequest DecodeUeContextReleaseRequest(const uint8_t *data, size_t length)
+{
+    auto envelope = DecodeEnvelope(data, length, PROCEDURE_UE_CONTEXT_RELEASE_REQUEST,
+                                   static_cast<int>(Criticality::IGNORE));
+    if (envelope.choice != 0)
+        throw CodecError("UE Context Release Request is not an initiating message");
+    UeContextReleaseRequest result{};
+    bool mmePresent = false, enbPresent = false, causePresent = false;
+    for (const auto &ie : DecodeIeContainer(envelope.value))
+    {
+        if (ie.id == IE_MME_UE_S1AP_ID)
+        {
+            if (ie.criticality != Criticality::REJECT) throw CodecError("MME-UE-S1AP-ID has invalid criticality");
+            result.mmeUeS1apId = DecodeUeId(ie.value, 0xFFFFFFFFU);
+            mmePresent = true;
+        }
+        else if (ie.id == IE_ENB_UE_S1AP_ID)
+        {
+            if (ie.criticality != Criticality::REJECT) throw CodecError("eNB-UE-S1AP-ID has invalid criticality");
+            result.enbUeS1apId = DecodeUeId(ie.value, 0xFFFFFFU);
+            enbPresent = true;
+        }
+        else if (ie.id == IE_CAUSE)
+        {
+            if (ie.criticality != Criticality::IGNORE) throw CodecError("Cause has invalid criticality");
+            BitReader reader(ie.value);
+            if (reader.readBit()) throw CodecError("Extended S1AP Cause category is not supported");
+            const int category = static_cast<int>(reader.readBits(3));
+            static const std::array<const char *, 5> names = {"radioNetwork", "transport", "nas", "protocol", "misc"};
+            static const std::array<size_t, 5> counts = {36, 2, 4, 7, 6};
+            if (category < 0 || category >= static_cast<int>(names.size()))
+                throw CodecError("Invalid S1AP Cause category");
+            result.causeCategory = names[static_cast<size_t>(category)];
+            result.causeValue = ReadExtensibleEnum(reader, counts[static_cast<size_t>(category)]);
+            reader.requireFinished();
+            causePresent = true;
+        }
+        else if (ie.criticality == Criticality::REJECT)
+            throw CodecError("Unknown reject-criticality IE in UE Context Release Request");
+    }
+    if (!mmePresent || !enbPresent || !causePresent)
+        throw CodecError("UE Context Release Request is missing a mandatory IE");
+    return result;
 }
 
 } // namespace lte::enb::s1ap

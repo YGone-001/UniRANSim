@@ -119,12 +119,25 @@ struct AttachAccept
     std::optional<ActivateDefaultEpsBearerContextRequest> bearer;
 };
 
+struct TauAccept
+{
+    uint8_t updateResult{};
+    std::optional<uint8_t> t3412;
+    std::optional<std::vector<uint8_t>> taiList;
+    std::optional<std::array<uint8_t, 11>> guti;
+    std::optional<uint16_t> bearerContextStatus;
+};
+
 // Decoded form of the protected downlink EMM message the UE must react to.
 enum class DownlinkEmm
 {
     SECURITY_MODE_COMMAND,
     ATTACH_ACCEPT,
     ATTACH_REJECT,
+    DETACH_ACCEPT,
+    SERVICE_REJECT,
+    TAU_ACCEPT,
+    TAU_REJECT,
     ESM_INFORMATION_REQUEST,
     OTHER
 };
@@ -135,6 +148,7 @@ struct DownlinkMessage
     uint8_t messageType{};
     SecurityModeCommand securityModeCommand{};
     AttachAccept attachAccept{};
+    TauAccept tauAccept{};
     EsmInformationRequest esmInformationRequest{};
     uint8_t emmCause{};
 };
@@ -156,5 +170,10 @@ std::vector<uint8_t> EncodeEsmInformationResponse(uint8_t procedureTransactionId
 // True when the message is an ESM Information Request (used to keep the happy
 // path optional while still supporting the procedure).
 bool IsEsmInformationRequest(const uint8_t *data, size_t size);
+
+std::vector<uint8_t> EncodeDetachRequest(uint8_t ksi, const std::array<uint8_t, 11> &guti, bool switchOff);
+std::vector<uint8_t> EncodeTauRequest(uint8_t ksi, const std::array<uint8_t, 11> &guti,
+                                      uint8_t defaultEbi, bool periodic);
+std::vector<uint8_t> EncodeTauComplete();
 
 } // namespace lte::ue::nas

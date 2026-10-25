@@ -99,11 +99,30 @@ struct LinkConfig
 
 struct TunConfig
 {
+    bool required{true};
     std::string namePrefix{"uniransim-lte"};
     int mtu{1400};
     // No routes are installed unless explicitly listed. A default route is
     // rejected; only validated IPv4 CIDR destinations are accepted.
     std::vector<std::string> routes;
+};
+
+enum class LifecycleScenario
+{
+    ATTACH_ONLY,
+    DETACH,
+    SERVICE_REQUEST,
+    TAU_NORMAL,
+    TAU_PERIODIC
+};
+
+struct LifecycleConfig
+{
+    LifecycleScenario scenario{LifecycleScenario::ATTACH_ONLY};
+    int triggerAfterMs{2000};
+    int procedureTimeoutMs{5000};
+    int maxRetries{3};
+    bool switchOff{};
 };
 
 struct Config
@@ -126,6 +145,7 @@ struct Config
     std::array<uint8_t, 8> imeisv{{0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88}};
     LinkConfig link;
     TunConfig tun;
+    LifecycleConfig lifecycle;
 };
 
 // In-memory EPS security context. Phase 1 fills the AKA half; Phase 2 derives

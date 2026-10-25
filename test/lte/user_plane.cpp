@@ -173,7 +173,10 @@ TEST_CASE("lte/user-plane/radio-link: NAS, data, readiness and direction remain 
     using T = lte::ue::link::MessageType;
     for (const M &input : {M{T::NAS_UPLINK, 1, {1}}, M{T::NAS_DOWNLINK, 1, {2}},
                            M{T::DATA_UPLINK, 1, Ipv4()}, M{T::DATA_DOWNLINK, 1, Ipv4()},
-                           M{T::BEARER_READY, 1, {5, 10, 45, 0, 2}}, M{T::BEARER_RELEASED, 1, {5}}})
+                           M{T::BEARER_READY, 1, {5, 10, 45, 0, 2}}, M{T::BEARER_RELEASED, 1, {5}},
+                           M{T::S1_CONTEXT_RELEASE_REQUEST, 1, {5}}, M{T::S1_CONTEXT_RELEASED, 1, {5}},
+                           M{T::S1_CONTEXT_RESTORED, 1, {5}},
+                           M{T::SERVICE_REQUEST, 1, {1, 0x12, 0x34, 0x56, 0x78, 0xC7, 0x00, 0xAA, 0xBB}}})
     {
         auto wire = lte::ue::link::Encode(input);
         auto decoded = lte::ue::link::Decode(wire.data(), wire.size());
@@ -183,7 +186,11 @@ TEST_CASE("lte/user-plane/radio-link: NAS, data, readiness and direction remain 
     CHECK(lte::ue::link::IsUplink(T::DATA_UPLINK));
     CHECK_FALSE(lte::ue::link::IsUplink(T::DATA_DOWNLINK));
     CHECK(lte::ue::link::IsDownlink(T::DATA_DOWNLINK));
+    CHECK(lte::ue::link::IsUplink(T::S1_CONTEXT_RELEASE_REQUEST));
+    CHECK(lte::ue::link::IsUplink(T::SERVICE_REQUEST));
+    CHECK(lte::ue::link::IsDownlink(T::S1_CONTEXT_RELEASED));
     CHECK_THROWS(lte::ue::link::Encode({T::BEARER_READY, 1, {5, 10}}));
+    CHECK_THROWS(lte::ue::link::Encode({T::SERVICE_REQUEST, 1, {0xC7, 0, 0, 0}}));
     CHECK_THROWS(lte::ue::link::Encode({static_cast<T>(99), 1, {1}}));
     std::vector<uint8_t> oversized(lte::ue::link::MaxDataPduSize + 1, 0);
     CHECK_THROWS(lte::ue::link::Encode({T::DATA_UPLINK, 1, oversized}));

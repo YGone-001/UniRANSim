@@ -25,7 +25,9 @@ bool IsKnown(MessageType type)
 {
     return type == MessageType::NAS_UPLINK || type == MessageType::NAS_DOWNLINK ||
            type == MessageType::DATA_UPLINK || type == MessageType::DATA_DOWNLINK ||
-           type == MessageType::BEARER_READY || type == MessageType::BEARER_RELEASED;
+           type == MessageType::BEARER_READY || type == MessageType::BEARER_RELEASED ||
+           type == MessageType::S1_CONTEXT_RELEASE_REQUEST || type == MessageType::S1_CONTEXT_RELEASED ||
+           type == MessageType::S1_CONTEXT_RESTORED || type == MessageType::SERVICE_REQUEST;
 }
 
 size_t MaximumPayload(MessageType type)
@@ -36,6 +38,8 @@ size_t MaximumPayload(MessageType type)
         return MaxDataPduSize;
     if (type == MessageType::BEARER_READY)
         return 5;
+    if (type == MessageType::SERVICE_REQUEST)
+        return 9;
     return 1;
 }
 }
@@ -45,7 +49,11 @@ std::vector<uint8_t> Encode(const Message &message)
     if (!IsKnown(message.type) || message.ueId == 0 || message.payload.empty() ||
         message.payload.size() > MaximumPayload(message.type) ||
         (message.type == MessageType::BEARER_READY && message.payload.size() != 5) ||
-        (message.type == MessageType::BEARER_RELEASED && message.payload.size() != 1))
+        (message.type == MessageType::SERVICE_REQUEST && message.payload.size() != 9) ||
+        ((message.type == MessageType::BEARER_RELEASED ||
+          message.type == MessageType::S1_CONTEXT_RELEASE_REQUEST ||
+          message.type == MessageType::S1_CONTEXT_RELEASED ||
+          message.type == MessageType::S1_CONTEXT_RESTORED) && message.payload.size() != 1))
         throw DecodeError("Invalid LTE radio-link message");
     std::vector<uint8_t> out(HeaderSize + message.payload.size());
     out[0] = Version;
@@ -70,7 +78,9 @@ Message Decode(const uint8_t *data, size_t size)
     uint16_t length = Read16(data + 6);
     if (length == 0 || length > MaximumPayload(type) || size != HeaderSize + length ||
         (type == MessageType::BEARER_READY && length != 5) ||
-        (type == MessageType::BEARER_RELEASED && length != 1))
+        (type == MessageType::SERVICE_REQUEST && length != 9) ||
+        ((type == MessageType::BEARER_RELEASED || type == MessageType::S1_CONTEXT_RELEASE_REQUEST ||
+          type == MessageType::S1_CONTEXT_RELEASED || type == MessageType::S1_CONTEXT_RESTORED) && length != 1))
         throw DecodeError("Malformed LTE radio-link payload length");
     uint32_t ueId = (static_cast<uint32_t>(data[2]) << 24U) | (static_cast<uint32_t>(data[3]) << 16U) |
                     (static_cast<uint32_t>(data[4]) << 8U) | data[5];
@@ -81,13 +91,15 @@ Message Decode(const uint8_t *data, size_t size)
 
 bool IsUplink(MessageType type)
 {
-    return type == MessageType::NAS_UPLINK || type == MessageType::DATA_UPLINK || type == MessageType::BEARER_READY;
+    return type == MessageType::NAS_UPLINK || type == MessageType::DATA_UPLINK || type == MessageType::BEARER_READY ||
+           type == MessageType::S1_CONTEXT_RELEASE_REQUEST || type == MessageType::SERVICE_REQUEST;
 }
 
 bool IsDownlink(MessageType type)
 {
     return type == MessageType::NAS_DOWNLINK || type == MessageType::DATA_DOWNLINK ||
-           type == MessageType::BEARER_RELEASED;
+           type == MessageType::BEARER_RELEASED || type == MessageType::S1_CONTEXT_RELEASED ||
+           type == MessageType::S1_CONTEXT_RESTORED;
 }
 
 } // namespace lte::ue::link

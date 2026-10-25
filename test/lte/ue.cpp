@@ -103,19 +103,42 @@ TEST_CASE("lte/ue/config: LTE TUN defaults install no route and explicit routes 
 {
     auto defaults = lte::ue::ParseConfig(ConfigText);
     CHECK(defaults.tun.namePrefix == "uniransim-lte");
+    CHECK(defaults.tun.required);
     CHECK(defaults.tun.mtu == 1400);
     CHECK(defaults.tun.routes.empty());
 
     std::string selected = ConfigText;
-    selected += "\ntun:\n  namePrefix: lte-test\n  mtu: 1300\n  routes: ['10.45.0.1/32']\n";
+    selected += "\ntun:\n  required: false\n  namePrefix: lte-test\n  mtu: 1300\n  routes: ['10.45.0.1/32']\n";
     auto configured = lte::ue::ParseConfig(selected);
     CHECK(configured.tun.namePrefix == "lte-test");
+    CHECK_FALSE(configured.tun.required);
     CHECK(configured.tun.mtu == 1300);
     CHECK(configured.tun.routes == std::vector<std::string>{"10.45.0.1/32"});
 
     std::string unsafe = ConfigText;
     unsafe += "\ntun:\n  routes: ['0.0.0.0/0']\n";
     CHECK_THROWS(lte::ue::ParseConfig(unsafe));
+}
+
+TEST_CASE("lte/ue/config: lifecycle scenarios and bounded procedure controls are validated")
+{
+    auto defaults = lte::ue::ParseConfig(ConfigText);
+    CHECK(defaults.lifecycle.scenario == lte::ue::LifecycleScenario::ATTACH_ONLY);
+    std::string configured = ConfigText;
+    configured += "\nlifecycle:\n  scenario: service-request\n  triggerAfterMs: 250\n"
+                  "  procedureTimeoutMs: 750\n  maxRetries: 2\n";
+    auto value = lte::ue::ParseConfig(configured);
+    CHECK(value.lifecycle.scenario == lte::ue::LifecycleScenario::SERVICE_REQUEST);
+    CHECK(value.lifecycle.triggerAfterMs == 250);
+    CHECK(value.lifecycle.procedureTimeoutMs == 750);
+    CHECK(value.lifecycle.maxRetries == 2);
+
+    std::string invalid = ConfigText;
+    invalid += "\nlifecycle:\n  scenario: arbitrary\n";
+    CHECK_THROWS(lte::ue::ParseConfig(invalid));
+    std::string invalidSwitchOff = ConfigText;
+    invalidSwitchOff += "\nlifecycle:\n  scenario: tau-periodic\n  switchOff: true\n";
+    CHECK_THROWS(lte::ue::ParseConfig(invalidSwitchOff));
 }
 
 TEST_CASE("lte/ue/nas: OP derivation and stale SQN handling fail or succeed independently")

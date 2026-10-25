@@ -28,7 +28,14 @@ enum class MessageType : uint8_t
     DATA_UPLINK = 3,
     DATA_DOWNLINK = 4,
     BEARER_READY = 5,
-    BEARER_RELEASED = 6
+    // Legacy bearer deletion indication. It remains decodable for wire
+    // compatibility but is not used for an ordinary S1 context release.
+    BEARER_RELEASED = 6,
+    S1_CONTEXT_RELEASE_REQUEST = 7,
+    S1_CONTEXT_RELEASED = 8,
+    S1_CONTEXT_RESTORED = 9,
+    // MMEC(1)||M-TMSI(4)||compact Service Request NAS(4).
+    SERVICE_REQUEST = 10
 };
 
 struct Message

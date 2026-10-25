@@ -437,6 +437,8 @@ int Run(const EnbConfig &config, const std::atomic_bool &shutdownRequested)
                                     std::to_string(config.ueLinkPort));
                     std::optional<InetAddress> uePeer;
                     std::optional<s1ap::UeContext> ueContext;
+                    uint32_t nextEnbUeS1apId = 1;
+                    constexpr uint32_t RadioUeId = 1;
                     GtpuBearer defaultBearer;
                     uint8_t radioBuffer[lte::ue::link::MaxDataPduSize + lte::ue::link::HeaderSize];
                     while (!shutdownRequested && !handler.associationLost)
@@ -468,7 +470,9 @@ int Run(const EnbConfig &config, const std::atomic_bool &shutdownRequested)
                                         throw s1ap::CodecError(
                                             "This LTE eNB establishes exactly one default EPS E-RAB");
                                     const auto &erab = request.erabs.front();
-                                    defaultBearer.establish(config, erab, ueContext->enbUeS1apId);
+                                    // The simulated radio identity is stable across S1 releases;
+                                    // fresh eNB-UE-S1AP-IDs must never leak into data-link routing.
+                                    defaultBearer.establish(config, erab, RadioUeId);
                                     s1ap::ErabSetupItem setup{erab.erabId, ParseIpv4(defaultBearer.localAddress),
                                                               TeidToBytes(defaultBearer.localTeid)};
                                     auto response = s1ap::EncodeInitialContextSetupResponse(
@@ -479,10 +483,18 @@ int Run(const EnbConfig &config, const std::atomic_bool &shutdownRequested)
                                     if (erab.nasPduPresent)
                                     {
                                         auto radio = lte::ue::link::Encode(
-                                            {lte::ue::link::MessageType::NAS_DOWNLINK, ueContext->enbUeS1apId,
+                                            {lte::ue::link::MessageType::NAS_DOWNLINK, RadioUeId,
                                              erab.nasPdu});
                                         ueLink.Send(*uePeer, radio.data(), radio.size());
                                         Log("INFO", "Forwarded Initial Context Setup NAS-PDU to LTE UE");
+                                    }
+                                    else
+                                    {
+                                        auto restored = lte::ue::link::Encode(
+                                            {lte::ue::link::MessageType::S1_CONTEXT_RESTORED, RadioUeId,
+                                             {defaultBearer.erabId}});
+                                        ueLink.Send(*uePeer, restored.data(), restored.size());
+                                        Log("INFO", "Signalled restored S1 context and E-RAB transport to LTE UE");
                                     }
                                 }
                                 else if (pdu.kind == s1ap::S1apPdu::Kind::INITIATING &&
@@ -500,7 +512,7 @@ int Run(const EnbConfig &config, const std::atomic_bool &shutdownRequested)
                                         throw s1ap::CodecError("MME-UE-S1AP-ID changed for the active UE context");
                                     ueContext->mmeUeS1apId = downlink.mmeUeS1apId;
                                     auto radio = lte::ue::link::Encode({lte::ue::link::MessageType::NAS_DOWNLINK,
-                                                                        ueContext->enbUeS1apId,
+                                                                        RadioUeId,
                                                                         std::move(downlink.nasPdu)});
                                     ueLink.Send(*uePeer, radio.data(), radio.size());
                                     Log("INFO", "Forwarded Downlink NAS Transport to LTE UE");
@@ -524,7 +536,7 @@ int Run(const EnbConfig &config, const std::atomic_bool &shutdownRequested)
                                     if (uePeer.has_value() && defaultBearer.context.signalingEstablished())
                                     {
                                         auto released = lte::ue::link::Encode(
-                                            {lte::ue::link::MessageType::BEARER_RELEASED, enbId,
+                                            {lte::ue::link::MessageType::S1_CONTEXT_RELEASED, RadioUeId,
                                              {defaultBearer.erabId}});
                                         ueLink.TrySend(*uePeer, released.data(), released.size());
                                     }
@@ -533,7 +545,6 @@ int Run(const EnbConfig &config, const std::atomic_bool &shutdownRequested)
                                     client.send(UeStream(handler, enbId), complete);
                                     Log("INFO", "UE Context Release Complete sent");
                                     ueContext.reset();
-                                    uePeer.reset();
                                 }
                                 else
                                 {
@@ -556,7 +567,7 @@ int Run(const EnbConfig &config, const std::atomic_bool &shutdownRequested)
                             try
                             {
                                 auto radio = lte::ue::link::Decode(radioBuffer, static_cast<size_t>(radioLength));
-                                if (!lte::ue::link::IsUplink(radio.type) || radio.ueId != 1)
+                                if (!lte::ue::link::IsUplink(radio.type) || radio.ueId != RadioUeId)
                                     throw lte::ue::link::DecodeError("Unsupported LTE UE radio-link identity or direction");
                                 if (!uePeer.has_value())
                                 {
@@ -567,17 +578,51 @@ int Run(const EnbConfig &config, const std::atomic_bool &shutdownRequested)
                                 else if (*uePeer != peer)
                                     throw lte::ue::link::DecodeError("A second LTE UE endpoint is not supported");
 
-                                if (radio.type == lte::ue::link::MessageType::BEARER_READY)
+                                if (radio.type == lte::ue::link::MessageType::S1_CONTEXT_RELEASE_REQUEST)
+                                {
+                                    if (!ueContext.has_value() || !ueContext->mmeUeS1apId.has_value() ||
+                                        !defaultBearer.context.signalingEstablished() || radio.payload[0] != defaultBearer.erabId)
+                                        throw lte::ue::link::DecodeError(
+                                            "S1 release request does not match an active registered UE context");
+                                    auto request = s1ap::EncodeUeContextReleaseRequest(
+                                        *ueContext->mmeUeS1apId, ueContext->enbUeS1apId);
+                                    client.send(UeStream(handler, ueContext->enbUeS1apId), request);
+                                    Log("INFO", "UE Context Release Request sent: cause=radioNetwork/user-inactivity");
+                                }
+                                else if (radio.type == lte::ue::link::MessageType::SERVICE_REQUEST &&
+                                         ueContext.has_value())
+                                    throw lte::ue::link::DecodeError(
+                                        "Duplicate Service Request cannot replace a pending or active S1 context");
+                                else if (radio.type == lte::ue::link::MessageType::BEARER_READY)
                                     defaultBearer.activate(radio.ueId, radio.payload);
                                 else if (radio.type == lte::ue::link::MessageType::DATA_UPLINK)
                                     defaultBearer.forwardUplink(radio.ueId, radio.payload);
                                 else if (!ueContext.has_value())
                                 {
-                                    ueContext = s1ap::UeContext{radio.ueId, std::nullopt};
-                                    auto initial =
-                                        s1ap::EncodeInitialUeMessage(config, ueContext->enbUeS1apId, radio.payload);
+                                    if (radio.type != lte::ue::link::MessageType::NAS_UPLINK &&
+                                        radio.type != lte::ue::link::MessageType::SERVICE_REQUEST)
+                                        throw lte::ue::link::DecodeError(
+                                            "Only NAS may establish a fresh LTE S1 UE context");
+                                    const uint32_t enbUeId = nextEnbUeS1apId++;
+                                    if (nextEnbUeS1apId == 0 || nextEnbUeS1apId > 0xFFFFFFU)
+                                        nextEnbUeS1apId = 1;
+                                    ueContext = s1ap::UeContext{enbUeId, std::nullopt};
+                                    std::vector<uint8_t> nasPdu = radio.payload;
+                                    std::optional<s1ap::STmsi> sTmsi;
+                                    if (radio.type == lte::ue::link::MessageType::SERVICE_REQUEST)
+                                    {
+                                        const uint32_t mTmsi = (static_cast<uint32_t>(radio.payload[1]) << 24U) |
+                                                               (static_cast<uint32_t>(radio.payload[2]) << 16U) |
+                                                               (static_cast<uint32_t>(radio.payload[3]) << 8U) |
+                                                               radio.payload[4];
+                                        sTmsi = s1ap::STmsi{radio.payload[0], mTmsi};
+                                        nasPdu.assign(radio.payload.begin() + 5, radio.payload.end());
+                                    }
+                                    auto initial = s1ap::EncodeInitialUeMessage(
+                                        config, ueContext->enbUeS1apId, nasPdu, sTmsi);
                                     client.send(UeStream(handler, ueContext->enbUeS1apId), initial);
-                                    Log("INFO", "Initial UE Message sent for LTE UE 1");
+                                    Log("INFO", "Initial UE Message sent for LTE UE 1 with fresh eNB-UE-S1AP-ID=" +
+                                                    std::to_string(enbUeId));
                                 }
                                 else
                                 {

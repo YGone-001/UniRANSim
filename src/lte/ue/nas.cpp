@@ -27,6 +27,13 @@ constexpr uint8_t AttachRequest = 0x41;
 constexpr uint8_t AttachAcceptType = 0x42;
 constexpr uint8_t AttachCompleteType = 0x43;
 constexpr uint8_t AttachRejectType = 0x44;
+constexpr uint8_t DetachRequestType = 0x45;
+constexpr uint8_t DetachAcceptType = 0x46;
+constexpr uint8_t TauRequestType = 0x48;
+constexpr uint8_t TauAcceptType = 0x49;
+constexpr uint8_t TauCompleteType = 0x4A;
+constexpr uint8_t TauRejectType = 0x4B;
+constexpr uint8_t ServiceRejectType = 0x4E;
 constexpr uint8_t AuthenticationRequestType = 0x52;
 constexpr uint8_t AuthenticationResponseType = 0x53;
 constexpr uint8_t AuthenticationFailureType = 0x5C;
@@ -45,6 +52,9 @@ constexpr uint8_t IeiNonceMme = 0x56;
 constexpr uint8_t IeiReplayedUeAdditionalSecurityCapability = 0x6F;
 constexpr uint8_t IeiImeisv = 0x23;
 constexpr uint8_t IeiGuti = 0x50;
+constexpr uint8_t IeiTaiList = 0x54;
+constexpr uint8_t IeiBearerContextStatus = 0x57;
+constexpr uint8_t IeiT3412 = 0x5A;
 constexpr uint8_t IeiApn = 0x28;
 constexpr uint8_t IeiPco = 0x27;
 
@@ -509,17 +519,32 @@ DownlinkMessage DecodeDownlink(const uint8_t *data, size_t size)
             result.attachAccept.esmContainer.assign(data + offset, data + offset + esmLength);
             offset += esmLength;
             DecodeEsmContainer(result.attachAccept.esmContainer, result);
-            if (IsOptionalIei(data, size, offset, IeiGuti) && offset + 1 < size)
+            while (offset < size)
             {
-                // TS 24.301 9.9.2.9: GUTI is 11 octets after the length.
-                constexpr size_t GutiLength = 11;
-                const size_t length = data[offset + 1];
-                if (length == GutiLength && offset + 2 + length <= size)
+                const uint8_t iei = data[offset++];
+                if (iei == IeiT3412)
                 {
+                    if (offset >= size) throw DecodeError("Truncated Attach Accept T3412");
+                    result.attachAccept.t3412 = data[offset++];
+                    continue;
+                }
+                // Type-1 optional IEs carry their value in the IEI octet.
+                if ((iei & 0x80U) != 0) continue;
+                // The remaining optional Attach Accept fields are not needed
+                // by this lifecycle slice. Stop without rejecting a valid
+                // message whose IE representation is outside our parser.
+                if (iei != IeiGuti) break;
+                if (offset >= size) throw DecodeError("Truncated optional Attach Accept IE");
+                const size_t length = data[offset++];
+                if (offset + length > size) throw DecodeError("Truncated optional Attach Accept value");
+                if (iei == IeiGuti)
+                {
+                    if (length != 11) throw DecodeError("Invalid GUTI length in Attach Accept");
                     std::array<uint8_t, 11> guti{};
-                    std::copy(data + offset + 2, data + offset + 2 + length, guti.begin());
+                    std::copy(data + offset, data + offset + length, guti.begin());
                     result.attachAccept.guti = guti;
                 }
+                offset += length;
             }
             return result;
         }
@@ -528,6 +553,61 @@ DownlinkMessage DecodeDownlink(const uint8_t *data, size_t size)
             if (size >= 3)
                 result.emmCause = data[2];
             return result;
+        case DetachAcceptType:
+            if (size != 2) throw DecodeError("Malformed EPS Detach Accept");
+            result.type = DownlinkEmm::DETACH_ACCEPT;
+            return result;
+        case ServiceRejectType:
+            if (size < 3) throw DecodeError("Truncated EPS Service Reject");
+            result.type = DownlinkEmm::SERVICE_REJECT;
+            result.emmCause = data[2];
+            return result;
+        case TauRejectType:
+            if (size < 3) throw DecodeError("Truncated Tracking Area Update Reject");
+            result.type = DownlinkEmm::TAU_REJECT;
+            result.emmCause = data[2];
+            return result;
+        case TauAcceptType:
+        {
+            if (size < 3) throw DecodeError("Truncated Tracking Area Update Accept");
+            result.type = DownlinkEmm::TAU_ACCEPT;
+            result.tauAccept.updateResult = static_cast<uint8_t>(data[2] & 0x07U);
+            size_t offset = 3;
+            while (offset < size)
+            {
+                const uint8_t iei = data[offset++];
+                if (iei == IeiT3412)
+                {
+                    if (offset >= size) throw DecodeError("Truncated TAU Accept T3412");
+                    result.tauAccept.t3412 = data[offset++];
+                    continue;
+                }
+                // Unknown type-1 optional IEs are comprehension-skippable and
+                // carry their value in the IEI octet itself.
+                if ((iei & 0x80U) != 0) continue;
+                if (offset >= size) throw DecodeError("Truncated optional TAU Accept IE");
+                const size_t length = data[offset++];
+                if (offset + length > size) throw DecodeError("Truncated optional TAU Accept value");
+                if (iei == IeiGuti)
+                {
+                    if (length != 11) throw DecodeError("Invalid GUTI length in TAU Accept");
+                    std::array<uint8_t, 11> guti{};
+                    std::copy(data + offset, data + offset + length, guti.begin());
+                    result.tauAccept.guti = guti;
+                }
+                else if (iei == IeiTaiList)
+                    result.tauAccept.taiList = std::vector<uint8_t>(data + offset, data + offset + length);
+                else if (iei == IeiBearerContextStatus)
+                {
+                    if (length != 2) throw DecodeError("Invalid EPS bearer context status length");
+                    result.tauAccept.bearerContextStatus =
+                        static_cast<uint16_t>(data[offset]) |
+                        static_cast<uint16_t>(static_cast<uint16_t>(data[offset + 1]) << 8U);
+                }
+                offset += length;
+            }
+            return result;
+        }
         default:
             result.type = DownlinkEmm::OTHER;
             return result;
@@ -586,6 +666,40 @@ std::vector<uint8_t> EncodeEsmInformationResponse(uint8_t procedureTransactionId
         out.insert(out.end(), encoded.begin(), encoded.end());
     }
     return out;
+}
+
+std::vector<uint8_t> EncodeDetachRequest(uint8_t ksi, const std::array<uint8_t, 11> &guti, bool switchOff)
+{
+    if (ksi > 6 || (guti[0] & 0x07U) != 0x06U)
+        throw DecodeError("Detach Request requires a native EPS KSI and GUTI");
+    const uint8_t detachType = static_cast<uint8_t>((ksi << 4U) | (switchOff ? 0x08U : 0U) | 0x01U);
+    std::vector<uint8_t> out{EpsEmm, DetachRequestType, detachType, static_cast<uint8_t>(guti.size())};
+    out.insert(out.end(), guti.begin(), guti.end());
+    return out;
+}
+
+std::vector<uint8_t> EncodeTauRequest(uint8_t ksi, const std::array<uint8_t, 11> &guti,
+                                      uint8_t defaultEbi, bool periodic)
+{
+    if (ksi > 6 || (guti[0] & 0x07U) != 0x06U || defaultEbi < 5 || defaultEbi > 15)
+        throw DecodeError("TAU Request requires a native EPS KSI, GUTI and default EBI");
+    // EPS update type 0 is normal TAU; 3 is periodic TAU. Active flag remains
+    // clear so the procedure itself does not claim a bearer restoration.
+    const uint8_t updateType = periodic ? 0x03U : 0x00U;
+    std::vector<uint8_t> out{EpsEmm, TauRequestType, static_cast<uint8_t>((ksi << 4U) | updateType),
+                             static_cast<uint8_t>(guti.size())};
+    out.insert(out.end(), guti.begin(), guti.end());
+    // TS 24.301 9.9.2.1: octet 3 carries EBI 0..7 and octet 4 carries
+    // EBI 8..15, with bit n representing EBI n within its octet.
+    std::array<uint8_t, 2> status{};
+    status[defaultEbi / 8U] = static_cast<uint8_t>(1U << (defaultEbi % 8U));
+    out.insert(out.end(), {IeiBearerContextStatus, 0x02, status[0], status[1]});
+    return out;
+}
+
+std::vector<uint8_t> EncodeTauComplete()
+{
+    return {EpsEmm, TauCompleteType};
 }
 
 } // namespace lte::ue::nas
