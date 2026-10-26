@@ -78,8 +78,9 @@ accepted EBI and assigned IPv4 address after TUN setup, allowing the eNB to bind
 the encrypted NAS result to the E-RAB. `S1_CONTEXT_RELEASE_REQUEST`,
 `S1_CONTEXT_RELEASED`, and `S1_CONTEXT_RESTORED` distinguish an ordinary ECM
 release from bearer deletion. The legacy `BEARER_RELEASED` alone closes UE TUN
-resources. Direction, UE identity, peer endpoint, type, and length are checked
-before use.
+resources. `PAGING_INDICATION` is the downlink-only simulated paging occasion
+described below. Direction, UE identity, peer endpoint, type, and length are
+checked before use.
 
 ## EPS lifecycle
 
@@ -110,10 +111,11 @@ The optional deterministic scenario block is:
 
 ```yaml
 lifecycle:
-  scenario: attach-only     # detach | service-request | tau-normal | tau-periodic
+  scenario: attach-only     # detach | service-request | paging | tau-normal | tau-periodic
   triggerAfterMs: 2000
   procedureTimeoutMs: 5000
   maxRetries: 3
+  pagingWaitMs: 60000       # paging only; bounded wait for a network page
   switchOff: false          # detach only; normal acknowledged Detach is preferred
 ```
 
@@ -121,6 +123,172 @@ For `service-request`, the trigger first sends a standards-valid S1AP UE Context
 Release Request with `radioNetwork/user-inactivity`; the UE waits for the MME's
 Release Command and eNB Release Complete before sending Service Request. Logs
 separately report ECM-IDLE and restoration. Keep one UE/eNB pair per run.
+
+`paging` shares that release sequence but deliberately stops there: after
+ECM-IDLE the UE sends **no** Service Request on its own and only responds to a
+verified network paging indication. This is the scenario for network-triggered
+service restoration; see the Phase 6 section below.
+
+## Network-triggered paging (Phase 6)
+
+Phase 6 adds network-initiated service restoration: a real downlink IPv4 packet
+addressed to an ECM-IDLE UE makes the EPC page that UE, and only the matching UE
+answers with an authenticated Service Request.
+
+```text
+downlink IPv4 to the idle UE address
+        -> PGW-U / SGW-U  (Downlink Data Notification)
+        -> MME            (S1AP Paging, procedure 10, stream 0)
+        -> lte-enb        (decode, TAI filter, bounded fanout)
+        -> lte-ue         (S-TMSI match, ECM-IDLE preconditions)
+        -> compact EPS Service Request -> Initial UE Message
+        -> Initial Context Setup -> fresh eNB TEID -> IPv4 forwarding
+```
+
+### S1AP Paging decoding
+
+`DecodePaging` in `src/lte/enb/codec.cpp` parses the Paging initiating message
+with the existing APER primitives and validates it fail-closed. It rejects a
+wrong procedure code, a non-initiating PDU kind, a wrong PDU criticality, every
+truncation of a valid PDU, missing or duplicate mandatory IEs, an unexpected IE
+criticality, non-canonical ten-bit alignment, a zero M-TMSI, an extended CHOICE,
+a non-decimal IMSI, a TAI item with the wrong identifier, an oversized TAI
+collection and unknown reject-critical IEs.
+
+The information elements and their wire identifiers are:
+
+| IE | id | Criticality | Handling |
+|---|---|---|---|
+| UE Identity Index value | 80 | ignore | `INTEGER (0..1023)`, ten bits in the two most significant bits of two octets |
+| UE Paging Identity | 43 | ignore | `CHOICE { s-TMSI, iMSI }`; s-TMSI is `MMEC` (8 bits) then an octet-aligned 32-bit M-TMSI |
+| CN Domain | 109 | ignore | `ps-domain` is the only value acted upon |
+| TAI list | 46 | ignore | `SEQUENCE OF ProtocolIE-SingleContainer`; each item is `id-TAIItem` (47) wrapping a PLMN + TAC |
+| Paging DRX | 137 | ignore | optional; recorded but not used for radio timing |
+
+That layout was not guessed: a live Open5GS 2.8 MME page captured on the lab S1
+interface was decoded with the reference ASN.1 dissector, which reported
+`UEIdentityIndexValue=1`, s-TMSI `MMEC=1` / `M-TMSI=0xC00007C4`, `ps-domain`,
+one TAI `460/02/TAC=1`. The captured 43-octet PDU is an automated fixture
+(`test/lte/paging.cpp`), and `EncodePaging` reproduces it byte for byte.
+
+The UE Identity Index value is a paging-frame input derived from the subscriber
+identity, never a paging identity. It is decoded and range-checked but never
+used to decide whether a page belongs to a UE.
+
+### Tracking area and identity filtering
+
+The eNB forwards a page only when the received TAI list contains an exact
+`(PLMN, TAC)` match for its configured serving cell. A page for another PLMN or
+another TAC is counted and dropped. The eNB never invents an MME-UE-S1AP-ID and
+never inspects NAS: it has no NAS identity for any UE.
+
+CS-domain pages and IMSI-addressed pages are counted and dropped explicitly.
+IMSI paging is **not** supported in this phase; it is never reinterpreted as an
+S-TMSI.
+
+### Simulated radio paging
+
+Because the software radio link has no broadcast medium, the eNB sends one
+`PAGING_INDICATION` frame to every retained idle UE radio endpoint, bounded by
+`maxUes`. The frame payload is fixed at seven octets:
+
+```text
+MMEC(1) || M-TMSI(4, big endian) || served TAC(2, big endian)
+```
+
+Each UE re-derives its own S-TMSI from its assigned GUTI (type octet must be a
+GUTI, MMEC and M-TMSI are both compared) and answers only on a full match. A UE
+that is `EMM-DEREGISTERED`, `ECM-CONNECTED`, missing its security context or
+GUTI, missing its logical default bearer, or holding any pending mobility
+procedure ignores the indication without changing state. This is a laboratory
+abstraction: it is not an RRC Paging message, has no paging frames, no DRX
+timing and no air-interface authentication, and must never be described as one.
+
+### NAS reuse and pending state
+
+An accepted page enters `SERVICE_REQUEST` and sends the existing compact EPS
+Service Request (security header type 12, native KSI, five-bit sequence, EIA2
+short MAC). One accepted page advances the uplink NAS COUNT exactly once; a
+duplicate page during the pending procedure is ignored, so it neither sends a
+second request nor consumes a second COUNT. A page never makes the bearer
+active by itself, and ECM-IDLE never resets the NAS COUNT.
+
+### Downlink trigger procedure
+
+```bash
+sudo ./cmake-build-phase6/lte-enb -c config/open5gs-lte-enb.yaml
+sudo ./cmake-build-phase6/lte-ue  -c config/open5gs-lte-ue-paging.local.yaml
+# wait for State=ECM_IDLE, then send real traffic to the assigned address
+ping -c 2 10.45.0.118
+```
+
+Run the probe from a host or namespace whose route to the UE address actually
+enters the EPC user plane. On an all-in-one Open5GS host the PGW-U `ogstun`
+address is on-link, so a probe to the assigned UE address traverses
+PGW-U -> SGW-U -> eNB.
+
+**The UE TUN must not live in the same namespace as the probe.** If it does, the
+assigned UE address becomes a *local* address of that host and the kernel answers
+the probe itself: the ping succeeds in ~0.04 ms and no downlink packet, no
+Downlink Data Notification and no Paging ever exist. That is a false positive and
+must never be reported as paging evidence. Move each UE TUN into its own
+namespace before probing:
+
+```bash
+# after lte-ue created <tun> with <ue-ipv4>
+ip netns add p6ns7
+ip netns exec p6ns7 ip link set lo up
+ip link set <tun> netns p6ns7          # moving a link flushes its IPv4 address
+ip netns exec p6ns7 ip addr add <ue-ipv4>/32 dev <tun>
+ip netns exec p6ns7 ip link set <tun> up
+ip netns exec p6ns7 sysctl -qw net.ipv6.conf.<tun>.disable_ipv6=1
+ip netns exec p6ns7 ip route add 10.45.0.0/16 dev <tun>
+ip route get <ue-ipv4>                 # must report dev ogstun
+```
+
+Then `ping <ue-ipv4>` from the host produces real EPC round trips (tens of
+milliseconds, not microseconds), and `ip netns exec p6ns7 ping -I <tun>
+10.45.0.1` exercises the uplink direction. Disabling IPv6 on the TUN avoids
+harmless router-solicitation frames that the IPv4-only uplink validator rejects.
+
+Verify the path rather than assuming it: if the EPC never emits Paging, the fault
+is on the EPC side and no S1AP decoder change can fix it.
+
+The first trigger packet may be discarded while the S1-U downlink TEID is gone;
+the MME then pages from the Downlink Data Notification. Acceptance therefore
+requires that real traffic triggers the page, that the page restores service,
+and that subsequent mobile-terminated packets reach the UE TUN. Whether the
+original trigger packet is buffered and delivered depends on the deployed EPC
+buffering policy and is recorded per run, never assumed.
+
+### Diagnostics
+
+The eNB reports, at shutdown and per page:
+
+```text
+S1AP Paging statistics: received=1 valid=1 invalid=0 cs-domain=0 imsi-unsupported=0
+                        tac-filtered=0 notified=1 notify-failures=0
+```
+
+The UE reports:
+
+```text
+Paging statistics: indications=1 matched=1 ignored=0 service-requests=1
+                   restorations=1 restoration-failures=0
+```
+
+A notification-delivery counter is not evidence of restoration. The decisive
+evidence is the Service Request, the Initial Context Setup with a fresh
+eNB-UE-S1AP-ID and TEID, and IPv4 bytes arriving on the UE TUN.
+
+### Known paging limitations
+
+- No RRC paging channel, paging frames, DRX scheduling or paging-area broadcast.
+- IMSI paging is rejected explicitly; only S-TMSI paging is supported.
+- The eNB pushes a notification to idle radio endpoints instead of broadcasting
+  over a cell, and the simulated link provides no radio authentication.
+- The paging wait timeout is a laboratory bound; MME paging retries are owned by
+  the EPC and are only observed, never configured.
 
 ## TUN and route policy
 
@@ -156,13 +324,13 @@ IP packets. Such a run is not user-plane or Phase 4 continuity evidence.
 ## Build and run
 
 ```bash
-cmake -S . -B cmake-build-phase5 -DCMAKE_BUILD_TYPE=Release
-cmake --build cmake-build-phase5 --parallel 2
-ctest --test-dir cmake-build-phase5 --output-on-failure --no-tests=error
+cmake -S . -B cmake-build-phase6 -DCMAKE_BUILD_TYPE=Release
+cmake --build cmake-build-phase6 --parallel 2
+ctest --test-dir cmake-build-phase6 --output-on-failure --no-tests=error
 
-sudo ./cmake-build-phase5/lte-enb -c config/open5gs-lte-enb.yaml
-sudo ./cmake-build-phase5/lte-ue -c config/open5gs-lte-ue.local.yaml
-sudo ./cmake-build-phase5/lte-ue -c config/open5gs-lte-ue-b.local.yaml
+sudo ./cmake-build-phase6/lte-enb -c config/open5gs-lte-enb.yaml
+sudo ./cmake-build-phase6/lte-ue -c config/open5gs-lte-ue.local.yaml
+sudo ./cmake-build-phase6/lte-ue -c config/open5gs-lte-ue-b.local.yaml
 ```
 
 One eNB serves every UE. Each `lte-ue` process needs its own ignored local
@@ -295,15 +463,78 @@ radio-link socket. Zero-timeout UDP receive is now a genuine non-blocking poll,
 covered by a focused regression test. The complete local suite contains 146
 tests after that addition.
 
+## Phase 6 runtime acceptance record
+
+The 2026-10-26 acceptance run used Ubuntu 24.04 (kernel 6.17.0-35-generic) with
+Open5GS 2.8 running natively on the same host, serving PLMN 460/02, TAC 1, MME
+S1AP 10.10.0.139:36412 and SGW-U 10.10.0.139:2152. The eNB advertised the
+S1-U endpoint 127.0.0.5:2152. Subscribers 460020000000007 and
+460020000000008 were used; no subscriber data is recorded here.
+
+**Single UE (IMSI ...007).** Attach established EBI 5 with eNB-UE-S1AP-ID 1,
+MME-UE-S1AP-ID 487, eNB TEID `0x4E666705` and SGW TEID `0x000018B4`, and the EPC
+assigned `10.45.0.169/32`. After the S1 release the UE was ECM-IDLE with no
+active TEID. A host `ping` to `10.45.0.169` (route `dev ogstun`) produced a real
+MME page:
+
+```text
+S1AP Paging: MMEC=0x01 M-TMSI=0xC00000E1 TAI=460/02/TAC=1 CN=ps-domain
+             UE-identity-index=7; notified 1 of 1 retained idle UE(s)
+```
+
+The UE matched its S-TMSI and sent the compact Service Request; the MME created a
+fresh context and the eNB allocated a fresh receiving TEID:
+
+```text
+Initial UE Message sent for LTE UE 1 with fresh eNB-UE-S1AP-ID=2
+Established default bearer ... eNB-UE-S1AP-ID=2, MME-UE-S1AP-ID=490
+    eNB-TEID=0x4E666706 SGW-TEID=0x000018B4
+```
+
+End-to-end delivery and counters:
+
+```text
+host ping           3/3, rtt 29.9/43.9/61.8 ms
+namespace ping      5/5, rtt 39.2/54.8/70.5 ms
+tcpdump <tun>       10.45.0.1 > 10.45.0.169: ICMP echo request
+                    10.45.0.169 > 10.45.0.1: ICMP echo reply
+UE                  tun-ul=8/672 tun-dl=8/672
+eNB                 radio-ul=8/672 radio-dl=8/672 s1u-ul=8/672 s1u-dl=8/672
+                    drops(malformed/teid/peer/inactive)=0/0/0/0
+UE paging counters  indications=1 matched=1 ignored=0 service-requests=1
+                    restorations=1 restoration-failures=0
+```
+
+**Two UEs, A idle and B connected.** A (`10.45.0.171`) was released and B
+(`10.45.0.172`) stayed ECM-CONNECTED. A page for A restored only A
+(eNB-UE-S1AP-ID 1 -> 3, eNB TEID `0x1897C607` -> `0x1897C609`, SGW TEID
+`0x00008EBC` unchanged) and B reported `indications=0 service-requests=0` while
+continuing to pass traffic. Both probes completed 3/3 with 25-62 ms round trips.
+
+**Two UEs both idle.** A page addressed to A was fanned out to both retained idle
+endpoints (`notified 2 of 2`); A matched and restored, B logged
+`Paging indication ignored: IDENTITY_MISMATCH` and stayed idle. A later page for
+B restored B independently, and B's final counters were
+`indications=3 matched=1 ignored=2` - it observed the other UE's pages and
+correctly declined them. Stale pages for retired sessions were never delivered:
+the eNB reported `notified 0 of 0` for identities that no live context owned.
+
+IPv6 router solicitations emitted on a fresh TUN before the namespace move were
+rejected as non-IPv4 uplink frames (5 drops in that run); disabling IPv6 on the
+isolated TUN removed the noise. The IPv4-only uplink validator fails closed.
+
 ## Supported scope
 
 Supported: multiple concurrent LTE UEs (bounded by `maxUes`) through one eNB
 with independent S1AP contexts, default bearers and TEID mappings, one default
 bearer per UE, IPv4, EEA0/EEA2 NAS security, S1-U GTP-U, persistent TUN
 forwarding, per-UE lifecycle isolation (Detach, ECM-IDLE, Service Request,
-periodic TAU), per-UE context cleanup, and per-UE packet/drop counters.
+periodic TAU), per-UE context cleanup, per-UE packet/drop counters, real
+S1AP Paging decoding with tracking-area filtering, simulated radio paging with
+S-TMSI matching, network-triggered compact Service Request, and restoration of
+the existing default bearer.
 
-Not supported: additional PDN connections, dedicated bearers, paging-driven
-mobile-terminated service, inter-MME mobility, handover, IPv6/IPv4v6 forwarding,
-RF/SDR, IMS/VoLTE, QoS scheduling, GTP-U kernel offload, or session persistence
-across eNB process restarts.
+Not supported: RRC paging channels, paging frames and DRX radio timing, IMSI
+paging, additional PDN connections, dedicated bearers, inter-MME mobility,
+handover, IPv6/IPv4v6 forwarding, RF/SDR, IMS/VoLTE, QoS scheduling, GTP-U
+kernel offload, or session persistence across eNB process restarts.

@@ -47,6 +47,18 @@ std::string Describe(const EnbUeEntry &entry)
     return stream.str();
 }
 
+// Compact hex of a received S1AP Paging PDU. A Paging message carries the
+// paging identity but no NAS security material, so recording it is safe and it
+// is the only way to diff an MME encoding against the local decoder.
+std::string ToHex(const uint8_t *data, size_t size)
+{
+    std::ostringstream stream;
+    stream << std::uppercase << std::hex << std::setfill('0');
+    for (size_t i = 0; i < size; ++i)
+        stream << std::setw(2) << static_cast<int>(data[i]);
+    return stream.str();
+}
+
 } // namespace
 
 EnbMultiplexer::EnbMultiplexer(const EnbConfig &config, IS1apSender &sender)
@@ -88,6 +100,8 @@ void EnbMultiplexer::handleS1ap(const uint8_t *data, size_t size, uint16_t strea
             onDownlinkNasTransport(data, size);
         else if (pdu.kind == s1ap::S1apPdu::Kind::INITIATING && pdu.procedureCode == 23)
             onUeContextReleaseCommand(data, size);
+        else if (pdu.kind == s1ap::S1apPdu::Kind::INITIATING && pdu.procedureCode == 10)
+            onPaging(data, size, stream);
         else
             throw s1ap::CodecError("Unexpected S1AP procedure code " + std::to_string(pdu.procedureCode));
     }
@@ -98,6 +112,108 @@ void EnbMultiplexer::handleS1ap(const uint8_t *data, size_t size, uint16_t strea
         Log("WARN", std::string("Rejected post-setup S1AP message on stream ") + std::to_string(stream) + ": " +
                        e.what());
     }
+}
+
+void EnbMultiplexer::onPaging(const uint8_t *data, size_t size, uint16_t stream)
+{
+    ++m_paging.received;
+    if (stream != 0)
+    {
+        // TS 36.412: non-UE-associated S1AP signalling uses stream identifier
+        // zero. A page that claims to belong to a UE-associated stream is never
+        // attached to an active UE context.
+        ++m_paging.invalid;
+        throw s1ap::CodecError("S1AP Paging arrived on a UE-associated SCTP stream");
+    }
+
+    s1ap::PagingMessage page;
+    try
+    {
+        page = s1ap::DecodePaging(data, size);
+    }
+    catch (const std::exception &e)
+    {
+        ++m_paging.invalid;
+        Log("WARN", std::string("Rejected S1AP Paging PDU (") + std::to_string(size) + " bytes): " + e.what() +
+                        " raw=" + ToHex(data, size));
+        throw;
+    }
+    ++m_paging.valid;
+
+    if (page.cnDomain != 0)
+    {
+        // CS-domain paging never targets an EPS bearer.
+        ++m_paging.csDomainIgnored;
+        Log("INFO", "Ignoring S1AP Paging for the circuit-switched domain");
+        return;
+    }
+    if (page.identity != s1ap::PagingMessage::Identity::S_TMSI)
+    {
+        // Never echo an IMSI page: it carries a permanent subscriber identity.
+        ++m_paging.unsupportedIdentity;
+        Log("WARN", "Ignoring S1AP Paging addressed by IMSI (identity redacted): this phase pages only by S-TMSI");
+        return;
+    }
+    // A Paging PDU with an S-TMSI carries no permanent subscriber identity and
+    // no NAS security material, so it is safe to record verbatim.
+    Log("INFO", "Accepted S1AP Paging PDU (" + std::to_string(size) + " bytes): " + ToHex(data, size));
+    if (!servesPagingTai(page.taiList))
+    {
+        ++m_paging.filteredByTac;
+        Log("INFO", "Ignoring S1AP Paging: its TAI list does not include the served tracking area " +
+                        m_config.plmn.toString() + "/TAC=" + std::to_string(m_config.tac));
+        return;
+    }
+
+    // A real eNB broadcasts the page over its cell. This software radio link
+    // has no broadcast medium and the eNB holds no UE NAS identity, so the
+    // notification is delivered to the bounded set of retained idle radio
+    // endpoints and each UE matches its own S-TMSI. Active contexts are not
+    // touched: an ECM-CONNECTED UE simply has no page to answer.
+    size_t notified = 0;
+    size_t idle = 0;
+    for (auto *entry : m_registry.all())
+    {
+        if (entry->s1 != UeS1State::IDLE_RETAINED)
+            continue;
+        ++idle;
+        if (idle > static_cast<size_t>(m_config.maxUes))
+            break;
+        const std::vector<uint8_t> payload = lte::ue::link::EncodePagingNotification(
+            {page.sTmsi.mmeCode, page.sTmsi.mTmsi, m_config.tac});
+        auto frame =
+            lte::ue::link::Encode({lte::ue::link::MessageType::PAGING_INDICATION, entry->radioUeId, payload});
+        if (m_ueLink.TrySend(entry->peer, frame.data(), frame.size()))
+        {
+            ++notified;
+            ++entry->pagingNotifications;
+            ++m_paging.notificationsDelivered;
+        }
+        else
+        {
+            ++m_paging.notificationFailures;
+            Log("WARN", "Simulated paging notification to LTE UE " + std::to_string(entry->radioUeId) +
+                            " would block and was dropped");
+        }
+    }
+
+    std::ostringstream stream2;
+    stream2 << "S1AP Paging: MMEC=0x" << std::uppercase << std::hex << std::setfill('0') << std::setw(2)
+            << static_cast<int>(page.sTmsi.mmeCode) << " M-TMSI=0x" << std::setw(8) << page.sTmsi.mTmsi
+            << std::dec << " TAI=" << m_config.plmn.toString() << "/TAC=" << page.taiList.front().tac
+            << " CN=ps-domain UE-identity-index=" << page.ueIdentityIndexValue << "; notified " << notified
+            << " of " << idle << " retained idle UE(s)";
+    Log("INFO", stream2.str());
+}
+
+bool EnbMultiplexer::servesPagingTai(const std::vector<s1ap::Tai> &taiList) const
+{
+    for (const auto &tai : taiList)
+    {
+        if (tai.tac == m_config.tac && tai.plmn.mcc == m_config.plmn.mcc && tai.plmn.mnc == m_config.plmn.mnc)
+            return true;
+    }
+    return false;
 }
 
 void EnbMultiplexer::onInitialContextSetupRequest(const uint8_t *data, size_t size)
@@ -337,6 +453,11 @@ InetAddress EnbMultiplexer::s1uAddress() const
     return m_s1u.localAddress();
 }
 
+const PagingCounters &EnbMultiplexer::pagingCounters() const
+{
+    return m_paging;
+}
+
 void EnbMultiplexer::shutdown()
 {
     for (auto *entry : m_registry.all())
@@ -359,6 +480,13 @@ void EnbMultiplexer::shutdown()
     Log("INFO", "Shared S1-U endpoint statistics: echo=" + std::to_string(m_s1u.counters().echoRequests) +
                     " drops(malformed/unknown-teid)=" + std::to_string(m_s1u.counters().malformedDrops) + "/" +
                     std::to_string(m_s1u.counters().unknownTeidDrops));
+    Log("INFO", "S1AP Paging statistics: received=" + std::to_string(m_paging.received) +
+                    " valid=" + std::to_string(m_paging.valid) + " invalid=" + std::to_string(m_paging.invalid) +
+                    " cs-domain=" + std::to_string(m_paging.csDomainIgnored) +
+                    " imsi-unsupported=" + std::to_string(m_paging.unsupportedIdentity) +
+                    " tac-filtered=" + std::to_string(m_paging.filteredByTac) +
+                    " notified=" + std::to_string(m_paging.notificationsDelivered) +
+                    " notify-failures=" + std::to_string(m_paging.notificationFailures));
 }
 
 } // namespace lte::enb

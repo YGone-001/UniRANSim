@@ -10,13 +10,16 @@
 
 #include "lifecycle.hpp"
 #include "nas.hpp"
+#include "paging.hpp"
 #include "radio_link.hpp"
 #include "security.hpp"
 #include "tun.hpp"
 
 #include <chrono>
+#include <iomanip>
 #include <iostream>
 #include <memory>
+#include <sstream>
 
 #include <lte/ip_packet.hpp>
 
@@ -101,6 +104,17 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
     std::vector<uint8_t> pendingWire;
     int procedureRetries = 0;
     auto procedureDeadline = std::chrono::steady_clock::time_point::max();
+    // Network-triggered paging bookkeeping. Nothing here can make the UE send a
+    // Service Request on its own: only an accepted page does.
+    bool pagingWaitArmed = false;
+    bool pagingTriggeredProcedure = false;
+    auto pagingDeadline = std::chrono::steady_clock::time_point::max();
+    uint64_t pagingIndications = 0;
+    uint64_t pagingMatched = 0;
+    uint64_t pagingIgnored = 0;
+    uint64_t pagingServiceRequests = 0;
+    uint64_t pagingRestorations = 0;
+    uint64_t pagingRestorationFailures = 0;
     udp::UdpServer socket(config.link.localAddress, config.link.localPort);
     InetAddress enb(config.link.enbAddress, config.link.enbPort);
     const uint32_t ueId = config.ueId;
@@ -124,14 +138,23 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
         if (mobility.emm == EmmState::REGISTERED && !scenarioTriggered && now >= scenarioDeadline)
         {
             scenarioTriggered = true;
-            if (config.lifecycle.scenario == LifecycleScenario::SERVICE_REQUEST)
+            if (config.lifecycle.scenario == LifecycleScenario::SERVICE_REQUEST ||
+                config.lifecycle.scenario == LifecycleScenario::PAGING)
             {
                 auto request = link::Encode({link::MessageType::S1_CONTEXT_RELEASE_REQUEST, ueId,
                                              {mobility.defaultEbi}});
                 socket.Send(enb, request.data(), request.size());
                 idleReleaseRequested = true;
                 procedureDeadline = now + std::chrono::milliseconds(config.lifecycle.procedureTimeoutMs);
-                Log("INFO", "Controlled idle trigger sent a standards-based S1 Context Release Request");
+                if (config.lifecycle.scenario == LifecycleScenario::PAGING)
+                {
+                    pagingWaitArmed = true;
+                    pagingDeadline = now + std::chrono::milliseconds(config.lifecycle.pagingWaitMs);
+                    Log("INFO", "Controlled idle trigger sent an S1 Context Release Request; the UE will wait "
+                                "for a network paging indication instead of sending Service Request");
+                }
+                else
+                    Log("INFO", "Controlled idle trigger sent a standards-based S1 Context Release Request");
             }
             else if (config.lifecycle.scenario == LifecycleScenario::DETACH)
             {
@@ -173,10 +196,23 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
             return 1;
         }
 
+        if (pagingWaitArmed && now >= pagingDeadline)
+        {
+            // The MME owns paging retries. This is a bounded laboratory wait, and
+            // its expiry is an unresolved test condition, never paging success.
+            Log("ERROR", "Timed out waiting for a network paging indication; no Service Request was sent");
+            return 1;
+        }
+
         if (mobility.pending != PendingProcedure::NONE && !pendingWire.empty() && now >= procedureDeadline)
         {
             if (procedureRetries >= config.lifecycle.maxRetries)
             {
+                if (pagingTriggeredProcedure)
+                {
+                    ++pagingRestorationFailures;
+                    Log("ERROR", "Paging-triggered service restoration failed after bounded retransmissions");
+                }
                 Log("ERROR", std::string(ToString(mobility.pending)) + " timed out after bounded retransmissions");
                 return 1;
             }
@@ -254,15 +290,54 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 if (idleReleaseRequested)
                 {
                     idleReleaseRequested = false;
-                    mobility.startServiceRequest();
-                    pendingWire = nas::EncodeServiceRequest(security);
-                    SendServiceRequest(socket, enb, ueId, *mobility.guti, pendingWire);
-                    security.ulNasCount = (security.ulNasCount + 1U) & 0xFFFFFFU;
-                    procedureRetries = 0;
-                    procedureDeadline = std::chrono::steady_clock::now() +
-                                        std::chrono::milliseconds(config.lifecycle.procedureTimeoutMs);
-                    Log("INFO", "Compact EPS Service Request sent from ECM-IDLE");
+                    if (config.lifecycle.scenario == LifecycleScenario::PAGING)
+                    {
+                        // Network-triggered scenario: stay idle until the MME pages.
+                        Log("INFO", "Waiting for a network paging indication; no Service Request is sent locally");
+                    }
+                    else
+                    {
+                        mobility.startServiceRequest();
+                        pendingWire = nas::EncodeServiceRequest(security);
+                        SendServiceRequest(socket, enb, ueId, *mobility.guti, pendingWire);
+                        security.ulNasCount = (security.ulNasCount + 1U) & 0xFFFFFFU;
+                        procedureRetries = 0;
+                        procedureDeadline = std::chrono::steady_clock::now() +
+                                            std::chrono::milliseconds(config.lifecycle.procedureTimeoutMs);
+                        Log("INFO", "Compact EPS Service Request sent from ECM-IDLE");
+                    }
                 }
+                continue;
+            }
+            if (message.type == link::MessageType::PAGING_INDICATION)
+            {
+                ++pagingIndications;
+                // Decoding is strict: a notification that is not exactly the
+                // seven-octet S-TMSI||TAC frame never reaches the state machine.
+                const auto notification =
+                    link::DecodePagingNotification(message.payload.data(), message.payload.size());
+                const auto match = EvaluatePaging(mobility, config.plmn, notification);
+                if (match != PagingMatch::ACCEPTED)
+                {
+                    ++pagingIgnored;
+                    Log("INFO", std::string("Paging indication ignored: ") + ToString(match));
+                    continue;
+                }
+
+                ++pagingMatched;
+                auto compact = RespondToPaging(mobility, config.plmn, notification, security);
+                if (!compact.has_value())
+                    throw std::runtime_error("Accepted paging produced no compact Service Request");
+                pendingWire = std::move(*compact);
+                SendServiceRequest(socket, enb, ueId, *mobility.guti, pendingWire);
+                ++pagingServiceRequests;
+                pagingTriggeredProcedure = true;
+                pagingWaitArmed = false;
+                procedureRetries = 0;
+                procedureDeadline = std::chrono::steady_clock::now() +
+                                    std::chrono::milliseconds(config.lifecycle.procedureTimeoutMs);
+                Log("INFO", "Paging identity matched (MMEC=" + std::to_string(notification.mmeCode) +
+                                "); compact EPS Service Request sent for the network-triggered restoration");
                 continue;
             }
             if (message.type == link::MessageType::S1_CONTEXT_RESTORED)
@@ -271,6 +346,11 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                     throw link::DecodeError("Restored S1 context has the wrong EBI");
                 mobility.onServiceRestored(tun != nullptr);
                 pendingWire.clear();
+                if (pagingTriggeredProcedure)
+                {
+                    ++pagingRestorations;
+                    pagingTriggeredProcedure = false;
+                }
                 if (tun)
                 {
                     std::vector<uint8_t> ready{activeEbi, assignedIpv4[0], assignedIpv4[1], assignedIpv4[2],
@@ -505,6 +585,27 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 throw nas::DecodeError("Default bearer did not provide a supported non-zero IPv4 PDN address");
             mobility.onAttachComplete(activeEbi, assignedIpv4, accept.guti, accept.taiList, accept.t3412);
             mobility.securityContextValid = security.securityActive;
+            {
+                std::ostringstream taiHex;
+                taiHex << std::hex << std::uppercase << std::setfill('0');
+                for (uint8_t octet : mobility.taiList)
+                    taiHex << std::setw(2) << static_cast<int>(octet);
+                std::string sTmsiText = "none";
+                if (mobility.guti.has_value())
+                {
+                    const auto derived = STmsiFromGuti(*mobility.guti);
+                    if (derived.has_value())
+                    {
+                        std::ostringstream sTmsi;
+                        sTmsi << "MMEC=" << static_cast<int>(derived->mmeCode) << " M-TMSI=0x" << std::hex
+                              << std::uppercase << std::setw(8) << std::setfill('0') << derived->mTmsi;
+                        sTmsiText = sTmsi.str();
+                    }
+                }
+                Log("INFO", "Assigned EPS bearer EBI=" + std::to_string(activeEbi) + " IPv4=" +
+                                Ipv4ToString(assignedIpv4) + " S-TMSI{" + sTmsiText + "} TAI-list=" +
+                                taiHex.str());
+            }
             try { tun = std::make_unique<TunDevice>(config.tun, assignedIpv4); }
             catch (const std::exception &e)
             {
@@ -566,6 +667,12 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                     std::to_string(tunUplinkBytes) + " tun-dl=" + std::to_string(tunDownlinkPackets) + "/" +
                     std::to_string(tunDownlinkBytes) + " drops(malformed/inactive)=" +
                     std::to_string(malformedDrops) + "/" + std::to_string(bearerInactiveDrops));
+    Log("INFO", "Paging statistics: indications=" + std::to_string(pagingIndications) +
+                    " matched=" + std::to_string(pagingMatched) +
+                    " ignored=" + std::to_string(pagingIgnored) +
+                    " service-requests=" + std::to_string(pagingServiceRequests) +
+                    " restorations=" + std::to_string(pagingRestorations) +
+                    " restoration-failures=" + std::to_string(pagingRestorationFailures));
     tun.reset();
     Log("INFO", "LTE UE shutdown complete");
     return 0;

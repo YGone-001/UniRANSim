@@ -77,6 +77,9 @@ struct EnbUeEntry
     DefaultBearerContext bearer{};
     InetAddress sgwPeer{};
     UserPlaneCounters counters{};
+    // Simulated paging notifications delivered to this radio endpoint. It
+    // counts delivery only; it is not evidence that the page was accepted.
+    uint64_t pagingNotifications{};
 
     [[nodiscard]] bool s1Active() const
     {

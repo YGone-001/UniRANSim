@@ -16,14 +16,17 @@ apn: internet
 networkCapability: 'A020'
 
 # One deterministic laboratory action is run after Attach. Keep attach-only for
-# ordinary use; select detach, service-request, tau-normal, or tau-periodic for
-# one bounded lifecycle acceptance run. tau-normal is valid only when the UE is
-# actually entering a tracking area outside its assigned TAI list.
+# ordinary use; select detach, service-request, paging, tau-normal, or
+# tau-periodic for one bounded lifecycle acceptance run. "paging" releases S1,
+# stays ECM-IDLE and answers only a real network page. tau-normal is valid only
+# when the UE is actually entering a tracking area outside its assigned TAI list.
 lifecycle:
   scenario: attach-only
   triggerAfterMs: 2000
   procedureTimeoutMs: 5000
   maxRetries: 3
+  # Bounded wait for the first paging indication; expiry fails the run.
+  pagingWaitMs: 60000
   switchOff: false
 
 enbLink:

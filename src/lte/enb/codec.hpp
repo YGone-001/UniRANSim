@@ -196,4 +196,49 @@ std::vector<uint8_t> EncodeUeContextReleaseRequest(uint32_t mmeUeS1apId, uint32_
                                                    int causeValue = 20);
 UeContextReleaseRequest DecodeUeContextReleaseRequest(const uint8_t *data, size_t length);
 
+// --- Phase 6: S1AP Paging (TS 36.413, procedure code 10) --------------------
+
+// One tracking area of a Paging TAI list: PLMN identity and 16-bit TAC.
+struct Tai
+{
+    Plmn plmn;
+    uint16_t tac{};
+};
+
+// Decoded S1AP Paging message. Paging is a non-UE-associated procedure, so no
+// field here identifies an S1 UE context.
+struct PagingMessage
+{
+    enum class Identity
+    {
+        S_TMSI,
+        IMSI
+    };
+
+    // TS 36.413 UEIdentityIndexValue ::= INTEGER (0..1023). It is a DRX paging
+    // frame input, never a substitute for the paging identity.
+    uint16_t ueIdentityIndexValue{};
+    Identity identity{Identity::S_TMSI};
+    STmsi sTmsi{};
+    // Raw TBCD octets when the network pages by IMSI; unsupported by this phase.
+    std::vector<uint8_t> imsi;
+    // 0 = ps-domain, 1 = cs-domain.
+    uint8_t cnDomain{};
+    // 1..16 tracking areas the MME is paging in.
+    std::vector<Tai> taiList;
+    // PagingDRX index: 0..3 meaning v32, v64, v128, v256.
+    std::optional<uint8_t> pagingDrx;
+};
+
+// Decodes and fully validates a Paging initiating message. Throws CodecError on
+// a wrong procedure code, non-initiating PDU kind, missing/duplicate mandatory
+// IE, unexpected criticality, malformed S-TMSI/TAI/IMSI encoding, oversized
+// collections or trailing APER bits.
+PagingMessage DecodePaging(const uint8_t *data, size_t length);
+
+// Minimal standards-valid Paging encoder for automated fixtures and offline
+// captures. It must never be used to impersonate a real MME on the live S1
+// interface.
+std::vector<uint8_t> EncodePaging(const PagingMessage &message);
+
 } // namespace lte::enb::s1ap

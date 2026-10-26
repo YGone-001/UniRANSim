@@ -125,6 +125,7 @@ Config ParseNode(const YAML::Node &root)
             else if (scenario == "service-request") config.lifecycle.scenario = LifecycleScenario::SERVICE_REQUEST;
             else if (scenario == "tau-normal") config.lifecycle.scenario = LifecycleScenario::TAU_NORMAL;
             else if (scenario == "tau-periodic") config.lifecycle.scenario = LifecycleScenario::TAU_PERIODIC;
+            else if (scenario == "paging") config.lifecycle.scenario = LifecycleScenario::PAGING;
             else throw std::runtime_error("Field 'lifecycle.scenario' is not supported");
         }
         if (yaml::HasField(lifecycle, "triggerAfterMs"))
@@ -133,6 +134,8 @@ Config ParseNode(const YAML::Node &root)
             config.lifecycle.procedureTimeoutMs = yaml::GetInt32(lifecycle, "procedureTimeoutMs", 100, 60000);
         if (yaml::HasField(lifecycle, "maxRetries"))
             config.lifecycle.maxRetries = yaml::GetInt32(lifecycle, "maxRetries", 0, 10);
+        if (yaml::HasField(lifecycle, "pagingWaitMs"))
+            config.lifecycle.pagingWaitMs = yaml::GetInt32(lifecycle, "pagingWaitMs", 100, 600000);
         if (yaml::HasField(lifecycle, "switchOff")) config.lifecycle.switchOff = lifecycle["switchOff"].as<bool>();
         if (config.lifecycle.switchOff && config.lifecycle.scenario != LifecycleScenario::DETACH)
             throw std::runtime_error("Field 'lifecycle.switchOff' is valid only for the detach scenario");

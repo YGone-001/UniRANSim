@@ -113,7 +113,10 @@ enum class LifecycleScenario
     DETACH,
     SERVICE_REQUEST,
     TAU_NORMAL,
-    TAU_PERIODIC
+    TAU_PERIODIC,
+    // Network-triggered service restoration: release S1, remain ECM-IDLE and
+    // wait for a paging indication instead of starting Service Request locally.
+    PAGING
 };
 
 struct LifecycleConfig
@@ -123,6 +126,9 @@ struct LifecycleConfig
     int procedureTimeoutMs{5000};
     int maxRetries{3};
     bool switchOff{};
+    // Bounded wait for the first network paging indication in the paging
+    // scenario. A timeout is reported as a failure, never as paging success.
+    int pagingWaitMs{60000};
 };
 
 struct Config

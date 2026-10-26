@@ -16,10 +16,15 @@ apn: internet
 networkCapability: 'A020'
 
 lifecycle:
+  # attach-only | detach | service-request | paging | tau-normal | tau-periodic
+  # "paging" releases S1 and then waits for a real network page; it never sends
+  # Service Request on its own.
   scenario: attach-only
   triggerAfterMs: 2000
   procedureTimeoutMs: 5000
   maxRetries: 3
+  # Bounded wait for the first paging indication; expiry fails the run.
+  pagingWaitMs: 60000
   switchOff: false
 
 enbLink:

@@ -27,7 +27,8 @@ bool IsKnown(MessageType type)
            type == MessageType::DATA_UPLINK || type == MessageType::DATA_DOWNLINK ||
            type == MessageType::BEARER_READY || type == MessageType::BEARER_RELEASED ||
            type == MessageType::S1_CONTEXT_RELEASE_REQUEST || type == MessageType::S1_CONTEXT_RELEASED ||
-           type == MessageType::S1_CONTEXT_RESTORED || type == MessageType::SERVICE_REQUEST;
+           type == MessageType::S1_CONTEXT_RESTORED || type == MessageType::SERVICE_REQUEST ||
+           type == MessageType::PAGING_INDICATION;
 }
 
 size_t MaximumPayload(MessageType type)
@@ -40,6 +41,8 @@ size_t MaximumPayload(MessageType type)
         return 5;
     if (type == MessageType::SERVICE_REQUEST)
         return 9;
+    if (type == MessageType::PAGING_INDICATION)
+        return 7;
     return 1;
 }
 }
@@ -50,6 +53,7 @@ std::vector<uint8_t> Encode(const Message &message)
         message.payload.size() > MaximumPayload(message.type) ||
         (message.type == MessageType::BEARER_READY && message.payload.size() != 5) ||
         (message.type == MessageType::SERVICE_REQUEST && message.payload.size() != 9) ||
+        (message.type == MessageType::PAGING_INDICATION && message.payload.size() != 7) ||
         ((message.type == MessageType::BEARER_RELEASED ||
           message.type == MessageType::S1_CONTEXT_RELEASE_REQUEST ||
           message.type == MessageType::S1_CONTEXT_RELEASED ||
@@ -79,6 +83,7 @@ Message Decode(const uint8_t *data, size_t size)
     if (length == 0 || length > MaximumPayload(type) || size != HeaderSize + length ||
         (type == MessageType::BEARER_READY && length != 5) ||
         (type == MessageType::SERVICE_REQUEST && length != 9) ||
+        (type == MessageType::PAGING_INDICATION && length != 7) ||
         ((type == MessageType::BEARER_RELEASED || type == MessageType::S1_CONTEXT_RELEASE_REQUEST ||
           type == MessageType::S1_CONTEXT_RELEASED || type == MessageType::S1_CONTEXT_RESTORED) && length != 1))
         throw DecodeError("Malformed LTE radio-link payload length");
@@ -99,7 +104,36 @@ bool IsDownlink(MessageType type)
 {
     return type == MessageType::NAS_DOWNLINK || type == MessageType::DATA_DOWNLINK ||
            type == MessageType::BEARER_RELEASED || type == MessageType::S1_CONTEXT_RELEASED ||
-           type == MessageType::S1_CONTEXT_RESTORED;
+           type == MessageType::S1_CONTEXT_RESTORED || type == MessageType::PAGING_INDICATION;
+}
+
+std::vector<uint8_t> EncodePagingNotification(const PagingNotification &notification)
+{
+    if (notification.mTmsi == 0)
+        throw DecodeError("A paging notification cannot carry a zero M-TMSI");
+    std::vector<uint8_t> payload(7);
+    payload[0] = notification.mmeCode;
+    payload[1] = static_cast<uint8_t>(notification.mTmsi >> 24U);
+    payload[2] = static_cast<uint8_t>(notification.mTmsi >> 16U);
+    payload[3] = static_cast<uint8_t>(notification.mTmsi >> 8U);
+    payload[4] = static_cast<uint8_t>(notification.mTmsi);
+    payload[5] = static_cast<uint8_t>(notification.tac >> 8U);
+    payload[6] = static_cast<uint8_t>(notification.tac);
+    return payload;
+}
+
+PagingNotification DecodePagingNotification(const uint8_t *data, size_t size)
+{
+    if (data == nullptr || size != 7)
+        throw DecodeError("A paging notification must be exactly seven octets");
+    PagingNotification notification{};
+    notification.mmeCode = data[0];
+    notification.mTmsi = (static_cast<uint32_t>(data[1]) << 24U) | (static_cast<uint32_t>(data[2]) << 16U) |
+                         (static_cast<uint32_t>(data[3]) << 8U) | data[4];
+    notification.tac = Read16(data + 5);
+    if (notification.mTmsi == 0)
+        throw DecodeError("A paging notification carries a zero M-TMSI");
+    return notification;
 }
 
 } // namespace lte::ue::link

@@ -21,6 +21,7 @@ namespace
 {
 
 constexpr uint16_t PROCEDURE_INITIAL_CONTEXT_SETUP = 9;
+constexpr uint16_t PROCEDURE_PAGING = 10;
 constexpr uint16_t PROCEDURE_S1_SETUP = 17;
 constexpr uint16_t PROCEDURE_DOWNLINK_NAS_TRANSPORT = 11;
 constexpr uint16_t PROCEDURE_INITIAL_UE_MESSAGE = 12;
@@ -52,6 +53,18 @@ constexpr uint16_t IE_TAI = 67;
 constexpr uint16_t IE_EUTRAN_CGI = 100;
 constexpr uint16_t IE_RRC_ESTABLISHMENT_CAUSE = 134;
 constexpr uint16_t IE_S_TMSI = 96;
+// TS 36.413 Paging information elements. Paging is a non-UE-associated
+// procedure, so none of these carry an eNB-UE-S1AP-ID or an MME-UE-S1AP-ID.
+// The identifiers were verified against a live Open5GS 2.8 MME Paging PDU with
+// the reference ASN.1 decoder: UEIdentityIndexValue=80, UEPagingID=43,
+// CNDomain=109, TAIList=46 and TAIItem=47.
+constexpr uint16_t IE_CN_DOMAIN = 109;
+constexpr uint16_t IE_TAI_LIST = 46;
+constexpr uint16_t IE_TAI_ITEM = 47;
+constexpr uint16_t IE_UE_IDENTITY_INDEX_VALUE = 80;
+constexpr uint16_t IE_UE_PAGING_IDENTITY = 43;
+// TS 36.413 reuses IE id 137 for the optional PagingDRX of Paging and the
+// DefaultPagingDRX of S1 Setup; IE_DEFAULT_PAGING_DRX therefore serves both.
 
 enum class Criticality : uint8_t
 {
@@ -1496,6 +1509,242 @@ UeContextReleaseRequest DecodeUeContextReleaseRequest(const uint8_t *data, size_
     if (!mmePresent || !enbPresent || !causePresent)
         throw CodecError("UE Context Release Request is missing a mandatory IE");
     return result;
+}
+
+// --- Phase 6: S1AP Paging -----------------------------------------------------
+//
+// Paging is a non-UE-associated S1AP procedure (TS 36.413 9.1.6). Its IE
+// container is decoded with the same APER primitives as the rest of the LTE
+// codec, but nothing here resolves an eNB-UE-S1AP-ID or MME-UE-S1AP-ID: a
+// Paging PDU can never establish, resume or mutate an S1 UE context.
+namespace
+{
+
+// TBCD IMSI validation shared by the Paging encoder and decoder. Every
+// semi-octet is a decimal digit; an odd-length IMSI uses 0xF as the filler in
+// the most significant nibble of the last octet (TS 29.002 / TS 24.008).
+void ValidateTbcdImsi(const std::vector<uint8_t> &imsi)
+{
+    for (size_t i = 0; i < imsi.size(); ++i)
+    {
+        const uint8_t high = static_cast<uint8_t>(imsi[i] >> 4U);
+        const uint8_t low = static_cast<uint8_t>(imsi[i] & 0x0FU);
+        if (low > 9)
+            throw CodecError("Paging IMSI contains a non-decimal digit");
+        const bool lastOctet = i + 1 == imsi.size();
+        if (high > 9 && !(lastOctet && high == 0x0F))
+            throw CodecError("Paging IMSI contains a non-decimal digit");
+    }
+}
+
+std::vector<uint8_t> EncodePagingIdentityValue(const PagingMessage &message)
+{
+    BitWriter writer;
+    writer.writeBit(false); // UEPagingIdentity CHOICE extension marker
+    if (message.identity == PagingMessage::Identity::S_TMSI)
+    {
+        if (message.sTmsi.mTmsi == 0)
+            throw CodecError("Paging S-TMSI has an invalid zero M-TMSI");
+        writer.writeBit(false); // s-TMSI alternative
+        writer.writeBit(false); // S-TMSI SEQUENCE extension marker
+        writer.writeBit(false); // S-TMSI iE-Extensions absent
+        writer.writeBits(message.sTmsi.mmeCode, 8);
+        // X.691 aligned PER: an 8-bit fixed bit string is bit-packed, while the
+        // 32-bit M-TMSI starts on the next octet boundary. This is the exact
+        // layout the live Open5GS MME accepts in Initial UE Message S-TMSI.
+        writer.align();
+        writer.writeBits(message.sTmsi.mTmsi, 32);
+        return writer.take();
+    }
+
+    writer.writeBit(true); // iMSI alternative
+    if (message.imsi.size() < 3 || message.imsi.size() > 8)
+        throw CodecError("Paging IMSI identity must be 3..8 TBCD octets");
+    ValidateTbcdImsi(message.imsi);
+    WriteConstrained(writer, message.imsi.size(), 3, 8, true);
+    writer.align();
+    writer.writeBytes(message.imsi);
+    return writer.take();
+}
+
+std::vector<uint8_t> EncodePagingTaiListValue(const std::vector<Tai> &taiList)
+{
+    if (taiList.empty() || taiList.size() > 16)
+        throw CodecError("Paging TAI list must contain 1..16 tracking areas");
+    BitWriter writer;
+    WriteConstrained(writer, taiList.size() - 1, 0, 15, true);
+    for (const auto &tai : taiList)
+    {
+        // TS 36.413 TAIList is a SEQUENCE OF ProtocolIE-SingleContainer, so each
+        // tracking area travels inside an id-TAIItem field rather than bare.
+        BitWriter item;
+        item.writeBit(false); // TAI SEQUENCE extension marker
+        item.writeBit(false); // TAI iE-Extensions absent
+        auto plmn = EncodePlmn(tai.plmn);
+        WriteFixedOctets(item, plmn.data(), plmn.size());
+        item.writeBits(tai.tac, 16);
+        WriteIe(writer, IE_TAI_ITEM, Criticality::IGNORE, item.take());
+    }
+    return writer.take();
+}
+
+uint16_t DecodeUeIdentityIndexValue(const std::vector<uint8_t> &value)
+{
+    BitReader reader(value);
+    // TS 36.413 UEIdentityIndexValue ::= INTEGER (0..1023). Aligned PER carries
+    // the ten bits in the most significant bits of two octets, with six pad
+    // bits; a live Open5GS page encodes index 1 as 0x0040.
+    reader.align();
+    const uint16_t encoded = static_cast<uint16_t>(reader.readBits(16));
+    if ((encoded & 0x003FU) != 0)
+        throw CodecError("UE Identity Index value has non-zero APER pad bits");
+    reader.requireFinished();
+    return static_cast<uint16_t>(encoded >> 6U);
+}
+
+} // namespace
+
+PagingMessage DecodePaging(const uint8_t *data, size_t length)
+{
+    auto envelope = DecodeEnvelope(data, length, PROCEDURE_PAGING, static_cast<int>(Criticality::IGNORE));
+    if (envelope.choice != 0)
+        throw CodecError("Paging must be an initiating S1AP message");
+
+    PagingMessage result{};
+    bool indexPresent = false, identityPresent = false, domainPresent = false, taiListPresent = false;
+    for (const auto &ie : DecodeIeContainer(envelope.value))
+    {
+        if (ie.id == IE_UE_IDENTITY_INDEX_VALUE)
+        {
+            if (ie.criticality != Criticality::IGNORE)
+                throw CodecError("UE Identity Index value has unexpected criticality");
+            if (indexPresent)
+                throw CodecError("Duplicate UE Identity Index value");
+            result.ueIdentityIndexValue = DecodeUeIdentityIndexValue(ie.value);
+            indexPresent = true;
+        }
+        else if (ie.id == IE_UE_PAGING_IDENTITY)
+        {
+            if (ie.criticality != Criticality::IGNORE)
+                throw CodecError("UE Paging Identity has unexpected criticality");
+            if (identityPresent)
+                throw CodecError("Duplicate UE Paging Identity");
+            BitReader reader(ie.value);
+            if (reader.readBit())
+                throw CodecError("Extended UE Paging Identity choice is not supported");
+            if (reader.readBit())
+            {
+                result.identity = PagingMessage::Identity::IMSI;
+                const size_t octets = ReadConstrained(reader, 3, 8, true);
+                result.imsi = ReadFixedOctets(reader, octets);
+                ValidateTbcdImsi(result.imsi);
+            }
+            else
+            {
+                result.identity = PagingMessage::Identity::S_TMSI;
+                if (reader.readBit() || reader.readBit())
+                    throw CodecError("Unsupported S-TMSI extension in Paging");
+                result.sTmsi.mmeCode = static_cast<uint8_t>(reader.readBits(8));
+                reader.align();
+                result.sTmsi.mTmsi = static_cast<uint32_t>(reader.readBits(32));
+                if (result.sTmsi.mTmsi == 0)
+                    throw CodecError("Paging S-TMSI has an invalid zero M-TMSI");
+            }
+            reader.requireFinished();
+            identityPresent = true;
+        }
+        else if (ie.id == IE_CN_DOMAIN)
+        {
+            if (ie.criticality != Criticality::IGNORE)
+                throw CodecError("CN Domain has unexpected criticality");
+            if (domainPresent)
+                throw CodecError("Duplicate CN Domain");
+            BitReader reader(ie.value);
+            if (reader.readBit())
+                throw CodecError("Extended CN Domain is not supported");
+            result.cnDomain = static_cast<uint8_t>(reader.readBits(1));
+            reader.requireFinished();
+            domainPresent = true;
+        }
+        else if (ie.id == IE_TAI_LIST)
+        {
+            if (ie.criticality != Criticality::IGNORE)
+                throw CodecError("TAI list has unexpected criticality");
+            if (taiListPresent)
+                throw CodecError("Duplicate TAI list");
+            BitReader reader(ie.value);
+            const size_t count = ReadConstrained(reader, 0, 15, true) + 1;
+            result.taiList.reserve(count);
+            for (size_t i = 0; i < count; ++i)
+            {
+                if (ReadConstrained(reader, 0, 65535, true) != IE_TAI_ITEM)
+                    throw CodecError("Paging TAI list contains an unexpected item identifier");
+                if (reader.readBits(2) != static_cast<uint8_t>(Criticality::IGNORE))
+                    throw CodecError("Paging TAI item has unexpected criticality");
+                reader.align();
+                const auto itemValue = reader.readOpenType();
+                BitReader item(itemValue);
+                if (item.readBit() || item.readBit())
+                    throw CodecError("Unsupported TAI extension in Paging");
+                auto plmn = ReadFixedOctets(item, 3);
+                Tai tai{DecodePlmn(plmn.data(), plmn.size()), static_cast<uint16_t>(item.readBits(16))};
+                item.requireFinished();
+                result.taiList.push_back(std::move(tai));
+            }
+            reader.requireFinished();
+            taiListPresent = true;
+        }
+        else if (ie.id == IE_DEFAULT_PAGING_DRX)
+        {
+            if (ie.criticality != Criticality::IGNORE)
+                throw CodecError("PagingDRX has unexpected criticality");
+            BitReader reader(ie.value);
+            if (reader.readBit())
+                throw CodecError("Extended PagingDRX is not supported");
+            result.pagingDrx = static_cast<uint8_t>(reader.readBits(2));
+            reader.requireFinished();
+        }
+        else if (ie.criticality == Criticality::REJECT)
+            throw CodecError("Unsupported reject-criticality IE " + std::to_string(ie.id) + " in Paging");
+        // IGNORE/NOTIFY criticality: an unknown optional Paging IE is skipped.
+    }
+
+    if (!indexPresent || !identityPresent || !domainPresent || !taiListPresent)
+        throw CodecError("Paging is missing a mandatory information element");
+    return result;
+}
+
+std::vector<uint8_t> EncodePaging(const PagingMessage &message)
+{
+    if (message.taiList.empty() || message.taiList.size() > 16)
+        throw CodecError("Paging TAI list must contain 1..16 tracking areas");
+    if (message.cnDomain > 1)
+        throw CodecError("CN Domain must be ps-domain or cs-domain");
+
+    BitWriter index;
+    index.align();
+    index.writeBits(static_cast<uint64_t>(message.ueIdentityIndexValue) << 6U, 16);
+    index.align();
+
+    BitWriter domain;
+    domain.writeBit(false); // enumerations are not extended
+    domain.writeBits(message.cnDomain, 1);
+
+    std::vector<std::pair<std::pair<uint16_t, Criticality>, std::vector<uint8_t>>> ies;
+    ies.push_back({{IE_UE_IDENTITY_INDEX_VALUE, Criticality::IGNORE}, index.take()});
+    ies.push_back({{IE_UE_PAGING_IDENTITY, Criticality::IGNORE}, EncodePagingIdentityValue(message)});
+    ies.push_back({{IE_CN_DOMAIN, Criticality::IGNORE}, domain.take()});
+    ies.push_back({{IE_TAI_LIST, Criticality::IGNORE}, EncodePagingTaiListValue(message.taiList)});
+    if (message.pagingDrx.has_value())
+    {
+        if (*message.pagingDrx > 3)
+            throw CodecError("PagingDRX index is out of range");
+        BitWriter drx;
+        drx.writeBit(false);
+        drx.writeBits(*message.pagingDrx, 2);
+        ies.push_back({{IE_DEFAULT_PAGING_DRX, Criticality::IGNORE}, drx.take()});
+    }
+    return EncodePdu(0, PROCEDURE_PAGING, Criticality::IGNORE, ies);
 }
 
 } // namespace lte::enb::s1ap

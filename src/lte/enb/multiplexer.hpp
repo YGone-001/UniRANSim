@@ -33,6 +33,21 @@ class IS1apSender
     virtual void sendS1ap(uint16_t stream, const std::vector<uint8_t> &pdu) = 0;
 };
 
+// Diagnostics for the non-UE-associated S1AP Paging path. A delivered
+// notification is not proof that a page was accepted or that service was
+// restored; those are per-UE outcomes.
+struct PagingCounters
+{
+    uint64_t received{};
+    uint64_t valid{};
+    uint64_t invalid{};
+    uint64_t filteredByTac{};
+    uint64_t csDomainIgnored{};
+    uint64_t unsupportedIdentity{};
+    uint64_t notificationsDelivered{};
+    uint64_t notificationFailures{};
+};
+
 // Per-UE multiplexing over the shared eNB transports: one simulated radio
 // UDP link, one S1-U GTP-U endpoint and one S1AP association. Every inbound
 // message is routed strictly by validated identity, and a malformed or
@@ -60,6 +75,7 @@ class EnbMultiplexer
     [[nodiscard]] const UeRegistry &registry() const;
     [[nodiscard]] InetAddress ueLinkAddress() const;
     [[nodiscard]] InetAddress s1uAddress() const;
+    [[nodiscard]] const PagingCounters &pagingCounters() const;
 
     // Logs final per-UE statistics and releases every bearer; the shared
     // sockets remain owned by this object until it is destroyed.
@@ -69,6 +85,10 @@ class EnbMultiplexer
     void onInitialContextSetupRequest(const uint8_t *data, size_t size);
     void onDownlinkNasTransport(const uint8_t *data, size_t size);
     void onUeContextReleaseCommand(const uint8_t *data, size_t size);
+    // Non-UE-associated Paging: validates the PDU, filters by tracking area and
+    // fans one simulated notification out to retained idle radio endpoints.
+    void onPaging(const uint8_t *data, size_t size, uint16_t stream);
+    [[nodiscard]] bool servesPagingTai(const std::vector<s1ap::Tai> &taiList) const;
     void onBearerReady(EnbUeEntry &entry, const std::vector<uint8_t> &payload);
     void startInitialUeMessage(EnbUeEntry &entry, std::vector<uint8_t> nasPdu,
                                std::optional<s1ap::STmsi> sTmsi);
@@ -81,6 +101,7 @@ class EnbMultiplexer
     udp::UdpServer m_ueLink;
     UeRegistry m_registry;
     S1uEndpoint m_s1u;
+    PagingCounters m_paging;
 };
 
 } // namespace lte::enb

@@ -35,7 +35,12 @@ enum class MessageType : uint8_t
     S1_CONTEXT_RELEASED = 8,
     S1_CONTEXT_RESTORED = 9,
     // MMEC(1)||M-TMSI(4)||compact Service Request NAS(4).
-    SERVICE_REQUEST = 10
+    SERVICE_REQUEST = 10,
+    // Downlink-only simulation of an LTE paging occasion.
+    // MMEC(1)||M-TMSI(4)||served TAC(2). It carries no IMSI and no NAS
+    // material, so a UE can only match it against the S-TMSI of its own
+    // valid GUTI. This is a laboratory abstraction, not an RRC Paging message.
+    PAGING_INDICATION = 11
 };
 
 struct Message
@@ -55,5 +60,20 @@ std::vector<uint8_t> Encode(const Message &message);
 Message Decode(const uint8_t *data, size_t size);
 bool IsUplink(MessageType type);
 bool IsDownlink(MessageType type);
+
+// Payload of one simulated paging occasion: the S-TMSI being paged plus the
+// served tracking area. Both the eNB fanout and the UE matching path share this
+// encoding, so a notification cannot be reinterpreted on the way.
+struct PagingNotification
+{
+    uint8_t mmeCode{};
+    uint32_t mTmsi{};
+    uint16_t tac{};
+};
+
+// Seven-octet MMEC || M-TMSI || TAC payload. Throws DecodeError on any length
+// violation or zero M-TMSI.
+std::vector<uint8_t> EncodePagingNotification(const PagingNotification &notification);
+PagingNotification DecodePagingNotification(const uint8_t *data, size_t size);
 
 } // namespace lte::ue::link
