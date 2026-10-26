@@ -2005,7 +2005,10 @@ ErabReleaseCommand DecodeErabReleaseCommand(const uint8_t *data, size_t length)
         }
         else if (ie.id == IE_E_RAB_TO_BE_RELEASED_LIST)
         {
-            if (ie.criticality != Criticality::REJECT)
+            // TS 36.413 declares this list, its items and the NAS-PDU of the
+            // release command with ignore criticality. Treating the list as
+            // reject made the eNB discard a legitimate MME release.
+            if (ie.criticality != Criticality::IGNORE)
                 throw CodecError("E-RABToBeReleasedList has invalid criticality");
             BitReader reader(ie.value);
             const size_t count = ReadConstrained(reader, 1, 256, true);
@@ -2013,21 +2016,35 @@ ErabReleaseCommand DecodeErabReleaseCommand(const uint8_t *data, size_t length)
             for (size_t i = 0; i < count; ++i)
             {
                 const auto id = static_cast<uint16_t>(ReadConstrained(reader, 0, 65535, true));
-                if (id != IE_E_RAB_RELEASE_ITEM)
+                if (id != IE_E_RAB_ITEM)
                     throw CodecError("Unexpected E-RABToBeReleasedList item identity");
-                reader.readBits(2);
+                if (reader.readBits(2) != static_cast<uint64_t>(Criticality::IGNORE))
+                    throw CodecError("E-RABToBeReleasedList item has invalid criticality");
                 reader.align();
                 auto value = reader.readOpenType();
                 BitReader itemReader(value);
                 if (itemReader.readBit())
                     throw CodecError("Unsupported E-RAB release item extension");
                 if (itemReader.readBit())
-                    throw CodecError("Unsupported E-RAB release item extensions");
+                    throw CodecError("E-RAB release item extensions are not supported");
                 result.erabIds.push_back(ReadErabId(itemReader));
-                itemReader.requireFinished();
+                // E-RABItem also carries a Cause. It is not decoded: the chosen
+                // alternative varies its ENUMERATED width, and the eNB takes no
+                // decision from it. The item length already bounds the field.
             }
             reader.requireFinished();
             erabsPresent = true;
+        }
+        else if (ie.id == IE_NAS_PDU)
+        {
+            if (ie.criticality != Criticality::IGNORE)
+                throw CodecError("NAS-PDU has invalid criticality");
+            // NAS-PDU is an OCTET STRING, so its open type still starts with the
+            // length determinant. Forwarding the raw value would hand the UE a
+            // buffer whose first octet is a length instead of a security header.
+            BitReader reader(ie.value);
+            result.nasPdu = reader.readBytes(reader.readLength());
+            result.nasPduPresent = true;
         }
         else if (ie.id == IE_CAUSE)
         {
@@ -2060,16 +2077,24 @@ std::vector<uint8_t> EncodeErabReleaseCommand(const ErabReleaseCommand &command)
     for (auto erabId : command.erabIds)
     {
         BitWriter item;
-        item.writeBit(false);
-        item.writeBit(false);
+        item.writeBit(false); // SEQUENCE extension marker
+        item.writeBit(false); // iE-Extensions absent
         WriteErabId(item, erabId);
-        WriteIe(list, IE_E_RAB_RELEASE_ITEM, Criticality::REJECT, item.take());
+        WriteCause(item, "radioNetwork", 0);
+        WriteIe(list, IE_E_RAB_ITEM, Criticality::IGNORE, item.take());
     }
 
     std::vector<std::pair<std::pair<uint16_t, Criticality>, std::vector<uint8_t>>> ies;
     ies.push_back({{IE_MME_UE_S1AP_ID, Criticality::REJECT}, EncodeUeId(command.mmeUeS1apId, 0xFFFFFFFFU)});
     ies.push_back({{IE_ENB_UE_S1AP_ID, Criticality::REJECT}, EncodeUeId(command.enbUeS1apId, 0xFFFFFFU)});
-    ies.push_back({{IE_E_RAB_TO_BE_RELEASED_LIST, Criticality::REJECT}, list.take()});
+    ies.push_back({{IE_E_RAB_TO_BE_RELEASED_LIST, Criticality::IGNORE}, list.take()});
+    if (command.nasPduPresent)
+    {
+        BitWriter nas;
+        nas.writeLength(command.nasPdu.size());
+        nas.writeBytes(command.nasPdu);
+        ies.push_back({{IE_NAS_PDU, Criticality::IGNORE}, nas.take()});
+    }
     if (!command.causeCategory.empty())
     {
         BitWriter cause;

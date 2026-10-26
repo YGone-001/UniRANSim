@@ -194,3 +194,38 @@ TEST_CASE("lte/erab: a truncated setup request is rejected")
     CHECK_THROWS_AS(lte::enb::s1ap::DecodeErabSetupRequest(truncated.data(), truncated.size()),
                     lte::enb::s1ap::CodecError);
 }
+
+TEST_CASE("lte/erab: a release command carries the NAS deactivation unchanged")
+{
+    // The MME sends the protected ESM deactivation inside the release command.
+    // The eNB must hand those octets to the UE exactly as received, so the
+    // round-trip has to preserve them byte for byte.
+    lte::enb::s1ap::ErabReleaseCommand command;
+    command.mmeUeS1apId = 41;
+    command.enbUeS1apId = 1;
+    command.erabIds = {6};
+    command.nasPduPresent = true;
+    command.nasPdu = {0x27, 0x99, 0xCE, 0xB0, 0x4B, 0x04, 0x62, 0x00, 0xCD, 0x24};
+
+    const auto encoded = lte::enb::s1ap::EncodeErabReleaseCommand(command);
+    const auto decoded = lte::enb::s1ap::DecodeErabReleaseCommand(encoded.data(), encoded.size());
+
+    REQUIRE(decoded.nasPduPresent);
+    CHECK(decoded.nasPdu == command.nasPdu);
+    REQUIRE(decoded.erabIds.size() == 1);
+    CHECK(decoded.erabIds[0] == 6);
+}
+
+TEST_CASE("lte/erab: a release command without NAS stays without NAS")
+{
+    lte::enb::s1ap::ErabReleaseCommand command;
+    command.mmeUeS1apId = 41;
+    command.enbUeS1apId = 1;
+    command.erabIds = {7};
+
+    const auto encoded = lte::enb::s1ap::EncodeErabReleaseCommand(command);
+    const auto decoded = lte::enb::s1ap::DecodeErabReleaseCommand(encoded.data(), encoded.size());
+
+    CHECK_FALSE(decoded.nasPduPresent);
+    CHECK(decoded.nasPdu.empty());
+}

@@ -599,34 +599,87 @@ network's decision, not a simulator fallback, and it is recorded as observed.
 Application delivery was confirmed end to end: the UE sent, the EPC forwarded, a
 UDP responder on the EPC side echoed, and the reply arrived back on the UE TUN.
 
-### Runtime bearer removal is not available here
+### Driving a dedicated bearer from the policy interface
 
-Deleting the PCC rule from the subscriber record does not release an active
-dedicated bearer. The deployed policy function reads the database when a session
-is established, so no Gx update is generated for a live session and the MME never
-sends an E-RAB Release Command.
+The policy function exposes an Rx interface, and a request can create and remove a
+dedicated bearer on a live session. Two properties of this deployment shape the
+procedure.
 
-The Rx interface exists and is connected: the policy function listens on 3891 and
-has a live peer to the P-CSCF on 3871. Two blockers keep it from being usable for
-this test.
+First, an Rx request does not invent a bearer. The policy function maps the media
+type to a QoS class (audio to QCI 1, video to QCI 2, control to QCI 5) and then
+looks for a provisioned PCC rule with that class in the subscriber record. Without
+one it answers `DIAMETER_REQUESTED_SERVICE_NOT_AUTHORIZED`. A provisioned rule
+with an empty flow list is not installed at attach (`if (pcc_rule->num_of_flow)`),
+so the session starts with only the default bearer and the Rx request is what
+brings the dedicated bearer up.
 
-First, the policy function accepts only the peers named in its configuration. A
-request from any other Diameter identity is answered with
-`DIAMETER_UNKNOWN_PEER`. The usual `AcceptUnknownPeers` setting cannot be used to
-open it up, because this build's configuration parser does not recognise that
-keyword at all:
+Second, the flow description is an IPFilterRule whose endpoints are read from the
+network side, not from the UE. Writing the UE address after `from` produces a
+downlink filter that can never match an uplink packet. The mapping this deployment
+applies is:
 
 ```text
-[diam] ERROR: Unrecognized text on line 181 col 1: 'AcceptUnknownPeers'
+permit in  <proto>  from <ue-ip> <ue-port>  to <peer-ip> <peer-port>
+        |                    |                          |
+        uplink               local side                 remote side
 ```
 
-Second, driving the P-CSCF over SIP does not reach an AAR either. An INVITE with
-SDP naming the UE address is accepted (`100 Trying`), but without a registered
-callee the dialog never completes, so the P-CSCF never issues the request. A
-complete IMS registration plus a terminating endpoint would be needed.
+Using `out` instead of `in` yields a downlink filter, and swapping the endpoints
+puts the peer's port on the UE side. Both mistakes leave the bearer established
+and the counters flat, which looks like a forwarding defect rather than a policy
+description one.
 
-Verifying network-initiated dedicated bearer release therefore requires either a
-policy function that admits an additional Diameter peer, or a full IMS call path.
+A full lifecycle then reads as follows. The request establishes the bearer, the UE
+accepts it through NAS, traffic classified by the filter takes the dedicated
+tunnel, and a session termination request removes it again while the default
+bearer keeps carrying everything else:
+
+```text
+E-RABSetupRequest            Activate dedicated EPS bearer context request
+E-RABSetupResponse
+UplinkNASTransport           Activate dedicated EPS bearer context accept
+...
+E-RABReleaseCommand          Deactivate EPS bearer context request
+E-RABReleaseResponse
+UplinkNASTransport           Deactivate EPS bearer context accept
+```
+
+The release command carries that deactivation as a NAS-PDU information element.
+Two details matter when decoding it. The E-RAB list and its items are declared with
+`ignore` criticality, and a decoder that insists on `reject` discards a legitimate
+release. The NAS-PDU element is an OCTET STRING, so its open type still begins with
+a length octet; forwarding the raw value hands the UE a buffer whose first octet is
+a length instead of a security header. The item type is `id-E-RABItem`, not the
+separate release item used by other procedures.
+
+### Measured result
+
+One EPS session, two flows distinguished only by source port, then the release:
+
+```text
+uplink  sport 7000 (TFT match)   -> SGW TEID 0x00004761   dedicated
+uplink  sport 3000 (no match)    -> SGW TEID 0x0000aad7   default
+downlink both flows              -> eNB TEID 0x15ae614b   dedicated
+after release: sport 7000        -> SGW TEID 0x0000aad7   default
+```
+
+Both flows completed a round trip to a responder on the EPC side while the
+dedicated bearer existed, and the former matching flow continued to work over the
+default bearer after the release. The downlink direction used the dedicated tunnel
+for both flows because the provisioned rule carried only an uplink filter; that is
+the network's classification, not a simulator fallback.
+
+### Runtime bearer removal requires a provisioned rule and an Rx client
+
+Deleting the PCC rule from the subscriber record does not release an active
+dedicated bearer: the policy function reads the database when a session is
+established, so no update reaches a live session.
+
+Removal works through the Rx interface instead. The policy function accepts a
+configured Diameter peer and answers a session termination request with a charging
+rule removal, which the serving gateway turns into a bearer deletion. The peer must
+be declared in the policy configuration, and this build rejects the usual
+`AcceptUnknownPeers` setting, so an additional client has to be listed explicitly.
 
 ## Supported scope
 

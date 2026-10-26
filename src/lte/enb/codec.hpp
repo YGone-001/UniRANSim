@@ -234,6 +234,10 @@ struct ErabReleaseCommand
     std::vector<uint8_t> erabIds;
     std::string causeCategory;
     int causeValue{-1};
+    // The MME carries the NAS deactivation in the same message. It must be
+    // forwarded to the UE unchanged; the eNB holds no NAS keys.
+    bool nasPduPresent{false};
+    std::vector<uint8_t> nasPdu;
 };
 
 ErabReleaseCommand DecodeErabReleaseCommand(const uint8_t *data, size_t length);

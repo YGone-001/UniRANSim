@@ -349,8 +349,20 @@ void EnbMultiplexer::onErabReleaseCommand(const uint8_t *data, size_t size)
         if (entry->bearer.parameters().erabId == erabId)
             throw BearerError("The default bearer cannot be released by an E-RAB Release Command");
         m_registry.releaseBearer(*entry, erabId);
-        sendRadio(*entry, lte::ue::link::MessageType::BEARER_RELEASED, {erabId});
         Log("INFO", "Released dedicated E-RAB " + std::to_string(erabId) + " for " + Describe(*entry));
+    }
+
+    if (command.nasPduPresent)
+    {
+        // The network deactivates the bearer through NAS. Forwarding the
+        // protected message lets the UE apply its own ESM state machine and
+        // answer with the matching deactivate accept.
+        sendRadio(*entry, lte::ue::link::MessageType::NAS_DOWNLINK, command.nasPdu);
+    }
+    else
+    {
+        for (auto erabId : command.erabIds)
+            sendRadio(*entry, lte::ue::link::MessageType::BEARER_RELEASED, {erabId});
     }
 
     auto response = s1ap::EncodeErabReleaseResponse(command.mmeUeS1apId, command.enbUeS1apId, command.erabIds);
