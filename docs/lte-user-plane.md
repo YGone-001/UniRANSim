@@ -604,8 +604,29 @@ UDP responder on the EPC side echoed, and the reply arrived back on the UE TUN.
 Deleting the PCC rule from the subscriber record does not release an active
 dedicated bearer. The deployed policy function reads the database when a session
 is established, so no Gx update is generated for a live session and the MME never
-sends an E-RAB Release Command. Verifying network-initiated dedicated bearer
-release therefore requires a policy deployment that can push a session update.
+sends an E-RAB Release Command.
+
+The Rx interface exists and is connected: the policy function listens on 3891 and
+has a live peer to the P-CSCF on 3871. Two blockers keep it from being usable for
+this test.
+
+First, the policy function accepts only the peers named in its configuration. A
+request from any other Diameter identity is answered with
+`DIAMETER_UNKNOWN_PEER`. The usual `AcceptUnknownPeers` setting cannot be used to
+open it up, because this build's configuration parser does not recognise that
+keyword at all:
+
+```text
+[diam] ERROR: Unrecognized text on line 181 col 1: 'AcceptUnknownPeers'
+```
+
+Second, driving the P-CSCF over SIP does not reach an AAR either. An INVITE with
+SDP naming the UE address is accepted (`100 Trying`), but without a registered
+callee the dialog never completes, so the P-CSCF never issues the request. A
+complete IMS registration plus a terminating endpoint would be needed.
+
+Verifying network-initiated dedicated bearer release therefore requires either a
+policy function that admits an additional Diameter peer, or a full IMS call path.
 
 ## Supported scope
 
