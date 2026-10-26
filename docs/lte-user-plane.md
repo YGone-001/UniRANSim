@@ -681,6 +681,198 @@ rule removal, which the serving gateway turns into a bearer deletion. The peer m
 be declared in the policy configuration, and this build rejects the usual
 `AcceptUnknownPeers` setting, so an additional client has to be listed explicitly.
 
+## Live bearer modification
+
+E-RAB Modify (S1AP procedure 6) changes an existing per-UE bearer. It never
+allocates an EBI, receiving TEID, PDN address, TUN, or second S1-U listener.
+`EnbMultiplexer` validates the active eNB/MME identity pair before looking up
+each EBI in that UE's registry. A candidate bearer is validated before assignment;
+each item has an independent success or failure in E-RAB Modify Response. An
+unknown/released EBI reports `unknown-E-RAB-ID`, invalid QoS reports
+`invalid-qos-combination`, and an unusable transport reports
+`transport-resource-unavailable`. No successful item implies UE NAS acceptance.
+
+The Modify item has an extension bit, an IE-extension presence bit, E-RAB-ID,
+QoS parameters, mandatory NAS OCTET STRING, and optional IE-extension container.
+It has neither the Setup item's root address/TEID nor Context Setup's optional
+NAS presence bit. The NAS length is consumed exactly once. Request identities,
+list and item use reject criticality; response identities, lists and items use
+ignore criticality. The procedure uses reject criticality. Failure Cause uses
+its actual extensible choice/enumeration encoding, including category-specific
+root widths. Truncation, duplicate IEs/EBIs, invalid criticalities and unsupported
+reject/notify extensions fail before state mutation.
+
+The wire layouts and transport rules follow
+[TS 36.413, clauses 8.2.2 and 9.1.3.3/4](https://www.etsi.org/deliver/etsi_ts/136400_136499/136413/16.04.00_60/ts_136413v160400p.pdf).
+Independent APER fixtures in `test/lte/modify.cpp` are reproducible with
+`tools/lte-modify-fixtures.py` and pycrate 0.8.1. They cover QoS, GBR, UE-AMBR,
+IPv4/IPv6 Transport Information and a mixed response. They contain only synthetic
+identities, addresses and NAS. Comparing these bytes is additional to C++
+round-trip tests; pycrate is not a build/runtime dependency.
+
+### QoS and transport branches
+
+An ordinary modification stores QCI, ARP priority/pre-emption fields, and optional
+GBR/MBR values (bits/second). UE-AMBR is stored per UE when applicable and at
+least one E-RAB succeeds. EBI, linked EBI, PDN address, bearer kind, readiness,
+local/SGW TEIDs, other bearers and counters survive a QoS-only update. QCI zero,
+reserved ARP priority, missing GBR for QCI 1-4, contradictory GBR/MBR or rates
+beyond the supported root range fail without replacing the old metadata.
+These values describe negotiated configuration; there is no radio scheduler or
+GBR throughput enforcement.
+
+When item extension 185 (`TransportInformation`) is present, only its endpoint
+is considered: accompanying QoS and NAS are ignored for that E-RAB as specified
+by TS 36.413. A valid IPv4 unicast address and nonzero uplink TEID atomically
+replace the selected bearer destination; its eNB receiving TEID is unchanged.
+Both uplink destination selection and downlink peer checking consult that
+bearer's endpoint. Other bearers keep their endpoints and the shared UDP socket.
+Non-IPv4 root addresses receive a per-item transport failure. Malformed or
+unsupported extended ASN.1 structures are rejected by the decoder before any
+item is committed. No live transport relocation was generated in this acceptance;
+independent fixtures and actual UDP socket tests validate this branch separately.
+
+### Protected NAS and atomic TFT updates
+
+`Modify EPS Bearer Context Request` (C9) accepts optional New EPS QoS (5B) and
+TFT (36), independently or together. `Accept` is EBI/PD, PTI, CA; `Reject` adds a
+mandatory **value octet** ESM cause after CB. Requests use the existing EBI;
+they cannot create a bearer. Network-initiated PTI zero is supported, reserved
+255 is rejected with cause 81, and an assigned PTI without a matching local
+procedure is rejected with cause 47. See
+[TS 24.301, clauses 6.4.3, 7.3 and 8.3.16-18](https://www.etsi.org/deliver/etsi_ts/124300_124399/124301/17.12.00_60/ts_124301v171200p.pdf).
+
+The existing EIA2 and EEA0/EEA2 security context protects the response. Active
+downlink reception verifies integrity and COUNT and rejects duplicate/new-context
+headers before committing COUNT. Malformed or unauthenticated signaling cannot
+change bearer state, and bad protected traffic cannot terminate a registered UE.
+An authenticated malformed C9 with a complete header receives a protected Reject.
+An authenticated rejected request still consumes its received downlink COUNT;
+the protected Reject consumes the next uplink COUNT after sending. KSI/keys and
+EPS registration are preserved.
+
+The UE copies the complete existing configuration, validates all requested QoS
+and TFT changes, prepares its protected response, and commits at one event-loop
+boundary. Failed TFT updates retain the complete old filters and classification,
+including when failure happens after a valid first ADD/REPLACE/DELETE item.
+The classifier retains no filter pointer across events. A packet observes one
+consistent TFT version, and the TUN remains open.
+
+TFT supports CREATE_NEW, ADD_FILTERS, REPLACE_FILTERS, DELETE_FILTERS,
+DELETE_EXISTING and NO_TFT_OPERATION. DELETE_FILTERS contains identifier octets,
+not full filters. DELETE_EXISTING and NO_TFT_OPERATION have zero filters.
+Evaluation precedence uses all eight bits; local/remote range components are
+41/51. Duplicate identifiers/components, unknown targets, conflicting precedence,
+invalid direction/ranges, empty wire filters, unsupported components/parameters,
+trailing bytes and capacity overflow fail before commit. ESM causes distinguish
+resource exhaustion (26), QoS (37), TFT semantics/syntax (41/42), invalid bearer
+(43), filter semantics/syntax (44/45), malformed message (95), unsupported IE
+(99), duplicate IE (100), and conflicting lifecycle state (101). The component
+layouts follow
+[TS 24.008, clause 10.5.6.12](https://www.etsi.org/deliver/etsi_ts/124000_124099/124008/17.09.00_60/ts_124008v170900p.pdf).
+
+Only EPS QoS and dedicated-bearer IPv4 TFT changes are currently applied by NAS
+Modify. EPS QoS values of length 1/5/9/13 retain the full bitrate-extension
+octets. APN-AMBR, PCO, mapped legacy QoS and other optional Modify IEs are
+explicitly rejected with cause 99; default-bearer TFT changes are rejected with
+cause 41. Additional UE-initiated ESM resource procedures are not implemented.
+ECM-IDLE invalidates access transport; modification requires a live S1 context.
+UE TFT/QoS persists over idle, but this phase does not establish multi-E-RAB
+restoration or persistence through simulator restarts. Detach clears the UE
+configuration and eNB release invalidates TEID indexes.
+
+### Real EPC acceptance, 2026-10-27 (Asia/Shanghai)
+
+Baseline `develop` was `5cb3fe1f43ca736abb0f0486be65ea0929c831cf`, clean and
+equal to `origin/develop`; the complete Release suite passed 274/274 before edits.
+The extended suite has 306 cases, including independent wire fixtures, rollback,
+security/replay, mixed outcomes, cross-UE isolation and actual bidirectional UDP
+after bearer endpoint replacement. Full NR/LTE targets remain in the build.
+The unchanged CI workflow validates GCC, Clang, ASan/UBSan and coverage on the
+resulting commit; exact run/SHA evidence belongs to the final acceptance report.
+
+Read-only inspection of the deployed 2.8-based xCloud EPC found that a repeated
+AAR **in the same Rx session** updates the existing named PCC rule. PCRF compares
+media flows and regenerates Charging-Rule-Install; the gateway compares bearer
+QoS/filters and initiates Update Bearer rather than creating a new bearer. Merely
+editing MongoDB remains insufficient to update a live session.
+
+The user authorized one temporary, empty-flow QCI 1 rule on the existing test
+subscriber's internet APN, preserving its QCI 7 rule. The original policy was
+privately backed up before adding the rule; no PCRF configuration or service was
+changed. AAR created EBI 7, then repeated AARs changed bandwidth and added a port
+filter. The AF, captures, subscriber configuration and endpoint scripts remain
+outside Git.
+
+During the main acceptance window, UE A retained IPv4 `10.45.0.22`, eNB/MME
+identities `1/42`, default EBI 5, existing QCI 7 EBI 6 and Rx QCI 1 EBI 7.
+UE B retained `10.45.0.23`, identities `2/43` and its default bearer.
+
+| Bearer | SGW receiving TEID | eNB receiving TEID |
+|---|---|---|
+| UE A default EBI 5 | 00003231 | 4f80dff7 |
+| UE A existing EBI 6 | 00002ff5 | 4f80dff8 |
+| UE A modified EBI 7 | 000075c8 | 4f80dffa |
+| UE B default EBI 5 | 0000d121 | 4f80dff9 |
+
+Timestamp-correlated capture observations (seconds shown to six decimals):
+
+| Local time | Observation |
+|---|---|
+| 01:10:05.467442 | E-RAB Modify Request, UE 1/42, EBI 7; QoS-only update to 768000 bit/s |
+| 01:10:05.468130 | E-RAB Modify Response succeeds for EBI 7 |
+| 01:10:05.670924 | Protected NAS Modify Accept, PTI 0; DL COUNT 6, UL COUNT 5 |
+| 01:10:31.375888 | E-RAB Modify Request, same UE/EBI; QoS 1024000 bit/s plus ADD_FILTERS |
+| 01:10:31.376707 | E-RAB Modify Response succeeds for EBI 7 |
+| 01:10:31.583101 | Protected NAS Modify Accept; DL COUNT 7, UL COUNT 6 |
+| 01:14:09.655075 | Further QoS-only Modify, 1280000 bit/s, same two-filter TFT |
+| 01:14:09.862872 | Protected NAS Modify Accept; DL COUNT 8, UL COUNT 7 |
+| 01:14:09.863082 | MME Update Bearer Response, message type 98, overall/per-bearer cause 16 |
+| 01:14:25 | STR accepted; E-RAB Release and NAS Deactivate for EBI 7 |
+
+The S1AP response preceded the NAS Accept; there is no extra invented
+acknowledgment. The real TFT operation was **ADD_FILTERS**, not replacement:
+the new uplink filter was identifier 1 (wire nibble), precedence 3, UDP,
+local address UE A/32, remote test endpoint/32, local port 7101, remote port 5000.
+Its existing port-7100 filter was retained. No transport extension was sent.
+
+| UDP source port | Before TFT addition | After TFT addition | Remote replies per probe |
+|---|---|---|---|
+| 7100 | EBI 7 / SGW 000075c8 | EBI 7 / SGW 000075c8 | 3/3 before and after |
+| 7101 | EBI 5 / SGW 00003231 | EBI 7 / SGW 000075c8 | 3/3 before and after |
+| 3000 | EBI 5 / SGW 00003231 | EBI 5 / SGW 00003231 | 3/3 before and after |
+
+After STR, both former dedicated flows used the default SGW TEID and still
+received 3/3 replies. On the downlink the EPC selected EBI 7's eNB TEID for UDP
+replies while that Rx bearer existed; this was the network's classification.
+TUN capture, bearer-aware radio frames, GTP-U and echoed payloads corroborate
+the result. There was no new Attach or EBI recreation during these modifications.
+
+UE B had 967 consecutive Ping replies (sequence 109 through 1075, no internal
+gaps) across UE A's modifications and release. Its S1AP IDs/TEIDs remained
+unchanged, and no Modify/NAS exchange was addressed to it. The first 108 probes
+occurred before restoring the IPv4 address after moving its TUN to the namespace
+and were unsuccessful; they are excluded from the measured interval, not counted
+as successful delivery. UE A's measured UDP probes totalled 54/54 round trips;
+eNB A/B forwarding reported no malformed/TEID/peer/inactive drops.
+
+A separate cleanup run with a fresh registration repeated live Modify and then
+normal protected Detach; the MME accepted it and the eNB released its S1 context
+and receiving TEID. A second cleanup registration detached UE B as well. These
+deliberate cleanup registrations occurred after the main acceptance window.
+
+The temporary rule was removed and compared equal to the original complete
+policy. STR returned success. All test generators, AF, captures and simulator
+processes stopped; test-created namespaces/TUNs were removed. Host routes and
+rules matched the preflight snapshots. MME, HSS, SGW-C/U, PGW-C and PCRF kept
+their original PIDs; ogstun stayed UP and the pre-existing Rx peer configuration
+was retained. Private captures/backups were preserved outside the repository.
+
+Live replacement/deletion of individual TFT filters and real SGW transport
+relocation were NOT EXECUTED; deterministic rollback, replacement, deletion and
+socket tests cover those paths. The inherited G46 multiple-E-RAB paging restore
+and multi-tracking-area normal TAU limitations remain unverified.
+
 ## Supported scope
 
 Supported: multiple concurrent LTE UEs (bounded by `maxUes`) through one eNB

@@ -38,18 +38,18 @@ PacketFilter DecodeFilter(const uint8_t *data, size_t size, size_t &offset)
     const uint8_t header = data[offset];
     const uint8_t precedence = data[offset + 1];
     const size_t length = data[offset + 2];
+    if (length == 0)
+        throw TftError("Empty packet filter content", 45);
 
     // Spare bits must be zero; a non-zero spare is a decoder disagreement, not
     // a filter we may silently reinterpret.
     if ((header & 0xC0U) != 0)
         throw TftError("Packet filter carries non-zero spare bits");
-    if ((precedence & 0xF8U) != 0)
-        throw TftError("Packet filter evaluation precedence carries non-zero spare bits");
 
     PacketFilter filter;
     filter.direction = static_cast<FilterDirection>((header >> 4U) & 0x03U);
     filter.identifier = static_cast<uint8_t>(header & 0x0FU);
-    filter.precedence = static_cast<uint8_t>(precedence & 0x07U);
+    filter.precedence = precedence; // full octet, TS 24.008 10.5.6.12
 
     if (filter.direction == static_cast<FilterDirection>(0))
         throw TftError("Packet filter has an invalid direction");
@@ -70,6 +70,8 @@ PacketFilter DecodeFilter(const uint8_t *data, size_t size, size_t &offset)
         switch (type)
         {
         case ComponentIpv4RemoteAddress: {
+            if (filter.hasRemoteAddress)
+                throw TftError("Duplicate IPv4 remote component", 45);
             RequireBytes(offset, 8, end, "IPv4 remote address");
             std::copy(data + offset, data + offset + 4, filter.remoteAddress.begin());
             std::copy(data + offset + 4, data + offset + 8, filter.remoteMask.begin());
@@ -78,6 +80,8 @@ PacketFilter DecodeFilter(const uint8_t *data, size_t size, size_t &offset)
             break;
         }
         case ComponentIpv4LocalAddress: {
+            if (filter.hasLocalAddress)
+                throw TftError("Duplicate IPv4 local component", 45);
             RequireBytes(offset, 8, end, "IPv4 local address");
             std::copy(data + offset, data + offset + 4, filter.localAddress.begin());
             std::copy(data + offset + 4, data + offset + 8, filter.localMask.begin());
@@ -86,6 +90,8 @@ PacketFilter DecodeFilter(const uint8_t *data, size_t size, size_t &offset)
             break;
         }
         case ComponentProtocolOrNextHeader: {
+            if (filter.hasProtocol)
+                throw TftError("Duplicate protocol component", 45);
             RequireBytes(offset, 1, end, "protocol identifier");
             filter.protocol = data[offset];
             filter.hasProtocol = true;
@@ -93,6 +99,8 @@ PacketFilter DecodeFilter(const uint8_t *data, size_t size, size_t &offset)
             break;
         }
         case ComponentSingleLocalPort: {
+            if (filter.hasLocalPort)
+                throw TftError("Duplicate local port component", 45);
             RequireBytes(offset, 2, end, "single local port");
             filter.localPortLow = filter.localPortHigh = ReadUint16(data + offset);
             filter.hasLocalPort = true;
@@ -100,6 +108,8 @@ PacketFilter DecodeFilter(const uint8_t *data, size_t size, size_t &offset)
             break;
         }
         case ComponentLocalPortRange: {
+            if (filter.hasLocalPort)
+                throw TftError("Conflicting local port components", 45);
             RequireBytes(offset, 4, end, "local port range");
             filter.localPortLow = ReadUint16(data + offset);
             filter.localPortHigh = ReadUint16(data + offset + 2);
@@ -108,6 +118,8 @@ PacketFilter DecodeFilter(const uint8_t *data, size_t size, size_t &offset)
             break;
         }
         case ComponentSingleRemotePort: {
+            if (filter.hasRemotePort)
+                throw TftError("Duplicate remote port component", 45);
             RequireBytes(offset, 2, end, "single remote port");
             filter.remotePortLow = filter.remotePortHigh = ReadUint16(data + offset);
             filter.hasRemotePort = true;
@@ -115,6 +127,8 @@ PacketFilter DecodeFilter(const uint8_t *data, size_t size, size_t &offset)
             break;
         }
         case ComponentRemotePortRange: {
+            if (filter.hasRemotePort)
+                throw TftError("Conflicting remote port components", 45);
             RequireBytes(offset, 4, end, "remote port range");
             filter.remotePortLow = ReadUint16(data + offset);
             filter.remotePortHigh = ReadUint16(data + offset + 2);
@@ -180,7 +194,8 @@ TrafficFlowTemplate Decode(const uint8_t *data, size_t size)
 
     if (operation < OperationCode::CREATE_NEW || operation > OperationCode::NO_TFT_OPERATION)
         throw TftError("Unsupported TFT operation code");
-    if (operation == OperationCode::NO_TFT_OPERATION && filterCount != 0)
+    if ((operation == OperationCode::NO_TFT_OPERATION || operation == OperationCode::DELETE_EXISTING) &&
+        filterCount != 0)
         throw TftError("A no-TFT operation must not carry packet filters");
     if (operation != OperationCode::NO_TFT_OPERATION && filterCount > MaxPacketFilters)
         throw TftError("TFT carries more packet filters than the encoding allows");
@@ -196,7 +211,16 @@ TrafficFlowTemplate Decode(const uint8_t *data, size_t size)
     size_t offset = 1;
     for (size_t i = 0; i < filterCount; ++i)
     {
-        auto filter = DecodeFilter(data, size, offset);
+        PacketFilter filter;
+        if (operation == OperationCode::DELETE_FILTERS)
+        {
+            RequireBytes(offset, 1, size, "deleted packet filter identifier");
+            if (data[offset] & 0xF0U)
+                throw TftError("Invalid deleted filter identifier");
+            filter.identifier = data[offset++];
+        }
+        else
+            filter = DecodeFilter(data, size, offset);
         for (const auto &existing : tft.filters)
         {
             if (existing.identifier == filter.identifier)
@@ -208,7 +232,7 @@ TrafficFlowTemplate Decode(const uint8_t *data, size_t size)
     if (offset != size)
         throw TftError("TFT carries trailing octets after the packet filter list");
 
-    if (operation != OperationCode::NO_TFT_OPERATION && operation != OperationCode::CREATE_NEW &&
+    if (operation != OperationCode::NO_TFT_OPERATION && operation != OperationCode::DELETE_EXISTING &&
         tft.filters.empty())
         throw TftError("TFT operation requires at least one packet filter");
 
@@ -221,6 +245,10 @@ std::vector<uint8_t> Encode(const TrafficFlowTemplate &tft)
         throw TftError("TFT carries more packet filters than the encoding allows");
     if (tft.parametersPresent)
         throw TftError("TFT parameters list is not supported");
+    if (tft.operation < OperationCode::CREATE_NEW || tft.operation > OperationCode::NO_TFT_OPERATION ||
+        ((tft.operation == OperationCode::DELETE_EXISTING || tft.operation == OperationCode::NO_TFT_OPERATION) &&
+         !tft.filters.empty()))
+        throw TftError("Invalid TFT operation/filter count");
 
     std::vector<uint8_t> out;
     out.push_back(static_cast<uint8_t>((static_cast<uint8_t>(tft.operation) << 5U) |
@@ -228,6 +256,13 @@ std::vector<uint8_t> Encode(const TrafficFlowTemplate &tft)
 
     for (const auto &filter : tft.filters)
     {
+        if (filter.identifier > 15)
+            throw TftError("Invalid packet filter identifier");
+        if (tft.operation == OperationCode::DELETE_FILTERS)
+        {
+            out.push_back(filter.identifier);
+            continue;
+        }
         std::vector<uint8_t> components;
         if (filter.hasProtocol)
         {
@@ -286,7 +321,7 @@ std::vector<uint8_t> Encode(const TrafficFlowTemplate &tft)
 
         out.push_back(static_cast<uint8_t>((static_cast<uint8_t>(filter.direction) << 4U) |
                                            (filter.identifier & 0x0FU)));
-        out.push_back(static_cast<uint8_t>(filter.precedence & 0x07U));
+        out.push_back(filter.precedence);
         out.push_back(static_cast<uint8_t>(components.size() & 0xFFU));
         out.insert(out.end(), components.begin(), components.end());
     }
@@ -359,51 +394,86 @@ const PacketFilter *Classify(const std::vector<PacketFilter> &filters, const uin
 
 void TftState::apply(const TrafficFlowTemplate &tft)
 {
+    if (tft.parametersPresent)
+        throw TftError("Unsupported TFT parameters");
+    // All mutation is confined to this candidate, including capacity and final
+    // semantic checks. A failed operation leaves every old filter byte intact.
+    auto candidate = m_filters;
+    auto &filters = candidate;
+    std::vector<uint8_t> ids;
+    for (const auto &incoming : tft.filters)
+    {
+        if (incoming.identifier > 15 || std::find(ids.begin(), ids.end(), incoming.identifier) != ids.end())
+            throw TftError("Duplicate/invalid packet filter identifier", 45);
+        ids.push_back(incoming.identifier);
+        if (tft.operation != OperationCode::DELETE_FILTERS &&
+            (incoming.direction < FilterDirection::DOWNLINK_ONLY ||
+             incoming.direction > FilterDirection::BIDIRECTIONAL ||
+             (incoming.hasLocalPort && incoming.localPortLow > incoming.localPortHigh) ||
+             (incoming.hasRemotePort && incoming.remotePortLow > incoming.remotePortHigh)))
+            throw TftError("Invalid packet filter direction or port range", 44);
+    }
+    if ((tft.operation == OperationCode::DELETE_EXISTING || tft.operation == OperationCode::NO_TFT_OPERATION) &&
+        !tft.filters.empty())
+        throw TftError("TFT operation must not contain filters");
+    if ((tft.operation == OperationCode::ADD_FILTERS || tft.operation == OperationCode::REPLACE_FILTERS ||
+         tft.operation == OperationCode::DELETE_FILTERS || tft.operation == OperationCode::CREATE_NEW) &&
+        tft.filters.empty())
+        throw TftError("TFT operation requires filters");
     switch (tft.operation)
     {
     case OperationCode::CREATE_NEW:
+        filters = tft.filters;
+        break;
     case OperationCode::DELETE_EXISTING:
-        m_filters = tft.filters;
+        filters.clear();
         break;
     case OperationCode::ADD_FILTERS:
         for (const auto &incoming : tft.filters)
         {
-            for (const auto &existing : m_filters)
+            for (const auto &existing : filters)
             {
                 if (existing.identifier == incoming.identifier)
-                    throw TftError("TFT adds a packet filter identifier that already exists");
+                    throw TftError("TFT adds a packet filter identifier that already exists", 41);
             }
-            m_filters.push_back(incoming);
+            filters.push_back(incoming);
         }
         break;
     case OperationCode::REPLACE_FILTERS:
         for (const auto &incoming : tft.filters)
         {
-            const auto it = std::find_if(m_filters.begin(), m_filters.end(), [&](const PacketFilter &existing) {
+            const auto it = std::find_if(filters.begin(), filters.end(), [&](const PacketFilter &existing) {
                 return existing.identifier == incoming.identifier;
             });
-            if (it == m_filters.end())
-                throw TftError("TFT replaces a packet filter identifier that does not exist");
+            if (it == filters.end())
+                throw TftError("TFT replaces a packet filter identifier that does not exist", 41);
             *it = incoming;
         }
         break;
     case OperationCode::DELETE_FILTERS:
         for (const auto &incoming : tft.filters)
         {
-            const auto it = std::find_if(m_filters.begin(), m_filters.end(), [&](const PacketFilter &existing) {
+            const auto it = std::find_if(filters.begin(), filters.end(), [&](const PacketFilter &existing) {
                 return existing.identifier == incoming.identifier;
             });
-            if (it == m_filters.end())
-                throw TftError("TFT deletes a packet filter identifier that does not exist");
-            m_filters.erase(it);
+            if (it == filters.end())
+                throw TftError("TFT deletes a packet filter identifier that does not exist", 41);
+            filters.erase(it);
         }
         break;
     case OperationCode::NO_TFT_OPERATION:
         break;
+    default:
+        throw TftError("Invalid TFT operation");
     }
 
-    if (m_filters.size() > MaxPacketFilters)
-        throw TftError("Accumulated TFT exceeds the supported packet filter count");
+    if (filters.size() > MaxPacketFilters)
+        throw TftError("Accumulated TFT exceeds the supported packet filter count", 26);
+    for (size_t i = 0; i < filters.size(); ++i)
+        for (size_t j = i + 1; j < filters.size(); ++j)
+            if (filters[i].precedence == filters[j].precedence)
+                throw TftError("Conflicting packet filter evaluation precedence", 44);
+    m_filters.swap(candidate);
 }
 
 void TftState::clear()

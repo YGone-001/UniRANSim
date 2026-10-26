@@ -92,7 +92,7 @@ void S1uEndpoint::handleDatagram(const uint8_t *data, size_t size, const InetAdd
         Log("WARN", "Dropped S1-U T-PDU with unknown/stale TEID " + Hex(packet.teid, 8));
         return;
     }
-    if (peer != entry->sgwPeer)
+    if (peer != InetAddress(Ipv4ToString(bearer->parameters().sgwAddress), 2152))
     {
         ++entry->counters.unexpectedPeerDrops;
         Log("WARN", "Dropped S1-U datagram from unexpected peer " + peer.toString());
@@ -179,7 +179,8 @@ void S1uEndpoint::forwardUplink(EnbUeEntry &entry, BearerContext &bearer, const 
     ++entry.counters.simulatedUplinkPackets;
     entry.counters.simulatedUplinkBytes += size;
     auto datagram = gtpu::EncodeTPdu(bearer.parameters().sgwTeid, packet, size);
-    if (m_socket->TrySend(entry.sgwPeer, datagram.data(), datagram.size()))
+    const InetAddress destination(Ipv4ToString(bearer.parameters().sgwAddress), 2152);
+    if (m_socket->TrySend(destination, datagram.data(), datagram.size()))
     {
         ++entry.counters.s1uUplinkPackets;
         entry.counters.s1uUplinkBytes += size;

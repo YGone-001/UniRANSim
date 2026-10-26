@@ -10,6 +10,7 @@
 #pragma once
 
 #include "types.hpp"
+#include <lte/tft.hpp>
 
 #include <array>
 #include <cstdint>
@@ -149,6 +150,36 @@ struct DeactivateEpsBearerContextRequest
     uint8_t esmCause{};
 };
 
+class EsmError : public DecodeError
+{
+  public:
+    EsmError(uint8_t value, const std::string &message) : DecodeError(message), cause(value)
+    {
+    }
+    uint8_t cause;
+};
+
+struct ModifyEpsBearerContextRequest
+{
+    uint8_t epsBearerIdentity{}, procedureTransactionId{};
+    // Full negotiated EPS QoS value, including bitrate extension octets.
+    std::optional<std::vector<uint8_t>> epsQos;
+    std::optional<std::vector<uint8_t>> tft;
+};
+
+struct EpsBearerConfiguration
+{
+    uint8_t ebi{}, qci{}, linkedEbi{};
+    std::vector<uint8_t> epsQos;
+    lte::tft::TftState tft;
+};
+
+ModifyEpsBearerContextRequest DecodeModifyEpsBearerContextRequest(const uint8_t *data, size_t size);
+// Atomic candidate update. Caller resolves the existing per-UE bearer first.
+void ApplyBearerModification(EpsBearerConfiguration &bearer, const ModifyEpsBearerContextRequest &request);
+std::vector<uint8_t> EncodeModifyEpsBearerContextAccept(uint8_t ebi, uint8_t pti);
+std::vector<uint8_t> EncodeModifyEpsBearerContextReject(uint8_t ebi, uint8_t pti, uint8_t cause);
+
 // Decoded form of the protected downlink EMM message the UE must react to.
 enum class DownlinkEmm
 {
@@ -162,6 +193,7 @@ enum class DownlinkEmm
     ESM_INFORMATION_REQUEST,
     ACTIVATE_DEDICATED_EPS_BEARER_CONTEXT,
     DEACTIVATE_EPS_BEARER_CONTEXT,
+    MODIFY_EPS_BEARER_CONTEXT,
     OTHER
 };
 
@@ -175,6 +207,7 @@ struct DownlinkMessage
     EsmInformationRequest esmInformationRequest{};
     ActivateDedicatedEpsBearerContextRequest dedicatedBearer{};
     DeactivateEpsBearerContextRequest deactivateBearer{};
+    ModifyEpsBearerContextRequest modifyBearer{};
     uint8_t emmCause{};
 };
 

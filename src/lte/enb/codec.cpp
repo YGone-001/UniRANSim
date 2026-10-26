@@ -828,13 +828,22 @@ void ReadArp(BitReader &reader, ErabToBeSetupItem &item)
 }
 
 void WriteErabLevelQos(BitWriter &writer, uint8_t qci, uint8_t priorityLevel, bool preemptionCapability,
-                       bool preemptionVulnerability)
+                       bool preemptionVulnerability, const std::optional<GbrQos> &gbr = std::nullopt)
 {
     writer.writeBit(false); // SEQUENCE extension marker
-    writer.writeBit(false); // gbrQosInformation absent
+    writer.writeBit(gbr.has_value());
     writer.writeBit(false); // iE-Extensions absent
     WriteConstrained(writer, qci, 0, 255, true);
     WriteArp(writer, priorityLevel, preemptionCapability, preemptionVulnerability);
+    if (gbr)
+    {
+        writer.writeBit(false); // GBR sequence extension
+        writer.writeBit(false); // GBR IE extensions absent
+        WriteBitRate(writer, gbr->maximumDl);
+        WriteBitRate(writer, gbr->maximumUl);
+        WriteBitRate(writer, gbr->guaranteedDl);
+        WriteBitRate(writer, gbr->guaranteedUl);
+    }
 }
 
 void ReadErabLevelQos(BitReader &reader, ErabToBeSetupItem &item)
@@ -846,7 +855,11 @@ void ReadErabLevelQos(BitReader &reader, ErabToBeSetupItem &item)
     item.qci = static_cast<uint8_t>(ReadConstrained(reader, 0, 255, true));
     ReadArp(reader, item);
     if (gbrPresent)
-        throw CodecError("GBR-QosInformation is not supported for the default EPS bearer");
+    {
+        if (reader.readBit() || reader.readBit())
+            throw CodecError("Extended GBR-QosInformation is not supported");
+        item.gbr = GbrQos{ReadBitRate(reader), ReadBitRate(reader), ReadBitRate(reader), ReadBitRate(reader)};
+    }
     if (extensionsPresent)
         throw CodecError("E-RABLevelQoSParameters extensions are not supported");
 }
@@ -905,7 +918,8 @@ std::vector<uint8_t> EncodeErabToBeSetupItemBearerSUReq(const ErabToBeSetupItem 
     writer.writeBit(false); // SEQUENCE extension marker
     writer.writeBit(false); // iE-Extensions absent
     WriteErabId(writer, item.erabId);
-    WriteErabLevelQos(writer, item.qci, item.priorityLevel, item.preemptionCapability, item.preemptionVulnerability);
+    WriteErabLevelQos(writer, item.qci, item.priorityLevel, item.preemptionCapability, item.preemptionVulnerability,
+                      item.gbr);
     WriteTransportLayerAddress(writer, item.transportLayerAddress);
     WriteFixedOctets(writer, item.gtpTeid.data(), item.gtpTeid.size());
     writer.writeLength(item.nasPdu.size());
@@ -1310,7 +1324,8 @@ std::vector<uint8_t> EncodeInitialContextSetupRequest(const InitialContextSetupR
         item.writeBit(erab.nasPduPresent);
         item.writeBit(false); // iE-Extensions absent
         WriteErabId(item, erab.erabId);
-        WriteErabLevelQos(item, erab.qci, erab.priorityLevel, erab.preemptionCapability, erab.preemptionVulnerability);
+        WriteErabLevelQos(item, erab.qci, erab.priorityLevel, erab.preemptionCapability, erab.preemptionVulnerability,
+                          erab.gbr);
         WriteTransportLayerAddress(item, erab.transportLayerAddress);
         WriteFixedOctets(item, erab.gtpTeid.data(), erab.gtpTeid.size());
         if (erab.nasPduPresent)
@@ -1821,21 +1836,33 @@ void WriteCause(BitWriter &writer, const std::string &category, int value)
         throw CodecError("Unsupported S1AP cause category " + category);
     if (value < 0 || value > 255)
         throw CodecError("S1AP cause value is out of range");
-    writer.writeBits(static_cast<uint8_t>(index), 4);
-    writer.writeBit(false); // not an extension enumeration value
-    writer.writeBits(static_cast<uint8_t>(value), 8);
+    static const std::array<size_t, 5> roots{36, 2, 4, 7, 6};
+    writer.writeBit(false); // Cause CHOICE root
+    writer.writeBits(index, 3);
+    const auto root = roots[index];
+    writer.writeBit(static_cast<size_t>(value) >= root);
+    if (static_cast<size_t>(value) < root)
+        writer.writeBits(value, BitsForRange(root));
+    else
+    {
+        if (static_cast<size_t>(value) - root >= 64)
+            throw CodecError("Large Cause extension enumeration unsupported");
+        writer.writeBit(false); // normally small extension index
+        writer.writeBits(static_cast<size_t>(value) - root, 6);
+    }
 }
 
 void ReadCause(BitReader &reader, std::string &category, int &value)
 {
     static const std::array<const char *, 5> names{"radioNetwork", "transport", "nas", "protocol", "misc"};
-    const auto index = static_cast<size_t>(reader.readBits(4));
+    if (reader.readBit())
+        throw CodecError("Unsupported S1AP Cause choice extension");
+    const auto index = static_cast<size_t>(reader.readBits(3));
     if (index >= names.size())
         throw CodecError("Unsupported S1AP cause choice");
-    if (reader.readBit())
-        throw CodecError("S1AP cause extension values are not supported");
     category = names[index];
-    value = static_cast<int>(reader.readBits(8));
+    static const std::array<size_t, 5> roots{36, 2, 4, 7, 6};
+    value = ReadExtensibleEnum(reader, roots[index]);
 }
 
 } // namespace
@@ -2131,6 +2158,204 @@ std::vector<uint8_t> EncodeErabReleaseResponse(uint32_t mmeUeS1apId, uint32_t en
     ies.push_back({{IE_ENB_UE_S1AP_ID, Criticality::REJECT}, EncodeUeId(enbUeS1apId, 0xFFFFFFU)});
     ies.push_back({{IE_E_RAB_RELEASED_LIST, Criticality::IGNORE}, list.take()});
     return EncodePdu(1, PROCEDURE_E_RAB_RELEASE, Criticality::REJECT, ies);
+}
+
+// TS 36.413 9.1.3.3: this item has mandatory NAS, no root transport
+// fields, and an optional extension container containing TransportInformation.
+ErabModifyRequest DecodeErabModifyRequest(const uint8_t *data, size_t length)
+{
+    const auto envelope = DecodeEnvelope(data, length, 6, static_cast<int>(Criticality::REJECT));
+    if (envelope.choice != 0)
+        throw CodecError("E-RAB Modify Request must be initiating");
+    ErabModifyRequest result;
+    bool mme = false, enb = false, list = false;
+    for (const auto &ie : DecodeIeContainer(envelope.value))
+    {
+        if (ie.id == 0 || ie.id == 8 || ie.id == 66 || ie.id == 30)
+        {
+            if (ie.criticality != Criticality::REJECT)
+                throw CodecError("Invalid E-RAB Modify Request IE criticality");
+        }
+        if (ie.id == 0)
+        {
+            result.mmeUeS1apId = DecodeUeId(ie.value, 0xFFFFFFFFU);
+            mme = true;
+        }
+        else if (ie.id == 8)
+        {
+            result.enbUeS1apId = DecodeUeId(ie.value, 0xFFFFFFU);
+            enb = true;
+        }
+        else if (ie.id == 66)
+        {
+            BitReader r(ie.value);
+            if (r.readBit() || r.readBit())
+                throw CodecError("Unsupported UE-AMBR extension");
+            result.ueAmbr = UeAmbr{ReadBitRate(r), ReadBitRate(r)};
+            r.requireFinished();
+        }
+        else if (ie.id == 30)
+        {
+            BitReader r(ie.value);
+            const size_t count = ReadConstrained(r, 1, 256, true);
+            std::set<uint8_t> seen;
+            for (size_t i = 0; i < count; ++i)
+            {
+                if (ReadConstrained(r, 0, 65535, true) != 36 || r.readBits(2) != 0)
+                    throw CodecError("Invalid E-RAB Modify item identity/criticality");
+                auto bytes = r.readOpenType();
+                BitReader item(bytes);
+                if (item.readBit())
+                    throw CodecError("Unsupported E-RAB Modify sequence extension");
+                const bool extensions = item.readBit();
+                ErabToBeModifiedItem value;
+                value.erabId = ReadErabId(item);
+                if (!seen.insert(value.erabId).second)
+                    throw CodecError("Duplicate E-RAB Modify identity");
+                ErabToBeSetupItem qos;
+                ReadErabLevelQos(item, qos);
+                value.qos = {qos.qci, qos.priorityLevel, qos.preemptionCapability, qos.preemptionVulnerability,
+                             qos.gbr};
+                value.nasPdu = item.readBytes(item.readLength());
+                if (value.nasPdu.size() > 4096)
+                    throw CodecError("Oversized E-RAB Modify NAS-PDU");
+                if (extensions)
+                {
+                    const size_t n = ReadConstrained(item, 1, 65535, true);
+                    std::set<uint16_t> ids;
+                    for (size_t j = 0; j < n; ++j)
+                    {
+                        const auto id = static_cast<uint16_t>(ReadConstrained(item, 0, 65535, true));
+                        const auto criticality = item.readBits(2);
+                        auto ext = item.readOpenType();
+                        if (!ids.insert(id).second || criticality > 2)
+                            throw CodecError("Invalid E-RAB Modify extension container");
+                        if (id == 185)
+                        {
+                            if (criticality != 0)
+                                throw CodecError("TransportInformation must have reject criticality");
+                            BitReader tr(ext);
+                            if (tr.readBit())
+                                throw CodecError("Extended TransportInformation unsupported");
+                            ErabTransport transport;
+                            if (tr.readBit())
+                                throw CodecError("Extended transport address size unsupported");
+                            const size_t bits = ReadConstrained(tr, 1, 160, true);
+                            transport.ipv4 = bits == 32;
+                            if (bits > 16)
+                                tr.align();
+                            for (size_t b = 0; b < bits; ++b)
+                            {
+                                const bool bit = tr.readBit();
+                                if (transport.ipv4 && bit)
+                                    transport.address[b / 8] |= static_cast<uint8_t>(1U << (7U - b % 8));
+                            }
+                            const auto teid = ReadFixedOctets(tr, 4);
+                            for (auto octet : teid)
+                                transport.teid = (transport.teid << 8U) | octet;
+                            tr.requireFinished();
+                            value.transport = transport;
+                        }
+                        else if (criticality != 1)
+                            throw CodecError("Unsupported reject/notify E-RAB Modify extension");
+                    }
+                }
+                item.requireFinished();
+                result.erabs.push_back(std::move(value));
+            }
+            r.requireFinished();
+            list = true;
+        }
+        else if (ie.criticality != Criticality::IGNORE)
+            throw CodecError("Unsupported reject/notify E-RAB Modify IE");
+    }
+    if (!mme || !enb || !list)
+        throw CodecError("Missing mandatory E-RAB Modify IE");
+    return result;
+}
+
+std::vector<uint8_t> EncodeErabModifyRequest(const ErabModifyRequest &request)
+{
+    if (request.erabs.empty() || request.erabs.size() > 256)
+        throw CodecError("Invalid E-RAB Modify list size");
+    BitWriter list;
+    WriteConstrained(list, request.erabs.size(), 1, 256, true);
+    for (const auto &erab : request.erabs)
+    {
+        BitWriter item;
+        item.writeBit(false);
+        item.writeBit(erab.transport.has_value());
+        WriteErabId(item, erab.erabId);
+        const auto &q = erab.qos;
+        WriteErabLevelQos(item, q.qci, q.priorityLevel, q.preemptionCapability, q.preemptionVulnerability, q.gbr);
+        item.writeLength(erab.nasPdu.size());
+        item.writeBytes(erab.nasPdu);
+        if (erab.transport)
+        {
+            if (!erab.transport->ipv4)
+                throw CodecError("Offline Modify encoder only supports IPv4 transport");
+            WriteConstrained(item, 1, 1, 65535, true);
+            BitWriter transport;
+            transport.writeBit(false);
+            WriteTransportLayerAddress(transport, erab.transport->address);
+            const uint32_t t = erab.transport->teid;
+            const std::array<uint8_t, 4> teid{static_cast<uint8_t>(t >> 24U), static_cast<uint8_t>(t >> 16U),
+                                              static_cast<uint8_t>(t >> 8U), static_cast<uint8_t>(t)};
+            WriteFixedOctets(transport, teid.data(), teid.size());
+            WriteIe(item, 185, Criticality::REJECT, transport.take());
+        }
+        WriteIe(list, 36, Criticality::REJECT, item.take());
+    }
+    std::vector<std::pair<std::pair<uint16_t, Criticality>, std::vector<uint8_t>>> ies;
+    ies.push_back({{0, Criticality::REJECT}, EncodeUeId(request.mmeUeS1apId, 0xFFFFFFFFU)});
+    ies.push_back({{8, Criticality::REJECT}, EncodeUeId(request.enbUeS1apId, 0xFFFFFFU)});
+    if (request.ueAmbr)
+    {
+        BitWriter ambr;
+        ambr.writeBit(false);
+        ambr.writeBit(false);
+        WriteBitRate(ambr, request.ueAmbr->downlink);
+        WriteBitRate(ambr, request.ueAmbr->uplink);
+        ies.push_back({{66, Criticality::REJECT}, ambr.take()});
+    }
+    ies.push_back({{30, Criticality::REJECT}, list.take()});
+    return EncodePdu(0, 6, Criticality::REJECT, ies);
+}
+
+std::vector<uint8_t> EncodeErabModifyResponse(uint32_t mmeId, uint32_t enbId, const std::vector<uint8_t> &modified,
+                                              const std::vector<ErabFailedItem> &failed)
+{
+    if (modified.size() + failed.size() == 0 || modified.size() + failed.size() > 256)
+        throw CodecError("Invalid E-RAB Modify outcome count");
+    std::set<uint8_t> seen;
+    std::vector<std::pair<std::pair<uint16_t, Criticality>, std::vector<uint8_t>>> ies;
+    // Response identities are IGNORE, unlike the request.
+    ies.push_back({{0, Criticality::IGNORE}, EncodeUeId(mmeId, 0xFFFFFFFFU)});
+    ies.push_back({{8, Criticality::IGNORE}, EncodeUeId(enbId, 0xFFFFFFU)});
+    auto append = [&](bool success) {
+        const size_t count = success ? modified.size() : failed.size();
+        if (count == 0)
+            return;
+        BitWriter list;
+        WriteConstrained(list, count, 1, 256, true);
+        for (size_t i = 0; i < count; ++i)
+        {
+            const auto ebi = success ? modified[i] : failed[i].erabId;
+            if (!seen.insert(ebi).second)
+                throw CodecError("Duplicate E-RAB Modify outcome");
+            BitWriter item;
+            item.writeBit(false);
+            item.writeBit(false);
+            WriteErabId(item, ebi);
+            if (!success)
+                WriteCause(item, failed[i].causeCategory, failed[i].causeValue);
+            WriteIe(list, success ? 37 : 35, Criticality::IGNORE, item.take());
+        }
+        ies.push_back({{static_cast<uint16_t>(success ? 31 : 32), Criticality::IGNORE}, list.take()});
+    };
+    append(true);
+    append(false);
+    return EncodePdu(1, 6, Criticality::REJECT, ies);
 }
 
 } // namespace lte::enb::s1ap

@@ -89,6 +89,7 @@ class EnbMultiplexer
     // fans one simulated notification out to retained idle radio endpoints.
     // Adds one network-initiated dedicated E-RAB on an existing S1 context.
     void onErabSetupRequest(const uint8_t *data, size_t size);
+    void onErabModifyRequest(const uint8_t *data, size_t size);
     // Releases named dedicated E-RABs without touching the default bearer.
     void onErabReleaseCommand(const uint8_t *data, size_t size);
     void onPaging(const uint8_t *data, size_t size, uint16_t stream);

@@ -97,4 +97,21 @@ void DefaultBearerContext::release()
     m_established = false;
 }
 
+void DefaultBearerContext::modifyQos(const ErabQos &qos)
+{
+    if (!m_established || !qos.valid())
+        throw BearerError("Inactive bearer or invalid/unsupported E-RAB QoS");
+    m_parameters.qos = qos;
+    m_parameters.qci = qos.qci;
+}
+
+void DefaultBearerContext::modifyTransport(const std::array<uint8_t, 4> &address, uint32_t teid)
+{
+    if (!m_established || teid == 0 || address[0] == 0 || address[0] >= 224 ||
+        address == std::array<uint8_t, 4>{255, 255, 255, 255})
+        throw BearerError("Inactive bearer or invalid IPv4 S1-U transport endpoint");
+    m_parameters.sgwAddress = address;
+    m_parameters.sgwTeid = teid;
+}
+
 } // namespace lte::enb

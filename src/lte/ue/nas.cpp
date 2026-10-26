@@ -491,6 +491,14 @@ DownlinkMessage DecodeDownlink(const uint8_t *data, size_t size)
 
     DownlinkMessage result{};
 
+    if ((data[0] & 0x0FU) == Esm && size >= 3 && data[2] == 0xC9)
+    {
+        result.type = DownlinkEmm::MODIFY_EPS_BEARER_CONTEXT;
+        result.messageType = 0xC9;
+        result.modifyBearer = DecodeModifyEpsBearerContextRequest(data, size);
+        return result;
+    }
+
     if ((data[0] & 0x0FU) == Esm && size >= 3 && (data[2] == 0xC5 || data[2] == 0xCD))
     {
         result.messageType = data[2];
@@ -777,6 +785,87 @@ std::vector<uint8_t> EncodeTauRequest(uint8_t ksi, const std::array<uint8_t, 11>
 std::vector<uint8_t> EncodeTauComplete()
 {
     return {EpsEmm, TauCompleteType};
+}
+
+ModifyEpsBearerContextRequest DecodeModifyEpsBearerContextRequest(const uint8_t *data, size_t size)
+{
+    if (!data || size < 3 || (data[0] & 15U) != Esm || data[2] != 0xC9)
+        throw EsmError(95, "Invalid Modify EPS Bearer Context Request header");
+    ModifyEpsBearerContextRequest result;
+    result.epsBearerIdentity = data[0] >> 4U;
+    result.procedureTransactionId = data[1];
+    if (result.epsBearerIdentity < 5)
+        throw EsmError(43, "Invalid EPS bearer identity");
+    size_t offset = 3;
+    while (offset < size)
+    {
+        const auto iei = data[offset++];
+        if (iei != 0x5B && iei != 0x36)
+            throw EsmError(99, "Unsupported Modify EPS Bearer Context optional IE " + std::to_string(iei));
+        if (offset >= size)
+            throw EsmError(95, "Missing Modify IE length");
+        const size_t length = data[offset++];
+        if (!length || length > size - offset)
+            throw EsmError(95, "Truncated Modify IE value");
+        auto &destination = iei == 0x5B ? result.epsQos : result.tft;
+        if (destination)
+            throw EsmError(100, "Duplicate Modify IE");
+        destination = std::vector<uint8_t>(data + offset, data + offset + length);
+        if (iei == 0x5B && ((length != 1 && length != 5 && length != 9 && length != 13) || data[offset] == 0))
+            throw EsmError(37, "Unsupported/invalid EPS QoS value");
+        offset += length;
+    }
+    return result;
+}
+
+void ApplyBearerModification(EpsBearerConfiguration &bearer, const ModifyEpsBearerContextRequest &request)
+{
+    if (bearer.ebi < 5 || bearer.ebi != request.epsBearerIdentity)
+        throw EsmError(43, "Modification names an unknown EPS bearer");
+    if (request.procedureTransactionId == 255)
+        throw EsmError(81, "Reserved PTI");
+    if (request.procedureTransactionId != 0)
+        throw EsmError(47, "No matching UE-initiated ESM transaction");
+    auto candidate = bearer;
+    if (request.epsQos)
+    {
+        const auto &qos = *request.epsQos;
+        if ((qos.size() != 1 && qos.size() != 5 && qos.size() != 9 && qos.size() != 13) || qos[0] == 0)
+            throw EsmError(37, "Unsupported/invalid EPS QoS");
+        candidate.epsQos = qos;
+        candidate.qci = qos[0];
+    }
+    if (request.tft)
+    {
+        // Only dedicated TFTs are supported by this one-PDN IPv4 model.
+        if (candidate.linkedEbi == 0)
+            throw EsmError(41, "Default-bearer TFT modification unsupported");
+        try
+        {
+            const auto &value = *request.tft;
+            candidate.tft.apply(lte::tft::Decode(value.data(), value.size()));
+        }
+        catch (const lte::tft::TftError &e)
+        {
+            throw EsmError(e.esmCause, e.what());
+        }
+    }
+    bearer = std::move(candidate);
+}
+
+std::vector<uint8_t> EncodeModifyEpsBearerContextAccept(uint8_t ebi, uint8_t pti)
+{
+    if (ebi < 5 || ebi > 15)
+        throw DecodeError("Invalid Modify Accept EBI");
+    return {static_cast<uint8_t>((ebi << 4U) | Esm), pti, 0xCA};
+}
+
+std::vector<uint8_t> EncodeModifyEpsBearerContextReject(uint8_t ebi, uint8_t pti, uint8_t cause)
+{
+    if (ebi > 15)
+        throw DecodeError("Invalid Modify Reject EBI");
+    // ESM cause is a mandatory V octet, not LV.
+    return {static_cast<uint8_t>((ebi << 4U) | Esm), pti, 0xCB, cause};
 }
 
 } // namespace lte::ue::nas

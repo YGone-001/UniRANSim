@@ -9,6 +9,7 @@
 #pragma once
 
 #include "types.hpp"
+#include <lte/qos.hpp>
 
 #include <array>
 #include <cstddef>
@@ -133,6 +134,7 @@ struct ErabToBeSetupItem
     uint8_t priorityLevel{};
     bool preemptionCapability{};
     bool preemptionVulnerability{};
+    std::optional<GbrQos> gbr;
     std::array<uint8_t, 4> transportLayerAddress{};
     std::array<uint8_t, 4> gtpTeid{};
     bool nasPduPresent{};
@@ -198,9 +200,8 @@ UeContextReleaseRequest DecodeUeContextReleaseRequest(const uint8_t *data, size_
 
 // --- Phase 7: S1AP E-RAB management (TS 36.413, procedures 5 and 7) ---------
 
-// One E-RAB item of an MME-initiated E-RAB Setup Request. The item layout is
-// identical to the Initial Context Setup variant, which is why the same
-// structure and decoder serve both.
+// The common field storage is shared with Initial Context Setup, but the
+// BearerSUReq wire layout has mandatory NAS and its own decoder.
 struct ErabSetupRequest
 {
     uint32_t mmeUeS1apId{};
@@ -222,6 +223,37 @@ struct ErabFailedItem
     std::string causeCategory{"radioNetwork"};
     int causeValue{};
 };
+
+struct ErabTransport
+{
+    std::array<uint8_t, 4> address{};
+    uint32_t teid{};
+    // Non-IPv4 root BIT STRINGs are decoded so the eNB can report a
+    // per-E-RAB transport failure instead of timing out the whole request.
+    bool ipv4{true};
+};
+
+struct ErabToBeModifiedItem
+{
+    uint8_t erabId{};
+    ErabQos qos;
+    std::vector<uint8_t> nasPdu;
+    std::optional<ErabTransport> transport;
+};
+
+struct ErabModifyRequest
+{
+    uint32_t mmeUeS1apId{}, enbUeS1apId{};
+    std::optional<UeAmbr> ueAmbr;
+    std::vector<ErabToBeModifiedItem> erabs;
+};
+
+ErabModifyRequest DecodeErabModifyRequest(const uint8_t *data, size_t length);
+// Offline fixture helper; independent ASN.1 fixtures also exercise the decoder.
+std::vector<uint8_t> EncodeErabModifyRequest(const ErabModifyRequest &request);
+std::vector<uint8_t> EncodeErabModifyResponse(uint32_t mmeUeS1apId, uint32_t enbUeS1apId,
+                                              const std::vector<uint8_t> &modified,
+                                              const std::vector<ErabFailedItem> &failed);
 
 std::vector<uint8_t> EncodeErabSetupResponse(uint32_t mmeUeS1apId, uint32_t enbUeS1apId,
                                              const std::vector<ErabSetupItem> &established,

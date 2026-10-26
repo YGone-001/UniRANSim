@@ -74,14 +74,7 @@ void SendProtected(udp::UdpServer &socket, const InetAddress &enb, uint32_t ueId
 // the accepted DL COUNT. An unverified message never reaches the caller.
 std::vector<uint8_t> ReceiveProtected(SecurityContext &security, const std::vector<uint8_t> &message)
 {
-    auto parsed = nas::ParseProtectedHeader(message.data(), message.size());
-    auto plain =
-        nas::UnprotectBody(security, false, parsed.headerType, parsed.sequenceNumber, parsed.mac, parsed.plain);
-    if (nas::StartsNewContext(parsed.headerType))
-        security.dlNasCount = parsed.sequenceNumber;
-    else
-        security.dlNasCount = nas::EstimateNasCount(security.dlNasCount, parsed.sequenceNumber);
-    return plain;
+    return nas::ReceiveProtectedDownlink(security, message);
 }
 } // namespace
 
@@ -98,12 +91,8 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
     // Dedicated EPS bearers accepted on top of the default bearer. Each keeps
     // its own TFT so an uplink packet is routed by what the network selected,
     // never by a heuristic.
-    struct DedicatedBearerRuntime
-    {
-        uint8_t ebi{};
-        uint8_t qci{};
-        lte::tft::TftState tft;
-    };
+    using DedicatedBearerRuntime = nas::EpsBearerConfiguration;
+    nas::EpsBearerConfiguration defaultConfiguration;
     std::vector<DedicatedBearerRuntime> dedicatedBearers;
     uint64_t dedicatedUplinkPackets = 0;
     uint64_t dedicatedDownlinkPackets = 0;
@@ -564,6 +553,62 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
             }
             else
                 plain = ReceiveProtected(security, message.payload);
+            // Handle C9 here so a malformed optional IE still receives a
+            // protected Reject using the authenticated EBI/PTI header.
+            if (plain.size() >= 3 && (plain[0] & 15U) == 2 && plain[2] == 0xC9)
+            {
+                const uint8_t ebi = plain[0] >> 4U, pti = plain[1];
+                uint8_t cause = 0;
+                std::string error;
+                nas::EpsBearerConfiguration *target = nullptr;
+                nas::EpsBearerConfiguration candidate;
+                try
+                {
+                    if (mobility.emm != EmmState::REGISTERED || mobility.ecm != EcmState::CONNECTED ||
+                        mobility.pending != PendingProcedure::NONE)
+                        throw nas::EsmError(101, "Bearer modification conflicts with mobility state");
+                    const auto request = nas::DecodeModifyEpsBearerContextRequest(plain.data(), plain.size());
+                    if (ebi == activeEbi)
+                        target = &defaultConfiguration;
+                    else
+                        for (auto &bearer : dedicatedBearers)
+                            if (bearer.ebi == ebi)
+                                target = &bearer;
+                    if (!target)
+                        throw nas::EsmError(43, "Unknown EPS bearer");
+                    candidate = *target;
+                    nas::ApplyBearerModification(candidate, request);
+                }
+                catch (const nas::EsmError &e)
+                {
+                    cause = e.cause;
+                    error = e.what();
+                }
+                catch (const std::bad_alloc &)
+                {
+                    cause = 26;
+                    error = "Insufficient local resources";
+                }
+                if (cause)
+                {
+                    SendProtected(socket, enb, ueId, security, false,
+                                  nas::EncodeModifyEpsBearerContextReject(ebi, pti, cause));
+                    Log("WARN", "Modify EPS bearer rejected EBI=" + std::to_string(ebi) +
+                                    " cause=" + std::to_string(cause) + ": " + error);
+                }
+                else
+                {
+                    SendProtected(socket, enb, ueId, security, false,
+                                  nas::EncodeModifyEpsBearerContextAccept(ebi, pti));
+                    *target = std::move(candidate);
+                    Log("INFO", "Modify EPS bearer accepted EBI=" + std::to_string(ebi) +
+                                    " PTI=" + std::to_string(pti) + " QCI=" + std::to_string(target->qci) +
+                                    " filters=" + std::to_string(target->tft.size()) +
+                                    " UL-COUNT-next=" + std::to_string(security.ulNasCount) +
+                                    " DL-COUNT=" + std::to_string(security.dlNasCount));
+                }
+                continue;
+            }
             auto downlink = nas::DecodeDownlink(plain.data(), plain.size());
 
             if (downlink.type == nas::DownlinkEmm::ACTIVATE_DEDICATED_EPS_BEARER_CONTEXT)
@@ -586,6 +631,8 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                     DedicatedBearerRuntime bearer;
                     bearer.ebi = request.epsBearerIdentity;
                     bearer.qci = request.qci;
+                    bearer.linkedEbi = request.linkedEpsBearerIdentity;
+                    bearer.epsQos = {request.qci};
                     if (!request.tft.empty())
                         bearer.tft.apply(lte::tft::Decode(request.tft.data(), request.tft.size()));
 
@@ -643,6 +690,8 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 security = SecurityContext{};
                 pendingWire.clear();
                 tun.reset();
+                dedicatedBearers.clear();
+                defaultConfiguration = {};
                 Log("INFO", "EPS Detach accepted; State=EMM_DEREGISTERED, bearer and TUN released");
                 return 0;
             }
@@ -736,6 +785,9 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
             LogState(state);
 
             activeEbi = accept.bearer->epsBearerIdentity;
+            defaultConfiguration.ebi = activeEbi;
+            defaultConfiguration.qci = accept.bearer->qci;
+            defaultConfiguration.epsQos = {accept.bearer->qci};
             assignedIpv4 = accept.bearer->pdnAddress;
             if (assignedIpv4 == std::array<uint8_t, 4>{})
                 throw nas::DecodeError("Default bearer did not provide a supported non-zero IPv4 PDN address");
@@ -793,6 +845,12 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
         }
         catch (const nas::SecurityError &e)
         {
+            if (mobility.emm == EmmState::REGISTERED)
+            {
+                ++malformedDrops;
+                Log("WARN", std::string("Dropped unauthenticated/replayed NAS: ") + e.what());
+                continue;
+            }
             state = State::PROCEDURE_FAILED;
             LogState(state);
             Log("ERROR", std::string("NAS security failure: ") + e.what());
@@ -823,6 +881,8 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                     std::to_string(tunUplinkBytes) + " tun-dl=" + std::to_string(tunDownlinkPackets) + "/" +
                     std::to_string(tunDownlinkBytes) + " drops(malformed/inactive)=" +
                     std::to_string(malformedDrops) + "/" + std::to_string(bearerInactiveDrops));
+    Log("INFO", "NAS security counts: UL-next=" + std::to_string(security.ulNasCount) +
+                    " DL-last=" + std::to_string(security.dlNasCount));
     Log("INFO", "Paging statistics: indications=" + std::to_string(pagingIndications) +
                     " matched=" + std::to_string(pagingMatched) +
                     " ignored=" + std::to_string(pagingIgnored) +

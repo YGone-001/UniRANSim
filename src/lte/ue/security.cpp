@@ -340,4 +340,19 @@ uint32_t EstimateNasCount(uint32_t lastCount, uint8_t sequenceNumber)
     return ((overflow << 8U) | sequenceNumber) & 0xFFFFFFU;
 }
 
+std::vector<uint8_t> ReceiveProtectedDownlink(SecurityContext &context, const std::vector<uint8_t> &message)
+{
+    if (!context.securityActive)
+        throw SecurityError("Downlink requires active NAS security");
+    const auto parsed = ParseProtectedHeader(message.data(), message.size());
+    if (StartsNewContext(parsed.headerType))
+        throw SecurityError("Unexpected new-context header on active NAS context");
+    const auto count = EstimateNasCount(context.dlNasCount, parsed.sequenceNumber);
+    if (count <= context.dlNasCount)
+        throw SecurityError("Replayed/exhausted downlink NAS COUNT");
+    auto plain = UnprotectBody(context, false, parsed.headerType, parsed.sequenceNumber, parsed.mac, parsed.plain);
+    context.dlNasCount = count;
+    return plain;
+}
+
 } // namespace lte::ue::nas

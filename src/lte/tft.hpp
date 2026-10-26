@@ -27,14 +27,17 @@ namespace lte::tft
 class TftError : public std::runtime_error
 {
   public:
-    using std::runtime_error::runtime_error;
+    explicit TftError(const std::string &message, uint8_t cause = 42) : std::runtime_error(message), esmCause(cause)
+    {
+    }
+    uint8_t esmCause;
 };
 
-// A TFT cannot carry more than 16 filters (4-bit count field), and no single
+// A TFT cannot carry more than 15 filters (4-bit count field), and no single
 // filter is allowed to exceed the component budget below.
-constexpr size_t MaxPacketFilters = 16;
+constexpr size_t MaxPacketFilters = 15;
 constexpr size_t MaxComponentsPerFilter = 8;
-constexpr size_t MaxTftSize = 256;
+constexpr size_t MaxTftSize = 255;
 
 // Packet filter direction, TS 24.008 10.5.6.12. Values are the on-wire codes.
 enum class FilterDirection : uint8_t
@@ -61,8 +64,8 @@ constexpr uint8_t ComponentIpv4LocalAddress = 0x11;
 constexpr uint8_t ComponentProtocolOrNextHeader = 0x30;
 constexpr uint8_t ComponentSingleLocalPort = 0x40;
 constexpr uint8_t ComponentSingleRemotePort = 0x50;
-constexpr uint8_t ComponentLocalPortRange = 0x60;
-constexpr uint8_t ComponentRemotePortRange = 0x70;
+constexpr uint8_t ComponentLocalPortRange = 0x41;
+constexpr uint8_t ComponentRemotePortRange = 0x51;
 
 // One decoded packet filter. A component that is absent never matches-tests
 // against a value; it simply does not constrain that packet dimension.
@@ -107,7 +110,7 @@ struct TrafficFlowTemplate
 };
 
 // Decodes the TFT value field. `data` points at the TFT operation header, so the
-// caller has already consumed the IEI and the two-octet LV-E length. Throws
+// caller has already consumed the IEI and the one-octet TLV length. Throws
 // TftError on any malformed, truncated, duplicated or unsupported structure.
 TrafficFlowTemplate Decode(const uint8_t *data, size_t size);
 

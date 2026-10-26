@@ -102,6 +102,8 @@ void EnbMultiplexer::handleS1ap(const uint8_t *data, size_t size, uint16_t strea
             onUeContextReleaseCommand(data, size);
         else if (pdu.kind == s1ap::S1apPdu::Kind::INITIATING && pdu.procedureCode == 5)
             onErabSetupRequest(data, size);
+        else if (pdu.kind == s1ap::S1apPdu::Kind::INITIATING && pdu.procedureCode == 6)
+            onErabModifyRequest(data, size);
         else if (pdu.kind == s1ap::S1apPdu::Kind::INITIATING && pdu.procedureCode == 7)
             onErabReleaseCommand(data, size);
         else if (pdu.kind == s1ap::S1apPdu::Kind::INITIATING && pdu.procedureCode == 10)
@@ -244,7 +246,15 @@ void EnbMultiplexer::onInitialContextSetupRequest(const uint8_t *data, size_t si
     // The simulated radio identity is stable across S1 releases; fresh eNB
     // UE S1AP IDs and TEIDs must never leak into data-link routing.
     entry->bearer.establish(
-        {erab.erabId, erab.qci, entry->radioUeId, erab.transportLayerAddress, sgwTeid, localTeid});
+        {erab.erabId,
+         erab.qci,
+         entry->radioUeId,
+         erab.transportLayerAddress,
+         sgwTeid,
+         localTeid,
+         0,
+         {erab.qci, erab.priorityLevel, erab.preemptionCapability, erab.preemptionVulnerability, erab.gbr}});
+    entry->ueAmbr = UeAmbr{request.ueAmbrDl, request.ueAmbrUl};
     m_registry.bindLocalTeid(*entry, localTeid);
     entry->sgwPeer = InetAddress(Ipv4ToString(erab.transportLayerAddress), 2152);
     entry->s1 = UeS1State::CONTEXT_ESTABLISHED;
@@ -296,6 +306,8 @@ void EnbMultiplexer::onErabSetupRequest(const uint8_t *data, size_t size)
             BearerParameters parameters{};
             parameters.erabId = erab.erabId;
             parameters.qci = erab.qci;
+            parameters.qos = {erab.qci, erab.priorityLevel, erab.preemptionCapability, erab.preemptionVulnerability,
+                              erab.gbr};
             parameters.ueId = entry->radioUeId;
             parameters.sgwAddress = erab.transportLayerAddress;
             parameters.sgwTeid = TeidFromBytes(erab.gtpTeid);
@@ -331,6 +343,61 @@ void EnbMultiplexer::onErabSetupRequest(const uint8_t *data, size_t size)
 
     auto response = s1ap::EncodeErabSetupResponse(request.mmeUeS1apId, request.enbUeS1apId, established, failed);
     m_sender.sendS1ap(streamFor(*entry), response);
+}
+
+void EnbMultiplexer::onErabModifyRequest(const uint8_t *data, size_t size)
+{
+    const auto request = s1ap::DecodeErabModifyRequest(data, size);
+    auto *entry = m_registry.findByEnbUeS1apId(request.enbUeS1apId);
+    if (!entry || !entry->s1Active() || entry->mmeUeS1apId != request.mmeUeS1apId)
+        throw s1ap::CodecError("E-RAB Modify has an unknown/stale S1AP identity pair");
+    std::vector<uint8_t> modified;
+    std::vector<s1ap::ErabFailedItem> failed;
+    for (const auto &item : request.erabs)
+    {
+        auto *bearer = m_registry.findBearer(*entry, item.erabId);
+        if (!bearer || !bearer->signalingEstablished())
+        {
+            failed.push_back({item.erabId, "radioNetwork", 30}); // unknown-E-RAB-ID
+            continue;
+        }
+        auto candidate = *bearer;
+        try
+        {
+            if (item.transport)
+            {
+                if (!item.transport->ipv4)
+                    throw BearerError("Only IPv4 S1-U transport replacement is supported");
+                candidate.modifyTransport(item.transport->address, item.transport->teid);
+            }
+            else
+            {
+                candidate.modifyQos(item.qos);
+                if (item.nasPdu.empty())
+                    throw BearerError("Ordinary E-RAB Modify requires a NAS-PDU");
+            }
+        }
+        catch (const BearerError &e)
+        {
+            failed.push_back({item.erabId, item.transport ? "transport" : "radioNetwork", item.transport ? 0 : 27});
+            Log("WARN", "E-RAB Modify failed EBI=" + std::to_string(item.erabId) + ": " + e.what());
+            continue;
+        }
+        // The event loop cannot classify a packet between these operations.
+        // NAS delivery is independent of the later UE Accept/Reject.
+        if (!item.transport)
+            sendRadio(*entry, lte::ue::link::MessageType::NAS_DOWNLINK, item.nasPdu);
+        *bearer = std::move(candidate);
+        modified.push_back(item.erabId);
+        Log("INFO", "E-RAB Modify applied EBI=" + std::to_string(item.erabId) + " QCI=" +
+                        std::to_string(bearer->parameters().qci) + " SGW-TEID=" + Hex(bearer->parameters().sgwTeid, 8) +
+                        " eNB-TEID=" + Hex(bearer->parameters().localTeid, 8) +
+                        (item.transport ? " transport replacement (QoS/NAS ignored)" : " QoS metadata; NAS relayed"));
+    }
+    if (request.ueAmbr && !modified.empty())
+        entry->ueAmbr = request.ueAmbr;
+    m_sender.sendS1ap(streamFor(*entry),
+                      s1ap::EncodeErabModifyResponse(request.mmeUeS1apId, request.enbUeS1apId, modified, failed));
 }
 
 void EnbMultiplexer::onErabReleaseCommand(const uint8_t *data, size_t size)

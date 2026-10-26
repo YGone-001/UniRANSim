@@ -81,6 +81,9 @@ uint32_t EstimateNasCount(uint32_t lastCount, uint8_t sequenceNumber);
 // True for the security header types that establish a new EPS security context.
 bool StartsNewContext(SecurityHeaderType headerType);
 bool IsCiphered(SecurityHeaderType headerType);
+// Active-context receive path: verifies integrity and rejects replay/new-context
+// headers before committing the accepted downlink COUNT.
+std::vector<uint8_t> ReceiveProtectedDownlink(SecurityContext &context, const std::vector<uint8_t> &message);
 
 // TS 24.301 Service Request uses its compact security header (type 12), not a
 // normal protected NAS envelope. COUNT is the next uplink NAS COUNT.

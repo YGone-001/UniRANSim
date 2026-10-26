@@ -11,6 +11,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <lte/qos.hpp>
 #include <stdexcept>
 
 namespace lte::enb
@@ -29,6 +30,7 @@ struct BearerParameters
     // Zero for a default bearer. A dedicated bearer must name the default EBI
     // of the same PDN connection.
     uint8_t linkedDefaultEbi{};
+    ErabQos qos{};
 };
 
 enum class BearerKind : uint8_t
@@ -54,6 +56,9 @@ class DefaultBearerContext
     void validateUplink(uint32_t ueId, const uint8_t *packet, size_t size) const;
     void validateDownlink(uint32_t incomingTeid, const uint8_t *packet, size_t size) const;
     void release();
+    // Candidate validation precedes assignment. Neither operation recreates the bearer.
+    void modifyQos(const ErabQos &qos);
+    void modifyTransport(const std::array<uint8_t, 4> &address, uint32_t teid);
 
     [[nodiscard]] bool signalingEstablished() const { return m_established; }
     [[nodiscard]] bool active() const { return m_established && m_ueReady; }
