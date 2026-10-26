@@ -100,6 +100,10 @@ void EnbMultiplexer::handleS1ap(const uint8_t *data, size_t size, uint16_t strea
             onDownlinkNasTransport(data, size);
         else if (pdu.kind == s1ap::S1apPdu::Kind::INITIATING && pdu.procedureCode == 23)
             onUeContextReleaseCommand(data, size);
+        else if (pdu.kind == s1ap::S1apPdu::Kind::INITIATING && pdu.procedureCode == 5)
+            onErabSetupRequest(data, size);
+        else if (pdu.kind == s1ap::S1apPdu::Kind::INITIATING && pdu.procedureCode == 7)
+            onErabReleaseCommand(data, size);
         else if (pdu.kind == s1ap::S1apPdu::Kind::INITIATING && pdu.procedureCode == 10)
             onPaging(data, size, stream);
         else
@@ -269,6 +273,90 @@ void EnbMultiplexer::onInitialContextSetupRequest(const uint8_t *data, size_t si
     }
 }
 
+void EnbMultiplexer::onErabSetupRequest(const uint8_t *data, size_t size)
+{
+    auto request = s1ap::DecodeErabSetupRequest(data, size);
+    auto *entry = m_registry.findByEnbUeS1apId(request.enbUeS1apId);
+    if (entry == nullptr)
+        throw s1ap::CodecError("E-RAB Setup Request references an unknown or released eNB-UE-S1AP-ID");
+    if (entry->mmeUeS1apId != request.mmeUeS1apId)
+        throw s1ap::CodecError("E-RAB Setup Request does not match the UE context identity pair");
+    if (!entry->s1Active())
+        throw s1ap::CodecError("E-RAB Setup Request does not match an active S1 UE context");
+    if (!entry->bearer.signalingEstablished())
+        throw BearerError("A dedicated E-RAB requires an established default bearer");
+
+    std::vector<s1ap::ErabSetupItem> established;
+    std::vector<s1ap::ErabFailedItem> failed;
+
+    for (const auto &erab : request.erabs)
+    {
+        try
+        {
+            BearerParameters parameters{};
+            parameters.erabId = erab.erabId;
+            parameters.qci = erab.qci;
+            parameters.ueId = entry->radioUeId;
+            parameters.sgwAddress = erab.transportLayerAddress;
+            parameters.sgwTeid = TeidFromBytes(erab.gtpTeid);
+            parameters.localTeid = m_registry.allocateLocalTeid();
+            // A dedicated bearer always belongs to the PDN of this UE's default
+            // bearer; the network does not send the link and must not be guessed.
+            parameters.linkedDefaultEbi = entry->bearer.parameters().erabId;
+
+            auto &bearer = m_registry.addDedicatedBearer(*entry, parameters);
+            m_registry.bindLocalTeid(*entry, bearer, parameters.localTeid);
+
+            established.push_back(
+                {erab.erabId, ParseIpv4(m_config.s1uAddress), TeidToBytes(parameters.localTeid)});
+            Log("INFO", "Established dedicated E-RAB " + std::to_string(erab.erabId) + " for " + Describe(*entry) +
+                            ": QCI=" + std::to_string(erab.qci) + " eNB-TEID=" + Hex(parameters.localTeid, 8) +
+                            " SGW-TEID=" + Hex(parameters.sgwTeid, 8) +
+                            " linked-EBI=" + std::to_string(parameters.linkedDefaultEbi));
+
+            // The protected NAS activation request travels to the UE unchanged.
+            // The eNB holds no NAS keys and must not interpret it.
+            if (erab.nasPduPresent)
+                sendRadio(*entry, lte::ue::link::MessageType::NAS_DOWNLINK, erab.nasPdu);
+        }
+        catch (const std::exception &e)
+        {
+            failed.push_back({erab.erabId, "radioNetwork", 0});
+            Log("WARN", "Failed to establish dedicated E-RAB " + std::to_string(erab.erabId) + ": " + e.what());
+        }
+    }
+
+    if (established.empty())
+        throw BearerError("No requested dedicated E-RAB could be established");
+
+    auto response = s1ap::EncodeErabSetupResponse(request.mmeUeS1apId, request.enbUeS1apId, established, failed);
+    m_sender.sendS1ap(streamFor(*entry), response);
+}
+
+void EnbMultiplexer::onErabReleaseCommand(const uint8_t *data, size_t size)
+{
+    auto command = s1ap::DecodeErabReleaseCommand(data, size);
+    auto *entry = m_registry.findByEnbUeS1apId(command.enbUeS1apId);
+    if (entry == nullptr)
+        throw s1ap::CodecError("E-RAB Release Command references an unknown or released eNB-UE-S1AP-ID");
+    if (entry->mmeUeS1apId != command.mmeUeS1apId)
+        throw s1ap::CodecError("E-RAB Release Command does not match the UE context identity pair");
+
+    for (auto erabId : command.erabIds)
+    {
+        // Releasing the default bearer is a PDN teardown, not an E-RAB release;
+        // treating it as one would leave the UE registered with no user plane.
+        if (entry->bearer.parameters().erabId == erabId)
+            throw BearerError("The default bearer cannot be released by an E-RAB Release Command");
+        m_registry.releaseBearer(*entry, erabId);
+        sendRadio(*entry, lte::ue::link::MessageType::BEARER_RELEASED, {erabId});
+        Log("INFO", "Released dedicated E-RAB " + std::to_string(erabId) + " for " + Describe(*entry));
+    }
+
+    auto response = s1ap::EncodeErabReleaseResponse(command.mmeUeS1apId, command.enbUeS1apId, command.erabIds);
+    m_sender.sendS1ap(streamFor(*entry), response);
+}
+
 void EnbMultiplexer::onDownlinkNasTransport(const uint8_t *data, size_t size)
 {
     auto downlink = s1ap::DecodeDownlinkNasTransport(data, size);
@@ -389,6 +477,28 @@ void EnbMultiplexer::handleRadioFrame(const uint8_t *data, size_t size, const In
         else if (radio.type == lte::ue::link::MessageType::DATA_UPLINK)
         {
             m_s1u.forwardUplink(*entry, radio.payload.data(), radio.payload.size());
+        }
+        else if (radio.type == lte::ue::link::MessageType::DATA_UPLINK_BEARER)
+        {
+            if (radio.payload.size() < 2)
+                throw lte::ue::link::DecodeError("Malformed bearer-aware uplink frame");
+            BearerContext *bearer = m_registry.findBearer(*entry, radio.payload[0]);
+            if (bearer == nullptr || bearer->kind() != BearerKind::DEDICATED)
+                throw lte::ue::link::DecodeError("Uplink names an unknown or released dedicated bearer");
+            m_s1u.forwardUplink(*entry, *bearer, radio.payload.data() + 1, radio.payload.size() - 1);
+        }
+        else if (radio.type == lte::ue::link::MessageType::BEARER_ACTIVATED)
+        {
+            if (radio.payload.size() != 1)
+                throw lte::ue::link::DecodeError("Malformed bearer activation confirmation");
+            BearerContext *bearer = m_registry.findBearer(*entry, radio.payload[0]);
+            if (bearer == nullptr || bearer->kind() != BearerKind::DEDICATED)
+                throw lte::ue::link::DecodeError("Activation names an unknown dedicated bearer");
+            // The UE shares the PDN address of its default bearer, so a
+            // dedicated bearer becomes forwardable only after this confirmation.
+            bearer->activateUe(entry->radioUeId, radio.payload[0], entry->bearer.ueIpv4());
+            Log("INFO", "Dedicated EPS bearer " + std::to_string(radio.payload[0]) +
+                            " ready for forwarding on LTE UE " + std::to_string(entry->radioUeId));
         }
         else
             throw lte::ue::link::DecodeError("Unsupported LTE radio-link message for an active UE");

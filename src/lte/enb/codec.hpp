@@ -196,6 +196,54 @@ std::vector<uint8_t> EncodeUeContextReleaseRequest(uint32_t mmeUeS1apId, uint32_
                                                    int causeValue = 20);
 UeContextReleaseRequest DecodeUeContextReleaseRequest(const uint8_t *data, size_t length);
 
+// --- Phase 7: S1AP E-RAB management (TS 36.413, procedures 5 and 7) ---------
+
+// One E-RAB item of an MME-initiated E-RAB Setup Request. The item layout is
+// identical to the Initial Context Setup variant, which is why the same
+// structure and decoder serve both.
+struct ErabSetupRequest
+{
+    uint32_t mmeUeS1apId{};
+    uint32_t enbUeS1apId{};
+    std::vector<ErabToBeSetupItem> erabs;
+};
+
+// The MME sends this on an existing UE-associated S1 connection when it adds a
+// dedicated bearer, so it must not be confused with Initial Context Setup.
+ErabSetupRequest DecodeErabSetupRequest(const uint8_t *data, size_t length);
+// Encoder used by the automated tests and for offline fixture generation.
+std::vector<uint8_t> EncodeErabSetupRequest(const ErabSetupRequest &request);
+
+// An E-RAB the eNB could not establish, reported per item so one failure cannot
+// be mistaken for a success.
+struct ErabFailedItem
+{
+    uint8_t erabId{};
+    std::string causeCategory{"radioNetwork"};
+    int causeValue{};
+};
+
+std::vector<uint8_t> EncodeErabSetupResponse(uint32_t mmeUeS1apId, uint32_t enbUeS1apId,
+                                             const std::vector<ErabSetupItem> &established,
+                                             const std::vector<ErabFailedItem> &failed);
+
+struct ErabReleaseCommand
+{
+    uint32_t mmeUeS1apId{};
+    uint32_t enbUeS1apId{};
+    std::vector<uint8_t> erabIds;
+    std::string causeCategory;
+    int causeValue{-1};
+};
+
+ErabReleaseCommand DecodeErabReleaseCommand(const uint8_t *data, size_t length);
+// Encoder used by the automated tests and for offline fixture generation.
+std::vector<uint8_t> EncodeErabReleaseCommand(const ErabReleaseCommand &command);
+
+// Per-E-RAB outcome of a release. The eNB reports every requested E-RAB.
+std::vector<uint8_t> EncodeErabReleaseResponse(uint32_t mmeUeS1apId, uint32_t enbUeS1apId,
+                                               const std::vector<uint8_t> &releasedErabIds);
+
 // --- Phase 6: S1AP Paging (TS 36.413, procedure code 10) --------------------
 
 // One tracking area of a Paging TAI list: PLMN identity and 16-bit TAC.

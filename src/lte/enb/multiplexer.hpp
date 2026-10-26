@@ -87,6 +87,10 @@ class EnbMultiplexer
     void onUeContextReleaseCommand(const uint8_t *data, size_t size);
     // Non-UE-associated Paging: validates the PDU, filters by tracking area and
     // fans one simulated notification out to retained idle radio endpoints.
+    // Adds one network-initiated dedicated E-RAB on an existing S1 context.
+    void onErabSetupRequest(const uint8_t *data, size_t size);
+    // Releases named dedicated E-RABs without touching the default bearer.
+    void onErabReleaseCommand(const uint8_t *data, size_t size);
     void onPaging(const uint8_t *data, size_t size, uint16_t stream);
     [[nodiscard]] bool servesPagingTai(const std::vector<s1ap::Tai> &taiList) const;
     void onBearerReady(EnbUeEntry &entry, const std::vector<uint8_t> &payload);

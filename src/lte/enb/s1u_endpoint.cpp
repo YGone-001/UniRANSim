@@ -83,8 +83,10 @@ void S1uEndpoint::handleDatagram(const uint8_t *data, size_t size, const InetAdd
     if (packet.messageType == gtpu::EchoResponse)
         return;
 
-    EnbUeEntry *entry = m_registry.findByLocalTeid(packet.teid);
-    if (entry == nullptr)
+    const auto location = m_registry.findBearerByLocalTeid(packet.teid);
+    EnbUeEntry *entry = location.entry;
+    BearerContext *bearer = location.bearer;
+    if (entry == nullptr || bearer == nullptr)
     {
         ++m_counters.unknownTeidDrops;
         Log("WARN", "Dropped S1-U T-PDU with unknown/stale TEID " + Hex(packet.teid, 8));
@@ -96,14 +98,14 @@ void S1uEndpoint::handleDatagram(const uint8_t *data, size_t size, const InetAdd
         Log("WARN", "Dropped S1-U datagram from unexpected peer " + peer.toString());
         return;
     }
-    if (!entry->bearer.active())
+    if (!bearer->active())
     {
         ++entry->counters.bearerInactiveDrops;
         return;
     }
     try
     {
-        entry->bearer.validateDownlink(packet.teid, packet.payload.data(), packet.payload.size());
+        bearer->validateDownlink(packet.teid, packet.payload.data(), packet.payload.size());
     }
     catch (const std::exception &e)
     {
@@ -114,9 +116,25 @@ void S1uEndpoint::handleDatagram(const uint8_t *data, size_t size, const InetAdd
 
     ++entry->counters.s1uDownlinkPackets;
     entry->counters.s1uDownlinkBytes += packet.payload.size();
-    auto frame = lte::ue::link::Encode(
-        {lte::ue::link::MessageType::DATA_DOWNLINK, entry->radioUeId, std::move(packet.payload)});
-    const size_t ipBytes = frame.size() - lte::ue::link::HeaderSize;
+
+    // The bearer that received this T-PDU decides the framing the UE sees, so a
+    // dedicated packet can never be delivered as if it were default traffic.
+    const size_t ipBytes = packet.payload.size();
+    std::vector<uint8_t> frame;
+    if (bearer->kind() == BearerKind::DEDICATED)
+    {
+        std::vector<uint8_t> payload;
+        payload.reserve(ipBytes + 1U);
+        payload.push_back(bearer->parameters().erabId);
+        payload.insert(payload.end(), packet.payload.begin(), packet.payload.end());
+        frame = lte::ue::link::Encode(
+            {lte::ue::link::MessageType::DATA_DOWNLINK_BEARER, entry->radioUeId, std::move(payload)});
+    }
+    else
+    {
+        frame = lte::ue::link::Encode(
+            {lte::ue::link::MessageType::DATA_DOWNLINK, entry->radioUeId, std::move(packet.payload)});
+    }
     if (m_ueLink.TrySend(entry->peer, frame.data(), frame.size()))
     {
         ++entry->counters.simulatedDownlinkPackets;
@@ -139,14 +157,19 @@ void S1uEndpoint::poll(int budget)
 
 void S1uEndpoint::forwardUplink(EnbUeEntry &entry, const uint8_t *packet, size_t size)
 {
-    if (!entry.bearer.active())
+    forwardUplink(entry, entry.bearer, packet, size);
+}
+
+void S1uEndpoint::forwardUplink(EnbUeEntry &entry, BearerContext &bearer, const uint8_t *packet, size_t size)
+{
+    if (!bearer.active())
     {
         ++entry.counters.bearerInactiveDrops;
         throw BearerError("Uplink data received before bearer readiness");
     }
     try
     {
-        entry.bearer.validateUplink(entry.radioUeId, packet, size);
+        bearer.validateUplink(entry.radioUeId, packet, size);
     }
     catch (const std::exception &)
     {
@@ -155,7 +178,7 @@ void S1uEndpoint::forwardUplink(EnbUeEntry &entry, const uint8_t *packet, size_t
     }
     ++entry.counters.simulatedUplinkPackets;
     entry.counters.simulatedUplinkBytes += size;
-    auto datagram = gtpu::EncodeTPdu(entry.bearer.parameters().sgwTeid, packet, size);
+    auto datagram = gtpu::EncodeTPdu(bearer.parameters().sgwTeid, packet, size);
     if (m_socket->TrySend(entry.sgwPeer, datagram.data(), datagram.size()))
     {
         ++entry.counters.s1uUplinkPackets;

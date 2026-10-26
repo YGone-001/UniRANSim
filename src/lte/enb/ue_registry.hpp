@@ -75,6 +75,11 @@ struct EnbUeEntry
     // Zero until the MME assigns one; never invented locally.
     uint32_t mmeUeS1apId{};
     DefaultBearerContext bearer{};
+    // The default bearer remains named for Phase 6 source compatibility.
+    // Together with these bounded contexts it forms the per-UE EPS bearer
+    // collection; matching EBI values in different UE entries are valid.
+    static constexpr size_t MaxDedicatedBearers = 7;
+    std::vector<BearerContext> dedicatedBearers;
     InetAddress sgwPeer{};
     UserPlaneCounters counters{};
     // Simulated paging notifications delivered to this radio endpoint. It
@@ -86,6 +91,12 @@ struct EnbUeEntry
         return s1 == UeS1State::CONTEXT_PENDING || s1 == UeS1State::CONTEXT_ESTABLISHED ||
                s1 == UeS1State::BEARER_ACTIVE;
     }
+};
+
+struct BearerLocation
+{
+    EnbUeEntry *entry{};
+    BearerContext *bearer{};
 };
 
 // SCTP stream selection for UE-associated signalling. Stream zero carries
@@ -112,6 +123,14 @@ class UeRegistry
     EnbUeEntry *findByEnbUeS1apId(uint32_t enbUeS1apId);
     EnbUeEntry *findByMmeUeS1apId(uint32_t mmeUeS1apId);
     EnbUeEntry *findByLocalTeid(uint32_t teid);
+    BearerLocation findBearerByLocalTeid(uint32_t teid);
+    BearerContext *findBearer(EnbUeEntry &entry, uint8_t ebi);
+    const BearerContext *findBearer(const EnbUeEntry &entry, uint8_t ebi) const;
+
+    // Inserts a dedicated bearer only after validating that its linked default
+    // EBI belongs to this exact UE and that capacity/EBI uniqueness hold.
+    BearerContext &addDedicatedBearer(EnbUeEntry &entry, const BearerParameters &parameters);
+    void releaseBearer(EnbUeEntry &entry, uint8_t ebi);
 
     // Allocates an eNB-UE-S1AP-ID unique among live contexts, skipping zero
     // and wrapping around without colliding with active identifiers.
@@ -126,6 +145,7 @@ class UeRegistry
     // and never zero.
     uint32_t allocateLocalTeid();
     void bindLocalTeid(EnbUeEntry &entry, uint32_t teid);
+    void bindLocalTeid(EnbUeEntry &entry, BearerContext &bearer, uint32_t teid);
 
     // Releases the S1 connection of one UE: the S1AP identifiers and the local
     // GTP-U TEID stop resolving, the default bearer is released, and the entry

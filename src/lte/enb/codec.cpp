@@ -50,6 +50,17 @@ constexpr uint16_t IE_SERVED_GUMMEIS = 105;
 constexpr uint16_t IE_DEFAULT_PAGING_DRX = 137;
 constexpr uint16_t IE_CRITICALITY_DIAGNOSTICS = 58;
 constexpr uint16_t IE_TAI = 67;
+constexpr uint16_t PROCEDURE_E_RAB_SETUP = 5;
+constexpr uint16_t PROCEDURE_E_RAB_RELEASE = 7;
+constexpr uint16_t IE_E_RAB_TO_BE_SETUP_LIST_BEARER_SU_REQ = 16;
+constexpr uint16_t IE_E_RAB_TO_BE_SETUP_ITEM_BEARER_SU_REQ = 17;
+constexpr uint16_t IE_E_RAB_SETUP_LIST_BEARER_SU_RES = 28;
+constexpr uint16_t IE_E_RAB_FAILED_TO_SETUP_LIST_BEARER_SU_RES = 29;
+constexpr uint16_t IE_E_RAB_TO_BE_RELEASED_LIST = 33;
+constexpr uint16_t IE_E_RAB_ITEM = 35;
+constexpr uint16_t IE_E_RAB_RELEASE_ITEM = 38;
+constexpr uint16_t IE_E_RAB_SETUP_ITEM_BEARER_SU_RES = 39;
+constexpr uint16_t IE_E_RAB_RELEASED_LIST = 110;
 constexpr uint16_t IE_EUTRAN_CGI = 100;
 constexpr uint16_t IE_RRC_ESTABLISHMENT_CAUSE = 134;
 constexpr uint16_t IE_S_TMSI = 96;
@@ -862,6 +873,44 @@ ErabToBeSetupItem ReadErabToBeSetupItem(BitReader &reader)
     if (extensionsPresent)
         throw CodecError("E-RABToBeSetupItemCtxtSUReq extensions are not supported");
     return item;
+}
+
+// E-RABToBeSetupItemBearerSUReq carries a mandatory nAS-PDU, unlike the
+// CtxtSUReq variant whose nAS-PDU is OPTIONAL. Reading it with the CtxtSUReq
+// layout consumes one bit too many and shifts every following field, so the two
+// shapes must not share a decoder.
+ErabToBeSetupItem ReadErabToBeSetupItemBearerSUReq(BitReader &reader)
+{
+    ErabToBeSetupItem item{};
+    if (reader.readBit())
+        throw CodecError("Extended E-RABToBeSetupItemBearerSUReq is not supported");
+    const bool extensionsPresent = reader.readBit();
+    item.erabId = ReadErabId(reader);
+    ReadErabLevelQos(reader, item);
+    item.transportLayerAddress = ReadTransportLayerAddress(reader);
+    {
+        auto teid = ReadFixedOctets(reader, 4);
+        std::copy(teid.begin(), teid.end(), item.gtpTeid.begin());
+    }
+    item.nasPduPresent = true;
+    item.nasPdu = reader.readBytes(reader.readLength());
+    if (extensionsPresent)
+        throw CodecError("E-RABToBeSetupItemBearerSUReq extensions are not supported");
+    return item;
+}
+
+std::vector<uint8_t> EncodeErabToBeSetupItemBearerSUReq(const ErabToBeSetupItem &item)
+{
+    BitWriter writer;
+    writer.writeBit(false); // SEQUENCE extension marker
+    writer.writeBit(false); // iE-Extensions absent
+    WriteErabId(writer, item.erabId);
+    WriteErabLevelQos(writer, item.qci, item.priorityLevel, item.preemptionCapability, item.preemptionVulnerability);
+    WriteTransportLayerAddress(writer, item.transportLayerAddress);
+    WriteFixedOctets(writer, item.gtpTeid.data(), item.gtpTeid.size());
+    writer.writeLength(item.nasPdu.size());
+    writer.writeBytes(item.nasPdu);
+    return writer.take();
 }
 
 std::vector<uint8_t> EncodeErabSetupItem(const ErabSetupItem &item)
@@ -1745,6 +1794,318 @@ std::vector<uint8_t> EncodePaging(const PagingMessage &message)
         ies.push_back({{IE_DEFAULT_PAGING_DRX, Criticality::IGNORE}, drx.take()});
     }
     return EncodePdu(0, PROCEDURE_PAGING, Criticality::IGNORE, ies);
+}
+
+
+// --- Phase 7: S1AP E-RAB management (TS 36.413, procedures 5 and 7) ---------
+
+namespace
+{
+
+// Cause ::= CHOICE { radioNetwork(0), transport(1), nas(2), protocol(3), misc(4), ... }
+// Only the five standard categories are encoded; an extension cause would mean
+// the peer speaks a vocabulary this eNB does not implement.
+void WriteCause(BitWriter &writer, const std::string &category, int value)
+{
+    static const std::array<const char *, 5> names{"radioNetwork", "transport", "nas", "protocol", "misc"};
+    size_t index = names.size();
+    for (size_t i = 0; i < names.size(); ++i)
+    {
+        if (category == names[i])
+        {
+            index = i;
+            break;
+        }
+    }
+    if (index == names.size())
+        throw CodecError("Unsupported S1AP cause category " + category);
+    if (value < 0 || value > 255)
+        throw CodecError("S1AP cause value is out of range");
+    writer.writeBits(static_cast<uint8_t>(index), 4);
+    writer.writeBit(false); // not an extension enumeration value
+    writer.writeBits(static_cast<uint8_t>(value), 8);
+}
+
+void ReadCause(BitReader &reader, std::string &category, int &value)
+{
+    static const std::array<const char *, 5> names{"radioNetwork", "transport", "nas", "protocol", "misc"};
+    const auto index = static_cast<size_t>(reader.readBits(4));
+    if (index >= names.size())
+        throw CodecError("Unsupported S1AP cause choice");
+    if (reader.readBit())
+        throw CodecError("S1AP cause extension values are not supported");
+    category = names[index];
+    value = static_cast<int>(reader.readBits(8));
+}
+
+} // namespace
+
+ErabSetupRequest DecodeErabSetupRequest(const uint8_t *data, size_t length)
+{
+    auto envelope = DecodeEnvelope(data, length, PROCEDURE_E_RAB_SETUP, static_cast<int>(Criticality::REJECT));
+    if (envelope.choice != 0)
+        throw CodecError("E-RAB Setup Request is not an initiating message");
+
+    ErabSetupRequest result{};
+    bool mmePresent = false;
+    bool enbPresent = false;
+    bool erabsPresent = false;
+
+    for (const auto &ie : DecodeIeContainer(envelope.value))
+    {
+        if (ie.id == IE_MME_UE_S1AP_ID)
+        {
+            if (ie.criticality != Criticality::REJECT)
+                throw CodecError("MME-UE-S1AP-ID has invalid criticality");
+            result.mmeUeS1apId = DecodeUeId(ie.value, 0xFFFFFFFFU);
+            mmePresent = true;
+        }
+        else if (ie.id == IE_ENB_UE_S1AP_ID)
+        {
+            if (ie.criticality != Criticality::REJECT)
+                throw CodecError("eNB-UE-S1AP-ID has invalid criticality");
+            result.enbUeS1apId = DecodeUeId(ie.value, 0xFFFFFFU);
+            enbPresent = true;
+        }
+        else if (ie.id == IE_E_RAB_TO_BE_SETUP_LIST_BEARER_SU_REQ)
+        {
+            if (ie.criticality != Criticality::REJECT)
+                throw CodecError("E-RABToBeSetupListBearerSUReq has invalid criticality");
+            BitReader reader(ie.value);
+            const size_t count = ReadConstrained(reader, 1, 256, true);
+            result.erabs.reserve(count);
+            for (size_t i = 0; i < count; ++i)
+            {
+                const auto id = static_cast<uint16_t>(ReadConstrained(reader, 0, 65535, true));
+                if (id != IE_E_RAB_TO_BE_SETUP_ITEM_BEARER_SU_REQ)
+                    throw CodecError("Unexpected E-RABToBeSetupListBearerSUReq item identity");
+                reader.readBits(2);
+                reader.align();
+                auto value = reader.readOpenType();
+                BitReader itemReader(value);
+                result.erabs.push_back(ReadErabToBeSetupItemBearerSUReq(itemReader));
+                itemReader.requireFinished();
+            }
+            reader.requireFinished();
+            erabsPresent = true;
+        }
+        else if (ie.criticality == Criticality::REJECT)
+            throw CodecError("Unknown reject-criticality IE in E-RAB Setup Request");
+    }
+
+    if (!mmePresent || !enbPresent || !erabsPresent)
+        throw CodecError("E-RAB Setup Request is missing a mandatory IE");
+    if (result.erabs.empty())
+        throw CodecError("E-RAB Setup Request contains no E-RAB to establish");
+
+    for (size_t i = 0; i < result.erabs.size(); ++i)
+    {
+        for (size_t j = i + 1; j < result.erabs.size(); ++j)
+        {
+            if (result.erabs[i].erabId == result.erabs[j].erabId)
+                throw CodecError("E-RAB Setup Request repeats an E-RAB identity");
+        }
+    }
+
+    return result;
+}
+
+std::vector<uint8_t> EncodeErabSetupRequest(const ErabSetupRequest &request)
+{
+    if (request.erabs.empty() || request.erabs.size() > 256)
+        throw CodecError("E-RAB Setup Request requires 1..256 E-RABs");
+    if (request.mmeUeS1apId == 0 || request.enbUeS1apId == 0 || request.enbUeS1apId > 0xFFFFFFU)
+        throw CodecError("E-RAB Setup Request has an invalid UE S1AP identity");
+
+    BitWriter list;
+    WriteConstrained(list, request.erabs.size(), 1, 256, true);
+    for (const auto &erab : request.erabs)
+    {
+        WriteIe(list, IE_E_RAB_TO_BE_SETUP_ITEM_BEARER_SU_REQ, Criticality::REJECT,
+               EncodeErabToBeSetupItemBearerSUReq(erab));
+    }
+
+    std::vector<std::pair<std::pair<uint16_t, Criticality>, std::vector<uint8_t>>> ies;
+    ies.push_back({{IE_MME_UE_S1AP_ID, Criticality::REJECT}, EncodeUeId(request.mmeUeS1apId, 0xFFFFFFFFU)});
+    ies.push_back({{IE_ENB_UE_S1AP_ID, Criticality::REJECT}, EncodeUeId(request.enbUeS1apId, 0xFFFFFFU)});
+    ies.push_back({{IE_E_RAB_TO_BE_SETUP_LIST_BEARER_SU_REQ, Criticality::REJECT}, list.take()});
+    return EncodePdu(0, PROCEDURE_E_RAB_SETUP, Criticality::REJECT, ies);
+}
+
+std::vector<uint8_t> EncodeErabSetupResponse(uint32_t mmeUeS1apId, uint32_t enbUeS1apId,
+                                             const std::vector<ErabSetupItem> &established,
+                                             const std::vector<ErabFailedItem> &failed)
+{
+    if (mmeUeS1apId == 0 || enbUeS1apId == 0 || enbUeS1apId > 0xFFFFFFU)
+        throw CodecError("E-RAB Setup Response has an invalid UE S1AP identity");
+    if (established.empty())
+        throw CodecError("E-RAB Setup Response requires at least one established E-RAB");
+
+    BitWriter list;
+    WriteConstrained(list, established.size(), 1, 256, true);
+    for (const auto &erab : established)
+    {
+        BitWriter item;
+        item.writeBit(false);
+        item.writeBit(false);
+        WriteErabId(item, erab.erabId);
+        WriteTransportLayerAddress(item, erab.transportLayerAddress);
+        WriteFixedOctets(item, erab.gtpTeid.data(), erab.gtpTeid.size());
+        WriteIe(list, IE_E_RAB_SETUP_ITEM_BEARER_SU_RES, Criticality::IGNORE, item.take());
+    }
+
+    std::vector<std::pair<std::pair<uint16_t, Criticality>, std::vector<uint8_t>>> ies;
+    ies.push_back({{IE_MME_UE_S1AP_ID, Criticality::REJECT}, EncodeUeId(mmeUeS1apId, 0xFFFFFFFFU)});
+    ies.push_back({{IE_ENB_UE_S1AP_ID, Criticality::REJECT}, EncodeUeId(enbUeS1apId, 0xFFFFFFU)});
+    ies.push_back({{IE_E_RAB_SETUP_LIST_BEARER_SU_RES, Criticality::REJECT}, list.take()});
+
+    if (!failed.empty())
+    {
+        BitWriter failedList;
+        WriteConstrained(failedList, failed.size(), 1, 256, true);
+        for (const auto &erab : failed)
+        {
+            BitWriter item;
+            item.writeBit(false);
+            item.writeBit(false);
+            WriteErabId(item, erab.erabId);
+            WriteCause(item, erab.causeCategory, erab.causeValue);
+            WriteIe(failedList, IE_E_RAB_ITEM, Criticality::IGNORE, item.take());
+        }
+        ies.push_back({{IE_E_RAB_FAILED_TO_SETUP_LIST_BEARER_SU_RES, Criticality::IGNORE}, failedList.take()});
+    }
+
+    return EncodePdu(1, PROCEDURE_E_RAB_SETUP, Criticality::REJECT, ies);
+}
+
+ErabReleaseCommand DecodeErabReleaseCommand(const uint8_t *data, size_t length)
+{
+    auto envelope = DecodeEnvelope(data, length, PROCEDURE_E_RAB_RELEASE, static_cast<int>(Criticality::REJECT));
+    if (envelope.choice != 0)
+        throw CodecError("E-RAB Release Command is not an initiating message");
+
+    ErabReleaseCommand result{};
+    bool mmePresent = false;
+    bool erabsPresent = false;
+
+    for (const auto &ie : DecodeIeContainer(envelope.value))
+    {
+        if (ie.id == IE_MME_UE_S1AP_ID)
+        {
+            if (ie.criticality != Criticality::REJECT)
+                throw CodecError("MME-UE-S1AP-ID has invalid criticality");
+            result.mmeUeS1apId = DecodeUeId(ie.value, 0xFFFFFFFFU);
+            mmePresent = true;
+        }
+        else if (ie.id == IE_ENB_UE_S1AP_ID)
+        {
+            if (ie.criticality != Criticality::REJECT)
+                throw CodecError("eNB-UE-S1AP-ID has invalid criticality");
+            result.enbUeS1apId = DecodeUeId(ie.value, 0xFFFFFFU);
+        }
+        else if (ie.id == IE_E_RAB_TO_BE_RELEASED_LIST)
+        {
+            if (ie.criticality != Criticality::REJECT)
+                throw CodecError("E-RABToBeReleasedList has invalid criticality");
+            BitReader reader(ie.value);
+            const size_t count = ReadConstrained(reader, 1, 256, true);
+            result.erabIds.reserve(count);
+            for (size_t i = 0; i < count; ++i)
+            {
+                const auto id = static_cast<uint16_t>(ReadConstrained(reader, 0, 65535, true));
+                if (id != IE_E_RAB_RELEASE_ITEM)
+                    throw CodecError("Unexpected E-RABToBeReleasedList item identity");
+                reader.readBits(2);
+                reader.align();
+                auto value = reader.readOpenType();
+                BitReader itemReader(value);
+                if (itemReader.readBit())
+                    throw CodecError("Unsupported E-RAB release item extension");
+                if (itemReader.readBit())
+                    throw CodecError("Unsupported E-RAB release item extensions");
+                result.erabIds.push_back(ReadErabId(itemReader));
+                itemReader.requireFinished();
+            }
+            reader.requireFinished();
+            erabsPresent = true;
+        }
+        else if (ie.id == IE_CAUSE)
+        {
+            if (ie.criticality != Criticality::IGNORE)
+                throw CodecError("Cause has invalid criticality");
+            BitReader reader(ie.value);
+            ReadCause(reader, result.causeCategory, result.causeValue);
+            reader.requireFinished();
+        }
+        else if (ie.criticality == Criticality::REJECT)
+            throw CodecError("Unknown reject-criticality IE in E-RAB Release Command");
+    }
+
+    if (!mmePresent || !erabsPresent)
+        throw CodecError("E-RAB Release Command is missing a mandatory IE");
+    if (result.erabIds.empty())
+        throw CodecError("E-RAB Release Command requests no E-RAB release");
+    return result;
+}
+
+std::vector<uint8_t> EncodeErabReleaseCommand(const ErabReleaseCommand &command)
+{
+    if (command.erabIds.empty() || command.erabIds.size() > 256)
+        throw CodecError("E-RAB Release Command requires 1..256 E-RABs");
+    if (command.mmeUeS1apId == 0 || command.enbUeS1apId == 0 || command.enbUeS1apId > 0xFFFFFFU)
+        throw CodecError("E-RAB Release Command has an invalid UE S1AP identity");
+
+    BitWriter list;
+    WriteConstrained(list, command.erabIds.size(), 1, 256, true);
+    for (auto erabId : command.erabIds)
+    {
+        BitWriter item;
+        item.writeBit(false);
+        item.writeBit(false);
+        WriteErabId(item, erabId);
+        WriteIe(list, IE_E_RAB_RELEASE_ITEM, Criticality::REJECT, item.take());
+    }
+
+    std::vector<std::pair<std::pair<uint16_t, Criticality>, std::vector<uint8_t>>> ies;
+    ies.push_back({{IE_MME_UE_S1AP_ID, Criticality::REJECT}, EncodeUeId(command.mmeUeS1apId, 0xFFFFFFFFU)});
+    ies.push_back({{IE_ENB_UE_S1AP_ID, Criticality::REJECT}, EncodeUeId(command.enbUeS1apId, 0xFFFFFFU)});
+    ies.push_back({{IE_E_RAB_TO_BE_RELEASED_LIST, Criticality::REJECT}, list.take()});
+    if (!command.causeCategory.empty())
+    {
+        BitWriter cause;
+        WriteCause(cause, command.causeCategory, command.causeValue);
+        ies.push_back({{IE_CAUSE, Criticality::IGNORE}, cause.take()});
+    }
+    return EncodePdu(0, PROCEDURE_E_RAB_RELEASE, Criticality::REJECT, ies);
+}
+
+std::vector<uint8_t> EncodeErabReleaseResponse(uint32_t mmeUeS1apId, uint32_t enbUeS1apId,
+                                               const std::vector<uint8_t> &releasedErabIds)
+{
+    if (releasedErabIds.empty() || releasedErabIds.size() > 256)
+        throw CodecError("E-RAB Release Response requires 1..256 E-RABs");
+    if (mmeUeS1apId == 0 || enbUeS1apId == 0 || enbUeS1apId > 0xFFFFFFU)
+        throw CodecError("E-RAB Release Response has an invalid UE S1AP identity");
+
+    BitWriter list;
+    WriteConstrained(list, releasedErabIds.size(), 1, 256, true);
+    for (auto erabId : releasedErabIds)
+    {
+        BitWriter item;
+        item.writeBit(false);
+        item.writeBit(false);
+        WriteErabId(item, erabId);
+        // A successful release still carries a cause; unspecified radioNetwork
+        // is the neutral value that claims nothing about why it happened.
+        WriteCause(item, "radioNetwork", 0);
+        WriteIe(list, IE_E_RAB_ITEM, Criticality::IGNORE, item.take());
+    }
+
+    std::vector<std::pair<std::pair<uint16_t, Criticality>, std::vector<uint8_t>>> ies;
+    ies.push_back({{IE_MME_UE_S1AP_ID, Criticality::REJECT}, EncodeUeId(mmeUeS1apId, 0xFFFFFFFFU)});
+    ies.push_back({{IE_ENB_UE_S1AP_ID, Criticality::REJECT}, EncodeUeId(enbUeS1apId, 0xFFFFFFU)});
+    ies.push_back({{IE_E_RAB_RELEASED_LIST, Criticality::IGNORE}, list.take()});
+    return EncodePdu(1, PROCEDURE_E_RAB_RELEASE, Criticality::REJECT, ies);
 }
 
 } // namespace lte::enb::s1ap

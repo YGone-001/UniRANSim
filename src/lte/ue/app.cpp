@@ -15,6 +15,7 @@
 #include "security.hpp"
 #include "tun.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <iomanip>
 #include <iostream>
@@ -22,6 +23,7 @@
 #include <sstream>
 
 #include <lte/ip_packet.hpp>
+#include <lte/tft.hpp>
 
 #include <lib/udp/server.hpp>
 
@@ -93,6 +95,18 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
     uint8_t activeEbi = 0;
     std::array<uint8_t, 4> assignedIpv4{};
     std::unique_ptr<TunDevice> tun;
+    // Dedicated EPS bearers accepted on top of the default bearer. Each keeps
+    // its own TFT so an uplink packet is routed by what the network selected,
+    // never by a heuristic.
+    struct DedicatedBearerRuntime
+    {
+        uint8_t ebi{};
+        uint8_t qci{};
+        lte::tft::TftState tft;
+    };
+    std::vector<DedicatedBearerRuntime> dedicatedBearers;
+    uint64_t dedicatedUplinkPackets = 0;
+    uint64_t dedicatedDownlinkPackets = 0;
     uint64_t tunUplinkPackets = 0;
     uint64_t tunUplinkBytes = 0;
     uint64_t tunDownlinkPackets = 0;
@@ -243,7 +257,35 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                         throw ip::ValidationError("TUN uplink source does not match the assigned UE IPv4 address");
                     ++tunUplinkPackets;
                     tunUplinkBytes += packet.size();
-                    auto frame = link::Encode({link::MessageType::DATA_UPLINK, ueId, std::move(packet)});
+
+                    // Select the bearer by the network-provided TFT. Ties are
+                    // resolved by evaluation precedence, and no match falls
+                    // back to the default bearer.
+                    uint8_t selectedEbi = activeEbi;
+                    int bestPrecedence = 256;
+                    for (const auto &bearer : dedicatedBearers)
+                    {
+                        const auto *filter = bearer.tft.classify(packet.data(), packet.size(), true);
+                        if (filter != nullptr && filter->precedence < bestPrecedence)
+                        {
+                            bestPrecedence = filter->precedence;
+                            selectedEbi = bearer.ebi;
+                        }
+                    }
+
+                    std::vector<uint8_t> frame;
+                    if (selectedEbi != activeEbi)
+                    {
+                        std::vector<uint8_t> payload;
+                        payload.reserve(packet.size() + 1);
+                        payload.push_back(selectedEbi);
+                        payload.insert(payload.end(), packet.begin(), packet.end());
+                        frame = link::Encode({link::MessageType::DATA_UPLINK_BEARER, ueId, std::move(payload)});
+                        ++dedicatedUplinkPackets;
+                    }
+                    else
+                        frame = link::Encode({link::MessageType::DATA_UPLINK, ueId, std::move(packet)});
+
                     if (!socket.TrySend(enb, frame.data(), frame.size()))
                         Log("WARN", "LTE radio-link uplink send would block; packet dropped");
                 }
@@ -272,13 +314,27 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
 
             if (message.type == link::MessageType::BEARER_RELEASED)
             {
-                if (mobility.emm != EmmState::REGISTERED || message.payload.size() != 1 || message.payload[0] != activeEbi)
-                    throw link::DecodeError("Bearer release does not match the active default bearer");
-                tun.reset();
-                mobility.bearer = EpsBearerState::INACTIVE;
-                state = State::EPS_REGISTERED;
-                LogState(state);
-                Log("WARN", "Default bearer released; LTE TUN resources were closed");
+                if (mobility.emm != EmmState::REGISTERED || message.payload.size() != 1)
+                    throw link::DecodeError("Malformed bearer release");
+                const uint8_t releasedEbi = message.payload[0];
+                if (releasedEbi == activeEbi)
+                {
+                    tun.reset();
+                    mobility.bearer = EpsBearerState::INACTIVE;
+                    state = State::EPS_REGISTERED;
+                    LogState(state);
+                    Log("WARN", "Default bearer released; LTE TUN resources were closed");
+                    continue;
+                }
+                const auto released = std::find_if(dedicatedBearers.begin(), dedicatedBearers.end(),
+                                                   [releasedEbi](const DedicatedBearerRuntime &bearer) {
+                                                       return bearer.ebi == releasedEbi;
+                                                   });
+                if (released == dedicatedBearers.end())
+                    throw link::DecodeError("Bearer release names an unknown bearer");
+                dedicatedBearers.erase(released);
+                Log("INFO", "Dedicated EPS bearer " + std::to_string(releasedEbi) +
+                                " released; default bearer and TUN retained");
                 continue;
             }
             if (message.type == link::MessageType::S1_CONTEXT_RELEASED)
@@ -382,6 +438,37 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 continue;
             }
 
+            if (message.type == link::MessageType::DATA_DOWNLINK_BEARER)
+            {
+                if (!tun || !mobility.canForwardUserPlane())
+                {
+                    ++bearerInactiveDrops;
+                    throw link::DecodeError("Dedicated downlink data arrived before TUN readiness");
+                }
+                if (message.payload.size() < 2)
+                    throw link::DecodeError("Malformed bearer-aware downlink frame");
+                const uint8_t bearerEbi = message.payload[0];
+                const auto bearer = std::find_if(dedicatedBearers.begin(), dedicatedBearers.end(),
+                                                 [bearerEbi](const DedicatedBearerRuntime &candidate) {
+                                                     return candidate.ebi == bearerEbi;
+                                                 });
+                if (bearer == dedicatedBearers.end())
+                    throw link::DecodeError("Downlink names an unknown or released dedicated bearer");
+
+                std::vector<uint8_t> packet(message.payload.begin() + 1, message.payload.end());
+                const auto ipv4 = ip::Validate(packet.data(), packet.size(),
+                                               static_cast<size_t>(config.tun.mtu));
+                if (ipv4.destination != assignedIpv4)
+                    throw ip::ValidationError("Downlink destination does not match the assigned UE IPv4 address");
+                if (tun->writePacket(packet.data(), packet.size()))
+                {
+                    ++tunDownlinkPackets;
+                    ++dedicatedDownlinkPackets;
+                    tunDownlinkBytes += packet.size();
+                }
+                continue;
+            }
+
             if (message.type != link::MessageType::NAS_DOWNLINK)
                 throw link::DecodeError("Data/NAS direction mismatch");
             if (!security.securityActive)
@@ -478,6 +565,75 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
             else
                 plain = ReceiveProtected(security, message.payload);
             auto downlink = nas::DecodeDownlink(plain.data(), plain.size());
+
+            if (downlink.type == nas::DownlinkEmm::ACTIVATE_DEDICATED_EPS_BEARER_CONTEXT)
+            {
+                const auto &request = downlink.dedicatedBearer;
+                try
+                {
+                    if (mobility.emm != EmmState::REGISTERED)
+                        throw nas::DecodeError("Dedicated bearer activation before EPS registration");
+                    if (request.linkedEpsBearerIdentity != activeEbi)
+                        throw nas::DecodeError("Dedicated bearer references a different default bearer");
+                    for (const auto &bearer : dedicatedBearers)
+                    {
+                        if (bearer.ebi == request.epsBearerIdentity)
+                            throw nas::DecodeError("Dedicated bearer identity is already active");
+                    }
+                    if (dedicatedBearers.size() >= 7)
+                        throw nas::DecodeError("Dedicated bearer capacity is exhausted");
+
+                    DedicatedBearerRuntime bearer;
+                    bearer.ebi = request.epsBearerIdentity;
+                    bearer.qci = request.qci;
+                    if (!request.tft.empty())
+                        bearer.tft.apply(lte::tft::Decode(request.tft.data(), request.tft.size()));
+
+                    dedicatedBearers.push_back(std::move(bearer));
+                    SendProtected(socket, enb, ueId, security, false,
+                                  nas::EncodeActivateDedicatedEpsBearerContextAccept(
+                                      request.epsBearerIdentity, request.procedureTransactionId));
+
+                    std::vector<uint8_t> activated{request.epsBearerIdentity};
+                    auto activatedFrame =
+                        link::Encode({link::MessageType::BEARER_ACTIVATED, ueId, std::move(activated)});
+                    socket.Send(enb, activatedFrame.data(), activatedFrame.size());
+
+                    Log("INFO", "Dedicated EPS bearer " + std::to_string(request.epsBearerIdentity) +
+                                    " activated (QCI=" + std::to_string(request.qci) + ", linked-EBI=" +
+                                    std::to_string(request.linkedEpsBearerIdentity) + ", filters=" +
+                                    std::to_string(dedicatedBearers.back().tft.size()) + ")");
+                }
+                catch (const std::exception &e)
+                {
+                    // Reject with insufficient resources and keep every other
+                    // bearer untouched; a failed activation must not disturb the
+                    // default bearer.
+                    SendProtected(socket, enb, ueId, security, false,
+                                  nas::EncodeActivateDedicatedEpsBearerContextReject(
+                                      request.epsBearerIdentity, request.procedureTransactionId, 26));
+                    Log("WARN", std::string("Rejected dedicated EPS bearer activation: ") + e.what());
+                }
+                continue;
+            }
+
+            if (downlink.type == nas::DownlinkEmm::DEACTIVATE_EPS_BEARER_CONTEXT)
+            {
+                const auto &request = downlink.deactivateBearer;
+                const auto bearer = std::find_if(dedicatedBearers.begin(), dedicatedBearers.end(),
+                                                 [&request](const DedicatedBearerRuntime &candidate) {
+                                                     return candidate.ebi == request.epsBearerIdentity;
+                                                 });
+                if (bearer == dedicatedBearers.end())
+                    throw nas::DecodeError("Deactivation names an unknown dedicated bearer");
+                dedicatedBearers.erase(bearer);
+                SendProtected(socket, enb, ueId, security, false,
+                              nas::EncodeDeactivateEpsBearerContextAccept(request.epsBearerIdentity,
+                                                                          request.procedureTransactionId));
+                Log("INFO", "Dedicated EPS bearer " + std::to_string(request.epsBearerIdentity) +
+                                " deactivated; default bearer retained");
+                continue;
+            }
 
             if (downlink.type == nas::DownlinkEmm::DETACH_ACCEPT)
             {

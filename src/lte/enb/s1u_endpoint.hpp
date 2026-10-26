@@ -47,6 +47,9 @@ class S1uEndpoint
 
     // Forwards one uplink IPv4 packet on the UE's default bearer.
     void forwardUplink(EnbUeEntry &entry, const uint8_t *packet, size_t size);
+    // Dedicated and default bearers use the same shared socket, but select
+    // their own SGW TEID and independently validated readiness state.
+    void forwardUplink(EnbUeEntry &entry, BearerContext &bearer, const uint8_t *packet, size_t size);
 
     [[nodiscard]] InetAddress localAddress() const;
     [[nodiscard]] const S1uEndpointCounters &counters() const;

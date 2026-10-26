@@ -24,6 +24,9 @@ struct PacketInfo
     size_t totalLength{};
     std::array<uint8_t, 4> source{};
     std::array<uint8_t, 4> destination{};
+    // IPv4 protocol identifier from the header. TFT classification needs it;
+    // the transport protocol must never be guessed from port numbers.
+    uint8_t protocol{};
     bool fragmented{};
 };
 

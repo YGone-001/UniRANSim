@@ -34,10 +34,16 @@ uint32_t AllocateLocalTeid()
 void DefaultBearerContext::establish(const BearerParameters &parameters)
 {
     if (m_established)
-        throw BearerError("A default bearer is already established");
+        throw BearerError("An EPS bearer is already established");
     if (parameters.erabId < 5 || parameters.erabId > 15 || parameters.qci == 0 || parameters.ueId == 0 ||
         parameters.sgwTeid == 0 || parameters.localTeid == 0)
-        throw BearerError("Invalid default bearer parameters");
+        throw BearerError("Invalid EPS bearer parameters");
+    if (m_kind == BearerKind::DEFAULT && parameters.linkedDefaultEbi != 0)
+        throw BearerError("A default bearer cannot have a linked EBI");
+    if (m_kind == BearerKind::DEDICATED &&
+        (parameters.linkedDefaultEbi < 5 || parameters.linkedDefaultEbi > 15 ||
+         parameters.linkedDefaultEbi == parameters.erabId))
+        throw BearerError("A dedicated bearer has an invalid linked default EBI");
     m_parameters = parameters;
     m_ueIpv4 = {};
     m_established = true;
@@ -48,9 +54,9 @@ void DefaultBearerContext::activateUe(uint32_t ueId, uint8_t epsBearerIdentity,
                                       const std::array<uint8_t, 4> &ipv4Address)
 {
     if (!m_established)
-        throw BearerError("Default bearer signaling is not established");
+        throw BearerError("EPS bearer signaling is not established");
     if (m_ueReady)
-        throw BearerError("Default bearer is already active");
+        throw BearerError("EPS bearer is already active");
     if (ueId != m_parameters.ueId)
         throw BearerError("Bearer-ready UE identity does not match the S1 context");
     if (epsBearerIdentity != m_parameters.erabId)
@@ -64,7 +70,7 @@ void DefaultBearerContext::activateUe(uint32_t ueId, uint8_t epsBearerIdentity,
 void DefaultBearerContext::validateUplink(uint32_t ueId, const uint8_t *packet, size_t size) const
 {
     if (!active())
-        throw BearerError("Default bearer is inactive");
+        throw BearerError("EPS bearer is inactive");
     if (ueId != m_parameters.ueId)
         throw BearerError("Uplink UE identity does not match the bearer");
     const auto ipv4 = ip::Validate(packet, size);
@@ -75,7 +81,7 @@ void DefaultBearerContext::validateUplink(uint32_t ueId, const uint8_t *packet, 
 void DefaultBearerContext::validateDownlink(uint32_t incomingTeid, const uint8_t *packet, size_t size) const
 {
     if (!active())
-        throw BearerError("Default bearer is inactive");
+        throw BearerError("EPS bearer is inactive");
     if (incomingTeid != m_parameters.localTeid)
         throw BearerError("Unknown or stale downlink TEID");
     const auto ipv4 = ip::Validate(packet, size);

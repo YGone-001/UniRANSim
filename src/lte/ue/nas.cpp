@@ -491,6 +491,58 @@ DownlinkMessage DecodeDownlink(const uint8_t *data, size_t size)
 
     DownlinkMessage result{};
 
+    if ((data[0] & 0x0FU) == Esm && size >= 3 && (data[2] == 0xC5 || data[2] == 0xCD))
+    {
+        result.messageType = data[2];
+        const auto bearerIdentity = static_cast<uint8_t>(data[0] >> 4U);
+        const uint8_t pti = data[1];
+
+        if (data[2] == 0xC5)
+        {
+            if (size < 6)
+                throw DecodeError("Truncated Activate Dedicated EPS Bearer Context Request");
+            ActivateDedicatedEpsBearerContextRequest request;
+            request.epsBearerIdentity = bearerIdentity;
+            request.procedureTransactionId = pti;
+            request.linkedEpsBearerIdentity = static_cast<uint8_t>(data[3] & 0x0FU);
+            const size_t qosLength = data[4];
+            if (qosLength < 1 || 5U + qosLength > size)
+                throw DecodeError("Invalid EPS QoS in Activate Dedicated EPS Bearer Context Request");
+            request.qci = data[5];
+            size_t offset = 5U + qosLength;
+            // The TFT is a type 4 information element: a single length octet
+            // followed by the value field, not the two-octet LV-E form.
+            if (offset + 1U > size)
+                throw DecodeError("Missing TFT in Activate Dedicated EPS Bearer Context Request");
+            const size_t tftLength = data[offset];
+            offset += 1U;
+            if (offset + tftLength > size)
+                throw DecodeError("Truncated TFT in Activate Dedicated EPS Bearer Context Request");
+            request.tft.assign(data + offset, data + offset + tftLength);
+            offset += tftLength;
+            request.raw.assign(data, data + offset);
+            result.type = DownlinkEmm::ACTIVATE_DEDICATED_EPS_BEARER_CONTEXT;
+            result.dedicatedBearer = std::move(request);
+            return result;
+        }
+
+        if (data[2] == 0xCD)
+        {
+            if (size < 4)
+                throw DecodeError("Truncated Deactivate EPS Bearer Context Request");
+            DeactivateEpsBearerContextRequest request;
+            request.epsBearerIdentity = bearerIdentity;
+            request.procedureTransactionId = pti;
+            // The ESM cause is an LV whose length octet precedes the value.
+            if (size >= 5 && data[3] >= 1)
+                request.esmCause = data[4];
+            result.type = DownlinkEmm::DEACTIVATE_EPS_BEARER_CONTEXT;
+            result.deactivateBearer = request;
+            return result;
+        }
+
+    }
+
     if ((data[0] & 0x0FU) == EpsEmm)
     {
         result.messageType = data[1];
@@ -666,6 +718,31 @@ std::vector<uint8_t> EncodeEsmInformationResponse(uint8_t procedureTransactionId
         out.insert(out.end(), encoded.begin(), encoded.end());
     }
     return out;
+}
+
+std::vector<uint8_t> EncodeActivateDedicatedEpsBearerContextAccept(uint8_t epsBearerIdentity,
+                                                                   uint8_t procedureTransactionId)
+{
+    if (epsBearerIdentity < 5 || epsBearerIdentity > 15)
+        throw DecodeError("Invalid EPS bearer identity for dedicated bearer acceptance");
+    return {static_cast<uint8_t>((epsBearerIdentity << 4U) | Esm), procedureTransactionId, 0xC6};
+}
+
+std::vector<uint8_t> EncodeActivateDedicatedEpsBearerContextReject(uint8_t epsBearerIdentity,
+                                                                   uint8_t procedureTransactionId, uint8_t esmCause)
+{
+    if (epsBearerIdentity < 5 || epsBearerIdentity > 15)
+        throw DecodeError("Invalid EPS bearer identity for dedicated bearer rejection");
+    // The ESM cause is mandatory and carried as an LV with a length of one.
+    return {static_cast<uint8_t>((epsBearerIdentity << 4U) | Esm), procedureTransactionId, 0xC7, 0x01, esmCause};
+}
+
+std::vector<uint8_t> EncodeDeactivateEpsBearerContextAccept(uint8_t epsBearerIdentity,
+                                                            uint8_t procedureTransactionId)
+{
+    if (epsBearerIdentity < 5 || epsBearerIdentity > 15)
+        throw DecodeError("Invalid EPS bearer identity for bearer deactivation");
+    return {static_cast<uint8_t>((epsBearerIdentity << 4U) | Esm), procedureTransactionId, 0xCE};
 }
 
 std::vector<uint8_t> EncodeDetachRequest(uint8_t ksi, const std::array<uint8_t, 11> &guti, bool switchOff)

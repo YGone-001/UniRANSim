@@ -36,6 +36,14 @@ enum class MessageType : uint8_t
     S1_CONTEXT_RESTORED = 9,
     // MMEC(1)||M-TMSI(4)||compact Service Request NAS(4).
     SERVICE_REQUEST = 10,
+    // Bearer-aware user-plane frames. The payload starts with the EPS bearer
+    // identity, so a packet can never be attributed to the wrong bearer and an
+    // unknown EBI is rejected instead of falling back to the default bearer.
+    DATA_UPLINK_BEARER = 12,
+    DATA_DOWNLINK_BEARER = 13,
+    // Uplink confirmation that the UE accepted a dedicated bearer activation.
+    // Payload: EBI(1).
+    BEARER_ACTIVATED = 14,
     // Downlink-only simulation of an LTE paging occasion.
     // MMEC(1)||M-TMSI(4)||served TAC(2). It carries no IMSI and no NAS
     // material, so a UE can only match it against the S-TMSI of its own

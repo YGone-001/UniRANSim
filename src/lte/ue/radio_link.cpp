@@ -28,7 +28,8 @@ bool IsKnown(MessageType type)
            type == MessageType::BEARER_READY || type == MessageType::BEARER_RELEASED ||
            type == MessageType::S1_CONTEXT_RELEASE_REQUEST || type == MessageType::S1_CONTEXT_RELEASED ||
            type == MessageType::S1_CONTEXT_RESTORED || type == MessageType::SERVICE_REQUEST ||
-           type == MessageType::PAGING_INDICATION;
+           type == MessageType::PAGING_INDICATION || type == MessageType::DATA_UPLINK_BEARER ||
+           type == MessageType::DATA_DOWNLINK_BEARER || type == MessageType::BEARER_ACTIVATED;
 }
 
 size_t MaximumPayload(MessageType type)
@@ -37,6 +38,11 @@ size_t MaximumPayload(MessageType type)
         return MaxNasPduSize;
     if (type == MessageType::DATA_UPLINK || type == MessageType::DATA_DOWNLINK)
         return MaxDataPduSize;
+    // One octet of EPS bearer identity precedes the IPv4 payload.
+    if (type == MessageType::DATA_UPLINK_BEARER || type == MessageType::DATA_DOWNLINK_BEARER)
+        return MaxDataPduSize + 1U;
+    if (type == MessageType::BEARER_ACTIVATED)
+        return 1;
     if (type == MessageType::BEARER_READY)
         return 5;
     if (type == MessageType::SERVICE_REQUEST)
@@ -57,7 +63,8 @@ std::vector<uint8_t> Encode(const Message &message)
         ((message.type == MessageType::BEARER_RELEASED ||
           message.type == MessageType::S1_CONTEXT_RELEASE_REQUEST ||
           message.type == MessageType::S1_CONTEXT_RELEASED ||
-          message.type == MessageType::S1_CONTEXT_RESTORED) && message.payload.size() != 1))
+          message.type == MessageType::S1_CONTEXT_RESTORED ||
+          message.type == MessageType::BEARER_ACTIVATED) && message.payload.size() != 1))
         throw DecodeError("Invalid LTE radio-link message");
     std::vector<uint8_t> out(HeaderSize + message.payload.size());
     out[0] = Version;
@@ -97,14 +104,16 @@ Message Decode(const uint8_t *data, size_t size)
 bool IsUplink(MessageType type)
 {
     return type == MessageType::NAS_UPLINK || type == MessageType::DATA_UPLINK || type == MessageType::BEARER_READY ||
+           type == MessageType::DATA_UPLINK_BEARER || type == MessageType::BEARER_ACTIVATED ||
            type == MessageType::S1_CONTEXT_RELEASE_REQUEST || type == MessageType::SERVICE_REQUEST;
 }
 
 bool IsDownlink(MessageType type)
 {
     return type == MessageType::NAS_DOWNLINK || type == MessageType::DATA_DOWNLINK ||
-           type == MessageType::BEARER_RELEASED || type == MessageType::S1_CONTEXT_RELEASED ||
-           type == MessageType::S1_CONTEXT_RESTORED || type == MessageType::PAGING_INDICATION;
+           type == MessageType::DATA_DOWNLINK_BEARER || type == MessageType::BEARER_RELEASED ||
+           type == MessageType::S1_CONTEXT_RELEASED || type == MessageType::S1_CONTEXT_RESTORED ||
+           type == MessageType::PAGING_INDICATION;
 }
 
 std::vector<uint8_t> EncodePagingNotification(const PagingNotification &notification)

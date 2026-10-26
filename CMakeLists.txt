@@ -113,7 +113,7 @@ endif ()
 # Only the first-party libraries are instrumented. The generated ASN.1 code and the vendored libraries would dominate
 # the report and slow the build down, and they are not what the tests are written for.
 if (UERANSIM_COVERAGE)
-    foreach (target utils common-lib gnb ue lte-user-plane-common lte-radio-link lte-enb-lib lte-ue-lib)
+    foreach (target utils common-lib gnb ue lte-user-plane-common lte-tft lte-radio-link lte-enb-lib lte-ue-lib)
         target_compile_options(${target} PRIVATE --coverage)
         target_link_options(${target} INTERFACE --coverage)
     endforeach ()

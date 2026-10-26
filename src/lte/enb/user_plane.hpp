@@ -26,6 +26,15 @@ struct BearerParameters
     std::array<uint8_t, 4> sgwAddress{};
     uint32_t sgwTeid{};
     uint32_t localTeid{};
+    // Zero for a default bearer. A dedicated bearer must name the default EBI
+    // of the same PDN connection.
+    uint8_t linkedDefaultEbi{};
+};
+
+enum class BearerKind : uint8_t
+{
+    DEFAULT,
+    DEDICATED
 };
 
 class BearerError : public std::runtime_error
@@ -39,6 +48,7 @@ class BearerError : public std::runtime_error
 class DefaultBearerContext
 {
   public:
+    explicit DefaultBearerContext(BearerKind kind = BearerKind::DEFAULT) : m_kind(kind) {}
     void establish(const BearerParameters &parameters);
     void activateUe(uint32_t ueId, uint8_t epsBearerIdentity, const std::array<uint8_t, 4> &ipv4Address);
     void validateUplink(uint32_t ueId, const uint8_t *packet, size_t size) const;
@@ -49,12 +59,16 @@ class DefaultBearerContext
     [[nodiscard]] bool active() const { return m_established && m_ueReady; }
     [[nodiscard]] const BearerParameters &parameters() const { return m_parameters; }
     [[nodiscard]] const std::array<uint8_t, 4> &ueIpv4() const { return m_ueIpv4; }
+    [[nodiscard]] BearerKind kind() const { return m_kind; }
 
   private:
     BearerParameters m_parameters{};
     std::array<uint8_t, 4> m_ueIpv4{};
     bool m_established{};
     bool m_ueReady{};
+    BearerKind m_kind;
 };
+
+using BearerContext = DefaultBearerContext;
 
 } // namespace lte::enb

@@ -128,6 +128,27 @@ struct TauAccept
     std::optional<uint16_t> bearerContextStatus;
 };
 
+// Activate Dedicated EPS Bearer Context Request (TS 24.301 8.3.3). The TFT is
+// kept as the raw value field; the UE validates it with the shared decoder
+// rather than trusting a partially parsed copy.
+struct ActivateDedicatedEpsBearerContextRequest
+{
+    uint8_t epsBearerIdentity{};
+    uint8_t procedureTransactionId{};
+    uint8_t linkedEpsBearerIdentity{};
+    uint8_t qci{};
+    std::vector<uint8_t> tft;
+    std::vector<uint8_t> raw;
+};
+
+// Deactivate EPS Bearer Context Request (TS 24.301 8.3.5).
+struct DeactivateEpsBearerContextRequest
+{
+    uint8_t epsBearerIdentity{};
+    uint8_t procedureTransactionId{};
+    uint8_t esmCause{};
+};
+
 // Decoded form of the protected downlink EMM message the UE must react to.
 enum class DownlinkEmm
 {
@@ -139,6 +160,8 @@ enum class DownlinkEmm
     TAU_ACCEPT,
     TAU_REJECT,
     ESM_INFORMATION_REQUEST,
+    ACTIVATE_DEDICATED_EPS_BEARER_CONTEXT,
+    DEACTIVATE_EPS_BEARER_CONTEXT,
     OTHER
 };
 
@@ -150,6 +173,8 @@ struct DownlinkMessage
     AttachAccept attachAccept{};
     TauAccept tauAccept{};
     EsmInformationRequest esmInformationRequest{};
+    ActivateDedicatedEpsBearerContextRequest dedicatedBearer{};
+    DeactivateEpsBearerContextRequest deactivateBearer{};
     uint8_t emmCause{};
 };
 
@@ -170,6 +195,15 @@ std::vector<uint8_t> EncodeEsmInformationResponse(uint8_t procedureTransactionId
 // True when the message is an ESM Information Request (used to keep the happy
 // path optional while still supporting the procedure).
 bool IsEsmInformationRequest(const uint8_t *data, size_t size);
+
+// Plain ESM responses for a network-initiated dedicated bearer. They are
+// protected by the existing EPS security context before transmission.
+std::vector<uint8_t> EncodeActivateDedicatedEpsBearerContextAccept(uint8_t epsBearerIdentity,
+                                                                   uint8_t procedureTransactionId);
+std::vector<uint8_t> EncodeActivateDedicatedEpsBearerContextReject(uint8_t epsBearerIdentity,
+                                                                   uint8_t procedureTransactionId, uint8_t esmCause);
+std::vector<uint8_t> EncodeDeactivateEpsBearerContextAccept(uint8_t epsBearerIdentity,
+                                                            uint8_t procedureTransactionId);
 
 std::vector<uint8_t> EncodeDetachRequest(uint8_t ksi, const std::array<uint8_t, 11> &guti, bool switchOff);
 std::vector<uint8_t> EncodeTauRequest(uint8_t ksi, const std::array<uint8_t, 11> &guti,

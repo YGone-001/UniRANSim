@@ -35,6 +35,7 @@ PacketInfo Validate(const uint8_t *data, size_t size, size_t maximumSize)
     result.totalLength = totalLength;
     std::copy(data + 12, data + 16, result.source.begin());
     std::copy(data + 16, data + 20, result.destination.begin());
+    result.protocol = data[9];
     const uint16_t fragment = static_cast<uint16_t>((static_cast<uint16_t>(data[6]) << 8U) | data[7]);
     result.fragmented = (fragment & 0x3FFFU) != 0;
     return result;
