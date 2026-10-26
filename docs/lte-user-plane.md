@@ -523,6 +523,90 @@ IPv6 router solicitations emitted on a fresh TUN before the namespace move were
 rejected as non-IPv4 uplink frames (5 drops in that run); disabling IPv6 on the
 isolated TUN removed the noise. The IPv4-only uplink validator fails closed.
 
+## Dedicated bearer user-plane acceptance
+
+A network-initiated dedicated bearer must be proved on the wire, not by the
+simulator's own log. Three things have to hold at once: the uplink packet reaches
+the TUN, the TFT selects the dedicated bearer, and the two bearers use different
+GTP-U tunnels in both directions.
+
+### The TUN must live in its own namespace
+
+Testing from the host namespace cannot work when the EPC shares that host. The
+EPC management address is a local address there, so `ip route get` resolves it
+through the `local` table (rule 0, highest priority) and the packet is delivered
+to loopback. Adding `ip route replace <epc-ip>/32 dev <tun>` writes to the `main`
+table and is therefore never consulted:
+
+```text
+$ ip route get 192.168.64.128 from 10.45.0.11
+local 192.168.64.128 from 10.45.0.11 dev lo uid 1001
+```
+
+A zero uplink counter in that setup says nothing about the implementation. Move
+the TUN into a throwaway namespace instead, where the same address resolves
+through the TUN:
+
+```bash
+sudo ip netns add p7ue
+sudo ip link set uniransim-lte0 netns p7ue
+sudo ip netns exec p7ue ip link set uniransim-lte0 up
+sudo ip netns exec p7ue ip addr add <assigned-ipv4>/32 dev uniransim-lte0
+sudo ip netns exec p7ue ip route add default dev uniransim-lte0
+sudo ip netns exec p7ue ip route get <epc-ip> from <assigned-ipv4>
+```
+
+The UE process keeps working because it already holds the TUN descriptor; only
+the interface moves. Confirm the route names the TUN before sending anything, and
+capture on the interface inside the namespace so a silent delivery problem cannot
+be mistaken for a missing packet.
+
+### Policy wording that the EPC rejects
+
+The flow description is an IPFilterRule. `assigned` is not accepted by this
+deployment's parser, and the rejection is quiet at the policy layer:
+
+```text
+[core] ERROR: hostname ``assigned'' unknown (lib/ipfw/ipfw2.c:2858)
+[upf]  ERROR: Send Error Indication [TEID:...]
+```
+
+The dedicated bearer is still created, the UE still accepts it, and the eNB still
+reports it ready — but the UPF has no PDR to match, so every uplink T-PDU comes
+back as an Error Indication. Use literal addresses or `any` in the filter:
+
+```text
+permit out udp from any 5000 to any 7000
+permit out udp from any 7000 to any 5000
+```
+
+### Observed result
+
+Two flows from one EPS session, distinguished only by source port:
+
+```text
+uplink   sport 7000 (TFT match)    -> SGW TEID 0x0000fe0a   (dedicated)
+uplink   sport 3000 (no match)     -> SGW TEID 0x0000f461   (default)
+downlink dport 7000 and 3000       -> eNB TEID 0x8b7962ef   (default)
+```
+
+The uplink proof is unambiguous: the dedicated filter and the default bearer use
+different SGW receiving TEIDs on the same shared S1-U socket. The return packets
+were classified by the EPC onto the default bearer, because the downlink filter
+names source port 7000 while the replies originate from port 5000. That is the
+network's decision, not a simulator fallback, and it is recorded as observed.
+
+Application delivery was confirmed end to end: the UE sent, the EPC forwarded, a
+UDP responder on the EPC side echoed, and the reply arrived back on the UE TUN.
+
+### Runtime bearer removal is not available here
+
+Deleting the PCC rule from the subscriber record does not release an active
+dedicated bearer. The deployed policy function reads the database when a session
+is established, so no Gx update is generated for a live session and the MME never
+sends an E-RAB Release Command. Verifying network-initiated dedicated bearer
+release therefore requires a policy deployment that can push a session update.
+
 ## Supported scope
 
 Supported: multiple concurrent LTE UEs (bounded by `maxUes`) through one eNB
@@ -531,10 +615,11 @@ bearer per UE, IPv4, EEA0/EEA2 NAS security, S1-U GTP-U, persistent TUN
 forwarding, per-UE lifecycle isolation (Detach, ECM-IDLE, Service Request,
 periodic TAU), per-UE context cleanup, per-UE packet/drop counters, real
 S1AP Paging decoding with tracking-area filtering, simulated radio paging with
-S-TMSI matching, network-triggered compact Service Request, and restoration of
-the existing default bearer.
+S-TMSI matching, network-triggered compact Service Request, restoration of
+the existing default bearer, network-initiated dedicated bearers with TFT-based
+uplink classification, and per-bearer GTP-U tunnels.
 
 Not supported: RRC paging channels, paging frames and DRX radio timing, IMSI
-paging, additional PDN connections, dedicated bearers, inter-MME mobility,
+paging, additional PDN connections, inter-MME mobility,
 handover, IPv6/IPv4v6 forwarding, RF/SDR, IMS/VoLTE, QoS scheduling, GTP-U
 kernel offload, or session persistence across eNB process restarts.
