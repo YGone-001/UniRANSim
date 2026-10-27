@@ -31,7 +31,7 @@ bool IsKnown(MessageType type)
            type == MessageType::PAGING_INDICATION || type == MessageType::DATA_UPLINK_BEARER ||
            type == MessageType::DATA_DOWNLINK_BEARER || type == MessageType::BEARER_ACTIVATED ||
            type == MessageType::DEDICATED_BEARER_RESTORED || type == MessageType::BEARER_TRANSPORT_READY ||
-           type == MessageType::EPS_SESSION_DELETED;
+           type == MessageType::EPS_SESSION_DELETED || type == MessageType::S1_ACCESS_LOST;
 }
 
 size_t MaximumPayload(MessageType type)
@@ -45,7 +45,7 @@ size_t MaximumPayload(MessageType type)
         return MaxDataPduSize + 1U;
     if (type == MessageType::S1_CONTEXT_RELEASED || type == MessageType::S1_CONTEXT_RESTORED ||
         type == MessageType::DEDICATED_BEARER_RESTORED || type == MessageType::BEARER_TRANSPORT_READY ||
-        type == MessageType::EPS_SESSION_DELETED)
+        type == MessageType::EPS_SESSION_DELETED || type == MessageType::S1_ACCESS_LOST)
         return 5;
     if (type == MessageType::BEARER_ACTIVATED)
         return 1;
@@ -74,7 +74,7 @@ std::vector<uint8_t> Encode(const Message &message)
         message.payload.size() != 1 && message.payload.size() != 5)
         throw DecodeError("Invalid S1 restoration payload length");
     if (message.type == MessageType::DEDICATED_BEARER_RESTORED || message.type == MessageType::BEARER_TRANSPORT_READY ||
-        message.type == MessageType::EPS_SESSION_DELETED)
+        message.type == MessageType::EPS_SESSION_DELETED || message.type == MessageType::S1_ACCESS_LOST)
         DecodeBearerRestoration(message.payload);
     std::vector<uint8_t> out(HeaderSize + message.payload.size());
     out[0] = Version;
@@ -108,7 +108,7 @@ Message Decode(const uint8_t *data, size_t size)
         length != 1 && length != 5)
         throw DecodeError("Malformed S1 restoration payload length");
     if (type == MessageType::DEDICATED_BEARER_RESTORED || type == MessageType::BEARER_TRANSPORT_READY ||
-        type == MessageType::EPS_SESSION_DELETED)
+        type == MessageType::EPS_SESSION_DELETED || type == MessageType::S1_ACCESS_LOST)
         DecodeBearerRestoration(std::vector<uint8_t>(data + HeaderSize, data + size));
     uint32_t ueId = (static_cast<uint32_t>(data[2]) << 24U) | (static_cast<uint32_t>(data[3]) << 16U) |
                     (static_cast<uint32_t>(data[4]) << 8U) | data[5];
@@ -146,7 +146,8 @@ bool IsDownlink(MessageType type)
     return type == MessageType::NAS_DOWNLINK || type == MessageType::DATA_DOWNLINK ||
            type == MessageType::DATA_DOWNLINK_BEARER || type == MessageType::BEARER_RELEASED ||
            type == MessageType::S1_CONTEXT_RELEASED || type == MessageType::S1_CONTEXT_RESTORED ||
-           type == MessageType::PAGING_INDICATION || type == MessageType::DEDICATED_BEARER_RESTORED;
+           type == MessageType::PAGING_INDICATION || type == MessageType::DEDICATED_BEARER_RESTORED ||
+           type == MessageType::S1_ACCESS_LOST;
 }
 
 std::vector<uint8_t> EncodePagingNotification(const PagingNotification &notification)

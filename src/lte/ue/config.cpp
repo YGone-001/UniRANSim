@@ -136,6 +136,14 @@ Config ParseNode(const YAML::Node &root)
             config.lifecycle.maxRetries = yaml::GetInt32(lifecycle, "maxRetries", 0, 10);
         if (yaml::HasField(lifecycle, "pagingWaitMs"))
             config.lifecycle.pagingWaitMs = yaml::GetInt32(lifecycle, "pagingWaitMs", 100, 600000);
+        // Zero recoveryDelayMs disables the UE-initiated recovery path, which
+        // leaves network-initiated Paging as the only restoration trigger.
+        if (yaml::HasField(lifecycle, "recoveryDelayMs"))
+            config.lifecycle.recoveryDelayMs = yaml::GetInt32(lifecycle, "recoveryDelayMs", 0, 3600000);
+        if (yaml::HasField(lifecycle, "recoveryRetryMs"))
+            config.lifecycle.recoveryRetryMs = yaml::GetInt32(lifecycle, "recoveryRetryMs", 100, 600000);
+        if (yaml::HasField(lifecycle, "recoveryMaxAttempts"))
+            config.lifecycle.recoveryMaxAttempts = yaml::GetInt32(lifecycle, "recoveryMaxAttempts", 0, 10);
         if (yaml::HasField(lifecycle, "switchOff")) config.lifecycle.switchOff = lifecycle["switchOff"].as<bool>();
         if (config.lifecycle.switchOff && config.lifecycle.scenario != LifecycleScenario::DETACH)
             throw std::runtime_error("Field 'lifecycle.switchOff' is valid only for the detach scenario");

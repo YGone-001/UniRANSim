@@ -104,6 +104,35 @@ EnbConfig ParseNode(const YAML::Node &root)
             result.retry.connectTimeoutMs = yaml::GetInt32(sctp, "connectTimeoutMs", 100, 60000);
     }
 
+    if (yaml::HasField(root, "recovery"))
+    {
+        const YAML::Node recovery = root["recovery"];
+        if (!recovery.IsMap())
+            throw std::runtime_error("Field 'recovery' must be a mapping");
+        // Zero means "retry until shutdown"; a positive value bounds recovery.
+        if (yaml::HasField(recovery, "maxAttempts"))
+            result.recovery.maxAttempts = yaml::GetInt32(recovery, "maxAttempts", 0, 10000);
+        if (yaml::HasField(recovery, "delayMs"))
+            result.recovery.delayMs = yaml::GetInt32(recovery, "delayMs", 100, 600000);
+        if (yaml::HasField(recovery, "delayMaxMs"))
+            result.recovery.delayMaxMs = yaml::GetInt32(recovery, "delayMaxMs", 100, 600000);
+        if (result.recovery.delayMaxMs < result.recovery.delayMs)
+            throw std::runtime_error("Field 'recovery.delayMaxMs' must not be smaller than 'recovery.delayMs'");
+    }
+
+    // Absent or empty by default: no control file is opened and the injection
+    // mechanism does not exist in an ordinary deployment.
+    if (yaml::HasField(root, "failureInjection"))
+    {
+        const YAML::Node injection = root["failureInjection"];
+        if (!injection.IsMap())
+            throw std::runtime_error("Field 'failureInjection' must be a mapping");
+        if (yaml::HasField(injection, "controlFile"))
+            result.failureInjection.controlFile = yaml::GetString(injection, "controlFile", 1, 4096);
+        if (yaml::HasField(injection, "pollIntervalMs"))
+            result.failureInjection.pollIntervalMs = yaml::GetInt32(injection, "pollIntervalMs", 10, 60000);
+    }
+
     return result;
 }
 

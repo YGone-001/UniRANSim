@@ -9,9 +9,11 @@
 #include "app.hpp"
 #include "codec.hpp"
 #include "multiplexer.hpp"
+#include "recovery.hpp"
 
 #include <algorithm>
 #include <chrono>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
@@ -39,6 +41,18 @@ std::string Hex(uint32_t value, int width)
     return stream.str();
 }
 
+std::string Trim(const std::string &text)
+{
+    const auto first = text.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos)
+        return {};
+    const auto last = text.find_last_not_of(" \t\r\n");
+    return text.substr(first, last - first + 1U);
+}
+
+// Association-scoped S1AP endpoint. It lives exactly as long as one SCTP
+// association and is bound to the multiplexer only for that association's
+// epoch, so a handler left behind by a previous epoch can never transmit.
 class Handler final : public sctp::ISctpHandler, public IS1apSender
 {
   public:
@@ -91,13 +105,67 @@ class Handler final : public sctp::ISctpHandler, public IS1apSender
     }
 };
 
-bool InterruptibleDelay(int milliseconds, const std::atomic_bool &shutdownRequested)
+// Opt-in, one-shot S1 failure injection for the test-owned eNB.
+//
+// The mechanism does not exist at all unless a control file is configured, so
+// an ordinary deployment has no injection code path. It never touches the live
+// EPC, never uses a firewall and never kills a process: it only invalidates the
+// simulator's own SCTP association.
+class FailureInjector
 {
-    auto deadline = Clock::now() + std::chrono::milliseconds(milliseconds);
-    while (!shutdownRequested && Clock::now() < deadline)
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    return !shutdownRequested;
-}
+  public:
+    enum class Command
+    {
+        NONE,
+        // Tear the association down immediately.
+        LOSS,
+        // Drop the next S1AP PDU the eNB would have sent and tear the
+        // association down instead. Deterministically produces an in-flight
+        // interruption, e.g. during Initial Context Setup.
+        LOSS_BEFORE_S1AP_RESPONSE
+    };
+
+    explicit FailureInjector(const FailureInjectionConfig &config) : m_config(config)
+    {
+        if (m_config.controlFile.empty())
+            Log("INFO", "S1 failure injection is disabled (no control file configured)");
+        else
+            Log("INFO", "S1 failure injection armed; control file=" + m_config.controlFile);
+    }
+
+    Command poll()
+    {
+        if (m_config.controlFile.empty())
+            return Command::NONE;
+        const auto now = Clock::now();
+        if (now < m_nextPoll)
+            return Command::NONE;
+        m_nextPoll = now + std::chrono::milliseconds(m_config.pollIntervalMs);
+
+        std::ifstream input(m_config.controlFile);
+        if (!input.is_open())
+            return Command::NONE;
+        std::string line;
+        std::getline(input, line);
+        input.close();
+        // One-shot: the command is consumed so it cannot fire twice.
+        std::ofstream(m_config.controlFile, std::ios::trunc).close();
+
+        const std::string command = Trim(line);
+        if (command.empty())
+            return Command::NONE;
+        if (command == "loss")
+            return Command::LOSS;
+        if (command == "loss-before-s1ap-response")
+            return Command::LOSS_BEFORE_S1AP_RESPONSE;
+        Log("WARN", "Unknown S1 failure-injection command ignored: " + command);
+        return Command::NONE;
+    }
+
+  private:
+    FailureInjectionConfig m_config;
+    Clock::time_point m_nextPoll{};
+};
 
 void LogServedGummeis(const s1ap::SetupOutcome &outcome)
 {
@@ -118,6 +186,25 @@ void LogServedGummeis(const s1ap::SetupOutcome &outcome)
     }
 }
 
+void LogRecoveryCounters(const RecoveryCounters &counters)
+{
+    Log("INFO", "S1 recovery statistics: associations-established=" +
+                    std::to_string(counters.associationsEstablished) +
+                    " unexpected-losses=" + std::to_string(counters.unexpectedAssociationLosses) +
+                    " injected-losses=" + std::to_string(counters.injectedAssociationLosses) +
+                    " access-invalidations=" + std::to_string(counters.accessInvalidations) +
+                    " ues-affected=" + std::to_string(counters.activeUesAffectedByLoss) +
+                    " bearers-retained=" + std::to_string(counters.logicalBearersRetained) +
+                    " teids-invalidated=" + std::to_string(counters.localTeidsInvalidated) +
+                    " reconnect(attempts/success/failure)=" + std::to_string(counters.reconnectAttempts) + "/" +
+                    std::to_string(counters.reconnectSuccesses) + "/" + std::to_string(counters.reconnectFailures) +
+                    " s1-setup-failures=" + std::to_string(counters.s1SetupFailures) +
+                    " ue-restorations(success/failure)=" + std::to_string(counters.successfulUeRestorations) + "/" +
+                    std::to_string(counters.failedUeRestorations) +
+                    " rejected(stale-messages/sender/unbound)=" + std::to_string(counters.staleMessagesRejected) + "/" +
+                    std::to_string(counters.staleSenderRejects) + "/" + std::to_string(counters.unboundSenderRejects));
+}
+
 } // namespace
 
 int Run(const EnbConfig &config, const std::atomic_bool &shutdownRequested)
@@ -130,26 +217,75 @@ int Run(const EnbConfig &config, const std::atomic_bool &shutdownRequested)
 
     const auto setupRequest = s1ap::EncodeS1SetupRequest(config);
     ConnectionStateMachine state;
-    int requestedBackoffMs = 0;
 
-    for (int attempt = 1; attempt <= config.retry.maxAttempts && !shutdownRequested; ++attempt)
+    // Long-lived eNB runtime. The simulated-radio endpoint, the shared S1-U
+    // GTP-U socket and the whole per-UE registry survive every SCTP
+    // association epoch; only the association itself is recreated.
+    EnbMultiplexer multiplexer(config);
+    Log("INFO", "LTE UE radio-link listening on " + config.ueLinkAddress + ":" + std::to_string(config.ueLinkPort));
+    Log("INFO", "Shared eNB S1-U GTP-U endpoint bound to " + config.s1uAddress + ":" + std::to_string(config.s1uPort));
+
+    FailureInjector injector(config.failureInjection);
+
+    int requestedBackoffMs = 0;
+    int initialAttempts = 0;
+    int recoveryAttempts = 0;
+    bool establishedOnce = false;
+    bool shutdownInterrupted = false;
+
+    for (;;)
     {
-        if (attempt > 1)
+        if (shutdownRequested)
+            break;
+
+        if (establishedOnce)
         {
-            int delay = std::max(config.retry.delayMs, requestedBackoffMs);
-            Log("INFO", "Retry " + std::to_string(attempt) + "/" + std::to_string(config.retry.maxAttempts) +
+            if (config.recovery.maxAttempts > 0 && recoveryAttempts >= config.recovery.maxAttempts)
+            {
+                Log("ERROR", "S1 recovery did not complete after " + std::to_string(recoveryAttempts) +
+                                " reconnect attempt(s)");
+                LogRecoveryCounters(multiplexer.recoveryCounters());
+                return 1;
+            }
+            ++recoveryAttempts;
+            ++multiplexer.recoveryCounters().reconnectAttempts;
+            state.transition(ConnectionEvent::RECOVERY_STARTED);
+            const int delay = RecoveryBackoffMs(config.recovery, recoveryAttempts, requestedBackoffMs);
+            Log("INFO", "State=" + std::string(ToString(state.state())) + ", reconnect attempt " +
+                            std::to_string(recoveryAttempts) +
+                            (config.recovery.maxAttempts > 0 ? "/" + std::to_string(config.recovery.maxAttempts) : "") +
                             " after " + std::to_string(delay) + " ms");
             if (!InterruptibleDelay(delay, shutdownRequested))
+            {
+                shutdownInterrupted = true;
                 break;
+            }
+        }
+        else
+        {
+            ++initialAttempts;
+            if (initialAttempts > config.retry.maxAttempts)
+                break;
+            if (initialAttempts > 1)
+            {
+                const int delay = std::max(config.retry.delayMs, requestedBackoffMs);
+                Log("INFO", "Retry " + std::to_string(initialAttempts) + "/" + std::to_string(config.retry.maxAttempts) +
+                                " after " + std::to_string(delay) + " ms");
+                if (!InterruptibleDelay(delay, shutdownRequested))
+                {
+                    shutdownInterrupted = true;
+                    break;
+                }
+            }
+            state.transition(ConnectionEvent::CONNECT_STARTED);
+            Log("INFO", "State=" + std::string(ToString(state.state())) + ", connecting to MME");
         }
         requestedBackoffMs = 0;
-        state.transition(ConnectionEvent::CONNECT_STARTED);
-        Log("INFO", "State=" + std::string(ToString(state.state())) + ", connecting to MME");
 
         try
         {
-            sctp::SctpClient client(sctp::PayloadProtocolId::S1AP, config.localAddress, config.retry.connectMaxAttempts,
-                                    config.retry.connectTimeoutMs);
+            sctp::SctpClient client(sctp::PayloadProtocolId::S1AP, config.localAddress,
+                                    config.retry.connectMaxAttempts, config.retry.connectTimeoutMs);
             client.bind(config.localAddress, 0);
             client.connect(config.mmeAddress, config.mmePort);
             if (!state.transition(ConnectionEvent::SCTP_CONNECTED))
@@ -197,14 +333,33 @@ int Run(const EnbConfig &config, const std::atomic_bool &shutdownRequested)
                     state.transition(ConnectionEvent::SETUP_ACCEPTED);
                     Log("INFO", "S1 Setup accepted, State=" + std::string(ToString(state.state())));
 
-                    EnbMultiplexer multiplexer(config, handler);
-                    multiplexer.setOutboundStreams(handler.outboundStreams);
-                    Log("INFO", "LTE UE radio-link listening on " + config.ueLinkAddress + ":" +
-                                    std::to_string(config.ueLinkPort));
-                    Log("INFO", "Shared eNB S1-U GTP-U endpoint bound to " + config.s1uAddress + ":" +
-                                    std::to_string(config.s1uPort));
+                    // A successful S1 Setup authorizes a new association
+                    // epoch. Only now may UE-associated signalling flow.
+                    const uint32_t epoch = multiplexer.bindAssociation(handler, handler.outboundStreams);
+                    Log("INFO", "S1 association epoch=" + std::to_string(epoch) +
+                                    ", outbound-streams=" + std::to_string(handler.outboundStreams));
+                    if (establishedOnce)
+                        ++multiplexer.recoveryCounters().reconnectSuccesses;
+                    establishedOnce = true;
+                    attemptComplete = true;
+
+                    // Serve this association until it is lost or the process is
+                    // asked to stop. The multiplexer keeps running either way.
                     while (!shutdownRequested && !handler.associationLost)
                     {
+                        FailureInjector::Command command = injector.poll();
+                        if (command == FailureInjector::Command::LOSS)
+                        {
+                            Log("WARN", "S1 failure injection: association loss requested by the control file");
+                            handler.associationLost = true;
+                            break;
+                        }
+                        if (command == FailureInjector::Command::LOSS_BEFORE_S1AP_RESPONSE)
+                        {
+                            Log("WARN", "S1 failure injection: armed to interrupt the next S1AP response");
+                            multiplexer.armLossBeforeNextS1apSend();
+                        }
+
                         // Keep the shared SCTP association responsive; every
                         // received message is routed by the multiplexer to the
                         // matching UE context only.
@@ -216,18 +371,38 @@ int Run(const EnbConfig &config, const std::atomic_bool &shutdownRequested)
                             handler.message.clear();
                         }
                         multiplexer.poll(16, 16);
+
+                        if (multiplexer.injectionTriggered())
+                        {
+                            Log("WARN", "S1 failure injection: an in-flight S1AP procedure was interrupted");
+                            handler.associationLost = true;
+                            break;
+                        }
                     }
-                    multiplexer.shutdown();
-                    if (handler.associationLost)
+
+                    const bool stopping = shutdownRequested;
+                    // Access transport of every affected UE is invalidated and
+                    // the association sender is detached before anything else.
+                    const size_t affected = multiplexer.invalidateAccess();
+                    if (handler.associationLost && !stopping)
                     {
+                        ++multiplexer.recoveryCounters().unexpectedAssociationLosses;
                         state.transition(ConnectionEvent::CONNECTION_LOST);
-                        Log("WARN", "Connection disconnected, State=" + std::string(ToString(state.state())));
+                        Log("WARN", "Connection disconnected after invalidating access of " +
+                                        std::to_string(affected) + " LTE UE(s), State=" +
+                                        std::string(ToString(state.state())));
+                        LogRecoveryCounters(multiplexer.recoveryCounters());
+                        continue;
                     }
+                    state.transition(ConnectionEvent::SHUTDOWN_REQUESTED);
                     Log("INFO", "LTE eNB shutdown complete");
-                    return shutdownRequested ? 0 : 1;
+                    multiplexer.shutdown();
+                    LogRecoveryCounters(multiplexer.recoveryCounters());
+                    return 0;
                 }
 
                 state.transition(ConnectionEvent::SETUP_REJECTED);
+                ++multiplexer.recoveryCounters().s1SetupFailures;
                 std::string rejection = "S1 Setup rejected: cause=" + outcome.causeCategory + "/" + outcome.causeText +
                                         " (" + std::to_string(outcome.causeValue) + ")";
                 if (outcome.timeToWaitSeconds.has_value())
@@ -244,23 +419,41 @@ int Run(const EnbConfig &config, const std::atomic_bool &shutdownRequested)
             if (!attemptComplete && !shutdownRequested)
             {
                 state.transition(ConnectionEvent::SETUP_REJECTED);
+                ++multiplexer.recoveryCounters().s1SetupFailures;
                 Log("ERROR", "Timed out waiting for S1 Setup Response, State=" + std::string(ToString(state.state())));
             }
         }
         catch (const std::exception &e)
         {
+            // invalidateAccess detaches the sender first, so nothing produced
+            // during the cleanup can still reach the failed association.
+            const size_t affected = multiplexer.invalidateAccess();
             state.transition(ConnectionEvent::CONNECTION_LOST);
-            Log("ERROR",
-                std::string("S1 connection attempt failed: ") + e.what() + ", State=" + ToString(state.state()));
+            if (establishedOnce)
+            {
+                ++multiplexer.recoveryCounters().unexpectedAssociationLosses;
+                ++multiplexer.recoveryCounters().reconnectFailures;
+                Log("WARN", "S1 connection failed after invalidating access of " + std::to_string(affected) +
+                                " LTE UE(s): " + e.what() + ", State=" + ToString(state.state()));
+            }
+            else
+                Log("ERROR", std::string("S1 connection attempt failed: ") + e.what() + ", State=" +
+                                 ToString(state.state()));
         }
     }
 
-    if (shutdownRequested)
+    if (shutdownInterrupted || shutdownRequested)
     {
+        state.transition(ConnectionEvent::SHUTDOWN_REQUESTED);
+        multiplexer.invalidateAccess();
+        multiplexer.shutdown();
         Log("INFO", "LTE eNB shutdown complete");
+        LogRecoveryCounters(multiplexer.recoveryCounters());
         return 0;
     }
     Log("ERROR", "S1 Setup did not complete after " + std::to_string(config.retry.maxAttempts) + " attempts");
+    multiplexer.shutdown();
+    LogRecoveryCounters(multiplexer.recoveryCounters());
     return 1;
 }
 

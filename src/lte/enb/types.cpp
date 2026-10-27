@@ -27,12 +27,21 @@ const char *ToString(ConnectionState state)
         return "S1_SETUP_ESTABLISHED";
     case ConnectionState::S1_SETUP_FAILED:
         return "S1_SETUP_FAILED";
+    case ConnectionState::RECOVERING:
+        return "RECOVERING";
+    case ConnectionState::STOPPING:
+        return "STOPPING";
     }
     return "UNKNOWN";
 }
 
 bool ConnectionStateMachine::transition(ConnectionEvent event)
 {
+    if (event == ConnectionEvent::SHUTDOWN_REQUESTED)
+    {
+        m_state = ConnectionState::STOPPING;
+        return true;
+    }
     if (event == ConnectionEvent::CONNECTION_LOST)
     {
         m_state = ConnectionState::DISCONNECTED;
@@ -43,9 +52,15 @@ bool ConnectionStateMachine::transition(ConnectionEvent event)
     {
     case ConnectionState::DISCONNECTED:
     case ConnectionState::S1_SETUP_FAILED:
+    case ConnectionState::RECOVERING:
         if (event == ConnectionEvent::CONNECT_STARTED)
         {
             m_state = ConnectionState::SCTP_CONNECTING;
+            return true;
+        }
+        if (event == ConnectionEvent::RECOVERY_STARTED && m_state != ConnectionState::RECOVERING)
+        {
+            m_state = ConnectionState::RECOVERING;
             return true;
         }
         break;
@@ -76,6 +91,9 @@ bool ConnectionStateMachine::transition(ConnectionEvent event)
         }
         break;
     case ConnectionState::S1_SETUP_ESTABLISHED:
+        break;
+    case ConnectionState::STOPPING:
+        // Terminal: no further transition is accepted.
         break;
     }
     return false;

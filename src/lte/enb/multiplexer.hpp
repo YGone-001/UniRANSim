@@ -13,6 +13,7 @@
 #include "types.hpp"
 #include "ue_registry.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <vector>
@@ -31,6 +32,35 @@ class IS1apSender
   public:
     virtual ~IS1apSender() = default;
     virtual void sendS1ap(uint16_t stream, const std::vector<uint8_t> &pdu) = 0;
+};
+
+// Association-scoped binding between the multiplexer and one SCTP sender.
+//
+// A sender is only reachable while its association epoch is the current one.
+// Rebinding advances the epoch, so a handler left over from a previous
+// association can neither transmit through the new sender nor be mistaken for
+// it. An unbound sender is a counted no-op rather than a crash, because UE
+// radio and S1-U processing continue while no association exists.
+class S1apSenderBinding
+{
+  public:
+    void bind(IS1apSender &sender, uint32_t epoch);
+    // Unbinds only while the given epoch is still current, so a late teardown
+    // of an old association cannot detach the new one.
+    void unbind(uint32_t epoch);
+    [[nodiscard]] bool bound() const { return m_sender != nullptr; }
+    [[nodiscard]] uint32_t epoch() const { return m_epoch; }
+    // Returns false and counts the rejection when the caller's epoch is not
+    // the currently bound one.
+    bool send(uint32_t epoch, uint16_t stream, const std::vector<uint8_t> &pdu);
+    [[nodiscard]] uint64_t staleRejects() const { return m_staleRejects; }
+    [[nodiscard]] uint64_t unboundRejects() const { return m_unboundRejects; }
+
+  private:
+    IS1apSender *m_sender{};
+    uint32_t m_epoch{};
+    uint64_t m_staleRejects{};
+    uint64_t m_unboundRejects{};
 };
 
 // Diagnostics for the non-UE-associated S1AP Paging path. A delivered
@@ -55,7 +85,41 @@ struct PagingCounters
 class EnbMultiplexer
 {
   public:
+    // Binds the initial sender at epoch 1. The long-lived resources
+    // (simulated-radio endpoint, shared S1-U endpoint and UE registry) are
+    // owned by this object and survive every association epoch.
     EnbMultiplexer(const EnbConfig &config, IS1apSender &sender);
+    // Starts unbound: the caller binds the first association explicitly.
+    explicit EnbMultiplexer(const EnbConfig &config);
+
+    // Binds a new SCTP association: allocates the next association epoch,
+    // binds the sender to exactly that epoch and installs the stream count
+    // negotiated for this association. Returns the epoch that was allocated.
+    uint32_t bindAssociation(IS1apSender &sender, int outboundStreams);
+    // Detaches the currently bound association sender, if any. It is safe to
+    // call repeatedly and while nothing is bound.
+    void unbindAssociation();
+    [[nodiscard]] bool associationBound() const;
+    // The epoch of the currently bound association, or zero while unbound.
+    [[nodiscard]] uint32_t associationEpoch() const;
+    // The epoch that a subsequent bindAssociation will allocate. Never zero.
+    [[nodiscard]] uint32_t nextAssociationEpoch() const;
+
+    // Confirms an unexpected loss of the currently bound association. It is
+    // deliberately not a 3GPP UE Context Release: no S1AP message is sent.
+    // Every UE that still holds access transport has that transport
+    // invalidated, its S1AP identifiers and local TEIDs erased, and is notified
+    // through the internal S1_ACCESS_LOST software-radio indication. Confirmed
+    // logical EPS bearer identities are retained. Returns the number of UEs
+    // whose access was invalidated.
+    size_t invalidateAccess();
+
+    // One-shot test seam: the next S1AP PDU that would be sent is dropped and
+    // the injection is reported through injectionTriggered(). Disabled unless
+    // armed explicitly.
+    void armLossBeforeNextS1apSend();
+    [[nodiscard]] bool injectionTriggered() const;
+    void clearInjection();
 
     // The negotiated outbound SCTP stream count of the association; it bounds
     // the streams UE-associated signalling may use.
@@ -76,6 +140,11 @@ class EnbMultiplexer
     [[nodiscard]] InetAddress ueLinkAddress() const;
     [[nodiscard]] InetAddress s1uAddress() const;
     [[nodiscard]] const PagingCounters &pagingCounters() const;
+    [[nodiscard]] const RecoveryCounters &recoveryCounters() const;
+    [[nodiscard]] RecoveryCounters &recoveryCounters();
+    // Milliseconds between the most recent access invalidation and the first
+    // subsequent successful UE restoration; zero while none has completed.
+    [[nodiscard]] uint64_t restorationLatencyMs() const;
 
     // Logs final per-UE statistics and releases every bearer; the shared
     // sockets remain owned by this object until it is destroyed.
@@ -99,14 +168,27 @@ class EnbMultiplexer
                                std::optional<s1ap::STmsi> sTmsi);
     void sendRadio(EnbUeEntry &entry, lte::ue::link::MessageType type, std::vector<uint8_t> payload);
     uint16_t streamFor(const EnbUeEntry &entry) const;
+    // Association-aware send. Returns false when the PDU was not transmitted
+    // because no current association exists or an injection was armed.
+    bool sendS1ap(uint16_t stream, const std::vector<uint8_t> &pdu);
 
     EnbConfig m_config;
-    IS1apSender &m_sender;
+    S1apSenderBinding m_sender;
+    // Zero while no association is bound. Every bind allocates the next value
+    // from m_nextAssociationEpoch, so an epoch is never reused and a callback
+    // from a previous association can never match the current one.
+    uint32_t m_associationEpoch{};
+    uint32_t m_nextAssociationEpoch{};
     int m_outboundStreams{1};
+    bool m_injectionArmed{};
+    bool m_injectionTriggered{};
+    uint64_t m_restorationLatencyMs{};
+    std::chrono::steady_clock::time_point m_accessInvalidatedAt{};
     udp::UdpServer m_ueLink;
     UeRegistry m_registry;
     S1uEndpoint m_s1u;
     PagingCounters m_paging;
+    RecoveryCounters m_recovery;
 };
 
 } // namespace lte::enb

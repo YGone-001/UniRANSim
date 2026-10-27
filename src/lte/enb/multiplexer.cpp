@@ -59,10 +59,194 @@ std::string ToHex(const uint8_t *data, size_t size)
 } // namespace
 
 EnbMultiplexer::EnbMultiplexer(const EnbConfig &config, IS1apSender &sender)
-    : m_config(config), m_sender(sender), m_ueLink(config.ueLinkAddress, config.ueLinkPort),
+    : m_config(config), m_ueLink(config.ueLinkAddress, config.ueLinkPort),
       m_registry(static_cast<size_t>(config.maxUes)), m_s1u(config.s1uAddress, config.s1uPort, config.allowLoopbackS1u,
                                                            m_registry, m_ueLink)
 {
+    bindAssociation(sender, 1);
+}
+
+EnbMultiplexer::EnbMultiplexer(const EnbConfig &config)
+    : m_config(config), m_ueLink(config.ueLinkAddress, config.ueLinkPort),
+      m_registry(static_cast<size_t>(config.maxUes)), m_s1u(config.s1uAddress, config.s1uPort, config.allowLoopbackS1u,
+                                                           m_registry, m_ueLink)
+{
+}
+
+void S1apSenderBinding::bind(IS1apSender &sender, uint32_t epoch)
+{
+    if (epoch == 0)
+        throw std::runtime_error("An association epoch must be non-zero");
+    m_sender = &sender;
+    m_epoch = epoch;
+}
+
+void S1apSenderBinding::unbind(uint32_t epoch)
+{
+    if (m_sender == nullptr || m_epoch != epoch)
+        return;
+    m_sender = nullptr;
+}
+
+bool S1apSenderBinding::send(uint32_t epoch, uint16_t stream, const std::vector<uint8_t> &pdu)
+{
+    if (m_sender == nullptr)
+    {
+        ++m_unboundRejects;
+        return false;
+    }
+    if (m_epoch != epoch)
+    {
+        ++m_staleRejects;
+        return false;
+    }
+    m_sender->sendS1ap(stream, pdu);
+    return true;
+}
+
+uint32_t EnbMultiplexer::bindAssociation(IS1apSender &sender, int outboundStreams)
+{
+    if (m_sender.bound())
+        throw std::runtime_error("An SCTP association is already bound");
+    // Wraparound is handled explicitly: zero is never a valid epoch, so a
+    // counter that rolls over skips it instead of colliding with "unbound".
+    if (++m_nextAssociationEpoch == 0)
+        ++m_nextAssociationEpoch;
+    m_associationEpoch = m_nextAssociationEpoch;
+    m_sender.bind(sender, m_associationEpoch);
+    setOutboundStreams(outboundStreams);
+    m_injectionTriggered = false;
+    ++m_recovery.associationsEstablished;
+    return m_associationEpoch;
+}
+
+void EnbMultiplexer::unbindAssociation()
+{
+    if (m_associationEpoch != 0)
+        m_sender.unbind(m_associationEpoch);
+    m_associationEpoch = 0;
+}
+
+bool EnbMultiplexer::associationBound() const
+{
+    return m_sender.bound();
+}
+
+uint32_t EnbMultiplexer::associationEpoch() const
+{
+    return m_associationEpoch;
+}
+
+uint32_t EnbMultiplexer::nextAssociationEpoch() const
+{
+    uint32_t next = m_nextAssociationEpoch + 1U;
+    return next == 0 ? 1U : next;
+}
+
+bool EnbMultiplexer::sendS1ap(uint16_t stream, const std::vector<uint8_t> &pdu)
+{
+    if (m_injectionArmed)
+    {
+        // One-shot deterministic interruption: the PDU is dropped and the
+        // caller tears the association down instead of transmitting.
+        m_injectionArmed = false;
+        m_injectionTriggered = true;
+        ++m_recovery.injectedAssociationLosses;
+        return false;
+    }
+    const bool sent = m_sender.send(m_associationEpoch, stream, pdu);
+    if (!sent)
+    {
+        if (m_sender.bound())
+            ++m_recovery.staleSenderRejects;
+        else
+            ++m_recovery.unboundSenderRejects;
+    }
+    return sent;
+}
+
+void EnbMultiplexer::armLossBeforeNextS1apSend()
+{
+    m_injectionArmed = true;
+}
+
+bool EnbMultiplexer::injectionTriggered() const
+{
+    return m_injectionTriggered;
+}
+
+void EnbMultiplexer::clearInjection()
+{
+    m_injectionArmed = false;
+    m_injectionTriggered = false;
+}
+
+size_t EnbMultiplexer::invalidateAccess()
+{
+    // An unexpected association loss is not a 3GPP UE Context Release
+    // procedure. No S1AP message is fabricated here; the simulated UEs are
+    // told only through the internal S1_ACCESS_LOST software-radio indication,
+    // which is explicitly not a NAS or RRC message.
+    //
+    // Detaching the sender first guarantees that nothing generated during this
+    // cleanup can still reach the failed association, and that a later
+    // reconnection binds a brand-new epoch instead of reviving this one.
+    unbindAssociation();
+    m_accessInvalidatedAt = std::chrono::steady_clock::now();
+    ++m_recovery.accessInvalidations;
+
+    size_t affected = 0;
+    for (auto *entry : m_registry.all())
+    {
+        if (!entry->s1Active())
+            continue;
+        // A context that never reached bearer-active was mid-procedure: the
+        // association died before it could be completed, so the attempt failed.
+        if (entry->s1 == UeS1State::CONTEXT_PENDING)
+            ++m_recovery.failedUeRestorations;
+        const uint8_t defaultEbi = entry->bearer.parameters().erabId;
+        const size_t bearers = (entry->bearer.logicalExists() ? 1U : 0U) + entry->dedicatedBearers.size();
+        ++affected;
+        ++m_recovery.activeUesAffectedByLoss;
+        m_recovery.logicalBearersRetained += bearers;
+        for (const auto &bearer : entry->dedicatedBearers)
+            if (bearer.parameters().localTeid != 0)
+                ++m_recovery.localTeidsInvalidated;
+        if (entry->bearer.parameters().localTeid != 0)
+            ++m_recovery.localTeidsInvalidated;
+
+        m_registry.releaseS1(*entry);
+        try
+        {
+            // Generation-bound: the payload carries the new access generation,
+            // so a late or duplicated notification is rejected by the UE.
+            sendRadio(*entry, lte::ue::link::MessageType::S1_ACCESS_LOST,
+                      lte::ue::link::EncodeBearerRestoration(defaultEbi, entry->accessGeneration));
+        }
+        catch (const std::exception &e)
+        {
+            // One unreachable simulated radio peer must not block the cleanup
+            // of the other UEs.
+            Log("WARN", std::string("Access-loss notification failed for LTE UE ") +
+                            std::to_string(entry->radioUeId) + ": " + e.what());
+        }
+    }
+    return affected;
+}
+
+uint64_t EnbMultiplexer::restorationLatencyMs() const
+{
+    return m_restorationLatencyMs;
+}
+
+const RecoveryCounters &EnbMultiplexer::recoveryCounters() const
+{
+    return m_recovery;
+}
+
+RecoveryCounters &EnbMultiplexer::recoveryCounters()
+{
+    return m_recovery;
 }
 
 void EnbMultiplexer::setOutboundStreams(int outboundStreams)
@@ -112,6 +296,7 @@ void EnbMultiplexer::handleS1ap(const uint8_t *data, size_t size, uint16_t strea
     {
         // A rejected UE-specific message never endangers the shared
         // association or the contexts of the other UEs.
+        ++m_recovery.staleMessagesRejected;
         Log("WARN", std::string("Rejected post-setup S1AP message on stream ") + std::to_string(stream) + ": " +
                        e.what());
     }
@@ -233,7 +418,7 @@ void EnbMultiplexer::onInitialContextSetupRequest(const uint8_t *data, size_t si
         throw s1ap::CodecError("MME-UE-S1AP-ID is already owned by another UE context");
     // Decode and ownership checks precede any assignment or TEID indexing.
     auto fail = [&](const std::string &category, int value) {
-        m_sender.sendS1ap(streamFor(*entry), s1ap::EncodeInitialContextSetupFailure(
+        sendS1ap(streamFor(*entry), s1ap::EncodeInitialContextSetupFailure(
             request.mmeUeS1apId, request.enbUeS1apId, category, value));
     };
     std::set<uint8_t> seen;
@@ -332,7 +517,12 @@ void EnbMultiplexer::onInitialContextSetupRequest(const uint8_t *data, size_t si
             m_registry.bindLocalTeid(*entry, *bearer, bearer->parameters().localTeid);
         }
         m_registry.setMmeUeS1apId(*entry, request.mmeUeS1apId);
-        m_sender.sendS1ap(streamFor(*entry), response);
+        if (!sendS1ap(streamFor(*entry), response))
+            // The association died, or a test injection interrupted it, before
+            // the outcome could leave the eNB. Nothing is published: the catch
+            // below rolls back every allocated TEID so no half-committed bearer
+            // can ever become forwardable.
+            throw BearerError("Initial Context Setup Response could not be transmitted; context rolled back");
         candidate.mmeUeS1apId = request.mmeUeS1apId;
         *entry = std::move(candidate);
     }
@@ -430,7 +620,11 @@ void EnbMultiplexer::onErabSetupRequest(const uint8_t *data, size_t size)
             auto *bearer = m_registry.findBearer(candidate, item.erabId);
             m_registry.bindLocalTeid(*entry, *bearer, bearer->parameters().localTeid);
         }
-        m_sender.sendS1ap(streamFor(*entry), response);
+        if (!sendS1ap(streamFor(*entry), response))
+            // Same rule as Initial Context Setup: an outcome that never left the
+            // eNB is not an outcome, so the half-created dedicated bearers are
+            // rolled back and never become ready.
+            throw BearerError("E-RAB Setup Response could not be transmitted; context rolled back");
         *entry = std::move(candidate);
     }
     catch (...)
@@ -458,6 +652,17 @@ void EnbMultiplexer::onErabModifyRequest(const uint8_t *data, size_t size)
         throw s1ap::CodecError("E-RAB Modify has an unknown/stale S1AP identity pair");
     std::vector<uint8_t> modified;
     std::vector<s1ap::ErabFailedItem> failed;
+    // Every item is validated into a candidate first and published only after
+    // the Modify Response has actually left the eNB. An association loss in the
+    // middle of the procedure therefore cannot leave a partially applied
+    // NAS/QoS/transport transition behind.
+    struct PendingModification
+    {
+        BearerContext *target;
+        BearerContext candidate;
+        const s1ap::ErabToBeModifiedItem *item;
+    };
+    std::vector<PendingModification> pending;
     for (const auto &item : request.erabs)
     {
         auto *bearer = m_registry.findBearer(*entry, item.erabId);
@@ -488,21 +693,27 @@ void EnbMultiplexer::onErabModifyRequest(const uint8_t *data, size_t size)
             Log("WARN", "E-RAB Modify failed EBI=" + std::to_string(item.erabId) + ": " + e.what());
             continue;
         }
+        pending.push_back({bearer, std::move(candidate), &item});
+        modified.push_back(item.erabId);
+    }
+    if (!sendS1ap(streamFor(*entry),
+                  s1ap::EncodeErabModifyResponse(request.mmeUeS1apId, request.enbUeS1apId, modified, failed)))
+        throw BearerError("E-RAB Modify Response could not be transmitted; no bearer state was published");
+    for (auto &entry2 : pending)
+    {
         // The event loop cannot classify a packet between these operations.
         // NAS delivery is independent of the later UE Accept/Reject.
-        if (!item.transport)
-            sendRadio(*entry, lte::ue::link::MessageType::NAS_DOWNLINK, item.nasPdu);
-        *bearer = std::move(candidate);
-        modified.push_back(item.erabId);
-        Log("INFO", "E-RAB Modify applied EBI=" + std::to_string(item.erabId) + " QCI=" +
-                        std::to_string(bearer->parameters().qci) + " SGW-TEID=" + Hex(bearer->parameters().sgwTeid, 8) +
-                        " eNB-TEID=" + Hex(bearer->parameters().localTeid, 8) +
-                        (item.transport ? " transport replacement (QoS/NAS ignored)" : " QoS metadata; NAS relayed"));
+        if (!entry2.item->transport)
+            sendRadio(*entry, lte::ue::link::MessageType::NAS_DOWNLINK, entry2.item->nasPdu);
+        *entry2.target = std::move(entry2.candidate);
+        Log("INFO", "E-RAB Modify applied EBI=" + std::to_string(entry2.item->erabId) + " QCI=" +
+                        std::to_string(entry2.target->parameters().qci) +
+                        " SGW-TEID=" + Hex(entry2.target->parameters().sgwTeid, 8) +
+                        " eNB-TEID=" + Hex(entry2.target->parameters().localTeid, 8) +
+                        (entry2.item->transport ? " transport replacement (QoS/NAS ignored)" : " QoS metadata; NAS relayed"));
     }
     if (request.ueAmbr && !modified.empty())
         entry->ueAmbr = request.ueAmbr;
-    m_sender.sendS1ap(streamFor(*entry),
-                      s1ap::EncodeErabModifyResponse(request.mmeUeS1apId, request.enbUeS1apId, modified, failed));
 }
 
 void EnbMultiplexer::onErabReleaseCommand(const uint8_t *data, size_t size)
@@ -514,12 +725,19 @@ void EnbMultiplexer::onErabReleaseCommand(const uint8_t *data, size_t size)
     if (entry->mmeUeS1apId != command.mmeUeS1apId)
         throw s1ap::CodecError("E-RAB Release Command does not match the UE context identity pair");
 
+    // Validate the whole list before releasing anything, so a rejected item
+    // cannot leave a half-applied release behind when the association drops.
     for (auto erabId : command.erabIds)
     {
         // Releasing the default bearer is a PDN teardown, not an E-RAB release;
         // treating it as one would leave the UE registered with no user plane.
         if (entry->bearer.parameters().erabId == erabId)
             throw BearerError("The default bearer cannot be released by an E-RAB Release Command");
+        if (m_registry.findBearer(*entry, erabId) == nullptr)
+            throw BearerError("E-RAB Release Command names an unknown dedicated bearer");
+    }
+    for (auto erabId : command.erabIds)
+    {
         m_registry.releaseBearer(*entry, erabId);
         Log("INFO", "Released dedicated E-RAB " + std::to_string(erabId) + " for " + Describe(*entry));
     }
@@ -538,7 +756,7 @@ void EnbMultiplexer::onErabReleaseCommand(const uint8_t *data, size_t size)
     }
 
     auto response = s1ap::EncodeErabReleaseResponse(command.mmeUeS1apId, command.enbUeS1apId, command.erabIds);
-    m_sender.sendS1ap(streamFor(*entry), response);
+    sendS1ap(streamFor(*entry), response);
 }
 
 void EnbMultiplexer::onDownlinkNasTransport(const uint8_t *data, size_t size)
@@ -607,7 +825,7 @@ void EnbMultiplexer::onUeContextReleaseCommand(const uint8_t *data, size_t size)
                     std::to_string(enbId) + ", MME-UE-S1AP-ID=" + std::to_string(mmeId) +
                     "); its TEID mapping was invalidated");
     auto complete = s1ap::EncodeUeContextReleaseComplete(mmeId, enbId);
-    m_sender.sendS1ap(SctpStreamForUe(m_outboundStreams, enbId), complete);
+    sendS1ap(SctpStreamForUe(m_outboundStreams, enbId), complete);
     Log("INFO", "UE Context Release Complete sent for eNB-UE-S1AP-ID=" + std::to_string(enbId));
 }
 
@@ -638,7 +856,7 @@ void EnbMultiplexer::handleRadioFrame(const uint8_t *data, size_t size, const In
                 radio.payload[0] != entry->bearer.parameters().erabId)
                 throw lte::ue::link::DecodeError("S1 release request does not match an active registered UE context");
             auto request = s1ap::EncodeUeContextReleaseRequest(entry->mmeUeS1apId, entry->enbUeS1apId);
-            m_sender.sendS1ap(streamFor(*entry), request);
+            sendS1ap(streamFor(*entry), request);
             Log("INFO", "UE Context Release Request sent for " + Describe(*entry) +
                             ": cause=radioNetwork/user-inactivity");
         }
@@ -663,7 +881,7 @@ void EnbMultiplexer::handleRadioFrame(const uint8_t *data, size_t size, const In
                         "Uplink NAS cannot be routed before the MME assigned an MME-UE-S1AP-ID");
                 auto uplink =
                     s1ap::EncodeUplinkNasTransport(m_config, {entry->enbUeS1apId, entry->mmeUeS1apId}, radio.payload);
-                m_sender.sendS1ap(streamFor(*entry), uplink);
+                sendS1ap(streamFor(*entry), uplink);
                 Log("INFO", "Uplink NAS Transport sent for " + Describe(*entry));
             }
             else
@@ -694,7 +912,15 @@ void EnbMultiplexer::handleRadioFrame(const uint8_t *data, size_t size, const In
                 throw BearerError("Dedicated transport confirmation precedes default readiness");
             bearer->activateUe(entry->radioUeId, restored.first, entry->bearer.ueIpv4());
             if (bearer->kind() == BearerKind::DEFAULT)
+            {
                 entry->s1 = UeS1State::BEARER_ACTIVE;
+                ++m_recovery.successfulUeRestorations;
+                if (m_recovery.accessInvalidations != 0 && m_restorationLatencyMs == 0)
+                    m_restorationLatencyMs = static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
+                                                                             m_accessInvalidatedAt)
+                            .count());
+            }
         }
         else if (radio.type == lte::ue::link::MessageType::BEARER_READY)
         {
@@ -733,6 +959,11 @@ void EnbMultiplexer::handleRadioFrame(const uint8_t *data, size_t size, const In
     }
     catch (const std::exception &e)
     {
+        // Counts every datagram rejected as stale, malformed or unauthorized:
+        // a stale generation, an unknown EBI, a duplicated confirmation, an
+        // identity claimed from another endpoint and a genuine decode failure
+        // all land here and none of them disturbs any other UE context.
+        ++m_recovery.staleMessagesRejected;
         Log("WARN", std::string("Rejected LTE UE radio-link datagram: ") + e.what());
     }
 }
@@ -755,7 +986,17 @@ void EnbMultiplexer::startInitialUeMessage(EnbUeEntry &entry, std::vector<uint8_
     m_registry.bindEnbUeS1apId(entry, enbUeId);
     entry.s1 = UeS1State::CONTEXT_PENDING;
     auto initial = s1ap::EncodeInitialUeMessage(m_config, enbUeId, nasPdu, sTmsi);
-    m_sender.sendS1ap(SctpStreamForUe(m_outboundStreams, enbUeId), initial);
+    if (!sendS1ap(SctpStreamForUe(m_outboundStreams, enbUeId), initial))
+    {
+        // Nothing left the eNB, so no S1 procedure exists. The provisional
+        // context is discarded instead of lingering in CONTEXT_PENDING and
+        // blocking a later Service Request. The entry is returned to
+        // IDLE_RETAINED first so releaseS1 does not advance the access
+        // generation: no access epoch was ever created.
+        entry.s1 = UeS1State::IDLE_RETAINED;
+        m_registry.releaseS1(entry);
+        throw BearerError("Initial UE Message could not be transmitted; the provisional context was discarded");
+    }
     Log("INFO", "Initial UE Message sent for LTE UE " + std::to_string(entry.radioUeId) +
                     " with fresh eNB-UE-S1AP-ID=" + std::to_string(enbUeId));
 }

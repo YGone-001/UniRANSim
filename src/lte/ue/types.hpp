@@ -129,6 +129,14 @@ struct LifecycleConfig
     // Bounded wait for the first network paging indication in the paging
     // scenario. A timeout is reported as a failure, never as paging success.
     int pagingWaitMs{60000};
+    // Access restoration after an unexpected S1-MME association loss. The UE
+    // retains its EPS registration and sends a genuine compact Service Request
+    // after this delay; it never re-Attaches silently. Zero disables the
+    // UE-initiated path entirely and leaves network-initiated Paging as the
+    // only restoration trigger.
+    int recoveryDelayMs{6000};
+    int recoveryRetryMs{5000};
+    int recoveryMaxAttempts{3};
 };
 
 struct Config

@@ -102,6 +102,18 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
     uint64_t tunDownlinkBytes = 0;
     uint64_t malformedDrops = 0;
     uint64_t bearerInactiveDrops = 0;
+    // Packets generated while no usable access transport exists. They are
+    // dropped, counted and never buffered and never rerouted to another bearer.
+    uint64_t accessUnavailableDrops = 0;
+    // Unexpected S1-MME association loss bookkeeping. The UE keeps its EPS
+    // registration and logical bearers; only access transport is invalidated.
+    uint64_t accessLosses = 0;
+    bool recoveryPending = false;
+    bool recoveryDriven = false;
+    int recoveryAttempts = 0;
+    uint64_t recoveryRestorations = 0;
+    uint64_t recoveryFailures = 0;
+    auto recoveryDeadline = std::chrono::steady_clock::time_point::max();
     bool scenarioTriggered = false;
     bool idleReleaseRequested = false;
     std::vector<uint8_t> pendingWire;
@@ -212,6 +224,44 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
             return 1;
         }
 
+        // Access restoration after an unexpected S1-MME association loss. The
+        // UE sends a genuine compact EPS Service Request under its existing NAS
+        // security context and GUTI. It never re-Attaches silently and never
+        // invents a network procedure; the MME decides whether the old EPS
+        // context still exists.
+        if (recoveryPending && mobility.emm == EmmState::REGISTERED && mobility.ecm == EcmState::IDLE &&
+            mobility.pending == PendingProcedure::NONE && now >= recoveryDeadline)
+        {
+            if (recoveryAttempts >= config.lifecycle.recoveryMaxAttempts)
+            {
+                recoveryPending = false;
+                Log("ERROR", "Access recovery gave up after " + std::to_string(recoveryAttempts) +
+                                " Service Request attempt(s); the UE remains registered and ECM-IDLE");
+            }
+            else
+            {
+                try
+                {
+                    mobility.startServiceRequest();
+                    pendingWire = nas::EncodeServiceRequest(security);
+                    SendServiceRequest(socket, enb, ueId, *mobility.guti, pendingWire);
+                    security.ulNasCount = (security.ulNasCount + 1U) & 0xFFFFFFU;
+                    ++recoveryAttempts;
+                    recoveryDriven = true;
+                    procedureRetries = 0;
+                    procedureDeadline = now + std::chrono::milliseconds(config.lifecycle.procedureTimeoutMs);
+                    recoveryDeadline = now + std::chrono::milliseconds(config.lifecycle.recoveryRetryMs);
+                    Log("INFO", "Compact EPS Service Request sent after unexpected S1 access loss (attempt " +
+                                    std::to_string(recoveryAttempts) + ")");
+                }
+                catch (const std::exception &e)
+                {
+                    recoveryPending = false;
+                    Log("ERROR", std::string("Access recovery cannot start a Service Request: ") + e.what());
+                }
+            }
+        }
+
         if (mobility.pending != PendingProcedure::NONE && !pendingWire.empty() && now >= procedureDeadline)
         {
             if (procedureRetries >= config.lifecycle.maxRetries)
@@ -220,6 +270,19 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 {
                     ++pagingRestorationFailures;
                     Log("ERROR", "Paging-triggered service restoration failed after bounded retransmissions");
+                }
+                if (recoveryDriven)
+                {
+                    // A bounded recovery outcome: the network never completed
+                    // the restoration. The UE stays registered and ECM-IDLE and
+                    // reports the failure instead of fabricating success.
+                    ++recoveryFailures;
+                    recoveryDriven = false;
+                    pendingWire.clear();
+                    mobility.onProcedureRejected();
+                    Log("ERROR", "Access recovery Service Request timed out after bounded retransmissions");
+                    recoveryDeadline = now + std::chrono::milliseconds(config.lifecycle.recoveryRetryMs);
+                    continue;
                 }
                 Log("ERROR", std::string(ToString(mobility.pending)) + " timed out after bounded retransmissions");
                 return 1;
@@ -234,7 +297,7 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                             ", retry=" + std::to_string(procedureRetries));
         }
 
-        if (tun && mobility.canForwardUserPlane())
+        if (tun)
         {
             // Bound each turn so continuous application traffic cannot starve
             // downlink radio-link processing.
@@ -251,6 +314,16 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                         throw ip::ValidationError("TUN uplink source does not match the assigned UE IPv4 address");
                     ++tunUplinkPackets;
                     tunUplinkBytes += packet.size();
+
+                    // Access transport may be temporarily unavailable, for
+                    // example after an unexpected S1-MME association loss. Such
+                    // packets are dropped and counted: they are never buffered
+                    // and never sent through an obsolete TEID.
+                    if (!mobility.canForwardUserPlane())
+                    {
+                        ++accessUnavailableDrops;
+                        continue;
+                    }
 
                     // Select the bearer by the network-provided TFT. Ties are
                     // resolved by evaluation precedence, and no match falls
@@ -371,6 +444,32 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 }
                 continue;
             }
+            if (message.type == link::MessageType::S1_ACCESS_LOST)
+            {
+                // INTERNAL simulator abstraction: the eNB lost its S1-MME SCTP
+                // association and invalidated this UE's access transport. This
+                // is deliberately not a UE Context Release procedure — no S1AP
+                // message was exchanged and no NAS or RRC message is implied.
+                if (mobility.emm != EmmState::REGISTERED || message.payload[0] != activeEbi)
+                    throw link::DecodeError("S1 access loss does not match the registered bearer");
+                const auto lost = link::DecodeBearerRestoration(message.payload);
+                mobility.acceptAccessRelease(lost.first, lost.second);
+                pendingWire.clear();
+                for (auto &bearer : dedicatedBearers)
+                    bearer.releaseAccessTransport();
+                ++accessLosses;
+                recoveryDriven = false;
+                // Only the UE-initiated path is armed here. Network-initiated
+                // Paging is left untouched and remains fully functional.
+                recoveryPending = config.lifecycle.recoveryDelayMs > 0 &&
+                                  config.lifecycle.recoveryMaxAttempts > 0;
+                recoveryAttempts = 0;
+                recoveryDeadline = std::chrono::steady_clock::now() +
+                                   std::chrono::milliseconds(config.lifecycle.recoveryDelayMs);
+                Log("WARN", "S1 access transport lost unexpectedly; EPS registration, security, GUTI, "
+                            "logical bearers, TFT and TUN retained");
+                continue;
+            }
             if (message.type == link::MessageType::PAGING_INDICATION)
             {
                 ++pagingIndications;
@@ -408,6 +507,13 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 mobility.validateAccessRestoration(restored.first, restored.second, false);
                 mobility.onServiceRestored(tun != nullptr);
                 pendingWire.clear();
+                if (recoveryDriven || recoveryPending)
+                {
+                    ++recoveryRestorations;
+                    recoveryDriven = false;
+                    recoveryPending = false;
+                    Log("INFO", "Access restoration completed after unexpected S1 access loss");
+                }
                 if (pagingTriggeredProcedure)
                 {
                     ++pagingRestorations;
@@ -929,6 +1035,13 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                     " service-requests=" + std::to_string(pagingServiceRequests) +
                     " restorations=" + std::to_string(pagingRestorations) +
                     " restoration-failures=" + std::to_string(pagingRestorationFailures));
+    Log("INFO", "Access-recovery statistics: losses=" + std::to_string(accessLosses) +
+                    " restorations=" + std::to_string(recoveryRestorations) +
+                    " failures=" + std::to_string(recoveryFailures) +
+                    " attempts=" + std::to_string(recoveryAttempts) +
+                    " access-unavailable-drops=" + std::to_string(accessUnavailableDrops) +
+                    " dedicated-ul=" + std::to_string(dedicatedUplinkPackets) +
+                    " dedicated-dl=" + std::to_string(dedicatedDownlinkPackets));
     tun.reset();
     Log("INFO", "LTE UE shutdown complete");
     return 0;

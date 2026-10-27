@@ -49,6 +49,16 @@ enum class MessageType : uint8_t
     DEDICATED_BEARER_RESTORED = 15,
     BEARER_TRANSPORT_READY = 16,
     EPS_SESSION_DELETED = 17,
+    // Downlink-only INTERNAL simulator abstraction. Payload: EBI(1) || access
+    // generation(4). It reports that the eNB lost its S1-MME association and
+    // that this UE's access transport has been invalidated.
+    //
+    // It is NOT a 3GPP message. It is not a UE Context Release Command or
+    // Complete, not a NAS message and not an RRC message: no such procedure was
+    // executed on the network side. Only the simulated software-radio access
+    // transport is affected; the EPS registration, security context, GUTI,
+    // logical bearers, TFT and PDN address of the UE are retained.
+    S1_ACCESS_LOST = 18,
     // Downlink-only simulation of an LTE paging occasion.
     // MMEC(1)||M-TMSI(4)||served TAC(2). It carries no IMSI and no NAS
     // material, so a UE can only match it against the S-TMSI of its own

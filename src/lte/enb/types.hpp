@@ -36,6 +36,25 @@ struct RetryConfig
     int connectTimeoutMs{1000};
 };
 
+// Bounded recovery after an established S1 association was lost. Zero
+// maxAttempts means "retry until shutdown"; a positive value terminates the
+// recovery loop so a permanently unavailable MME cannot spin forever.
+struct RecoveryConfig
+{
+    int maxAttempts{0};
+    int delayMs{2000};
+    int delayMaxMs{15000};
+};
+
+// Opt-in failure injection for the test-owned eNB. The control file is only
+// opened when a path is configured, so an ordinary deployment has no injection
+// code path at all.
+struct FailureInjectionConfig
+{
+    std::string controlFile;
+    int pollIntervalMs{100};
+};
+
 struct EnbConfig
 {
     Plmn plmn;
@@ -55,6 +74,8 @@ struct EnbConfig
     // Bound on concurrently served simulated radio UEs in the registry.
     int maxUes{8};
     RetryConfig retry;
+    RecoveryConfig recovery;
+    FailureInjectionConfig failureInjection;
 };
 
 enum class ConnectionState
@@ -64,7 +85,13 @@ enum class ConnectionState
     SCTP_ASSOCIATED,
     S1_SETUP_PENDING,
     S1_SETUP_ESTABLISHED,
-    S1_SETUP_FAILED
+    S1_SETUP_FAILED,
+    // Entered after an established association was lost and a reconnection will
+    // be attempted. It is not a failure state: it records that the running eNB
+    // is between transport epochs.
+    RECOVERING,
+    // Terminal. Interrupts any backoff and stops UE and radio processing.
+    STOPPING
 };
 
 enum class ConnectionEvent
@@ -74,7 +101,34 @@ enum class ConnectionEvent
     SETUP_REQUEST_SENT,
     SETUP_ACCEPTED,
     SETUP_REJECTED,
-    CONNECTION_LOST
+    CONNECTION_LOST,
+    RECOVERY_STARTED,
+    SHUTDOWN_REQUESTED
+};
+
+// Bounded observability of the SCTP recovery loop. All counters are monotonic
+// for the lifetime of the eNB runtime and never carry subscriber material.
+// Post-recovery bearer traffic is deliberately not duplicated here: it is the
+// per-UE UserPlaneCounters of UeEntry, which already count every forwarded
+// packet on every bearer and are reported as a before/after delta.
+struct RecoveryCounters
+{
+    uint64_t associationsEstablished{};
+    uint64_t unexpectedAssociationLosses{};
+    uint64_t injectedAssociationLosses{};
+    uint64_t accessInvalidations{};
+    uint64_t reconnectAttempts{};
+    uint64_t reconnectSuccesses{};
+    uint64_t reconnectFailures{};
+    uint64_t s1SetupFailures{};
+    uint64_t activeUesAffectedByLoss{};
+    uint64_t logicalBearersRetained{};
+    uint64_t localTeidsInvalidated{};
+    uint64_t staleMessagesRejected{};
+    uint64_t staleSenderRejects{};
+    uint64_t unboundSenderRejects{};
+    uint64_t successfulUeRestorations{};
+    uint64_t failedUeRestorations{};
 };
 
 const char *ToString(ConnectionState state);
