@@ -70,6 +70,7 @@ struct MobilityContext
     std::vector<uint8_t> taiList;
     uint8_t t3412{};
     uint8_t defaultEbi{};
+    uint32_t accessGeneration{};
     std::array<uint8_t, 4> assignedIpv4{};
 
     std::optional<uint32_t> enbUeS1apId;
@@ -84,6 +85,8 @@ struct MobilityContext
     void onBearerTransportEstablished(uint32_t localTeid, uint32_t remoteTeid);
     void onUserPlaneReady();
     void onS1ContextReleased();
+    void acceptAccessRelease(uint8_t ebi, uint32_t generation);
+    void validateAccessRestoration(uint8_t ebi, uint32_t generation, bool dedicated) const;
     void startServiceRequest();
     void onServiceRestored(bool userPlaneReady = true);
     void onServiceRestored(uint32_t enbId, uint32_t mmeId, uint32_t localTeid, uint32_t remoteTeid);

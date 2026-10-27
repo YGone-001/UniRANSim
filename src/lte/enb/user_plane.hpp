@@ -47,6 +47,11 @@ class BearerError : public std::runtime_error
 
 // Pure bearer mapping and validation. Socket ownership remains in the eNB
 // runtime, while this object makes lifecycle and stale-TEID rules testable.
+struct BearerPacketCounters
+{
+    uint64_t uplinkPackets{}, uplinkBytes{}, downlinkPackets{}, downlinkBytes{};
+};
+
 class DefaultBearerContext
 {
   public:
@@ -56,6 +61,14 @@ class DefaultBearerContext
     void validateUplink(uint32_t ueId, const uint8_t *packet, size_t size) const;
     void validateDownlink(uint32_t incomingTeid, const uint8_t *packet, size_t size) const;
     void release();
+    // Access release retains logical EPS identity, negotiated QoS and PDN address.
+    void releaseAccessTransport();
+    void recordUplink(size_t size) { ++m_counters.uplinkPackets; m_counters.uplinkBytes += size; }
+    void recordDownlink(size_t size) { ++m_counters.downlinkPackets; m_counters.downlinkBytes += size; }
+    [[nodiscard]] const BearerPacketCounters &counters() const { return m_counters; }
+    [[nodiscard]] bool logicalConfirmed() const { return m_logicalConfirmed; }
+    [[nodiscard]] bool restorationPending() const { return m_restoringAccess; }
+    [[nodiscard]] bool logicalExists() const { return m_parameters.erabId != 0; }
     // Candidate validation precedes assignment. Neither operation recreates the bearer.
     void modifyQos(const ErabQos &qos);
     void modifyTransport(const std::array<uint8_t, 4> &address, uint32_t teid);
@@ -68,8 +81,11 @@ class DefaultBearerContext
 
   private:
     BearerParameters m_parameters{};
+    BearerPacketCounters m_counters{};
     std::array<uint8_t, 4> m_ueIpv4{};
     bool m_established{};
+    bool m_restoringAccess{};
+    bool m_logicalConfirmed{};
     bool m_ueReady{};
     BearerKind m_kind;
 };

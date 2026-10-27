@@ -35,6 +35,9 @@ void DefaultBearerContext::establish(const BearerParameters &parameters)
 {
     if (m_established)
         throw BearerError("An EPS bearer is already established");
+    if (logicalExists() && (parameters.erabId != m_parameters.erabId ||
+        parameters.ueId != m_parameters.ueId || parameters.linkedDefaultEbi != m_parameters.linkedDefaultEbi))
+        throw BearerError("Access restoration cannot replace a logical EPS bearer identity");
     if (parameters.erabId < 5 || parameters.erabId > 15 || parameters.qci == 0 || parameters.ueId == 0 ||
         parameters.sgwTeid == 0 || parameters.localTeid == 0)
         throw BearerError("Invalid EPS bearer parameters");
@@ -44,8 +47,8 @@ void DefaultBearerContext::establish(const BearerParameters &parameters)
         (parameters.linkedDefaultEbi < 5 || parameters.linkedDefaultEbi > 15 ||
          parameters.linkedDefaultEbi == parameters.erabId))
         throw BearerError("A dedicated bearer has an invalid linked default EBI");
+    m_restoringAccess = logicalExists();
     m_parameters = parameters;
-    m_ueIpv4 = {};
     m_established = true;
     m_ueReady = false;
 }
@@ -65,6 +68,8 @@ void DefaultBearerContext::activateUe(uint32_t ueId, uint8_t epsBearerIdentity,
         throw BearerError("Assigned UE IPv4 address is zero");
     m_ueIpv4 = ipv4Address;
     m_ueReady = true;
+    m_logicalConfirmed = true;
+    m_restoringAccess = false;
 }
 
 void DefaultBearerContext::validateUplink(uint32_t ueId, const uint8_t *packet, size_t size) const
@@ -92,9 +97,22 @@ void DefaultBearerContext::validateDownlink(uint32_t incomingTeid, const uint8_t
 void DefaultBearerContext::release()
 {
     m_parameters = {};
+    m_logicalConfirmed = false;
+    m_counters = {};
     m_ueIpv4 = {};
     m_ueReady = false;
     m_established = false;
+    m_restoringAccess = false;
+}
+
+void DefaultBearerContext::releaseAccessTransport()
+{
+    m_parameters.localTeid = 0;
+    m_parameters.sgwTeid = 0;
+    m_parameters.sgwAddress = {};
+    m_ueReady = false;
+    m_established = false;
+    m_restoringAccess = false;
 }
 
 void DefaultBearerContext::modifyQos(const ErabQos &qos)

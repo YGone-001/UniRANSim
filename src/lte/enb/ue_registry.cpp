@@ -135,10 +135,10 @@ BearerLocation UeRegistry::findBearerByLocalTeid(uint32_t teid)
 
 BearerContext *UeRegistry::findBearer(EnbUeEntry &entry, uint8_t ebi)
 {
-    if (entry.bearer.signalingEstablished() && entry.bearer.parameters().erabId == ebi)
+    if (entry.bearer.logicalExists() && entry.bearer.parameters().erabId == ebi)
         return &entry.bearer;
     for (auto &bearer : entry.dedicatedBearers)
-        if (bearer.signalingEstablished() && bearer.parameters().erabId == ebi)
+        if (bearer.logicalExists() && bearer.parameters().erabId == ebi)
             return &bearer;
     return nullptr;
 }
@@ -150,7 +150,8 @@ const BearerContext *UeRegistry::findBearer(const EnbUeEntry &entry, uint8_t ebi
 
 BearerContext &UeRegistry::addDedicatedBearer(EnbUeEntry &entry, const BearerParameters &parameters)
 {
-    if (parameters.erabId < 5 || parameters.erabId > 15 || findBearer(entry, parameters.erabId) != nullptr)
+    if (parameters.erabId < 5 || parameters.erabId > 15 ||
+        (findBearer(entry, parameters.erabId) != nullptr && findBearer(entry, parameters.erabId)->signalingEstablished()))
         throw RegistryError("The EPS bearer identity is invalid or already owned by this UE");
     if (!entry.bearer.signalingEstablished() || entry.bearer.parameters().erabId != parameters.linkedDefaultEbi)
         throw RegistryError("Dedicated bearer references no valid default bearer");
@@ -161,16 +162,18 @@ BearerContext &UeRegistry::addDedicatedBearer(EnbUeEntry &entry, const BearerPar
     {
         if (retained.parameters().erabId == parameters.erabId && !retained.signalingEstablished())
         {
+            if (!retained.logicalConfirmed())
+                throw RegistryError("Unconfirmed NAS bearer cannot be restored");
             retained.establish(parameters);
             return retained;
         }
     }
     if (entry.dedicatedBearers.size() >= EnbUeEntry::MaxDedicatedBearers)
         throw RegistryError("The per-UE dedicated bearer capacity is exhausted");
-    entry.dedicatedBearers.emplace_back(BearerKind::DEDICATED);
-    auto &bearer = entry.dedicatedBearers.back();
-    bearer.establish(parameters);
-    return bearer;
+    BearerContext candidate(BearerKind::DEDICATED);
+    candidate.establish(parameters);
+    entry.dedicatedBearers.push_back(std::move(candidate));
+    return entry.dedicatedBearers.back();
 }
 
 void UeRegistry::releaseBearer(EnbUeEntry &entry, uint8_t ebi)
@@ -240,10 +243,18 @@ void UeRegistry::setMmeUeS1apId(EnbUeEntry &entry, uint32_t mmeUeS1apId)
         return;
     if (const auto *owner = findByMmeUeS1apId(mmeUeS1apId); owner != nullptr && owner != &entry)
         throw RegistryError("The MME-UE-S1AP-ID is already owned by another UE context");
+    // Allocate the new index before changing ownership, for exception safety.
+    m_byMmeUeS1apId.emplace(mmeUeS1apId, &entry);
     if (entry.mmeUeS1apId != 0)
         m_byMmeUeS1apId.erase(entry.mmeUeS1apId);
     entry.mmeUeS1apId = mmeUeS1apId;
-    m_byMmeUeS1apId.emplace(mmeUeS1apId, &entry);
+}
+
+void UeRegistry::clearMmeUeS1apId(EnbUeEntry &entry)
+{
+    if (entry.mmeUeS1apId != 0)
+        m_byMmeUeS1apId.erase(entry.mmeUeS1apId);
+    entry.mmeUeS1apId = 0;
 }
 
 uint32_t UeRegistry::allocateLocalTeid()
@@ -276,6 +287,8 @@ void UeRegistry::bindLocalTeid(EnbUeEntry &entry, BearerContext &bearer, uint32_
 
 void UeRegistry::releaseS1(EnbUeEntry &entry)
 {
+    if (entry.s1 != UeS1State::IDLE_RETAINED && ++entry.accessGeneration == 0)
+        ++entry.accessGeneration;
     if (entry.enbUeS1apId != 0)
         m_byEnbUeS1apId.erase(entry.enbUeS1apId);
     if (entry.mmeUeS1apId != 0)
@@ -288,14 +301,31 @@ void UeRegistry::releaseS1(EnbUeEntry &entry)
     for (auto &dedicated : entry.dedicatedBearers)
         if (dedicated.parameters().localTeid != 0)
             m_byLocalTeid.erase(dedicated.parameters().localTeid);
-    entry.bearer.release();
+    entry.bearer.releaseAccessTransport();
     // ECM-IDLE drops access TEIDs, not EPS bearer contexts. Clearing the
     // dedicated contexts here would silently deactivate a bearer the network
     // still believes exists, so the logical entries are retained without
     // transport until a Service Request restores them.
     for (auto &dedicated : entry.dedicatedBearers)
-        dedicated.release();
+        dedicated.releaseAccessTransport();
     entry.s1 = UeS1State::IDLE_RETAINED;
+}
+
+void UeRegistry::unbindLocalTeid(EnbUeEntry &entry, uint32_t teid)
+{
+    const auto it = m_byLocalTeid.find(teid);
+    if (it != m_byLocalTeid.end() && it->second == &entry)
+        m_byLocalTeid.erase(it);
+}
+
+void UeRegistry::deleteBearerContexts(EnbUeEntry &entry)
+{
+    unbindLocalTeid(entry, entry.bearer.parameters().localTeid);
+    for (auto &bearer : entry.dedicatedBearers)
+        unbindLocalTeid(entry, bearer.parameters().localTeid);
+    entry.bearer.release();
+    entry.dedicatedBearers.clear();
+    entry.ueAmbr.reset();
 }
 
 void UeRegistry::remove(EnbUeEntry &entry)

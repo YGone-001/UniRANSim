@@ -137,6 +137,7 @@ void S1uEndpoint::handleDatagram(const uint8_t *data, size_t size, const InetAdd
     }
     if (m_ueLink.TrySend(entry->peer, frame.data(), frame.size()))
     {
+        bearer->recordDownlink(ipBytes);
         ++entry->counters.simulatedDownlinkPackets;
         entry->counters.simulatedDownlinkBytes += ipBytes;
     }
@@ -182,6 +183,7 @@ void S1uEndpoint::forwardUplink(EnbUeEntry &entry, BearerContext &bearer, const 
     const InetAddress destination(Ipv4ToString(bearer.parameters().sgwAddress), 2152);
     if (m_socket->TrySend(destination, datagram.data(), datagram.size()))
     {
+        bearer.recordUplink(size);
         ++entry.counters.s1uUplinkPackets;
         entry.counters.s1uUplinkBytes += size;
     }

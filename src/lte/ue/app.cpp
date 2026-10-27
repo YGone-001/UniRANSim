@@ -9,6 +9,7 @@
 #include "app.hpp"
 
 #include "lifecycle.hpp"
+#include "bearer_runtime.hpp"
 #include "nas.hpp"
 #include "paging.hpp"
 #include "radio_link.hpp"
@@ -91,7 +92,6 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
     // Dedicated EPS bearers accepted on top of the default bearer. Each keeps
     // its own TFT so an uplink packet is routed by what the network selected,
     // never by a heuristic.
-    using DedicatedBearerRuntime = nas::EpsBearerConfiguration;
     nas::EpsBearerConfiguration defaultConfiguration;
     std::vector<DedicatedBearerRuntime> dedicatedBearers;
     uint64_t dedicatedUplinkPackets = 0;
@@ -171,7 +171,12 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                                 (config.lifecycle.switchOff ? "true" : "false"));
                 if (config.lifecycle.switchOff)
                 {
+                    auto deleted = link::Encode({link::MessageType::EPS_SESSION_DELETED, ueId,
+                        link::EncodeBearerRestoration(activeEbi, mobility.accessGeneration)});
+                    socket.Send(enb, deleted.data(), deleted.size());
                     mobility.onDetachAccepted();
+                    dedicatedBearers.clear();
+                    defaultConfiguration = {};
                     security = SecurityContext{};
                     tun.reset();
                     Log("INFO", "Switch-off Detach completed without waiting for Detach Accept");
@@ -250,33 +255,37 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                     // Select the bearer by the network-provided TFT. Ties are
                     // resolved by evaluation precedence, and no match falls
                     // back to the default bearer.
-                    uint8_t selectedEbi = activeEbi;
-                    int bestPrecedence = 256;
-                    for (const auto &bearer : dedicatedBearers)
-                    {
-                        const auto *filter = bearer.tft.classify(packet.data(), packet.size(), true);
-                        if (filter != nullptr && filter->precedence < bestPrecedence)
-                        {
-                            bestPrecedence = filter->precedence;
-                            selectedEbi = bearer.ebi;
-                        }
-                    }
+                    const auto selection = SelectUplinkBearer(activeEbi, dedicatedBearers, packet.data(), packet.size());
+                    const uint8_t selectedEbi = selection.ebi;
 
                     std::vector<uint8_t> frame;
                     if (selectedEbi != activeEbi)
                     {
+                        auto &selected = *std::find_if(dedicatedBearers.begin(), dedicatedBearers.end(),
+                            [&](const auto &bearer) { return bearer.ebi == selectedEbi; });
+                        if (!selected.accessReady)
+                        {
+                            ++bearerInactiveDrops;
+                            ++selected.inactiveDrops;
+                            continue; // bounded drop; keep the TFT and never fall back to default
+                        }
                         std::vector<uint8_t> payload;
                         payload.reserve(packet.size() + 1);
                         payload.push_back(selectedEbi);
                         payload.insert(payload.end(), packet.begin(), packet.end());
                         frame = link::Encode({link::MessageType::DATA_UPLINK_BEARER, ueId, std::move(payload)});
-                        ++dedicatedUplinkPackets;
                     }
                     else
                         frame = link::Encode({link::MessageType::DATA_UPLINK, ueId, std::move(packet)});
 
                     if (!socket.TrySend(enb, frame.data(), frame.size()))
                         Log("WARN", "LTE radio-link uplink send would block; packet dropped");
+                    else if (selectedEbi != activeEbi)
+                    {
+                        ++dedicatedUplinkPackets;
+                        ++std::find_if(dedicatedBearers.begin(), dedicatedBearers.end(),
+                            [&](const auto &bearer) { return bearer.ebi == selectedEbi; })->uplinkPackets;
+                    }
                 }
                 catch (const std::exception &e)
                 {
@@ -309,6 +318,8 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 if (releasedEbi == activeEbi)
                 {
                     tun.reset();
+                    dedicatedBearers.clear();
+                    defaultConfiguration = {};
                     mobility.bearer = EpsBearerState::INACTIVE;
                     state = State::EPS_REGISTERED;
                     LogState(state);
@@ -330,7 +341,13 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
             {
                 if (mobility.emm != EmmState::REGISTERED || message.payload[0] != activeEbi)
                     throw link::DecodeError("S1 context release does not match the registered bearer");
-                mobility.onS1ContextReleased();
+                const auto release = link::DecodeBearerRestoration(message.payload);
+                const bool serviceAborted = mobility.pending == PendingProcedure::SERVICE_REQUEST;
+                mobility.acceptAccessRelease(release.first, release.second);
+                if (serviceAborted)
+                    pendingWire.clear();
+                for (auto &bearer : dedicatedBearers)
+                    bearer.releaseAccessTransport();
                 Log("INFO", "State=ECM_IDLE; EPS registration, security, GUTI, bearer and TUN retained");
                 if (idleReleaseRequested)
                 {
@@ -387,8 +404,8 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
             }
             if (message.type == link::MessageType::S1_CONTEXT_RESTORED)
             {
-                if (message.payload[0] != activeEbi)
-                    throw link::DecodeError("Restored S1 context has the wrong EBI");
+                const auto restored = link::DecodeBearerRestoration(message.payload);
+                mobility.validateAccessRestoration(restored.first, restored.second, false);
                 mobility.onServiceRestored(tun != nullptr);
                 pendingWire.clear();
                 if (pagingTriggeredProcedure)
@@ -398,14 +415,29 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 }
                 if (tun)
                 {
-                    std::vector<uint8_t> ready{activeEbi, assignedIpv4[0], assignedIpv4[1], assignedIpv4[2],
-                                               assignedIpv4[3]};
-                    auto readyFrame = link::Encode({link::MessageType::BEARER_READY, ueId, std::move(ready)});
+                    auto readyFrame = link::Encode({link::MessageType::BEARER_TRANSPORT_READY, ueId,
+                        link::EncodeBearerRestoration(activeEbi, mobility.accessGeneration)});
                     socket.Send(enb, readyFrame.data(), readyFrame.size());
                     Log("INFO", "State=ECM_CONNECTED; existing EPS bearer transport and user plane restored");
                 }
                 else
                     Log("WARN", "State=ECM_CONNECTED; bearer signaling restored in control-plane-only mode");
+                continue;
+            }
+            if (message.type == link::MessageType::DEDICATED_BEARER_RESTORED)
+            {
+                const auto restored = link::DecodeBearerRestoration(message.payload);
+                auto bearer = std::find_if(dedicatedBearers.begin(), dedicatedBearers.end(),
+                    [&](const auto &candidate) { return candidate.ebi == restored.first; });
+                if (bearer == dedicatedBearers.end() || !tun)
+                    throw link::DecodeError("Restoration has no logical dedicated bearer or TUN");
+                auto candidate = *bearer;
+                candidate.restoreAccess(mobility, restored.first, restored.second);
+                auto ack = link::Encode({link::MessageType::BEARER_TRANSPORT_READY, ueId, message.payload});
+                socket.Send(enb, ack.data(), ack.size());
+                *bearer = std::move(candidate);
+                Log("INFO", "Existing dedicated EBI=" + std::to_string(restored.first) +
+                            " access restored; retained TFT and NAS security unchanged");
                 continue;
             }
             if (message.type == link::MessageType::DATA_DOWNLINK)
@@ -441,8 +473,11 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                                                  [bearerEbi](const DedicatedBearerRuntime &candidate) {
                                                      return candidate.ebi == bearerEbi;
                                                  });
-                if (bearer == dedicatedBearers.end())
-                    throw link::DecodeError("Downlink names an unknown or released dedicated bearer");
+                if (bearer == dedicatedBearers.end() || !bearer->accessReady)
+                {
+                    ++bearerInactiveDrops;
+                    throw link::DecodeError("Downlink names an unknown or access-inactive dedicated bearer");
+                }
 
                 std::vector<uint8_t> packet(message.payload.begin() + 1, message.payload.end());
                 const auto ipv4 = ip::Validate(packet.data(), packet.size(),
@@ -453,6 +488,7 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 {
                     ++tunDownlinkPackets;
                     ++dedicatedDownlinkPackets;
+                    ++bearer->downlinkPackets;
                     tunDownlinkBytes += packet.size();
                 }
                 continue;
@@ -616,8 +652,9 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 const auto &request = downlink.dedicatedBearer;
                 try
                 {
-                    if (mobility.emm != EmmState::REGISTERED)
-                        throw nas::DecodeError("Dedicated bearer activation before EPS registration");
+                    if (mobility.emm != EmmState::REGISTERED || mobility.ecm != EcmState::CONNECTED ||
+                        mobility.pending != PendingProcedure::NONE)
+                        throw nas::DecodeError("Dedicated bearer activation conflicts with mobility state");
                     if (request.linkedEpsBearerIdentity != activeEbi)
                         throw nas::DecodeError("Dedicated bearer references a different default bearer");
                     for (const auto &bearer : dedicatedBearers)
@@ -686,6 +723,9 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
             {
                 if (mobility.pending != PendingProcedure::DETACH)
                     throw nas::DecodeError("Unexpected EPS Detach Accept");
+                auto deleted = link::Encode({link::MessageType::EPS_SESSION_DELETED, ueId,
+                    link::EncodeBearerRestoration(activeEbi, mobility.accessGeneration)});
+                socket.Send(enb, deleted.data(), deleted.size());
                 mobility.onDetachAccepted();
                 security = SecurityContext{};
                 pendingWire.clear();

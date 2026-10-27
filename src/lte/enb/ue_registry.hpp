@@ -62,7 +62,7 @@ class RegistryError : public std::runtime_error
 };
 
 // Per-UE eNB state. The simulated radio identity and its verified UDP peer are
-// stable for the entry lifetime; the S1AP identifiers, the default bearer and
+// stable for the entry lifetime; the S1AP identifiers, the access transport and
 // the local S1-U TEID belong to one S1 connection and are invalidated when
 // that connection is released.
 struct EnbUeEntry
@@ -74,6 +74,7 @@ struct EnbUeEntry
     uint32_t enbUeS1apId{};
     // Zero until the MME assigns one; never invented locally.
     uint32_t mmeUeS1apId{};
+    uint32_t accessGeneration{};
     DefaultBearerContext bearer{};
     // The default bearer remains named for Phase 6 source compatibility.
     // Together with these bounded contexts it forms the per-UE EPS bearer
@@ -141,6 +142,7 @@ class UeRegistry
     // already owned by another live context.
     void bindEnbUeS1apId(EnbUeEntry &entry, uint32_t enbUeS1apId);
     void setMmeUeS1apId(EnbUeEntry &entry, uint32_t mmeUeS1apId);
+    void clearMmeUeS1apId(EnbUeEntry &entry);
 
     // Allocates a local S1-U TEID unique across concurrently active bearers
     // and never zero.
@@ -149,10 +151,12 @@ class UeRegistry
     void bindLocalTeid(EnbUeEntry &entry, BearerContext &bearer, uint32_t teid);
 
     // Releases the S1 connection of one UE: the S1AP identifiers and the local
-    // GTP-U TEID stop resolving, the default bearer is released, and the entry
+    // GTP-U TEIDs stop resolving, logical bearers are retained, and the entry
     // is retained in IDLE_RETAINED state for a later Service Request or
     // re-Attach. Other entries are untouched.
     void releaseS1(EnbUeEntry &entry);
+    void unbindLocalTeid(EnbUeEntry &entry, uint32_t teid);
+    void deleteBearerContexts(EnbUeEntry &entry);
 
     // Erases the entry and every index it owns.
     void remove(EnbUeEntry &entry);

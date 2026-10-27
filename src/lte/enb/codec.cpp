@@ -35,6 +35,7 @@ constexpr uint16_t IE_E_RAB_TO_BE_SETUP_LIST_CTXT_SU_REQ = 24;
 constexpr uint16_t IE_NAS_PDU = 26;
 constexpr uint16_t IE_E_RAB_SETUP_ITEM_CTXT_SU_RES = 50;
 constexpr uint16_t IE_E_RAB_SETUP_LIST_CTXT_SU_RES = 51;
+constexpr uint16_t IE_E_RAB_FAILED_TO_SETUP_LIST_CTXT_SU_RES = 48;
 constexpr uint16_t IE_E_RAB_TO_BE_SETUP_ITEM_CTXT_SU_REQ = 52;
 constexpr uint16_t IE_UE_AGGREGATE_MAXIMUM_BITRATE = 66;
 constexpr uint16_t IE_SECURITY_KEY = 73;
@@ -83,6 +84,9 @@ enum class Criticality : uint8_t
     IGNORE = 1,
     NOTIFY = 2
 };
+
+class BitWriter;
+void WriteCause(BitWriter &, const std::string &, int);
 
 class BitWriter
 {
@@ -875,7 +879,18 @@ ErabToBeSetupItem ReadErabToBeSetupItem(BitReader &reader)
     const bool extensionsPresent = reader.readBit();
     item.erabId = ReadErabId(reader);
     ReadErabLevelQos(reader, item);
-    item.transportLayerAddress = ReadTransportLayerAddress(reader);
+    if (reader.readBit())
+        throw CodecError("Extended transport address size is not supported");
+    const auto addressBits = ReadConstrained(reader, 1, 160, true);
+    reader.align();
+    item.ipv4Transport = addressBits == 32;
+    for (size_t bit = 0; bit < addressBits; ++bit)
+    {
+        const bool value = reader.readBit();
+        if (item.ipv4Transport)
+            item.transportLayerAddress[bit / 8] |= static_cast<uint8_t>(value << (7 - bit % 8));
+    }
+    reader.align();
     {
         auto teid = ReadFixedOctets(reader, 4);
         std::copy(teid.begin(), teid.end(), item.gtpTeid.begin());
@@ -1268,7 +1283,8 @@ InitialContextSetupRequest DecodeInitialContextSetupRequest(const uint8_t *data,
                 auto id = static_cast<uint16_t>(ReadConstrained(reader, 0, 65535, true));
                 if (id != IE_E_RAB_TO_BE_SETUP_ITEM_CTXT_SU_REQ)
                     throw CodecError("Unexpected E-RABToBeSetupListCtxtSUReq item identity");
-                reader.readBits(2);
+                if (reader.readBits(2) != static_cast<uint8_t>(Criticality::REJECT))
+                    throw CodecError("E-RAB setup item has invalid criticality");
                 reader.align();
                 auto value = reader.readOpenType();
                 BitReader itemReader(value);
@@ -1303,6 +1319,8 @@ InitialContextSetupRequest DecodeInitialContextSetupRequest(const uint8_t *data,
     if (!mmePresent || !enbPresent || !ambrPresent || !erabsPresent || !securityCapabilitiesPresent ||
         !securityKeyPresent)
         throw CodecError("Initial Context Setup Request is missing a mandatory IE");
+    if (result.mmeUeS1apId == 0 || result.enbUeS1apId == 0)
+        throw CodecError("Initial Context Setup has a zero UE identity");
     if (result.erabs.empty())
         throw CodecError("Initial Context Setup Request contains no E-RAB to establish");
     return result;
@@ -1360,13 +1378,25 @@ std::vector<uint8_t> EncodeInitialContextSetupRequest(const InitialContextSetupR
 }
 
 std::vector<uint8_t> EncodeInitialContextSetupResponse(uint32_t mmeUeS1apId, uint32_t enbUeS1apId,
-                                                       const std::vector<ErabSetupItem> &erabs)
+                                                       const std::vector<ErabSetupItem> &erabs,
+                                                       const std::vector<ErabFailedItem> &failed)
 {
     if (mmeUeS1apId == 0 || enbUeS1apId == 0 || enbUeS1apId > 0xFFFFFFU)
         throw CodecError("Initial Context Setup Response has an invalid UE S1AP identity");
     if (erabs.empty() || erabs.size() > 256)
         throw CodecError("Initial Context Setup Response requires 1..256 established E-RABs");
 
+    if (failed.size() > 256)
+        throw CodecError("Too many failed E-RABs");
+    std::set<uint8_t> seen;
+    for (const auto &item : erabs)
+        if (item.erabId < 5 || item.erabId > 15 || item.transportLayerAddress[0] == 0 ||
+            item.transportLayerAddress[0] >= 224 || item.gtpTeid == std::array<uint8_t, 4>{} ||
+            !seen.insert(item.erabId).second)
+            throw CodecError("Invalid or repeated established EBI");
+    for (const auto &item : failed)
+        if (item.erabId > 15 || !seen.insert(item.erabId).second)
+            throw CodecError("EBI occurs more than once across setup outcomes");
     BitWriter list;
     WriteConstrained(list, erabs.size(), 1, 256, true);
     for (const auto &item : erabs)
@@ -1374,10 +1404,38 @@ std::vector<uint8_t> EncodeInitialContextSetupResponse(uint32_t mmeUeS1apId, uin
     auto listBytes = list.take();
 
     std::vector<std::pair<std::pair<uint16_t, Criticality>, std::vector<uint8_t>>> ies;
-    ies.push_back({{IE_MME_UE_S1AP_ID, Criticality::REJECT}, EncodeUeId(mmeUeS1apId, 0xFFFFFFFFU)});
-    ies.push_back({{IE_ENB_UE_S1AP_ID, Criticality::REJECT}, EncodeUeId(enbUeS1apId, 0xFFFFFFU)});
+    ies.push_back({{IE_MME_UE_S1AP_ID, Criticality::IGNORE}, EncodeUeId(mmeUeS1apId, 0xFFFFFFFFU)});
+    ies.push_back({{IE_ENB_UE_S1AP_ID, Criticality::IGNORE}, EncodeUeId(enbUeS1apId, 0xFFFFFFU)});
     ies.push_back({{IE_E_RAB_SETUP_LIST_CTXT_SU_RES, Criticality::IGNORE}, std::move(listBytes)});
+    if (!failed.empty())
+    {
+        BitWriter failures;
+        WriteConstrained(failures, failed.size(), 1, 256, true);
+        for (const auto &item : failed)
+        {
+            BitWriter value;
+            value.writeBit(false);
+            value.writeBit(false);
+            WriteErabId(value, item.erabId);
+            WriteCause(value, item.causeCategory, item.causeValue);
+            WriteIe(failures, IE_E_RAB_ITEM, Criticality::IGNORE, value.take());
+        }
+        ies.push_back({{IE_E_RAB_FAILED_TO_SETUP_LIST_CTXT_SU_RES, Criticality::IGNORE}, failures.take()});
+    }
     return EncodePdu(1, PROCEDURE_INITIAL_CONTEXT_SETUP, Criticality::REJECT, ies);
+}
+
+std::vector<uint8_t> EncodeInitialContextSetupFailure(uint32_t mmeUeS1apId, uint32_t enbUeS1apId,
+                                                      const std::string &category, int value)
+{
+    if (mmeUeS1apId == 0 || enbUeS1apId == 0 || enbUeS1apId > 0xFFFFFFU)
+        throw CodecError("Initial Context Setup Failure has invalid UE identities");
+    BitWriter cause;
+    WriteCause(cause, category, value);
+    return EncodePdu(2, PROCEDURE_INITIAL_CONTEXT_SETUP, Criticality::REJECT, {
+        {{IE_MME_UE_S1AP_ID, Criticality::IGNORE}, EncodeUeId(mmeUeS1apId, 0xFFFFFFFFU)},
+        {{IE_ENB_UE_S1AP_ID, Criticality::IGNORE}, EncodeUeId(enbUeS1apId, 0xFFFFFFU)},
+        {{IE_CAUSE, Criticality::IGNORE}, cause.take()}});
 }
 
 UeContextReleaseCommand DecodeUeContextReleaseCommand(const uint8_t *data, size_t length)
@@ -1965,11 +2023,19 @@ std::vector<uint8_t> EncodeErabSetupResponse(uint32_t mmeUeS1apId, uint32_t enbU
 {
     if (mmeUeS1apId == 0 || enbUeS1apId == 0 || enbUeS1apId > 0xFFFFFFU)
         throw CodecError("E-RAB Setup Response has an invalid UE S1AP identity");
-    if (established.empty())
-        throw CodecError("E-RAB Setup Response requires at least one established E-RAB");
+    if ((established.empty() && failed.empty()) || established.size() > 256 || failed.size() > 256)
+        throw CodecError("E-RAB Setup Response requires bounded nonempty outcomes");
+    std::set<uint8_t> seen;
+    for (const auto &item : established)
+        if (!seen.insert(item.erabId).second)
+            throw CodecError("Repeated E-RAB setup outcome");
+    for (const auto &item : failed)
+        if (!seen.insert(item.erabId).second)
+            throw CodecError("Repeated E-RAB setup outcome");
 
     BitWriter list;
-    WriteConstrained(list, established.size(), 1, 256, true);
+    if (!established.empty())
+        WriteConstrained(list, established.size(), 1, 256, true);
     for (const auto &erab : established)
     {
         BitWriter item;
@@ -1982,9 +2048,10 @@ std::vector<uint8_t> EncodeErabSetupResponse(uint32_t mmeUeS1apId, uint32_t enbU
     }
 
     std::vector<std::pair<std::pair<uint16_t, Criticality>, std::vector<uint8_t>>> ies;
-    ies.push_back({{IE_MME_UE_S1AP_ID, Criticality::REJECT}, EncodeUeId(mmeUeS1apId, 0xFFFFFFFFU)});
-    ies.push_back({{IE_ENB_UE_S1AP_ID, Criticality::REJECT}, EncodeUeId(enbUeS1apId, 0xFFFFFFU)});
-    ies.push_back({{IE_E_RAB_SETUP_LIST_BEARER_SU_RES, Criticality::REJECT}, list.take()});
+    ies.push_back({{IE_MME_UE_S1AP_ID, Criticality::IGNORE}, EncodeUeId(mmeUeS1apId, 0xFFFFFFFFU)});
+    ies.push_back({{IE_ENB_UE_S1AP_ID, Criticality::IGNORE}, EncodeUeId(enbUeS1apId, 0xFFFFFFU)});
+    if (!established.empty())
+        ies.push_back({{IE_E_RAB_SETUP_LIST_BEARER_SU_RES, Criticality::IGNORE}, list.take()});
 
     if (!failed.empty())
     {

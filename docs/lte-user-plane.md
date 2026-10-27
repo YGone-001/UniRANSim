@@ -873,6 +873,119 @@ relocation were NOT EXECUTED; deterministic rollback, replacement, deletion and
 socket tests cover those paths. The inherited G46 multiple-E-RAB paging restore
 and multi-tracking-area normal TAU limitations remain unverified.
 
+## Existing EPS bearer restoration across ECM-IDLE
+
+S1 release and EPS bearer deletion have separate lifecycles.
+`releaseAccessTransport()` preserves EBI, bearer kind, linked default EBI,
+negotiated QoS, validated PDN IPv4 and logical confirmation. It clears both
+access TEIDs, the SGW-U endpoint and forwarding readiness. `releaseS1()` removes
+all old TEID and S1AP identity indexes for that UE. Full `release()` deletes the
+logical context. Dedicated deactivation removes only its bearer; completed
+Detach explicitly deletes all UE logical bearers. Nothing persists across
+process restart.
+
+Initial Context Setup restores one default and up to seven retained dedicated
+contexts. It identifies the default by its previously confirmed EBI, irrespective
+of list order or QCI. Unknown EBIs cannot create dedicated logical contexts.
+Initial Attach supports one provisional default candidate; the UE's post-NAS
+`BEARER_READY` confirms its EBI and IPv4 before logical confirmation/forwarding.
+Ambiguous multi-item initial Attach fails explicitly. The eNB never decrypts NAS.
+
+APER structure, duplicate identities and S1AP ownership are validated before
+mutation. A bounded private candidate stages each accepted item's current
+network QoS, SGW endpoint and fresh eNB receiving TEID. The response includes all
+successes and IE 48's failed E-RAB list, with disjoint identities. Unsupported
+IPv6 transport, invalid endpoints/QoS and unknown EBIs fail individually.
+Failure of the required default/non-GBR context uses Initial Context Setup
+Failure, not an empty success. Provisional indexes/MME identity are rolled back
+if sending the response fails. TEID indexes hold UE pointers, not pointers into
+the resizable dedicated vector.
+
+This follows the successful/unsuccessful operation rules in
+[TS 36.413 clauses 8.3.1.2–8.3.1.3](https://www.etsi.org/deliver/etsi_ts/136400_136499/136413/18.04.00_60/ts_136413v180400p.pdf).
+
+### Radio readiness and retained TFT
+
+The version-1 radio header remains eight octets. These control messages use
+`EBI(1) || access-generation(4)` in network byte order:
+
+| Type | Direction | Meaning |
+|---|---|---|
+| 8, S1_CONTEXT_RELEASED | eNB to UE | All access bearers released; logical EPS state retained |
+| 9, S1_CONTEXT_RESTORED | eNB to UE | Required default has new network-authorized transport |
+| 15, DEDICATED_BEARER_RESTORED | eNB to UE | One existing dedicated EBI has new transport |
+| 16, BEARER_TRANSPORT_READY | UE to eNB | UE accepted that EBI and restoration generation |
+| 17, EPS_SESSION_DELETED | UE to eNB | Completed normal/switch-off Detach deletes logical state |
+
+The eNB increments generation on S1 release and notifies default before
+dedicated bearers, even if the MME lists dedicated EBIs first. Both endpoints
+validate direction, peer, UE ID, existing identity and generation. The UE also
+requires registration, valid security, the linked default and a pending Service
+Request for default restoration. Out-of-order dedicated indications are rejected
+while default restoration is pending. Duplicate indications do not reactivate a
+bearer. eNB forwarding requires a generation-bound UE confirmation; old
+activation/default-ready frames cannot confirm a restored tunnel. S1 release
+during a pending Service Request invalidates the pending restoration. Detach
+notification tolerates a preceding S1 release racing delivery, but cannot delete
+an active later restoration generation.
+
+Legacy one-octet type 8/9 frames remain decodable in the framing codec; the new
+UE runtime requires five-octet lifecycle payloads. Update both LTE binaries
+together. This trusted laboratory UDP link is not physical RRC or an
+authenticated radio protocol.
+
+Each UE dedicated runtime stores NAS EBI/QoS/TFT separately from `accessReady`.
+Idle sets all dedicated access flags false and preserves the complete modified
+TFT. Only actually requested/established E-RABs can become ready. A TFT match to
+an inactive dedicated bearer produces a counted drop with no buffering or
+default fallback. Nonmatching traffic uses the ready default. Idle/restoration
+retains the TUN object/routes; it does not create a new TUN or replace host
+routes. Access-only indications send no NAS activation Accept and consume no
+NAS COUNT. The genuine compact Service Request consumes its normal uplink COUNT.
+
+Standalone E-RAB Setup after default restoration may reuse a confirmed retained
+dedicated EBI with fresh transport. Its mandatory protected NAS is forwarded
+unchanged and checked by the UE; a duplicate activation is not converted into
+another activation Accept. TFT changes require valid NAS Modify/deactivation.
+Standalone setup stages bounded outcomes, including an all-failed response.
+This procedure remains distinct from multi-E-RAB Initial Context Setup.
+
+### Verification and live boundary
+
+`test/lte/restoration.cpp` adds deterministic lifecycle, negative, generation,
+classification, multi-UE and actual local UDP/GTP-U socket checks. Independent
+pycrate 0.8.1 fixtures cover two/three-item requests/responses, reordered and
+duplicate requests, mixed/all-failure outcomes, unsupported IPv6 transport and
+standalone responses. Reproduce with
+`python tools/lte-restoration-fixtures.py --header`; `--decode HEX` independently
+inspects a simulator PDU. Synthetic fixtures are not live Open5GS evidence.
+
+Read-only inspection on 2026-10-27 (Asia/Shanghai) found the EPC running as
+`mmed/sgwcd/sgwud/pcrfd/hssd`. Readable installed configuration uses PLMN 460/02,
+TAC 1 and MME S1AP/SGW-U at 10.10.0.139. The source tree identifies itself as
+`R50V208-23-g11a905e3e`; running-binary/source equivalence is unverified. Its
+Service Request builder iterates active EPS bearers, while Attach selects the
+first bearer. MME access release clears eNB S1-U paths without deleting EPS
+bearers; SGW-C deactivates downlink PFCP forwarding for the retained sessions.
+This establishes source feasibility, not a captured network outcome.
+
+Live restoration remains **BLOCKED** pending the existing authorized private UE
+configuration paths and privileged TUN/namespace execution. No subscriber/PCC
+policy, Rx peer, EPC source/service, global route or NAT was changed. Existing
+`p6ns7/p6ns8` namespaces are unrelated retained lab state and must be preserved.
+
+For live acceptance, correlate pre-release EBI/QoS/TFT/TEIDs, actual Release
+Command/Complete, new S1AP IDs, the MME's complete requested E-RAB list,
+per-item outcomes, bidirectional GTP-U and TUN/application replies. Isolate each
+UE TUN in its own namespace and verify the route to the authorized destination
+before sending. Keep Rx/policy valid while idle. A default-only request leaves
+dedicated access inactive; any subsequent standalone setup must be documented
+separately. Keep captures and private configuration outside Git. The inherited
+live multi-E-RAB Paging gap remains unresolved until that sequence is captured.
+
+The final delivery report records the exact Git/CI identities and the individual
+G1–G51 gates, separately from these implementation notes.
+
 ## Supported scope
 
 Supported: multiple concurrent LTE UEs (bounded by `maxUes`) through one eNB
@@ -882,8 +995,10 @@ forwarding, per-UE lifecycle isolation (Detach, ECM-IDLE, Service Request,
 periodic TAU), per-UE context cleanup, per-UE packet/drop counters, real
 S1AP Paging decoding with tracking-area filtering, simulated radio paging with
 S-TMSI matching, network-triggered compact Service Request, restoration of
-the existing default bearer, network-initiated dedicated bearers with TFT-based
-uplink classification, and per-bearer GTP-U tunnels.
+the existing default bearer and MME-requested retained dedicated bearers,
+network-initiated dedicated bearers with TFT-based uplink classification, and
+per-bearer GTP-U tunnels. Multi-bearer restoration has deterministic coverage;
+its new real-EPC acceptance remains blocked as described above.
 
 Not supported: RRC paging channels, paging frames and DRX radio timing, IMSI
 paging, additional PDN connections, inter-MME mobility,

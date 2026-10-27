@@ -105,6 +105,32 @@ void MobilityContext::onS1ContextReleased()
         bearer = EpsBearerState::INACTIVE;
 }
 
+void MobilityContext::acceptAccessRelease(uint8_t ebi, uint32_t generation)
+{
+    if (emm != EmmState::REGISTERED || ebi != defaultEbi || generation == 0 ||
+        generation != accessGeneration + 1U ||
+        (ecm != EcmState::CONNECTED && pending != PendingProcedure::SERVICE_REQUEST))
+        throw LifecycleError("Unexpected or stale access release");
+    onS1ContextReleased();
+    if (pending == PendingProcedure::SERVICE_REQUEST)
+        pending = PendingProcedure::NONE;
+    accessGeneration = generation;
+}
+
+void MobilityContext::validateAccessRestoration(uint8_t ebi, uint32_t generation, bool dedicated) const
+{
+    if (emm != EmmState::REGISTERED || !securityContextValid || generation == 0 || generation != accessGeneration ||
+        ebi < 5 || ebi > 15 || (dedicated ? ebi == defaultEbi : ebi != defaultEbi))
+        throw LifecycleError("Invalid bearer restoration identity or generation");
+    if (dedicated)
+    {
+        if (ecm != EcmState::CONNECTED || pending != PendingProcedure::NONE)
+            throw LifecycleError("Dedicated restoration precedes default service restoration");
+    }
+    else if (pending != PendingProcedure::SERVICE_REQUEST || ecm != EcmState::IDLE)
+        throw LifecycleError("Default restoration has no pending Service Request");
+}
+
 void MobilityContext::startServiceRequest()
 {
     if (emm != EmmState::REGISTERED || ecm != EcmState::IDLE ||

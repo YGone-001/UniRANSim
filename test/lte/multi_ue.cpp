@@ -561,7 +561,7 @@ TEST_CASE("multi-ue/s1ap: UE Context Release Command releases only the addressed
     REQUIRE(released.has_value());
     CHECK(released->type == lte::ue::link::MessageType::S1_CONTEXT_RELEASED);
     CHECK(released->ueId == 1);
-    CHECK(released->payload == std::vector<uint8_t>{5});
+    CHECK(released->payload == lte::ue::link::EncodeBearerRestoration(5, 1));
     CHECK(entryA->s1 == UeS1State::IDLE_RETAINED);
     CHECK(entryA->bearer.parameters().localTeid == 0);
     CHECK_FALSE(entryB->bearer.parameters().localTeid == 0);
@@ -885,7 +885,8 @@ TEST_CASE("multi-ue/lifecycle: ECM-IDLE release and Service Request restore isol
     REQUIRE(restored.has_value());
     CHECK(restored->type == lte::ue::link::MessageType::S1_CONTEXT_RESTORED);
     CHECK(restored->ueId == 1);
-    SendRadio(mux, ueA, lte::ue::link::MessageType::BEARER_READY, {5, 10, 45, 0, 2});
+    CHECK(restored->payload == lte::ue::link::EncodeBearerRestoration(5, 1));
+    SendRadio(mux, ueA, lte::ue::link::MessageType::BEARER_TRANSPORT_READY, restored->payload);
     CHECK(entryA->s1 == UeS1State::BEARER_ACTIVE);
     CHECK(entryB->s1 == UeS1State::BEARER_ACTIVE);
     CHECK(mux.registry().findByMmeUeS1apId(0x111) == entryA);

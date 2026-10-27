@@ -944,6 +944,7 @@ TEST_CASE("lte/paging/multi: restoration allocates a fresh eNB TEID and invalida
     mux.registry().bindEnbUeS1apId(entry, 11);
     mux.registry().setMmeUeS1apId(entry, 22);
     entry.bearer.establish({5, 9, 1, {10, 10, 0, 139}, 0x0000A001u, firstTeid});
+    entry.bearer.activateUe(1, 5, {10, 45, 0, 2});
     mux.registry().bindLocalTeid(entry, firstTeid);
     entry.sgwPeer = InetAddress("10.10.0.139", 2152);
     entry.s1 = UeS1State::BEARER_ACTIVE;

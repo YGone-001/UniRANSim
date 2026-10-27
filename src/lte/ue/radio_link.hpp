@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <vector>
+#include <utility>
 
 namespace lte::ue::link
 {
@@ -44,6 +45,10 @@ enum class MessageType : uint8_t
     // Uplink confirmation that the UE accepted a dedicated bearer activation.
     // Payload: EBI(1).
     BEARER_ACTIVATED = 14,
+    // EBI(1) || access release generation(4), network byte order.
+    DEDICATED_BEARER_RESTORED = 15,
+    BEARER_TRANSPORT_READY = 16,
+    EPS_SESSION_DELETED = 17,
     // Downlink-only simulation of an LTE paging occasion.
     // MMEC(1)||M-TMSI(4)||served TAC(2). It carries no IMSI and no NAS
     // material, so a UE can only match it against the S-TMSI of its own
@@ -66,6 +71,8 @@ class DecodeError : public std::runtime_error
 
 std::vector<uint8_t> Encode(const Message &message);
 Message Decode(const uint8_t *data, size_t size);
+std::vector<uint8_t> EncodeBearerRestoration(uint8_t ebi, uint32_t generation);
+std::pair<uint8_t, uint32_t> DecodeBearerRestoration(const std::vector<uint8_t> &payload);
 bool IsUplink(MessageType type);
 bool IsDownlink(MessageType type);
 

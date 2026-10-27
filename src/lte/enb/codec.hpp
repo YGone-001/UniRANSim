@@ -131,12 +131,13 @@ struct ErabToBeSetupItem
 {
     uint8_t erabId{};
     uint8_t qci{};
-    uint8_t priorityLevel{};
+    uint8_t priorityLevel{15};
     bool preemptionCapability{};
     bool preemptionVulnerability{};
     std::optional<GbrQos> gbr;
     std::array<uint8_t, 4> transportLayerAddress{};
     std::array<uint8_t, 4> gtpTeid{};
+    bool ipv4Transport{true};
     bool nasPduPresent{};
     std::vector<uint8_t> nasPdu;
 };
@@ -166,8 +167,19 @@ struct ErabSetupItem
     std::array<uint8_t, 4> gtpTeid{};
 };
 
+// Per-E-RAB failure, shared by Initial Context Setup and E-RAB management.
+struct ErabFailedItem
+{
+    uint8_t erabId{};
+    std::string causeCategory{"radioNetwork"};
+    int causeValue{};
+};
+
 std::vector<uint8_t> EncodeInitialContextSetupResponse(uint32_t mmeUeS1apId, uint32_t enbUeS1apId,
-                                                       const std::vector<ErabSetupItem> &erabs);
+                                                       const std::vector<ErabSetupItem> &erabs,
+                                                       const std::vector<ErabFailedItem> &failed = {});
+std::vector<uint8_t> EncodeInitialContextSetupFailure(uint32_t mmeUeS1apId, uint32_t enbUeS1apId,
+                                                      const std::string &causeCategory, int causeValue);
 
 struct UeContextReleaseCommand
 {
@@ -214,15 +226,6 @@ struct ErabSetupRequest
 ErabSetupRequest DecodeErabSetupRequest(const uint8_t *data, size_t length);
 // Encoder used by the automated tests and for offline fixture generation.
 std::vector<uint8_t> EncodeErabSetupRequest(const ErabSetupRequest &request);
-
-// An E-RAB the eNB could not establish, reported per item so one failure cannot
-// be mistaken for a success.
-struct ErabFailedItem
-{
-    uint8_t erabId{};
-    std::string causeCategory{"radioNetwork"};
-    int causeValue{};
-};
 
 struct ErabTransport
 {
