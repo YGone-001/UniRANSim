@@ -260,6 +260,11 @@ int Run(const EnbConfig &config, const std::atomic_bool &shutdownRequested)
                 shutdownInterrupted = true;
                 break;
             }
+            // RECOVERING is not an SCTP-connecting state. Re-enter the same
+            // CONNECT_STARTED step the initial path uses so the SCTP_CONNECTED
+            // transition below is legal again.
+            state.transition(ConnectionEvent::CONNECT_STARTED);
+            Log("INFO", "State=" + std::string(ToString(state.state())) + ", connecting to MME");
         }
         else
         {

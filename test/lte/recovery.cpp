@@ -852,6 +852,10 @@ TEST_CASE("recovery/state: RECOVERING and STOPPING extend the connection state m
     CHECK(machine.state() == ConnectionState::DISCONNECTED);
     CHECK(machine.transition(ConnectionEvent::RECOVERY_STARTED));
     CHECK(machine.state() == ConnectionState::RECOVERING);
+    // A reconnect must re-enter SCTP_CONNECTING first. The runtime may not
+    // jump straight from RECOVERING to SCTP_CONNECTED once connect() returns.
+    CHECK_FALSE(machine.transition(ConnectionEvent::SCTP_CONNECTED));
+    CHECK(machine.state() == ConnectionState::RECOVERING);
     CHECK(machine.transition(ConnectionEvent::CONNECT_STARTED));
     CHECK(machine.state() == ConnectionState::SCTP_CONNECTING);
     CHECK(machine.transition(ConnectionEvent::SCTP_CONNECTED));
