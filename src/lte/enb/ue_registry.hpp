@@ -158,6 +158,14 @@ class UeRegistry
     void unbindLocalTeid(EnbUeEntry &entry, uint32_t teid);
     void deleteBearerContexts(EnbUeEntry &entry);
 
+    // Starts a brand-new EPS session on a retained registry entry. Unlike a
+    // Service Request, an Attach is a new logical session, so the retained
+    // bearer contexts go away and the access-generation counter restarts
+    // together with the fresh mobility context of the attaching UE. Leaving
+    // the counter behind would desynchronise it from the UE and make a later
+    // legitimate S1 release look stale to that UE.
+    void beginNewAttach(EnbUeEntry &entry);
+
     // Erases the entry and every index it owns.
     void remove(EnbUeEntry &entry);
 

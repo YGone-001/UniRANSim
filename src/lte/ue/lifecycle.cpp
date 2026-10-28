@@ -131,6 +131,11 @@ void MobilityContext::validateAccessRestoration(uint8_t ebi, uint32_t generation
         throw LifecycleError("Default restoration has no pending Service Request");
 }
 
+void MobilityContext::beginNewAttach()
+{
+    accessGeneration = 0;
+}
+
 void MobilityContext::startServiceRequest()
 {
     if (emm != EmmState::REGISTERED || ecm != EcmState::IDLE ||

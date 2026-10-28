@@ -328,6 +328,12 @@ void UeRegistry::deleteBearerContexts(EnbUeEntry &entry)
     entry.ueAmbr.reset();
 }
 
+void UeRegistry::beginNewAttach(EnbUeEntry &entry)
+{
+    deleteBearerContexts(entry);
+    entry.accessGeneration = 0;
+}
+
 void UeRegistry::remove(EnbUeEntry &entry)
 {
     releaseS1(entry);

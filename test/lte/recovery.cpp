@@ -794,6 +794,99 @@ TEST_CASE("recovery/lifetime: repeated association flapping reuses no identifier
     CHECK(lab.mux.recoveryCounters().accessInvalidations == 5);
 }
 
+TEST_CASE("recovery/lifetime: a new Attach on a reused registry entry restarts the access generation")
+{
+    Lab lab;
+    FakeUe ue(1);
+    Establish(lab, ue, 0x100, 0x2000, {10, 45, 0, 2});
+    auto *entry = lab.mux.registry().find(1);
+    REQUIRE(entry != nullptr);
+
+    // The first legitimate ECM-IDLE transition moves the shared counter to 1.
+    lab.mux.registry().releaseS1(*entry);
+    REQUIRE(entry->accessGeneration == 1);
+    auto previous = Mobility();
+    CHECK_NOTHROW(previous.acceptAccessRelease(5, 1));
+    CHECK(previous.accessGeneration == 1);
+
+    // The UE restarts on the same radio endpoint and sends a fresh Attach
+    // Request. The eNB reuses the registry entry but restarts the shared
+    // counter together with the new mobility context of the restarted UE.
+    lab.drain(ue);
+    lab.uplink(ue, link::MessageType::NAS_UPLINK, {0x41, 0x01, 0x02, 0x03});
+    REQUIRE(lab.mux.registry().find(1) == entry);
+    CHECK(entry->accessGeneration == 0);
+    CHECK(entry->s1 == UeS1State::CONTEXT_PENDING);
+    CHECK_FALSE(entry->bearer.logicalConfirmed());
+
+    // The next legitimate S1 release is in step with the restarted UE.
+    entry->s1 = UeS1State::BEARER_ACTIVE;
+    lab.mux.registry().releaseS1(*entry);
+    CHECK(entry->accessGeneration == 1);
+    auto restarted = Mobility();
+    CHECK_NOTHROW(restarted.acceptAccessRelease(5, 1));
+    CHECK(restarted.accessGeneration == 1);
+}
+
+TEST_CASE("recovery/lifetime: a carried access generation is what desynchronises a restarted UE")
+{
+    // The failure the restart above prevents: a fresh mobility context starts
+    // at generation zero, so a release the eNB numbered from a carried counter
+    // arrives one step ahead and is rejected instead of being honoured.
+    auto restarted = Mobility();
+    CHECK(restarted.accessGeneration == 0);
+    CHECK_THROWS(restarted.acceptAccessRelease(5, 2));
+    CHECK(restarted.accessGeneration == 0);
+    CHECK_NOTHROW(restarted.acceptAccessRelease(5, 1));
+    CHECK(restarted.accessGeneration == 1);
+}
+
+TEST_CASE("recovery/lifetime: repeated association loss leaves a retained idle UE reachable and pageable")
+{
+    Lab lab;
+    FakeUe ue(1);
+    Establish(lab, ue, 0x100, 0x2000, {10, 45, 0, 2});
+    auto *entry = lab.mux.registry().find(1);
+    REQUIRE(entry != nullptr);
+
+    // Legitimate ECM-IDLE before the first outage.
+    lab.mux.registry().releaseS1(*entry);
+    const uint32_t idleGeneration = entry->accessGeneration;
+    REQUIRE(idleGeneration == 1);
+
+    for (int round = 0; round < 4; ++round)
+    {
+        // An already idle UE is not touched by an association loss: no access
+        // notification is sent and the shared generation does not move.
+        lab.drain(ue);
+        CHECK(lab.mux.invalidateAccess() == 0);
+        CHECK(entry->s1 == UeS1State::IDLE_RETAINED);
+        CHECK(entry->accessGeneration == idleGeneration);
+        CHECK(lab.drain(ue).empty());
+
+        // Reconnection allocates a fresh association epoch every time.
+        CHECK(lab.reconnect() > 1);
+
+        // A genuine page after the epoch change still reaches the retained
+        // idle radio peer.
+        s1ap::PagingMessage page{};
+        page.ueIdentityIndexValue = 1;
+        page.identity = s1ap::PagingMessage::Identity::S_TMSI;
+        page.sTmsi = {1, 0xC0000104u};
+        page.cnDomain = 0;
+        page.taiList = {{{"460", "02"}, 1}};
+        const auto pdu = s1ap::EncodePaging(page);
+        lab.mux.handleS1ap(pdu.data(), pdu.size(), 0);
+        const auto messages = lab.drain(ue);
+        REQUIRE(messages.size() == 1);
+        CHECK(messages.front().type == link::MessageType::PAGING_INDICATION);
+    }
+
+    CHECK(entry->s1 == UeS1State::IDLE_RETAINED);
+    CHECK(entry->accessGeneration == idleGeneration);
+    CHECK(lab.mux.recoveryCounters().activeUesAffectedByLoss == 0);
+}
+
 // ---------------------------------------------------------------------------
 // Retry policy, state machine and configuration
 // ---------------------------------------------------------------------------

@@ -87,6 +87,11 @@ struct MobilityContext
     void onS1ContextReleased();
     void acceptAccessRelease(uint8_t ebi, uint32_t generation);
     void validateAccessRestoration(uint8_t ebi, uint32_t generation, bool dedicated) const;
+    // A fresh Attach begins a new logical EPS session and a new radio
+    // incarnation. The access-generation counter is shared with the eNB and
+    // must restart on both sides at the same point, otherwise a later
+    // legitimate S1 release reaches this UE already out of step.
+    void beginNewAttach();
     void startServiceRequest();
     void onServiceRestored(bool userPlaneReady = true);
     void onServiceRestored(uint32_t enbId, uint32_t mmeId, uint32_t localTeid, uint32_t remoteTeid);

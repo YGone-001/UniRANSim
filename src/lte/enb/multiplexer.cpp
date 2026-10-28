@@ -371,7 +371,19 @@ void EnbMultiplexer::onPaging(const uint8_t *data, size_t size, uint16_t stream)
             {page.sTmsi.mmeCode, page.sTmsi.mTmsi, m_config.tac});
         auto frame =
             lte::ue::link::Encode({lte::ue::link::MessageType::PAGING_INDICATION, entry->radioUeId, payload});
-        if (m_ueLink.TrySend(entry->peer, frame.data(), frame.size()))
+        // One unusable radio endpoint must never cost the other idle UEs their
+        // page, so a send that fails or cannot even be attempted is confined to
+        // this entry and the fanout continues.
+        bool delivered = false;
+        try
+        {
+            delivered = m_ueLink.TrySend(entry->peer, frame.data(), frame.size());
+        }
+        catch (const std::exception &)
+        {
+            delivered = false;
+        }
+        if (delivered)
         {
             ++notified;
             ++entry->pagingNotifications;
@@ -381,7 +393,7 @@ void EnbMultiplexer::onPaging(const uint8_t *data, size_t size, uint16_t stream)
         {
             ++m_paging.notificationFailures;
             Log("WARN", "Simulated paging notification to LTE UE " + std::to_string(entry->radioUeId) +
-                            " would block and was dropped");
+                            " was dropped; the remaining retained idle UEs are still notified");
         }
     }
 
@@ -887,7 +899,7 @@ void EnbMultiplexer::handleRadioFrame(const uint8_t *data, size_t size, const In
             else
             {
                 // A new Attach is a new logical session, unlike Service Request.
-                m_registry.deleteBearerContexts(*entry);
+                m_registry.beginNewAttach(*entry);
                 startInitialUeMessage(*entry, std::move(radio.payload), std::nullopt);
             }
         }

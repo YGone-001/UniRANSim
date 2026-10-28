@@ -662,6 +662,67 @@ TEST_CASE("lte/paging/enb: the fanout stays within the configured maxUes bound")
     }
 }
 
+TEST_CASE("lte/paging/enb: an unusable radio endpoint does not cost the other idle UEs their page")
+{
+    CaptureSender sender;
+    EnbMultiplexer mux(TestEnbConfig(), sender);
+    FakeUe reachable(2);
+    // UE 1 names a radio endpoint the shared UE link cannot even address, so
+    // its notification fails; UE 2 is an ordinary reachable radio peer.
+    mux.registry().registerPeer(1, InetAddress{"::1", 4998}).s1 = UeS1State::IDLE_RETAINED;
+    mux.registry().registerPeer(2, reachable.radio.LocalAddress()).s1 = UeS1State::IDLE_RETAINED;
+
+    const auto pdu = s1ap::EncodePaging(Page(1, 1, 0xC000010Du, 1));
+    CHECK_NOTHROW(mux.handleS1ap(pdu.data(), pdu.size(), 0));
+
+    CHECK(mux.pagingCounters().notificationFailures == 1);
+    CHECK(mux.pagingCounters().notificationsDelivered == 1);
+    CHECK(mux.pagingCounters().valid == 1);
+    const auto message = ReceiveRadio(reachable.radio, 500);
+    REQUIRE(message.has_value());
+    CHECK(message->type == lte::ue::link::MessageType::PAGING_INDICATION);
+    CHECK(message->ueId == 2);
+}
+
+TEST_CASE("lte/paging/enb: a page while the S1 association is down reaches the retained idle UE safely")
+{
+    CaptureSender sender;
+    EnbMultiplexer mux(TestEnbConfig(), sender);
+    FakeUe ue(1);
+    auto &entry = mux.registry().registerPeer(1, ue.radio.LocalAddress());
+    entry.s1 = UeS1State::IDLE_RETAINED;
+    entry.accessGeneration = 1;
+
+    // The association died while this UE was already idle, so no access was
+    // invalidated and the retained context is left exactly where it was.
+    CHECK(mux.invalidateAccess() == 0);
+    CHECK(mux.associationEpoch() == 0);
+
+    const auto pdu = s1ap::EncodePaging(Page(1, 1, 0xC000010Eu, 1));
+    CHECK_NOTHROW(mux.handleS1ap(pdu.data(), pdu.size(), 0));
+
+    // A page is a radio event: it still reaches the retained idle peer, but it
+    // resurrects no S1 identity and nothing is pushed into the dead sender.
+    const auto message = ReceiveRadio(ue.radio, 500);
+    REQUIRE(message.has_value());
+    CHECK(message->type == lte::ue::link::MessageType::PAGING_INDICATION);
+    CHECK(sender.sent.empty());
+    const auto *stored = mux.registry().find(1);
+    REQUIRE(stored != nullptr);
+    CHECK(stored->s1 == UeS1State::IDLE_RETAINED);
+    CHECK(stored->enbUeS1apId == 0);
+    CHECK(stored->mmeUeS1apId == 0);
+    CHECK(stored->accessGeneration == 1);
+
+    // A page arriving just after the fresh S1 Setup is delivered as well.
+    CHECK(mux.bindAssociation(sender, 10) > 1);
+    const auto afterSetup = s1ap::EncodePaging(Page(1, 1, 0xC000010Fu, 1));
+    CHECK_NOTHROW(mux.handleS1ap(afterSetup.data(), afterSetup.size(), 0));
+    const auto second = ReceiveRadio(ue.radio, 500);
+    REQUIRE(second.has_value());
+    CHECK(second->type == lte::ue::link::MessageType::PAGING_INDICATION);
+}
+
 TEST_CASE("lte/paging/enb: the simulated notification frame rejects a malformed payload")
 {
     const std::vector<uint8_t> shortPayload{0x01, 0x00, 0x00, 0x00, 0x01};
@@ -757,6 +818,22 @@ TEST_CASE("lte/paging/ue: a pending TAU does not start a conflicting Service Req
     context.startTau(true);
     CHECK(lte::ue::EvaluatePaging(context, {"460", "02"}, Notification(1, 0xC00007C4u)) ==
           lte::ue::PagingMatch::PROCEDURE_PENDING);
+}
+
+TEST_CASE("lte/paging/ue: a page while a Service Request is already pending is ignored")
+{
+    auto context = IdleRegistered(Guti(1, 0xC00007C4u));
+    auto security = ActiveSecurity(5);
+    REQUIRE(lte::ue::RespondToPaging(context, {"460", "02"}, Notification(1, 0xC00007C4u), security).has_value());
+    REQUIRE(context.pending == lte::ue::PendingProcedure::SERVICE_REQUEST);
+
+    // The in-flight restoration owns the procedure: a late page cannot start a
+    // second one and cannot consume a second NAS COUNT.
+    CHECK(lte::ue::EvaluatePaging(context, {"460", "02"}, Notification(1, 0xC00007C4u)) ==
+          lte::ue::PagingMatch::PROCEDURE_PENDING);
+    CHECK_FALSE(
+        lte::ue::RespondToPaging(context, {"460", "02"}, Notification(1, 0xC00007C4u), security).has_value());
+    CHECK(security.ulNasCount == 6);
 }
 
 TEST_CASE("lte/paging/ue: a page outside the assigned TAI list is ignored")

@@ -14,6 +14,7 @@
 #include "paging.hpp"
 #include "radio_link.hpp"
 #include "security.hpp"
+#include "trigger.hpp"
 #include "tun.hpp"
 
 #include <algorithm>
@@ -108,8 +109,7 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
     // Unexpected S1-MME association loss bookkeeping. The UE keeps its EPS
     // registration and logical bearers; only access transport is invalidated.
     uint64_t accessLosses = 0;
-    bool recoveryPending = false;
-    bool recoveryDriven = false;
+    RestorationTrigger restorationTrigger;
     int recoveryAttempts = 0;
     uint64_t recoveryRestorations = 0;
     uint64_t recoveryFailures = 0;
@@ -122,11 +122,11 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
     // Network-triggered paging bookkeeping. Nothing here can make the UE send a
     // Service Request on its own: only an accepted page does.
     bool pagingWaitArmed = false;
-    bool pagingTriggeredProcedure = false;
     auto pagingDeadline = std::chrono::steady_clock::time_point::max();
     uint64_t pagingIndications = 0;
     uint64_t pagingMatched = 0;
     uint64_t pagingIgnored = 0;
+    uint64_t pagingSuppressed = 0;
     uint64_t pagingServiceRequests = 0;
     uint64_t pagingRestorations = 0;
     uint64_t pagingRestorationFailures = 0;
@@ -137,6 +137,7 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
     state = State::CONNECTED_TO_ENB;
     LogState(state);
     Log("INFO", "LTE UE " + std::to_string(ueId) + " using subscriber IMSI ..." + config.imsi.substr(config.imsi.size() - 4));
+    mobility.beginNewAttach();
     auto attach = nas::EncodeAttachRequest(config);
     SendNas(socket, enb, ueId, std::move(attach));
     state = State::ATTACH_REQUEST_SENT;
@@ -229,16 +230,16 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
         // security context and GUTI. It never re-Attaches silently and never
         // invents a network procedure; the MME decides whether the old EPS
         // context still exists.
-        if (recoveryPending && mobility.emm == EmmState::REGISTERED && mobility.ecm == EcmState::IDLE &&
-            mobility.pending == PendingProcedure::NONE && now >= recoveryDeadline)
+        if (restorationTrigger.recoveryArmed() && mobility.emm == EmmState::REGISTERED &&
+            mobility.ecm == EcmState::IDLE && mobility.pending == PendingProcedure::NONE && now >= recoveryDeadline)
         {
             if (recoveryAttempts >= config.lifecycle.recoveryMaxAttempts)
             {
-                recoveryPending = false;
+                restorationTrigger.abandon();
                 Log("ERROR", "Access recovery gave up after " + std::to_string(recoveryAttempts) +
                                 " Service Request attempt(s); the UE remains registered and ECM-IDLE");
             }
-            else
+            else if (restorationTrigger.tryTakeFromRecovery())
             {
                 try
                 {
@@ -247,7 +248,6 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                     SendServiceRequest(socket, enb, ueId, *mobility.guti, pendingWire);
                     security.ulNasCount = (security.ulNasCount + 1U) & 0xFFFFFFU;
                     ++recoveryAttempts;
-                    recoveryDriven = true;
                     procedureRetries = 0;
                     procedureDeadline = now + std::chrono::milliseconds(config.lifecycle.procedureTimeoutMs);
                     recoveryDeadline = now + std::chrono::milliseconds(config.lifecycle.recoveryRetryMs);
@@ -256,7 +256,7 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 }
                 catch (const std::exception &e)
                 {
-                    recoveryPending = false;
+                    restorationTrigger.abandon();
                     Log("ERROR", std::string("Access recovery cannot start a Service Request: ") + e.what());
                 }
             }
@@ -266,18 +266,18 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
         {
             if (procedureRetries >= config.lifecycle.maxRetries)
             {
-                if (pagingTriggeredProcedure)
+                const auto failed = restorationTrigger.takeFailed();
+                if (failed == RestorationOwner::PAGING)
                 {
                     ++pagingRestorationFailures;
                     Log("ERROR", "Paging-triggered service restoration failed after bounded retransmissions");
                 }
-                if (recoveryDriven)
+                else if (failed == RestorationOwner::RECOVERY)
                 {
                     // A bounded recovery outcome: the network never completed
                     // the restoration. The UE stays registered and ECM-IDLE and
                     // reports the failure instead of fabricating success.
                     ++recoveryFailures;
-                    recoveryDriven = false;
                     pendingWire.clear();
                     mobility.onProcedureRejected();
                     Log("ERROR", "Access recovery Service Request timed out after bounded retransmissions");
@@ -458,11 +458,10 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 for (auto &bearer : dedicatedBearers)
                     bearer.releaseAccessTransport();
                 ++accessLosses;
-                recoveryDriven = false;
                 // Only the UE-initiated path is armed here. Network-initiated
                 // Paging is left untouched and remains fully functional.
-                recoveryPending = config.lifecycle.recoveryDelayMs > 0 &&
-                                  config.lifecycle.recoveryMaxAttempts > 0;
+                restorationTrigger.onAccessLoss(config.lifecycle.recoveryDelayMs > 0 &&
+                                                config.lifecycle.recoveryMaxAttempts > 0);
                 recoveryAttempts = 0;
                 recoveryDeadline = std::chrono::steady_clock::now() +
                                    std::chrono::milliseconds(config.lifecycle.recoveryDelayMs);
@@ -485,6 +484,15 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                     continue;
                 }
 
+                // A duplicate or late page must not start a second Service
+                // Request, consume a second NAS COUNT, nor erase a
+                // UE-initiated restoration that is already in flight.
+                if (!restorationTrigger.tryTakeFromPaging())
+                {
+                    ++pagingSuppressed;
+                    Log("INFO", "Paging indication ignored: another trigger already owns the pending restoration");
+                    continue;
+                }
                 ++pagingMatched;
                 auto compact = RespondToPaging(mobility, config.plmn, notification, security);
                 if (!compact.has_value())
@@ -492,7 +500,6 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 pendingWire = std::move(*compact);
                 SendServiceRequest(socket, enb, ueId, *mobility.guti, pendingWire);
                 ++pagingServiceRequests;
-                pagingTriggeredProcedure = true;
                 pagingWaitArmed = false;
                 procedureRetries = 0;
                 procedureDeadline = std::chrono::steady_clock::now() +
@@ -507,17 +514,21 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 mobility.validateAccessRestoration(restored.first, restored.second, false);
                 mobility.onServiceRestored(tun != nullptr);
                 pendingWire.clear();
-                if (recoveryDriven || recoveryPending)
+                // Exactly one trigger owns a restoration. A page that won the
+                // race against an armed recovery timer is a paging restoration
+                // even though the timer had already been scheduled.
+                switch (restorationTrigger.takeRestored())
                 {
-                    ++recoveryRestorations;
-                    recoveryDriven = false;
-                    recoveryPending = false;
-                    Log("INFO", "Access restoration completed after unexpected S1 access loss");
-                }
-                if (pagingTriggeredProcedure)
-                {
+                case RestorationOwner::PAGING:
                     ++pagingRestorations;
-                    pagingTriggeredProcedure = false;
+                    Log("INFO", "Access restoration completed after a network paging indication");
+                    break;
+                case RestorationOwner::RECOVERY:
+                    ++recoveryRestorations;
+                    Log("INFO", "Access restoration completed after unexpected S1 access loss");
+                    break;
+                case RestorationOwner::NONE:
+                    break;
                 }
                 if (tun)
                 {
@@ -1032,6 +1043,7 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
     Log("INFO", "Paging statistics: indications=" + std::to_string(pagingIndications) +
                     " matched=" + std::to_string(pagingMatched) +
                     " ignored=" + std::to_string(pagingIgnored) +
+                    " duplicate-trigger-suppressed=" + std::to_string(pagingSuppressed) +
                     " service-requests=" + std::to_string(pagingServiceRequests) +
                     " restorations=" + std::to_string(pagingRestorations) +
                     " restoration-failures=" + std::to_string(pagingRestorationFailures));
