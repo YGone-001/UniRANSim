@@ -139,6 +139,22 @@ TEST_CASE("lte/ue/config: lifecycle scenarios and bounded procedure controls are
     std::string invalidSwitchOff = ConfigText;
     invalidSwitchOff += "\nlifecycle:\n  scenario: tau-periodic\n  switchOff: true\n";
     CHECK_THROWS(lte::ue::ParseConfig(invalidSwitchOff));
+
+    // The network-triggered paging window is bounded like the other deadline
+    // controls: an absent field keeps the default, and a value outside the
+    // supported range is rejected rather than silently clamped.
+    CHECK(defaults.lifecycle.pagingWaitMs == 60000);
+    std::string paging = ConfigText;
+    paging += "\nlifecycle:\n  scenario: paging\n  pagingWaitMs: 1200\n";
+    CHECK(lte::ue::ParseConfig(paging).lifecycle.pagingWaitMs == 1200);
+    for (const char *bound : {"99", "600001"})
+    {
+        std::string outOfRange = ConfigText;
+        outOfRange += "\nlifecycle:\n  scenario: paging\n  pagingWaitMs: ";
+        outOfRange += bound;
+        outOfRange += "\n";
+        CHECK_THROWS(lte::ue::ParseConfig(outOfRange));
+    }
 }
 
 TEST_CASE("lte/ue/nas: OP derivation and stale SQN handling fail or succeed independently")

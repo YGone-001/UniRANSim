@@ -44,18 +44,6 @@ std::string Describe(const EnbUeEntry &entry)
     return stream.str();
 }
 
-// Compact hex of a received S1AP Paging PDU. A Paging message carries the
-// paging identity but no NAS security material, so recording it is safe and it
-// is the only way to diff an MME encoding against the local decoder.
-std::string ToHex(const uint8_t *data, size_t size)
-{
-    std::ostringstream stream;
-    stream << std::uppercase << std::hex << std::setfill('0');
-    for (size_t i = 0; i < size; ++i)
-        stream << std::setw(2) << static_cast<int>(data[i]);
-    return stream.str();
-}
-
 } // namespace
 
 EnbMultiplexer::EnbMultiplexer(const EnbConfig &config, IS1apSender &sender)
@@ -151,7 +139,10 @@ bool EnbMultiplexer::sendS1ap(uint16_t stream, const std::vector<uint8_t> &pdu)
         // caller tears the association down instead of transmitting.
         m_injectionArmed = false;
         m_injectionTriggered = true;
-        ++m_recovery.injectedAssociationLosses;
+        // The interruption has now actually happened, so it is counted once as
+        // an injected loss and the association-loss event it causes is not
+        // counted a second time as unexpected.
+        noteInjectedAssociationLoss();
         return false;
     }
     const bool sent = m_sender.send(m_associationEpoch, stream, pdu);
@@ -175,10 +166,39 @@ bool EnbMultiplexer::injectionTriggered() const
     return m_injectionTriggered;
 }
 
+bool EnbMultiplexer::injectionArmed() const
+{
+    return m_injectionArmed;
+}
+
 void EnbMultiplexer::clearInjection()
 {
     m_injectionArmed = false;
     m_injectionTriggered = false;
+}
+
+void EnbMultiplexer::noteInjectedAssociationLoss()
+{
+    ++m_recovery.injectedAssociationLosses;
+    m_injectedLossPending = true;
+}
+
+bool EnbMultiplexer::takeInjectedAssociationLoss()
+{
+    const bool injected = m_injectedLossPending;
+    m_injectedLossPending = false;
+    return injected;
+}
+
+void EnbMultiplexer::classifyAssociationLoss(bool stopping, bool established)
+{
+    // The mark is consumed on every teardown, including one that counts
+    // nothing, so a mark left by a consumed command can never be applied to a
+    // later and unrelated failure.
+    const bool injected = takeInjectedAssociationLoss();
+    if (!established || stopping || injected)
+        return;
+    ++m_recovery.unexpectedAssociationLosses;
 }
 
 size_t EnbMultiplexer::invalidateAccess()
@@ -319,12 +339,19 @@ void EnbMultiplexer::onPaging(const uint8_t *data, size_t size, uint16_t stream)
     {
         page = s1ap::DecodePaging(data, size);
     }
-    catch (const std::exception &e)
+    catch (const std::exception &)
     {
+        // A malformed Paging PDU can carry a permanent subscriber identity in
+        // its APER octets, and neither those octets nor an unchecked decoder
+        // message derived from them may reach an ordinary log. Only the fact of
+        // the rejection, its length and a fixed category are recorded here, and
+        // the exception handed on to the shared S1AP dispatcher is a fixed
+        // allowlisted reason rather than the decoder's message, so the
+        // dispatcher's own rejection line cannot echo untrusted input either.
         ++m_paging.invalid;
-        Log("WARN", std::string("Rejected S1AP Paging PDU (") + std::to_string(size) + " bytes): " + e.what() +
-                        " raw=" + ToHex(data, size));
-        throw;
+        Log("WARN", "Rejected S1AP Paging PDU (" + std::to_string(size) +
+                        " bytes): category=aper-decode; raw payload withheld");
+        throw s1ap::CodecError("S1AP Paging PDU rejected during APER decode");
     }
     ++m_paging.valid;
 
@@ -342,14 +369,18 @@ void EnbMultiplexer::onPaging(const uint8_t *data, size_t size, uint16_t stream)
         Log("WARN", "Ignoring S1AP Paging addressed by IMSI (identity redacted): this phase pages only by S-TMSI");
         return;
     }
-    // A Paging PDU with an S-TMSI carries no permanent subscriber identity and
-    // no NAS security material, so it is safe to record verbatim.
-    Log("INFO", "Accepted S1AP Paging PDU (" + std::to_string(size) + " bytes): " + ToHex(data, size));
+    // Only the decoded identity is recorded, never the raw APER octets: an
+    // ignore-criticality information element that this decoder does not inspect
+    // could still carry a permanent subscriber identity in its bytes.
     if (!servesPagingTai(page.taiList))
     {
         ++m_paging.filteredByTac;
-        Log("INFO", "Ignoring S1AP Paging: its TAI list does not include the served tracking area " +
-                        m_config.plmn.toString() + "/TAC=" + std::to_string(m_config.tac));
+        std::ostringstream filtered;
+        filtered << "Ignoring S1AP Paging for M-TMSI=0x" << std::uppercase << std::hex << std::setfill('0')
+                 << std::setw(8) << page.sTmsi.mTmsi << std::dec
+                 << ": its TAI list does not include the served tracking area " << m_config.plmn.toString()
+                 << "/TAC=" << m_config.tac;
+        Log("INFO", filtered.str());
         return;
     }
 
@@ -649,6 +680,16 @@ void EnbMultiplexer::onErabSetupRequest(const uint8_t *data, size_t size)
     {
         const auto &erab = *std::find_if(request.erabs.begin(), request.erabs.end(),
             [&](const auto &r) { return r.erabId == item.erabId; });
+        // Committed transport only. A candidate that failed, or whose response
+        // never left the eNB, was rolled back above and never reaches this line,
+        // so the recorded TEIDs are the ones actually in force. This is the
+        // standalone counterpart of the Initial Context Setup line and gives a
+        // later fresh-TEID restoration an explicit baseline to compare against.
+        const auto *bearer = m_registry.findBearer(*entry, item.erabId);
+        Log("INFO", "Dedicated E-RAB Setup EBI=" + std::to_string(item.erabId) +
+                        " QCI=" + std::to_string(bearer->parameters().qci) +
+                        " eNB-TEID=" + Hex(bearer->parameters().localTeid, 8) +
+                        " SGW-TEID=" + Hex(bearer->parameters().sgwTeid, 8));
         sendRadio(*entry, lte::ue::link::MessageType::NAS_DOWNLINK, erab.nasPdu);
         if (retained[erab.erabId])
             sendRadio(*entry, lte::ue::link::MessageType::DEDICATED_BEARER_RESTORED,

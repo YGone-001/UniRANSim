@@ -119,7 +119,24 @@ class EnbMultiplexer
     // armed explicitly.
     void armLossBeforeNextS1apSend();
     [[nodiscard]] bool injectionTriggered() const;
+    [[nodiscard]] bool injectionArmed() const;
     void clearInjection();
+
+    // Fault-injection accounting. A consumed injection command and the
+    // association-loss event it causes are one event, not two: the command is
+    // counted as an injected loss when it executes, and the ensuing loss is
+    // then classified as injected rather than unexpected. takeInjectedAssociationLoss()
+    // consumes that mark, so a real transport failure remains separately
+    // observable and a graceful shutdown counts as neither.
+    void noteInjectedAssociationLoss();
+    bool takeInjectedAssociationLoss();
+    // Classifies one association-loss teardown. The outstanding injection mark
+    // is always consumed here so it cannot leak into a later teardown. Exactly
+    // one category applies to one event: a loss a consumed command asked for is
+    // already counted as injected when that command executed, a genuine
+    // transport failure after a live association is unexpected, and a graceful
+    // shutdown or a never-established association is neither.
+    void classifyAssociationLoss(bool stopping, bool established);
 
     // The negotiated outbound SCTP stream count of the association; it bounds
     // the streams UE-associated signalling may use.
@@ -182,6 +199,7 @@ class EnbMultiplexer
     int m_outboundStreams{1};
     bool m_injectionArmed{};
     bool m_injectionTriggered{};
+    bool m_injectedLossPending{};
     uint64_t m_restorationLatencyMs{};
     std::chrono::steady_clock::time_point m_accessInvalidatedAt{};
     udp::UdpServer m_ueLink;

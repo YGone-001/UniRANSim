@@ -8,6 +8,7 @@
 
 #include "app.hpp"
 #include "codec.hpp"
+#include "failure_injection.hpp"
 #include "multiplexer.hpp"
 #include "recovery.hpp"
 
@@ -39,15 +40,6 @@ std::string Hex(uint32_t value, int width)
     std::ostringstream stream;
     stream << "0x" << std::uppercase << std::hex << std::setfill('0') << std::setw(width) << value;
     return stream.str();
-}
-
-std::string Trim(const std::string &text)
-{
-    const auto first = text.find_first_not_of(" \t\r\n");
-    if (first == std::string::npos)
-        return {};
-    const auto last = text.find_last_not_of(" \t\r\n");
-    return text.substr(first, last - first + 1U);
 }
 
 // Association-scoped S1AP endpoint. It lives exactly as long as one SCTP
@@ -105,67 +97,9 @@ class Handler final : public sctp::ISctpHandler, public IS1apSender
     }
 };
 
-// Opt-in, one-shot S1 failure injection for the test-owned eNB.
-//
-// The mechanism does not exist at all unless a control file is configured, so
-// an ordinary deployment has no injection code path. It never touches the live
-// EPC, never uses a firewall and never kills a process: it only invalidates the
-// simulator's own SCTP association.
-class FailureInjector
-{
-  public:
-    enum class Command
-    {
-        NONE,
-        // Tear the association down immediately.
-        LOSS,
-        // Drop the next S1AP PDU the eNB would have sent and tear the
-        // association down instead. Deterministically produces an in-flight
-        // interruption, e.g. during Initial Context Setup.
-        LOSS_BEFORE_S1AP_RESPONSE
-    };
-
-    explicit FailureInjector(const FailureInjectionConfig &config) : m_config(config)
-    {
-        if (m_config.controlFile.empty())
-            Log("INFO", "S1 failure injection is disabled (no control file configured)");
-        else
-            Log("INFO", "S1 failure injection armed; control file=" + m_config.controlFile);
-    }
-
-    Command poll()
-    {
-        if (m_config.controlFile.empty())
-            return Command::NONE;
-        const auto now = Clock::now();
-        if (now < m_nextPoll)
-            return Command::NONE;
-        m_nextPoll = now + std::chrono::milliseconds(m_config.pollIntervalMs);
-
-        std::ifstream input(m_config.controlFile);
-        if (!input.is_open())
-            return Command::NONE;
-        std::string line;
-        std::getline(input, line);
-        input.close();
-        // One-shot: the command is consumed so it cannot fire twice.
-        std::ofstream(m_config.controlFile, std::ios::trunc).close();
-
-        const std::string command = Trim(line);
-        if (command.empty())
-            return Command::NONE;
-        if (command == "loss")
-            return Command::LOSS;
-        if (command == "loss-before-s1ap-response")
-            return Command::LOSS_BEFORE_S1AP_RESPONSE;
-        Log("WARN", "Unknown S1 failure-injection command ignored: " + command);
-        return Command::NONE;
-    }
-
-  private:
-    FailureInjectionConfig m_config;
-    Clock::time_point m_nextPoll{};
-};
+// Opt-in, one-shot S1 failure injection for the test-owned eNB lives in
+// failure_injection.hpp so its command parsing and one-shot consumption can be
+// exercised directly by the recovery tests.
 
 void LogServedGummeis(const s1ap::SetupOutcome &outcome)
 {
@@ -226,6 +160,10 @@ int Run(const EnbConfig &config, const std::atomic_bool &shutdownRequested)
     Log("INFO", "Shared eNB S1-U GTP-U endpoint bound to " + config.s1uAddress + ":" + std::to_string(config.s1uPort));
 
     FailureInjector injector(config.failureInjection);
+    if (injector.enabled())
+        Log("INFO", "S1 failure injection armed; control file=" + config.failureInjection.controlFile);
+    else
+        Log("INFO", "S1 failure injection is disabled (no control file configured)");
 
     int requestedBackoffMs = 0;
     int initialAttempts = 0;
@@ -356,6 +294,10 @@ int Run(const EnbConfig &config, const std::atomic_bool &shutdownRequested)
                         if (command == FailureInjector::Command::LOSS)
                         {
                             Log("WARN", "S1 failure injection: association loss requested by the control file");
+                            // The command is consumed and executed here, so it is
+                            // counted once as an injected loss; the teardown that
+                            // follows must not also be counted as unexpected.
+                            multiplexer.noteInjectedAssociationLoss();
                             handler.associationLost = true;
                             break;
                         }
@@ -364,6 +306,8 @@ int Run(const EnbConfig &config, const std::atomic_bool &shutdownRequested)
                             Log("WARN", "S1 failure injection: armed to interrupt the next S1AP response");
                             multiplexer.armLossBeforeNextS1apSend();
                         }
+                        if (command == FailureInjector::Command::UNKNOWN)
+                            Log("WARN", "Unknown S1 failure-injection command ignored: " + injector.lastCommand());
 
                         // Keep the shared SCTP association responsive; every
                         // received message is routed by the multiplexer to the
@@ -389,9 +333,14 @@ int Run(const EnbConfig &config, const std::atomic_bool &shutdownRequested)
                     // Access transport of every affected UE is invalidated and
                     // the association sender is detached before anything else.
                     const size_t affected = multiplexer.invalidateAccess();
+                    // One loss falls into exactly one category. A teardown a
+                    // consumed fault-injection command asked for is already
+                    // counted as injected; only a genuine transport failure is
+                    // unexpected; a graceful shutdown, or a turn that ended
+                    // without losing the association, is neither.
+                    multiplexer.classifyAssociationLoss(stopping || !handler.associationLost, establishedOnce);
                     if (handler.associationLost && !stopping)
                     {
-                        ++multiplexer.recoveryCounters().unexpectedAssociationLosses;
                         state.transition(ConnectionEvent::CONNECTION_LOST);
                         Log("WARN", "Connection disconnected after invalidating access of " +
                                         std::to_string(affected) + " LTE UE(s), State=" +
@@ -434,9 +383,13 @@ int Run(const EnbConfig &config, const std::atomic_bool &shutdownRequested)
             // during the cleanup can still reach the failed association.
             const size_t affected = multiplexer.invalidateAccess();
             state.transition(ConnectionEvent::CONNECTION_LOST);
+            // The same rule as the orderly teardown: a loss a consumed
+            // fault-injection command asked for is already counted as injected,
+            // a genuine transport failure after a live association is
+            // unexpected, and a graceful shutdown is neither.
+            multiplexer.classifyAssociationLoss(shutdownRequested, establishedOnce);
             if (establishedOnce)
             {
-                ++multiplexer.recoveryCounters().unexpectedAssociationLosses;
                 ++multiplexer.recoveryCounters().reconnectFailures;
                 Log("WARN", "S1 connection failed after invalidating access of " + std::to_string(affected) +
                                 " LTE UE(s): " + e.what() + ", State=" + ToString(state.state()));

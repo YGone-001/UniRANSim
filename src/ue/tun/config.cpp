@@ -204,7 +204,11 @@ static void InitializeTunHandling()
     initialized = 1;
 }
 
-static const char *NextInterfaceName(const std::string &prefix)
+// The first unused interface name with the given prefix, or an empty string
+// when the prefix is exhausted. Returned by value: the name is only ever copied
+// into a fixed-size buffer here, so a heap allocation would have to be released
+// on every throw path in the caller.
+static std::string NextInterfaceName(const std::string &prefix)
 {
     std::set<std::string> names;
 
@@ -227,9 +231,9 @@ static const char *NextInterfaceName(const std::string &prefix)
     {
         std::string name = prefix + std::to_string(i);
         if (!names.count(name))
-            return strdup(name.c_str());
+            return name;
     }
-    return nullptr;
+    return {};
 }
 
 static void TunSetIpAndUp(const char *ifName, const char *ipAddr, const char *netmask, int mtu)
@@ -454,12 +458,12 @@ int AllocateTun(const char *ifPrefix, char **allocatedName, const char *nsName, 
     if (useNamespace)
         InitializeTunHandling();
 
-    const char *ifName = NextInterfaceName(ifPrefix);
-    if (!ifName)
+    const std::string ifName = NextInterfaceName(ifPrefix);
+    if (ifName.empty())
         throw LibError("TUN interface name could not be allocated.", errno);
 
     char tunName[IFNAMSIZ];
-    strcpy(tunName, ifName);
+    strcpy(tunName, ifName.c_str());
 
     ifreq ifr{};
     int fd;
@@ -480,7 +484,7 @@ int AllocateTun(const char *ifPrefix, char **allocatedName, const char *nsName, 
     }
 
     strcpy(tunName, ifr.ifr_name);
-    if (strcmp(tunName, ifName) != 0)
+    if (ifName != tunName)
         throw LibError("TUN interface name could not be allocated.");
 
     if (useNamespace)

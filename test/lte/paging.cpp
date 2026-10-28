@@ -11,6 +11,8 @@
 
 #include <ext/doctest/doctest.h>
 
+#include "log_capture.hpp"
+
 #include <lte/enb/codec.hpp>
 #include <lte/enb/multiplexer.hpp>
 #include <lte/enb/types.hpp>
@@ -22,7 +24,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <memory>
 #include <optional>
@@ -1090,4 +1094,186 @@ TEST_CASE("lte/paging/multi: per-UE paging counters stay independent across a fa
     CHECK(mux.pagingCounters().notificationsDelivered == 4);
     CHECK(entryA.s1 == UeS1State::IDLE_RETAINED);
     CHECK(entryB.s1 == UeS1State::IDLE_RETAINED);
+}
+
+// --- Malformed-Paging diagnostic privacy ------------------------------------
+
+namespace
+{
+
+// Synthetic, obviously non-real subscriber identity. It exists only to prove
+// that a rejection never echoes peer octets: it is not a laboratory IMSI and
+// is not derived from one.
+const std::string SyntheticMarker = "SYNTHSUBMARK";
+
+// TBCD for the synthetic IMSI 999999999999999. The octet run is distinctive
+// enough to recognise in any hex dump of the PDU.
+std::vector<uint8_t> SyntheticImsiTbcd()
+{
+    return {0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0xF9};
+}
+
+s1ap::PagingMessage SyntheticImsiPage()
+{
+    s1ap::PagingMessage page = Page(7, 0, LiveMTmsi, 1);
+    page.identity = s1ap::PagingMessage::Identity::IMSI;
+    page.imsi = SyntheticImsiTbcd();
+    return page;
+}
+
+// Turns a valid Paging PDU into a malformed one without removing any octet:
+// an unknown reject-criticality information element carrying `marker` is
+// appended and the protocolIEs count is corrected. The decoder must reject the
+// PDU, and every octet of the marker is still present in the buffer handed to
+// the production dispatcher, which is exactly the case a raw dump would leak.
+std::vector<uint8_t> MalformedWithMarker(const std::vector<uint8_t> &valid, const std::string &marker)
+{
+    auto payload = PagingPayload(valid);
+    payload.push_back(0x03); // id 999
+    payload.push_back(0xE7);
+    payload.push_back(0x00); // reject criticality
+    payload.push_back(static_cast<uint8_t>(marker.size()));
+    payload.insert(payload.end(), marker.begin(), marker.end());
+    payload[2] = static_cast<uint8_t>(payload[2] + 1U);
+    return WrapPagingPayload(payload);
+}
+
+std::string ToHexDump(const std::vector<uint8_t> &bytes)
+{
+    std::string out;
+    out.reserve(bytes.size() * 2);
+    for (uint8_t byte : bytes)
+    {
+        char digits[3];
+        std::snprintf(digits, sizeof(digits), "%02X", byte);
+        out += digits;
+    }
+    return out;
+}
+
+bool ContainsHexRun(const std::string &log, const std::string &upperHex)
+{
+    if (log.find(upperHex) != std::string::npos)
+        return true;
+    std::string lower = upperHex;
+    for (char &c : lower)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return log.find(lower) != std::string::npos;
+}
+
+} // namespace
+
+TEST_CASE("lte/paging/privacy: a malformed IMSI-addressed PDU logs a fixed rejection and no peer octets")
+{
+    CaptureSender sender;
+    EnbMultiplexer mux(TestEnbConfig(), sender);
+    FakeUe ue(1);
+    mux.registry().registerPeer(1, ue.radio.LocalAddress()).s1 = UeS1State::IDLE_RETAINED;
+
+    const auto valid = s1ap::EncodePaging(SyntheticImsiPage());
+    const auto malformed = MalformedWithMarker(valid, SyntheticMarker);
+    // The marker is present in the bytes the production path receives.
+    const std::string raw(malformed.begin(), malformed.end());
+    REQUIRE(raw.find(SyntheticMarker) != std::string::npos);
+
+    std::string log;
+    {
+        lte::test::LogCapture capture;
+        CHECK_NOTHROW(mux.handleS1ap(malformed.data(), malformed.size(), 0));
+        log = capture.text();
+    }
+
+    CHECK(mux.pagingCounters().received == 1);
+    CHECK(mux.pagingCounters().invalid == 1);
+    CHECK(mux.pagingCounters().notificationsDelivered == 0);
+    CHECK_FALSE(ReceiveRadio(ue.radio, 100).has_value());
+
+    // The rejection is explicit and categorised.
+    CHECK(log.find("Rejected S1AP Paging PDU (") != std::string::npos);
+    CHECK(log.find("category=aper-decode; raw payload withheld") != std::string::npos);
+    CHECK(log.find("S1AP Paging PDU rejected during APER decode") != std::string::npos);
+
+    // Neither the synthetic subscriber-identity marker nor any hex form of it
+    // or of the PDU may appear.
+    CHECK(log.find(SyntheticMarker) == std::string::npos);
+    CHECK_FALSE(ContainsHexRun(log, ToHexDump(std::vector<uint8_t>(SyntheticMarker.begin(), SyntheticMarker.end()))));
+    CHECK_FALSE(ContainsHexRun(log, ToHexDump(SyntheticImsiTbcd())));
+    CHECK_FALSE(ContainsHexRun(log, ToHexDump(malformed)));
+}
+
+TEST_CASE("lte/paging/privacy: a truncated PDU logs a fixed rejection and no peer octets")
+{
+    CaptureSender sender;
+    EnbMultiplexer mux(TestEnbConfig(), sender);
+    FakeUe ue(1);
+    mux.registry().registerPeer(1, ue.radio.LocalAddress()).s1 = UeS1State::IDLE_RETAINED;
+
+    const auto valid = s1ap::EncodePaging(SyntheticImsiPage());
+    REQUIRE(valid.size() > 6);
+    // Keep the synthetic identity octets and cut the tail, so the PDU is
+    // truncated and the marker is still inside the buffer.
+    const auto marker = SyntheticImsiTbcd();
+    std::vector<uint8_t> truncated(valid.begin(), valid.end() - 4);
+    REQUIRE(std::string(truncated.begin(), truncated.end()).find(
+                std::string(marker.begin(), marker.end())) != std::string::npos);
+
+    std::string log;
+    {
+        lte::test::LogCapture capture;
+        CHECK_NOTHROW(mux.handleS1ap(truncated.data(), truncated.size(), 0));
+        log = capture.text();
+    }
+
+    CHECK(mux.pagingCounters().received == 1);
+    CHECK(mux.pagingCounters().invalid == 1);
+    CHECK(mux.pagingCounters().notificationsDelivered == 0);
+    CHECK_FALSE(ReceiveRadio(ue.radio, 100).has_value());
+
+    CHECK(log.find("Rejected S1AP Paging PDU (") != std::string::npos);
+    CHECK(log.find("category=aper-decode; raw payload withheld") != std::string::npos);
+    CHECK(log.find("S1AP Paging PDU rejected during APER decode") != std::string::npos);
+    CHECK_FALSE(ContainsHexRun(log, ToHexDump(SyntheticImsiTbcd())));
+    CHECK_FALSE(ContainsHexRun(log, ToHexDump(truncated)));
+}
+
+TEST_CASE("lte/paging/privacy: a valid IMSI page is redacted rather than echoed")
+{
+    CaptureSender sender;
+    EnbMultiplexer mux(TestEnbConfig(), sender);
+    FakeUe ue(1);
+    mux.registry().registerPeer(1, ue.radio.LocalAddress()).s1 = UeS1State::IDLE_RETAINED;
+
+    const auto pdu = s1ap::EncodePaging(SyntheticImsiPage());
+    std::string log;
+    {
+        lte::test::LogCapture capture;
+        mux.handleS1ap(pdu.data(), pdu.size(), 0);
+        log = capture.text();
+    }
+
+    CHECK(mux.pagingCounters().valid == 1);
+    CHECK(mux.pagingCounters().unsupportedIdentity == 1);
+    CHECK(log.find("Ignoring S1AP Paging addressed by IMSI (identity redacted)") != std::string::npos);
+    CHECK_FALSE(ContainsHexRun(log, ToHexDump(SyntheticImsiTbcd())));
+    CHECK_FALSE(ContainsHexRun(log, ToHexDump(pdu)));
+}
+
+TEST_CASE("lte/paging/privacy: a TAI-filtered page logs structured identity and no raw PDU")
+{
+    CaptureSender sender;
+    EnbMultiplexer mux(TestEnbConfig(), sender);
+    FakeUe ue(1);
+    mux.registry().registerPeer(1, ue.radio.LocalAddress()).s1 = UeS1State::IDLE_RETAINED;
+
+    const auto pdu = s1ap::EncodePaging(Page(1, 1, 0xC000010Fu, 7));
+    std::string log;
+    {
+        lte::test::LogCapture capture;
+        mux.handleS1ap(pdu.data(), pdu.size(), 0);
+        log = capture.text();
+    }
+
+    CHECK(mux.pagingCounters().filteredByTac == 1);
+    CHECK(log.find("Ignoring S1AP Paging for M-TMSI=0xC000010F") != std::string::npos);
+    CHECK_FALSE(ContainsHexRun(log, ToHexDump(pdu)));
 }

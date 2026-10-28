@@ -163,12 +163,8 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 idleReleaseRequested = true;
                 procedureDeadline = now + std::chrono::milliseconds(config.lifecycle.procedureTimeoutMs);
                 if (config.lifecycle.scenario == LifecycleScenario::PAGING)
-                {
-                    pagingWaitArmed = true;
-                    pagingDeadline = now + std::chrono::milliseconds(config.lifecycle.pagingWaitMs);
                     Log("INFO", "Controlled idle trigger sent an S1 Context Release Request; the UE will wait "
                                 "for a network paging indication instead of sending Service Request");
-                }
                 else
                     Log("INFO", "Controlled idle trigger sent a standards-based S1 Context Release Request");
             }
@@ -211,13 +207,17 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
             }
         }
 
-        if (idleReleaseRequested && now >= procedureDeadline)
+        // A stop request always wins over a deadline inside the same turn, so a
+        // shutdown is never reported as a failed procedure. The loop condition
+        // is evaluated before these checks; the guard makes the precedence
+        // explicit rather than depending on when the flag was set.
+        if (!shutdownRequested && idleReleaseRequested && now >= procedureDeadline)
         {
             Log("ERROR", "Timed out waiting for the MME S1 Context Release Command/Complete flow");
             return 1;
         }
 
-        if (pagingWaitArmed && now >= pagingDeadline)
+        if (!shutdownRequested && pagingWaitArmed && now >= pagingDeadline)
         {
             // The MME owns paging retries. This is a bounded laboratory wait, and
             // its expiry is an unresolved test condition, never paging success.
@@ -427,6 +427,14 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                     idleReleaseRequested = false;
                     if (config.lifecycle.scenario == LifecycleScenario::PAGING)
                     {
+                        // The wait starts here, at the first ECM-IDLE turn, so its
+                        // deadline measures the paging window alone. Arming it when
+                        // the release request was sent would let a short pagingWaitMs
+                        // expire in the middle of the release exchange and report a
+                        // paging timeout for what is really a release failure.
+                        pagingWaitArmed = true;
+                        pagingDeadline = std::chrono::steady_clock::now() +
+                                         std::chrono::milliseconds(config.lifecycle.pagingWaitMs);
                         // Network-triggered scenario: stay idle until the MME pages.
                         Log("INFO", "Waiting for a network paging indication; no Service Request is sent locally");
                     }
@@ -1034,6 +1042,10 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
         Log("ERROR", "Timed out waiting for MME EPS Attach signaling");
         return 1;
     }
+    if (pagingWaitArmed)
+        // Reaching here with the wait still armed is only possible through the
+        // stop request, so this is a shutdown and never a paging timeout.
+        Log("INFO", "Paging wait abandoned at shutdown; no Service Request was sent");
     Log("INFO", "User-plane statistics: tun-ul=" + std::to_string(tunUplinkPackets) + "/" +
                     std::to_string(tunUplinkBytes) + " tun-dl=" + std::to_string(tunDownlinkPackets) + "/" +
                     std::to_string(tunDownlinkBytes) + " drops(malformed/inactive)=" +

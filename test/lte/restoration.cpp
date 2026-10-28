@@ -1,6 +1,7 @@
 // This file is a part of UERANSIM project.
 // https://github.com/aligungr/UERANSIM/
 // See README, LICENSE, and CONTRIBUTING files for licensing details.
+#include "log_capture.hpp"
 #include "restoration_fixtures.hpp"
 #include <algorithm>
 #include <ext/doctest/doctest.h>
@@ -11,7 +12,9 @@
 #include <lte/ue/paging.hpp>
 #include <lte/ue/radio_link.hpp>
 #include <lte/ue/security.hpp>
+#include <iomanip>
 #include <set>
+#include <sstream>
 
 namespace
 {
@@ -154,6 +157,52 @@ std::vector<uint8_t> Ip(bool downlink = false)
 {
     return Hex(downlink ? "450000140000000040010000c00002010a2d0002"
                         : "4500001400000000400100000a2d0002c0000201");
+}
+
+// The production TEID rendering, so a logging assertion can name the committed
+// values exactly rather than a hard-coded guess.
+std::string TeidHex(uint32_t value)
+{
+    std::ostringstream stream;
+    stream << "0x" << std::uppercase << std::hex << std::setfill('0') << std::setw(8) << value;
+    return stream.str();
+}
+
+std::string BearerLine(const char *label, const BearerParameters &parameters)
+{
+    return std::string(label) + " EBI=" + std::to_string(parameters.erabId) +
+           " QCI=" + std::to_string(parameters.qci) + " eNB-TEID=" + TeidHex(parameters.localTeid) +
+           " SGW-TEID=" + TeidHex(parameters.sgwTeid);
+}
+
+// One E-RAB to be set up, built in code so the QoS and transport a log
+// assertion names are known exactly instead of inferred from a fixture.
+s1ap::ErabToBeSetupItem Item(uint8_t ebi, uint8_t qci, uint32_t sgwTeid, bool withNas = true)
+{
+    s1ap::ErabToBeSetupItem item{};
+    item.erabId = ebi;
+    item.qci = qci;
+    item.transportLayerAddress = {127, 0, 0, 9};
+    item.gtpTeid = TeidToBytes(sgwTeid);
+    item.nasPduPresent = withNas;
+    item.nasPdu = {0x27, 0, 0, 0, 0, 1, 0};
+    return item;
+}
+
+// A standalone dedicated E-RAB Setup Request under the live S1 identities.
+void ErabSetup(Lab &lab, std::vector<s1ap::ErabToBeSetupItem> items)
+{
+    s1ap::ErabSetupRequest request{lab.entry.mmeUeS1apId, lab.entry.enbUeS1apId, std::move(items)};
+    const auto bytes = s1ap::EncodeErabSetupRequest(request);
+    lab.mux.handleS1ap(bytes.data(), bytes.size(), 1);
+}
+
+size_t CountLines(const std::string &log, const std::string &needle)
+{
+    size_t count = 0;
+    for (size_t at = log.find(needle); at != std::string::npos; at = log.find(needle, at + 1))
+        ++count;
+    return count;
 }
 } // namespace
 
@@ -861,4 +910,116 @@ TEST_CASE("restoration/lifecycle: radio delivery failure cannot prevent S1 Relea
     CHECK(lab.entry.s1 == UeS1State::IDLE_RETAINED);
     CHECK(lab.entry.bearer.logicalConfirmed());
     CHECK(lab.mux.registry().findByEnbUeS1apId(1) == nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// Committed dedicated E-RAB transport logging
+//
+// A successful standalone E-RAB Setup names the TEIDs that are actually in
+// force once the response has left the eNB. A candidate that failed, or whose
+// response never left the eNB, is rolled back and must not be logged as an
+// established bearer.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("restoration/logging: a committed standalone dedicated E-RAB setup logs its actual TEIDs")
+{
+    lte::test::LogCapture capture;
+    Lab lab(0);
+    auto r = Request();
+    r.erabs.resize(1);
+    lab.request(r);
+    lab.ready(5);
+    ErabSetup(lab, {Item(6, 7, 0x2006)});
+    const std::string log = capture.text();
+
+    REQUIRE(lab.entry.dedicatedBearers.size() == 1);
+    const auto &committed = lab.entry.dedicatedBearers[0];
+    CHECK(committed.signalingEstablished());
+    CHECK(committed.parameters().localTeid != 0);
+    CHECK(committed.parameters().sgwTeid == 0x2006u);
+
+    // The line names the committed local TEID and the SGW TEID the MME
+    // actually assigned, not a provisional or requested-only value.
+    const std::string expected =
+        "Dedicated E-RAB Setup EBI=6 QCI=7 eNB-TEID=" + TeidHex(committed.parameters().localTeid) +
+        " SGW-TEID=0x00002006";
+    CHECK(CountLines(log, expected) == 1);
+    CHECK(CountLines(log, "Dedicated E-RAB Setup") == 1);
+}
+
+TEST_CASE("restoration/logging: a rolled-back dedicated E-RAB setup logs no success line")
+{
+    lte::test::LogCapture capture;
+    Lab lab(0);
+    auto r = Request();
+    r.erabs.resize(1);
+    lab.request(r);
+    lab.ready(5);
+    lab.sender.fail = true;
+    ErabSetup(lab, {Item(6, 7, 0x2006)});
+    const std::string log = capture.text();
+
+    // The response never left the eNB, so the candidate transport was rolled
+    // back and no bearer may be reported as established.
+    CHECK(lab.entry.dedicatedBearers.empty());
+    CHECK(CountLines(log, "Dedicated E-RAB Setup") == 0);
+    CHECK(CountLines(log, "0x00002006") == 0);
+}
+
+TEST_CASE("restoration/logging: only accepted dedicated E-RABs are logged as established")
+{
+    lte::test::LogCapture capture;
+    Lab lab(0);
+    auto r = Request();
+    r.erabs.resize(1);
+    lab.request(r);
+    lab.ready(5);
+    // The second item names a zero SGW TEID and must fail on its own.
+    ErabSetup(lab, {Item(6, 7, 0x2006), Item(7, 9, 0)});
+    const std::string log = capture.text();
+
+    REQUIRE(lab.entry.dedicatedBearers.size() == 1);
+    const auto &committed = lab.entry.dedicatedBearers[0];
+    CHECK(committed.parameters().erabId == 6);
+
+    CHECK(CountLines(log, "Dedicated E-RAB Setup") == 1);
+    CHECK(CountLines(log, "Dedicated E-RAB Setup EBI=6 QCI=7 eNB-TEID=" +
+                              TeidHex(committed.parameters().localTeid) + " SGW-TEID=0x00002006") == 1);
+    // The rejected item is not reported with any transport.
+    CHECK(log.find("Dedicated E-RAB Setup EBI=7") == std::string::npos);
+    CHECK(CountLines(log, "0x00000000") == 0);
+}
+
+TEST_CASE("restoration/logging: initial context setup lines are unchanged and each bearer is independent")
+{
+    lte::test::LogCapture capture;
+    Lab lab(2);
+    lab.request(f::request3);
+    const std::string log = capture.text();
+
+    // The established-order line shape is exactly the one the multi-E-RAB
+    // restoration already reported; nothing about the standalone line changed it.
+    CHECK(CountLines(log, "Initial Context Setup EBI=") == 3);
+    CHECK(CountLines(log, "Initial Context Setup EBI=5 QCI=9 eNB-TEID=" +
+                              TeidHex(lab.entry.bearer.parameters().localTeid) +
+                              " SGW-TEID=" + TeidHex(lab.entry.bearer.parameters().sgwTeid)) == 1);
+    for (const auto &bearer : lab.entry.dedicatedBearers)
+        CHECK(CountLines(log, BearerLine("Initial Context Setup", bearer.parameters())) == 1);
+    // The dedicated standalone line is a counterpart, not a duplicate.
+    CHECK(CountLines(log, "Dedicated E-RAB Setup") == 0);
+
+    // A later standalone setup adds exactly one more line, for its own bearer.
+    lte::test::LogCapture dedicated;
+    ErabSetup(lab, {Item(8, 5, 0x2008)});
+    const std::string tail = dedicated.text();
+    REQUIRE(lab.entry.dedicatedBearers.size() == 3);
+    const auto &added = lab.entry.dedicatedBearers.back();
+    CHECK(added.parameters().erabId == 8);
+    CHECK(CountLines(tail, "Dedicated E-RAB Setup") == 1);
+    CHECK(CountLines(tail, BearerLine("Dedicated E-RAB Setup", added.parameters())) == 1);
+    // Its transport is distinct from every bearer the context setup committed.
+    CHECK(added.parameters().localTeid != lab.entry.bearer.parameters().localTeid);
+    for (const auto &bearer : lab.entry.dedicatedBearers)
+        if (bearer.parameters().erabId != 8)
+            CHECK(added.parameters().localTeid != bearer.parameters().localTeid);
 }

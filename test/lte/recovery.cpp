@@ -9,6 +9,7 @@
 #include <ext/doctest/doctest.h>
 
 #include <lte/enb/codec.hpp>
+#include <lte/enb/failure_injection.hpp>
 #include <lte/enb/config.hpp>
 #include <lte/enb/multiplexer.hpp>
 #include <lte/enb/recovery.hpp>
@@ -20,6 +21,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <fstream>
 #include <set>
 #include <string>
 #include <thread>
@@ -207,6 +210,43 @@ std::vector<uint8_t> ServiceRequestPayload()
 {
     return {1, 0x12, 0x34, 0x56, 0x78, 0xC7, 0x00, 0x01, 0x02};
 }
+
+// A temporary fault-injection control file. Created empty and removed on scope
+// exit so a test can never leave a command behind for a later one. The poll
+// interval is kept at the configured minimum because the injector paces its
+// own reads; a test that polls twice sleeps past it.
+struct ControlFile
+{
+    std::string path;
+
+    explicit ControlFile(const std::string &name) : path("/tmp/uniransim-injection-" + name + "-" + Next())
+    {
+        Write("");
+    }
+
+    ~ControlFile() { std::remove(path.c_str()); }
+
+    void Write(const std::string &line) const
+    {
+        std::ofstream out(path, std::ios::trunc);
+        out << line;
+    }
+
+    [[nodiscard]] FailureInjectionConfig Config() const
+    {
+        FailureInjectionConfig config;
+        config.controlFile = path;
+        config.pollIntervalMs = 10;
+        return config;
+    }
+
+  private:
+    static std::string Next()
+    {
+        static unsigned long sequence = 0;
+        return std::to_string(++sequence);
+    }
+};
 
 ue::MobilityContext Mobility()
 {
@@ -1045,4 +1085,192 @@ enbLink:
     std::string unbounded = base;
     unbounded += "\nlifecycle:\n  recoveryMaxAttempts: 11\n";
     CHECK_THROWS(lte::ue::ParseConfig(unbounded));
+}
+
+// ---------------------------------------------------------------------------
+// Injected-loss versus unexpected-loss accounting
+//
+// A consumed injection command and the association-loss event it causes are one
+// event. The command is counted as injected when it executes, the ensuing
+// teardown is then classified as injected rather than unexpected, and a
+// graceful shutdown or a never-established association counts as neither. Real
+// transport failures stay separately observable.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("recovery/counters: a consumed loss command is counted as injected and not also unexpected")
+{
+    Lab lab;
+    ControlFile control("loss-command");
+    control.Write("loss");
+    FailureInjector injector(control.Config());
+
+    REQUIRE(injector.poll() == FailureInjector::Command::LOSS);
+    // Exactly what the serve loop does once the command has been consumed.
+    lab.mux.noteInjectedAssociationLoss();
+    lab.mux.classifyAssociationLoss(/*stopping=*/false, /*established=*/true);
+
+    CHECK(lab.mux.recoveryCounters().injectedAssociationLosses == 1);
+    CHECK(lab.mux.recoveryCounters().unexpectedAssociationLosses == 0);
+
+    // A later and unrelated transport failure is a separate event and is still
+    // observable as unexpected.
+    lab.mux.classifyAssociationLoss(false, true);
+    CHECK(lab.mux.recoveryCounters().injectedAssociationLosses == 1);
+    CHECK(lab.mux.recoveryCounters().unexpectedAssociationLosses == 1);
+}
+
+TEST_CASE("recovery/counters: an executed loss-before-s1ap-response counts as injected exactly once")
+{
+    Lab lab;
+    FakeUe ue(1);
+    Establish(lab, ue, 0x100, 0x2000, {10, 45, 0, 2});
+    lab.mux.invalidateAccess();
+    lab.reconnect();
+
+    ControlFile control("loss-before-response");
+    control.Write("loss-before-s1ap-response");
+    FailureInjector injector(control.Config());
+    REQUIRE(injector.poll() == FailureInjector::Command::LOSS_BEFORE_S1AP_RESPONSE);
+    lab.mux.armLossBeforeNextS1apSend();
+    CHECK(lab.mux.injectionArmed());
+
+    // The interruption happens inside the production send path, which is where
+    // the injected loss is marked.
+    lab.uplink(ue, link::MessageType::SERVICE_REQUEST, ServiceRequestPayload());
+    REQUIRE(lab.mux.injectionTriggered());
+    CHECK(lab.mux.recoveryCounters().injectedAssociationLosses == 1);
+
+    lab.mux.classifyAssociationLoss(false, true);
+    CHECK(lab.mux.recoveryCounters().injectedAssociationLosses == 1);
+    CHECK(lab.mux.recoveryCounters().unexpectedAssociationLosses == 0);
+}
+
+TEST_CASE("recovery/counters: an armed injection that never fires counts nothing")
+{
+    Lab lab;
+    ControlFile control("loss-never-fired");
+    control.Write("loss-before-s1ap-response");
+    FailureInjector injector(control.Config());
+    REQUIRE(injector.poll() == FailureInjector::Command::LOSS_BEFORE_S1AP_RESPONSE);
+    lab.mux.armLossBeforeNextS1apSend();
+
+    // No send happens, so nothing is interrupted and nothing is marked. The
+    // armed state alone is not a loss.
+    CHECK(lab.mux.injectionArmed());
+    CHECK_FALSE(lab.mux.injectionTriggered());
+    CHECK(lab.mux.recoveryCounters().injectedAssociationLosses == 0);
+    CHECK(lab.mux.recoveryCounters().unexpectedAssociationLosses == 0);
+    CHECK_FALSE(lab.mux.takeInjectedAssociationLoss());
+
+    // A teardown of a never-established association counts as neither.
+    lab.mux.classifyAssociationLoss(false, false);
+    CHECK(lab.mux.recoveryCounters().injectedAssociationLosses == 0);
+    CHECK(lab.mux.recoveryCounters().unexpectedAssociationLosses == 0);
+}
+
+TEST_CASE("recovery/counters: an unknown control command is ignored and counts nothing")
+{
+    Lab lab;
+    ControlFile control("unknown-command");
+    control.Write("reboot-the-core");
+    FailureInjector injector(control.Config());
+
+    REQUIRE(injector.poll() == FailureInjector::Command::UNKNOWN);
+    CHECK(injector.lastCommand() == "reboot-the-core");
+
+    // The serve loop only logs an unknown command; it neither marks an injected
+    // loss nor tears the association down.
+    CHECK(lab.mux.recoveryCounters().injectedAssociationLosses == 0);
+    CHECK_FALSE(lab.mux.takeInjectedAssociationLoss());
+
+    // A genuine loss that follows is therefore still classified as unexpected.
+    lab.mux.classifyAssociationLoss(false, true);
+    CHECK(lab.mux.recoveryCounters().injectedAssociationLosses == 0);
+    CHECK(lab.mux.recoveryCounters().unexpectedAssociationLosses == 1);
+}
+
+TEST_CASE("recovery/counters: a graceful shutdown counts as neither")
+{
+    Lab lab;
+    CHECK(lab.mux.recoveryCounters().injectedAssociationLosses == 0);
+
+    lab.mux.classifyAssociationLoss(/*stopping=*/true, /*established=*/true);
+    CHECK(lab.mux.recoveryCounters().injectedAssociationLosses == 0);
+    CHECK(lab.mux.recoveryCounters().unexpectedAssociationLosses == 0);
+
+    // A shutdown that follows a consumed injection still carries exactly the one
+    // count the command earned, and the stop adds nothing of its own.
+    lab.mux.noteInjectedAssociationLoss();
+    lab.mux.classifyAssociationLoss(true, true);
+    CHECK(lab.mux.recoveryCounters().injectedAssociationLosses == 1);
+    CHECK(lab.mux.recoveryCounters().unexpectedAssociationLosses == 0);
+}
+
+TEST_CASE("recovery/counters: a real transport failure is counted as unexpected and separately observable")
+{
+    Lab lab;
+    lab.mux.classifyAssociationLoss(false, true);
+    lab.mux.classifyAssociationLoss(false, true);
+    lab.mux.classifyAssociationLoss(false, true);
+
+    CHECK(lab.mux.recoveryCounters().unexpectedAssociationLosses == 3);
+    CHECK(lab.mux.recoveryCounters().injectedAssociationLosses == 0);
+
+    // A mark that is never paired with a teardown does not leak into a later
+    // unrelated failure.
+    lab.mux.noteInjectedAssociationLoss();
+    lab.mux.takeInjectedAssociationLoss();
+    lab.mux.classifyAssociationLoss(false, true);
+    CHECK(lab.mux.recoveryCounters().unexpectedAssociationLosses == 4);
+    CHECK(lab.mux.recoveryCounters().injectedAssociationLosses == 1);
+}
+
+TEST_CASE("recovery/counters: association flapping counts one loss per consumed executed command")
+{
+    Lab lab;
+    ControlFile control("flapping");
+    FailureInjector injector(control.Config());
+
+    for (int i = 0; i < 4; ++i)
+    {
+        control.Write("loss");
+        // The injector paces its own reads; a flapping loop always exceeds the
+        // interval in practice.
+        std::this_thread::sleep_for(std::chrono::milliseconds(15));
+        REQUIRE(injector.poll() == FailureInjector::Command::LOSS);
+        lab.mux.noteInjectedAssociationLoss();
+        lab.mux.classifyAssociationLoss(false, true);
+    }
+    CHECK(lab.mux.recoveryCounters().injectedAssociationLosses == 4);
+    CHECK(lab.mux.recoveryCounters().unexpectedAssociationLosses == 0);
+
+    // A genuine failure in the middle of the flapping is still its own event.
+    lab.mux.classifyAssociationLoss(false, true);
+    CHECK(lab.mux.recoveryCounters().injectedAssociationLosses == 4);
+    CHECK(lab.mux.recoveryCounters().unexpectedAssociationLosses == 1);
+}
+
+TEST_CASE("recovery/counters: a control command is consumed once and cannot fire twice")
+{
+    ControlFile control("one-shot");
+    control.Write("loss");
+    FailureInjector injector(control.Config());
+
+    REQUIRE(injector.poll() == FailureInjector::Command::LOSS);
+    // Consumption is by truncation, so the command is gone from the control
+    // file rather than merely remembered as already seen.
+    std::ifstream remaining(control.path);
+    std::string leftover;
+    std::getline(remaining, leftover);
+    CHECK(leftover.empty());
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    CHECK(injector.poll() == FailureInjector::Command::NONE);
+
+    // A genuinely new command is still picked up.
+    control.Write("loss-before-s1ap-response");
+    std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    CHECK(injector.poll() == FailureInjector::Command::LOSS_BEFORE_S1AP_RESPONSE);
+    std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    CHECK(injector.poll() == FailureInjector::Command::NONE);
 }
