@@ -16,22 +16,18 @@ namespace nr::ue::tun
 int TunAllocate(const char *namePrefix, std::string &allocatedName, const std::string &nsName, bool useNamespace,
                 std::string &error)
 {
-    int fd;
-    char *name = nullptr;
     try
     {
-        fd = tun::AllocateTun(namePrefix, &name, nsName.c_str(), useNamespace);
-        allocatedName = std::string{name};
-        free(name);
+        // The name is returned by value, so there is no heap allocation to release on the
+        // success path or on any of the throwing ones.
+        return tun::AllocateTun(namePrefix != nullptr ? namePrefix : "", allocatedName, nsName, useNamespace);
     }
     catch (const LibError &e)
     {
         error = e.what();
-        allocatedName = "";
+        allocatedName.clear();
         return -1;
     }
-
-    return fd;
 }
 
 bool TunConfigure(const std::string &tunName, const std::string &ipAddress, const std::string &netmask, int mtu,
@@ -39,8 +35,7 @@ bool TunConfigure(const std::string &tunName, const std::string &ipAddress, cons
 {
     try
     {
-        tun::ConfigureTun(tunName.c_str(), ipAddress.c_str(), netmask.c_str(), mtu, nsName.c_str(), useNamespace,
-                          configureRouting);
+        tun::ConfigureTun(tunName, ipAddress, netmask, mtu, nsName, useNamespace, configureRouting);
     }
     catch (const LibError &e)
     {
@@ -55,7 +50,7 @@ bool TunCleanup(const std::string &tunName, const std::string &nsName, bool useN
 {
     try
     {
-        tun::CleanupTun(tunName.c_str(), nsName.c_str(), useNamespace);
+        tun::CleanupTun(tunName, nsName, useNamespace);
     }
     catch (const LibError &e)
     {

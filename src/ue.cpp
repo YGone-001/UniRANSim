@@ -18,6 +18,7 @@
 #include <lib/app/cli_cmd.hpp>
 #include <lib/app/proc_table.hpp>
 #include <lib/app/ue_ctl.hpp>
+#include <ue/tun/naming.hpp>
 #include <ue/ue.hpp>
 #include <utils/common.hpp>
 #include <utils/concurrent_map.hpp>
@@ -182,13 +183,26 @@ static nr::ue::UeConfig *ReadConfigYaml()
     if (yaml::HasField(config, "imeiSv"))
         result->imeiSv = yaml::GetString(config, "imeiSv", 16, 16);
     if (yaml::HasField(config, "tunName"))
+    {
         result->tunName = yaml::GetString(config, "tunName", 1, 12);
+        // This is the prefix the shared allocator appends an index to, so it has to satisfy
+        // the same rules there. Checked here as well, so a bad name fails at startup rather
+        // than when a PDU session is brought up.
+        const std::string reason = nr::ue::tun::InterfacePrefixError(*result->tunName);
+        if (!reason.empty())
+            throw std::runtime_error("Field 'tunName' is not usable: " + reason);
+    }
     if (yaml::HasField(config, "tunNetmask"))
         result->tunNetmask = yaml::GetString(config, "tunNetmask", 9, 15);
     if (yaml::HasField(config, "useNamespace"))
         result->useNamespace = yaml::GetBool(config, "useNamespace");
     if (yaml::HasField(config, "nsNamePrefix"))
+    {
         result->nsNamePrefix = yaml::GetString(config, "nsNamePrefix", 1, 64);
+        const std::string reason = nr::ue::tun::NamespaceNameError(*result->nsNamePrefix);
+        if (!reason.empty())
+            throw std::runtime_error("Field 'nsNamePrefix' is not usable: " + reason);
+    }
 
     yaml::AssertHasField(config, "integrity");
     yaml::AssertHasField(config, "ciphering");

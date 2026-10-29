@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <stdexcept>
 
+#include <ue/tun/naming.hpp>
 #include <utils/yaml_utils.hpp>
 #include <utils/octet_string.hpp>
 #include <yaml-cpp/yaml.h>
@@ -47,11 +48,11 @@ void ValidateApn(const std::string &apn)
 
 void ValidateTunNamePrefix(const std::string &name)
 {
-    if (name.empty() || name.size() > 14 ||
-        !std::all_of(name.begin(), name.end(), [](unsigned char c) {
-            return std::isalnum(c) != 0 || c == '-' || c == '_';
-        }))
-        throw std::runtime_error("Field 'tun.namePrefix' must be 1..14 alphanumeric, '-' or '_' characters");
+    // The shared allocator appends an index to this and measures the result against IFNAMSIZ,
+    // so the prefix is held to the same rules here rather than only at allocation time.
+    const std::string reason = nr::ue::tun::InterfacePrefixError(name);
+    if (!reason.empty())
+        throw std::runtime_error("Field 'tun.namePrefix' is not usable: " + reason);
 }
 
 void ValidateRoute(const std::string &route)

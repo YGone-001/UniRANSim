@@ -8,31 +8,21 @@
 
 #include "config.hpp"
 
+#include "env.hpp"
+#include "naming.hpp"
+#include "ownership.hpp"
+
 #include <arpa/inet.h>
-#include <array>
 #include <cerrno>
-#include <cstdarg>
-#include <cstdio>
-#include <cstdlib>
 #include <cstring>
-#include <fcntl.h>
 #include <fstream>
-#include <ifaddrs.h>
-#include <iostream>
-#include <linux/if_tun.h>
-#include <memory>
 #include <mutex>
 #include <net/if.h>
 #include <set>
 #include <sstream>
 #include <string>
 #include <sys/ioctl.h>
-#include <sys/select.h>
 #include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/time.h>
-#include <sys/types.h>
-#include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
 
@@ -40,69 +30,77 @@
 #include <utils/libc_error.hpp>
 
 #define ROUTING_TABLE_PREFIX "rt_"
-#define MAX_INTERFACE_COUNT 1024
-#define MAX_NAMESPACE_NAME_LEN 256
 
+// Guards the device and namespace work below. Held across blocking command executions, so it
+// is not the same lock as the namespace registry, which must stay responsive during cleanup.
 static std::mutex configMutex;
-// Guards the namespace deletion registry only. Kept separate from configMutex (which is held across
-// blocking 'ip' executions) so the at-exit cleanup never blocks on a long-running command.
-static std::mutex namespaceRegistryMutex;
-static char namespacesToDelete[MAX_INTERFACE_COUNT][MAX_NAMESPACE_NAME_LEN];
-static int namespacesToDeleteCount = 0;
 static int initialized = 0;
 
-static int ExecOutput(const char *cmd, std::string &output)
+namespace nr::ue::tun
 {
-    char buffer[128];
-    std::string result;
-    FILE *pipe = popen(cmd, "r");
-    if (!pipe)
-    {
-        output = "popen() failed!";
-        return -1;
-    }
-    try
-    {
-        while (fgets(buffer, sizeof buffer, pipe) != nullptr)
-            result += buffer;
-    }
-    catch (...)
-    {
-        pclose(pipe);
-        output = "";
-        return -1;
-    }
-    output = result;
+namespace
+{
 
-    int status = pclose(pipe);
-    return WEXITSTATUS(status);
+// A descriptor released on every path out of a function, including the throwing ones.
+class ScopedFd
+{
+  public:
+    explicit ScopedFd(int fd) : m_fd{fd} {}
+    ~ScopedFd()
+    {
+        if (m_fd >= 0)
+            ::close(m_fd);
+    }
+    ScopedFd(const ScopedFd &) = delete;
+    ScopedFd &operator=(const ScopedFd &) = delete;
+    [[nodiscard]] int get() const { return m_fd; }
+
+  private:
+    int m_fd;
+};
+
+// Command output and similar text kept short enough that a failure message stays readable.
+std::string Bounded(const std::string &text)
+{
+    constexpr std::size_t limit = 200;
+    if (text.size() <= limit)
+        return text;
+    return text.substr(0, limit) + "...";
 }
 
-static std::string ExecStrict(const std::string &cmd)
+// The command, for a diagnostic only. Every argument has already been checked to be a fixed
+// literal or an accepted identifier, and no command is ever handed to a shell, so an
+// argument cannot change what this describes.
+std::string DescribeCommand(const CommandArgs &args)
 {
-    std::string output;
-    if (ExecOutput(cmd.c_str(), output))
+    std::string text;
+    for (const auto &arg : args)
     {
-        throw LibError("Command execution failed. The command was: " + cmd + ". The output is: '" + output +
-                       "Command execution failure");
+        if (!text.empty())
+            text += ' ';
+        text += arg;
     }
-    return output;
+    return text;
 }
 
-static std::string ExecLoose(const std::string &cmd)
+// Runs an argument vector and returns its output, or throws with what went wrong. Nothing is
+// passed through a shell here: each argument stays exactly one argument.
+CommandResult RunRequired(const CommandArgs &args)
 {
-    std::string output;
-    if (ExecOutput(cmd.c_str(), output))
-        return "";
-    return output;
+    const CommandResult result = TunEnv().runCommand(args);
+    if (!result.started || result.status != 0)
+        throw LibError("Command execution failed. The command was: " + DescribeCommand(args) +
+                       ". The output is: '" + Bounded(result.output) + "'");
+    return result;
 }
 
-static bool IsValidNamespaceName(const std::string &nsName)
+bool IsIpv4Address(const std::string &value)
 {
-    return !nsName.empty() && nsName.size() < MAX_NAMESPACE_NAME_LEN && nsName.find('/') == std::string::npos;
+    in_addr addr{};
+    return inet_pton(AF_INET, value.c_str(), &addr) == 1;
 }
 
-static int NetmaskToPrefixLength(const std::string &netmask)
+int NetmaskToPrefixLength(const std::string &netmask)
 {
     in_addr addr{};
     if (inet_pton(AF_INET, netmask.c_str(), &addr) != 1)
@@ -129,164 +127,48 @@ static int NetmaskToPrefixLength(const std::string &netmask)
     return prefixLength;
 }
 
-static bool LinksHaveNonLoopback(const std::string &linkOutput)
-{
-    // 'ip -o link show' prints one interface per line as "<index>: <name>: ...".
-    std::stringstream ss(linkOutput);
-    std::string line;
-    while (std::getline(ss, line))
-    {
-        std::string index, name;
-        std::stringstream ls(line);
-        ls >> index >> name;
-        if (!name.empty() && name != "lo:")
-            return true;
-    }
-    return false;
-}
-
-static void SaveNamespaceForDeletion(const std::string &nsName)
-{
-    const std::lock_guard<std::mutex> lock(namespaceRegistryMutex);
-
-    if (!IsValidNamespaceName(nsName) || namespacesToDeleteCount >= MAX_INTERFACE_COUNT)
-        return;
-
-    for (int i = 0; i < namespacesToDeleteCount; ++i)
-    {
-        if (std::strcmp(namespacesToDelete[i], nsName.c_str()) == 0)
-            return;
-    }
-
-    std::snprintf(namespacesToDelete[namespacesToDeleteCount++], MAX_NAMESPACE_NAME_LEN, "%s", nsName.c_str());
-}
-
-static void RemoveSavedNamespace(const std::string &nsName)
-{
-    const std::lock_guard<std::mutex> lock(namespaceRegistryMutex);
-
-    for (int i = 0; i < namespacesToDeleteCount; ++i)
-    {
-        if (std::strcmp(namespacesToDelete[i], nsName.c_str()) == 0)
-        {
-            for (int j = i; j < namespacesToDeleteCount - 1; ++j)
-                std::snprintf(namespacesToDelete[j], MAX_NAMESPACE_NAME_LEN, "%s", namespacesToDelete[j + 1]);
-            --namespacesToDeleteCount;
-            return;
-        }
-    }
-}
-
-static void DeleteSavedNamespaces()
-{
-    // Snapshot the registry under the lock, then run the deletions outside it so we never hold a
-    // mutex while a blocking 'ip' command executes.
-    std::vector<std::string> namespaces;
-    {
-        const std::lock_guard<std::mutex> lock(namespaceRegistryMutex);
-        for (int i = 0; i < namespacesToDeleteCount; ++i)
-            namespaces.emplace_back(namespacesToDelete[i]);
-        namespacesToDeleteCount = 0;
-    }
-
-    for (const auto &ns : namespaces)
-        ExecLoose("ip netns delete " + ns);
-}
-
-static void InitializeTunHandling()
-{
-    if (initialized)
-        return;
-
-    // Reuse the framework's signal/exit handling instead of installing our own handlers, which would
-    // otherwise override app::BaseSignalHandler. RunAtExit is the same mechanism proc_table uses.
-    app::RunAtExit(DeleteSavedNamespaces);
-    initialized = 1;
-}
-
-// The first unused interface name with the given prefix, or an empty string
-// when the prefix is exhausted. Returned by value: the name is only ever copied
-// into a fixed-size buffer here, so a heap allocation would have to be released
-// on every throw path in the caller.
-static std::string NextInterfaceName(const std::string &prefix)
-{
-    std::set<std::string> names;
-
-    struct ifaddrs *addrs, *tmp;
-
-    getifaddrs(&addrs);
-    tmp = addrs;
-
-    while (tmp)
-    {
-        std::string name = tmp->ifa_name;
-        if (name.rfind(prefix, 0) == 0)
-            names.insert(name);
-        tmp = tmp->ifa_next;
-    }
-
-    freeifaddrs(addrs);
-
-    for (int i = 0; i < MAX_INTERFACE_COUNT; i++)
-    {
-        std::string name = prefix + std::to_string(i);
-        if (!names.count(name))
-            return name;
-    }
-    return {};
-}
-
-static void TunSetIpAndUp(const char *ifName, const char *ipAddr, const char *netmask, int mtu)
+void TunSetIpAndUp(const std::string &ifName, const std::string &ipAddr, const std::string &netmask, int mtu)
 {
     ifreq ifr{};
-    memset(&ifr, 0, sizeof(struct ifreq));
+    if (!CopyInterfaceName(ifr.ifr_name, sizeof(ifr.ifr_name), ifName))
+        throw LibError("TUN configuration refused: the interface name is not usable.");
 
-    sockaddr_in sai{};
-    memset(&sai, 0, sizeof(struct sockaddr));
-    
-    sockaddr_in netmask_addr{};
-    memset(&netmask_addr, 0, sizeof(struct sockaddr_in));
+    const ScopedFd sock{socket(AF_INET, SOCK_DGRAM, 0)};
+    if (sock.get() < 0)
+        throw LibError("socket(AF_INET)", errno);
 
-    netmask_addr.sin_family = AF_INET;
-    netmask_addr.sin_addr.s_addr = inet_addr(netmask);
-
-    int sockFd;
-    char *p;
-
-    sockFd = socket(AF_INET, SOCK_DGRAM, 0);
-
-    strcpy(ifr.ifr_name, ifName);
-
-    sai.sin_family = AF_INET;
-    sai.sin_port = 0;
-
-    sai.sin_addr.s_addr = inet_addr(ipAddr);
-
-    p = (char *)&sai;
-    memcpy((((char *)&ifr + offsetof(struct ifreq, ifr_addr))), p, sizeof(struct sockaddr));
-
-    if (ioctl(sockFd, SIOCSIFADDR, &ifr) < 0)
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = inet_addr(ipAddr.c_str());
+    memcpy(&ifr.ifr_addr, &address, sizeof(address));
+    if (ioctl(sock.get(), SIOCSIFADDR, &ifr) < 0)
         throw LibError("ioctl(SIOCSIFADDR)", errno);
 
-    memcpy(&ifr.ifr_netmask, &netmask_addr, sizeof(struct sockaddr));
-    if (ioctl(sockFd, SIOCSIFNETMASK, &ifr) < 0)
-	throw LibError("ioctl(SIOCSIFNETMASK)", errno);
+    sockaddr_in netmaskAddr{};
+    netmaskAddr.sin_family = AF_INET;
+    netmaskAddr.sin_addr.s_addr = inet_addr(netmask.c_str());
+    memcpy(&ifr.ifr_netmask, &netmaskAddr, sizeof(netmaskAddr));
+    if (ioctl(sock.get(), SIOCSIFNETMASK, &ifr) < 0)
+        throw LibError("ioctl(SIOCSIFNETMASK)", errno);
 
-    if (ioctl(sockFd, SIOCGIFFLAGS, &ifr) < 0)
+    if (ioctl(sock.get(), SIOCGIFFLAGS, &ifr) < 0)
         throw LibError("ioctl(SIOCGIFFLAGS)", errno);
 
+    // The interface flags and the MTU share a union in 'ifreq', so the flags read above are
+    // saved before the MTU overwrites them and restored afterwards. Writing the MTU straight
+    // over the flags and then raising IFF_UP would hand the kernel the MTU value as flags.
+    const short flags = ifr.ifr_flags;
+
     ifr.ifr_mtu = mtu;
-    if (ioctl(sockFd, SIOCSIFMTU, &ifr) < 0)
+    if (ioctl(sock.get(), SIOCSIFMTU, &ifr) < 0)
         throw LibError("ioctl(SIOCSIFMTU)", errno);
 
-    ifr.ifr_flags |= IFF_UP | IFF_RUNNING;
-    if (ioctl(sockFd, SIOCSIFFLAGS, &ifr) < 0)
+    ifr.ifr_flags = flags | IFF_UP | IFF_RUNNING;
+    if (ioctl(sock.get(), SIOCSIFFLAGS, &ifr) < 0)
         throw LibError("ioctl(SIOCSIFFLAGS)", errno);
-
-    close(sockFd);
 }
 
-static void ConfigureRtTables(const std::string &table_name)
+void ConfigureRtTables(const std::string &tableName)
 {
     std::ifstream ifs;
     ifs.open("/etc/iproute2/rt_tables");
@@ -314,7 +196,7 @@ static void ConfigureRtTables(const std::string &table_name)
 
         nums.insert(num);
 
-        if (line == table_name)
+        if (line == tableName)
             found = true;
     }
 
@@ -332,68 +214,56 @@ static void ConfigureRtTables(const std::string &table_name)
         if (!ofs.is_open() || !ofs.good())
             throw LibError("Could not open '/etc/iproute2/rt_tables'");
 
-        ofs << "\n" << availableId << "\t" << table_name << std::endl;
+        ofs << "\n" << availableId << "\t" << tableName << std::endl;
         ofs.close();
     }
 }
 
-static void RemoveExistingIpRules(const std::string &ip_addr)
+void RemoveExistingIpRules(const std::string &ipAddr)
 {
-    std::string list_command = "ip rule list from " + ip_addr;
-    std::string output = ExecStrict(list_command);
+    const CommandResult listed = RunRequired({"ip", "rule", "list", "from", ipAddr});
 
-    std::stringstream ss;
-    ss << output;
-
-    std::vector<std::string> lines;
-    std::vector<std::string> will_remove;
-
-    std::string s;
-    while (std::getline(ss, s))
-        lines.push_back(s);
-
-    for (auto &line : lines)
+    std::vector<CommandArgs> toRemove;
+    std::stringstream ss{listed.output};
+    std::string line;
+    while (std::getline(ss, line))
     {
+        if (line.empty())
+            continue;
+
+        // Parsed into separate words rather than scanned into fixed buffers: the table name
+        // and address come back from a command, and an unbounded %s would overflow them.
         int num = 0;
-        char from_ip[512] = {0};
-        char table_name[512] = {0};
+        std::string colon, from, keyword, table;
+        std::stringstream words{line};
+        if (!(words >> num >> colon >> from >> keyword >> table) || colon != ":" || keyword != "lookup")
+            throw LibError("ip rule list output could not be parsed");
 
-        if (sscanf(line.c_str(), "%d: from %s lookup %s", &num, from_ip, table_name) != 3)
-            throw LibError("ip rule list lookup command could not parsed");
-
-        if (!strcmp(from_ip, ip_addr.c_str()))
-        {
-            std::stringstream rule;
-            rule << "from " << from_ip << " lookup " << table_name;
-            will_remove.push_back(rule.str());
-        }
+        if (from == ipAddr)
+            toRemove.push_back({"ip", "rule", "del", "from", from, "lookup", table});
     }
 
-    for (auto &line : will_remove)
-        ExecStrict("ip rule del " + line);
+    for (const auto &args : toRemove)
+        RunRequired(args);
 }
 
-static void AddNewIpRules(const std::string &ip_addr, const std::string &table_name)
+void AddNewIpRules(const std::string &ipAddr, const std::string &tableName)
 {
-    std::stringstream cmd;
-    cmd << "ip rule add from " << ip_addr << " table " << table_name;
-    ExecStrict(cmd.str());
+    RunRequired({"ip", "rule", "add", "from", ipAddr, "table", tableName});
 }
 
-static bool IsFibTableExists(const std::string &table_name)
+bool IsFibTableExists(const std::string &tableName)
 {
-    std::string output = ExecStrict("ip route show table all");
+    const CommandResult listed = RunRequired({"ip", "route", "show", "table", "all"});
 
-    std::stringstream ss;
-    ss << output;
-
+    std::stringstream ss{listed.output};
     std::string token;
     while (ss >> token)
     {
         if (token == "table")
         {
             ss >> token;
-            if (token == table_name)
+            if (token == tableName)
                 return true;
         }
     }
@@ -401,56 +271,110 @@ static bool IsFibTableExists(const std::string &table_name)
     return false;
 }
 
-static void RemoveExistingIpRoutes(const std::string &interface_name, const std::string &table_name)
+void RemoveExistingIpRoutes(const std::string &interfaceName, const std::string &tableName)
 {
-    if (!IsFibTableExists(table_name))
+    if (!IsFibTableExists(tableName))
         return;
 
-    std::string list_command = "ip route list table " + table_name;
+    const CommandResult listed = RunRequired({"ip", "route", "list", "table", tableName});
 
-    std::string output = ExecStrict(list_command);
-
-    std::stringstream ss;
-    ss << output;
-
-    std::vector<std::string> lines;
-    std::vector<std::string> will_remove;
-
-    std::string s;
-    while (std::getline(ss, s))
-        lines.push_back(s);
-
-    for (auto &line : lines)
+    std::vector<CommandArgs> toRemove;
+    std::stringstream ss{listed.output};
+    std::string line;
+    while (std::getline(ss, line))
     {
-        char if_name[IF_NAMESIZE + 8] = {0};
+        if (line.empty())
+            continue;
 
-        if (sscanf(line.c_str(), "default dev %s scope link", if_name) != 1)
-            throw LibError("ip route list command could not parsed");
+        std::string keyword1, keyword2, dev, keyword3, keyword4;
+        std::stringstream words{line};
+        if (!(words >> keyword1 >> keyword2 >> dev >> keyword3 >> keyword4) || keyword1 != "default" ||
+            keyword2 != "dev" || keyword3 != "scope" || keyword4 != "link")
+            throw LibError("ip route list output could not be parsed");
 
-        if (!strcmp(if_name, interface_name.c_str()))
-        {
-            std::stringstream rule;
-            rule << "ip route del default dev " << interface_name << " table " << table_name;
-            will_remove.push_back(rule.str());
-        }
+        if (dev == interfaceName)
+            toRemove.push_back({"ip", "route", "del", "default", "dev", dev, "table", tableName});
     }
 
-    for (auto &line : will_remove)
-        ExecStrict(line);
+    for (const auto &args : toRemove)
+        RunRequired(args);
 }
 
-static void AddIpRoutes(const std::string &if_name, const std::string &table_name)
+void AddIpRoutes(const std::string &interfaceName, const std::string &tableName)
 {
-    std::stringstream cmd;
-    cmd << "ip route add default dev " << if_name << " table " << table_name;
-
-    std::string output = ExecStrict(cmd.str());
+    RunRequired({"ip", "route", "add", "default", "dev", interfaceName, "table", tableName});
 }
 
-namespace nr::ue::tun
+// A namespace is configured only while this invocation can still prove that it created it.
+// The name alone is not enough: if the namespace behind the name has been replaced,
+// configuring it would silently adopt somebody else's.
+void VerifyOwnedNamespace(const std::string &nsName)
 {
+    NamespaceRecord record;
+    if (!FindNamespaceRecord(nsName, record) || record.ownership != NamespaceOwnership::CreatedHere)
+        throw LibError("Network namespace '" + nsName + "' is not owned by this invocation; refusing to use it.");
 
-int AllocateTun(const char *ifPrefix, char **allocatedName, const char *nsName, bool useNamespace)
+    const NamespaceState now = TunEnv().readNamespaceState(nsName);
+    if (now.presence != NamespacePresence::Present || !record.identity.Matches(now.identity))
+        throw LibError("Network namespace '" + nsName +
+                       "' is no longer the namespace this invocation created; refusing to use it.");
+}
+
+// Moves the freshly created device into a namespace created by this call. An existing
+// namespace is refused and left exactly as it was: what it contains is never used to decide
+// whether it is disposable, and it is never deleted to make room.
+void PlaceInNewNamespace(const std::string &ifName, const std::string &nsName)
+{
+    const std::string nameError = NamespaceNameError(nsName);
+    if (!nameError.empty())
+        throw LibError("Network namespace could not be created: " + nameError + ".");
+
+    const NamespaceState before = TunEnv().readNamespaceState(nsName);
+    if (before.presence == NamespacePresence::Unknown)
+        throw LibError("Network namespace '" + nsName +
+                       "' could not be inspected, so this invocation cannot claim it; leaving it untouched.");
+    if (before.presence == NamespacePresence::Present)
+        throw LibError("Network namespace '" + nsName +
+                       "' already exists and was not created by this invocation; leaving it untouched.");
+
+    RunRequired({"ip", "netns", "add", nsName});
+
+    const NamespaceState ours = TunEnv().readNamespaceState(nsName);
+    RecordNamespace(nsName, NamespaceOwnership::CreatedHere, ours.identity);
+    if (ours.presence != NamespacePresence::Present || !ours.identity.known)
+        throw LibError("Network namespace '" + nsName +
+                       "' could not be verified after it was created, so it is left in place rather than removed "
+                       "under an identity that cannot be confirmed.");
+
+    try
+    {
+        RunRequired({"ip", "netns", "exec", nsName, "ip", "link", "set", "lo", "up"});
+        RunRequired({"ip", "link", "set", ifName, "netns", nsName});
+        RunRequired({"ip", "netns", "exec", nsName, "ip", "link", "show", ifName});
+    }
+    catch (...)
+    {
+        // Roll back only what this invocation created, and only while it can still prove that
+        // the name identifies that same namespace.
+        (void)CleanupOwnedNamespace(nsName);
+        throw;
+    }
+}
+
+void InitializeTunHandling()
+{
+    if (initialized)
+        return;
+
+    // Reuse the framework's signal/exit handling instead of installing our own handlers, which would
+    // otherwise override app::BaseSignalHandler. RunAtExit is the same mechanism proc_table uses.
+    app::RunAtExit(CleanupAllOwnedNamespaces);
+    initialized = 1;
+}
+
+} // namespace
+
+int AllocateTun(const std::string &ifPrefix, std::string &allocatedName, const std::string &nsName, bool useNamespace)
 {
     // acquire the configuration lock
     const std::lock_guard<std::mutex> lock(configMutex);
@@ -458,132 +382,116 @@ int AllocateTun(const char *ifPrefix, char **allocatedName, const char *nsName, 
     if (useNamespace)
         InitializeTunHandling();
 
-    const std::string ifName = NextInterfaceName(ifPrefix);
-    if (ifName.empty())
-        throw LibError("TUN interface name could not be allocated.", errno);
+    const std::string prefixError = InterfacePrefixError(ifPrefix);
+    if (!prefixError.empty())
+        throw LibError("TUN interface could not be allocated: " + prefixError + ".");
 
-    char tunName[IFNAMSIZ];
-    strcpy(tunName, ifName.c_str());
-
-    ifreq ifr{};
-    int fd;
-
-    if ((fd = open("/dev/net/tun", O_RDWR)) < 0)
-        throw LibError("Open failure /dev/net/tun");
-
-    memset(&ifr, 0, sizeof(ifr));
-
-    ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
-
-    strncpy(ifr.ifr_name, tunName, IFNAMSIZ);
-
-    if (ioctl(fd, TUNSETIFF, (void *)&ifr) < 0)
+    // Both names are settled before anything is created, so a rejected configuration cannot
+    // leave a half-built device or namespace behind.
+    if (useNamespace)
     {
-        close(fd);
-        throw LibError("ioctl(TUNSETIFF)", errno);
+        const std::string nameError = NamespaceNameError(nsName);
+        if (!nameError.empty())
+            throw LibError("Network namespace could not be created: " + nameError + ".");
     }
 
-    strcpy(tunName, ifr.ifr_name);
-    if (ifName != tunName)
-        throw LibError("TUN interface name could not be allocated.");
+    std::set<std::string> existing;
+    if (!TunEnv().enumerateInterfaces(existing))
+        throw LibError("TUN interface could not be allocated: the existing interfaces could not be enumerated.");
+
+    // The complete generated name is measured before it goes anywhere near a fixed buffer, and
+    // a candidate that would not fit is skipped rather than cut down to size.
+    const std::string ifName = NextInterfaceName(ifPrefix, existing);
+    if (ifName.empty())
+        throw LibError("TUN interface could not be allocated: every interface name the prefix '" + ifPrefix +
+                       "' can produce within IFNAMSIZ is already in use.");
+
+    const int fd = TunEnv().createTunDevice(ifName);
+    if (fd < 0)
+        throw LibError("TUN interface '" + ifName + "' could not be created.");
 
     if (useNamespace)
     {
-        std::string namespaceName = nsName ? nsName : "";
-        if (!IsValidNamespaceName(namespaceName))
-        {
-            close(fd);
-            throw LibError("Invalid namespace name.");
-        }
-
-        // If the namespace already exists, reclaim it only when stale. A UE's TUN device is
-        // non-persistent and dies with the process, so a crashed UE leaves a namespace with only 'lo';
-        // one that still holds a device belongs to a live UE and must not be touched.
-        std::string existingLinks = ExecLoose("ip netns exec " + namespaceName + " ip -o link show");
-        if (!existingLinks.empty())
-        {
-            if (LinksHaveNonLoopback(existingLinks))
-            {
-                close(fd);
-                throw LibError("Network namespace already in use: " + namespaceName);
-            }
-            ExecLoose("ip netns delete " + namespaceName);
-        }
-
-        bool namespaceCreated = false;
         try
         {
-            ExecStrict("ip netns add " + namespaceName);
-            namespaceCreated = true;
-            SaveNamespaceForDeletion(namespaceName);
-            ExecLoose("ip netns exec " + namespaceName + " ip link set lo up");
-            ExecStrict("ip link set " + std::string(tunName) + " netns " + namespaceName);
-            ExecStrict("ip netns exec " + namespaceName + " ip link show " + std::string(tunName));
+            PlaceInNewNamespace(ifName, nsName);
         }
         catch (...)
         {
-            // Roll back only what we created: close the fd and, if we added the namespace, remove it.
             close(fd);
-            if (namespaceCreated)
-            {
-                ExecLoose("ip netns delete " + namespaceName);
-                RemoveSavedNamespace(namespaceName);
-            }
             throw;
         }
     }
 
-    *allocatedName = strdup(tunName);
+    allocatedName = ifName;
     return fd;
 }
 
-void ConfigureTun(const char *tunName, const char *ipAddr, const char *netmask, int mtu, const char *nsName,
-                  bool useNamespace, bool configureRoute)
+void ConfigureTun(const std::string &tunName, const std::string &ipAddr, const std::string &netmask, int mtu,
+                  const std::string &nsName, bool useNamespace, bool configureRoute)
 {
     // acquire the configuration lock
     const std::lock_guard<std::mutex> lock(configMutex);
 
+    if (!IsUsableInterfaceName(tunName))
+        throw LibError("TUN configuration refused: the interface name is not usable.");
+    if (mtu <= 0)
+        throw LibError("TUN configuration refused: the MTU must be positive.");
+    if (!IsIpv4Address(ipAddr))
+        throw LibError("TUN configuration refused: the IPv4 address is not usable.");
+    const int prefixLength = NetmaskToPrefixLength(netmask);
+    if (prefixLength < 0)
+        throw LibError("TUN configuration refused: the netmask is not usable.");
+
     if (useNamespace)
     {
-        std::string namespaceName = nsName ? nsName : "";
-        int prefixLength = NetmaskToPrefixLength(netmask ? netmask : "");
-        if (!IsValidNamespaceName(namespaceName))
-            throw LibError("Invalid namespace name.");
-        if (prefixLength < 0)
-            throw LibError("Invalid netmask.");
+        const std::string nameError = NamespaceNameError(nsName);
+        if (!nameError.empty())
+            throw LibError("TUN configuration refused: " + nameError + ".");
+        VerifyOwnedNamespace(nsName);
 
-        ExecStrict("ip netns exec " + namespaceName + " ip addr add " + std::string(ipAddr) + "/" +
-                   std::to_string(prefixLength) + " dev " + tunName);
-        ExecStrict("ip netns exec " + namespaceName + " ip link set " + tunName + " mtu " + std::to_string(mtu));
-        ExecStrict("ip netns exec " + namespaceName + " ip link set " + tunName + " up");
+        RunRequired({"ip", "netns", "exec", nsName, "ip", "addr", "add", ipAddr + "/" + std::to_string(prefixLength),
+                     "dev", tunName});
+        RunRequired({"ip", "netns", "exec", nsName, "ip", "link", "set", tunName, "mtu", std::to_string(mtu)});
+        RunRequired({"ip", "netns", "exec", nsName, "ip", "link", "set", tunName, "up"});
         if (configureRoute)
-            ExecStrict("ip netns exec " + namespaceName + " ip route replace default dev " + tunName);
+            RunRequired({"ip", "netns", "exec", nsName, "ip", "route", "replace", "default", "dev", tunName});
         return;
     }
 
     TunSetIpAndUp(tunName, ipAddr, netmask, mtu);
     if (configureRoute)
     {
-        std::string table_name = ROUTING_TABLE_PREFIX + std::string(tunName);
+        const std::string tableName = ROUTING_TABLE_PREFIX + tunName;
 
-        ConfigureRtTables(table_name);
+        ConfigureRtTables(tableName);
         RemoveExistingIpRules(ipAddr);
-        AddNewIpRules(ipAddr, table_name);
-        RemoveExistingIpRoutes(tunName, table_name);
-        AddIpRoutes(tunName, table_name);
+        AddNewIpRules(ipAddr, tableName);
+        RemoveExistingIpRoutes(tunName, tableName);
+        AddIpRoutes(tunName, tableName);
     }
 }
 
-void CleanupTun(const char *tunName, const char *nsName, bool useNamespace)
+void CleanupTun(const std::string &tunName, const std::string &nsName, bool useNamespace)
 {
     const std::lock_guard<std::mutex> lock(configMutex);
 
-    if (!useNamespace || nsName == nullptr || *nsName == '\0')
+    if (!useNamespace || nsName.empty())
         return;
 
-    std::string namespaceName = nsName;
-    ExecLoose("ip netns delete " + namespaceName);
-    RemoveSavedNamespace(namespaceName);
+    // Both names are checked before anything is attempted, so a name that cannot be an
+    // identifier never reaches a command.
+    if (!IsUsableInterfaceName(tunName))
+        throw LibError("TUN cleanup refused: the interface name is not usable.");
+    const std::string nameError = NamespaceNameError(nsName);
+    if (!nameError.empty())
+        throw LibError("TUN cleanup refused: " + nameError + ".");
+
+    // No record means no ownership, and no ownership means no delete. A namespace somebody
+    // else created is never registered here in the first place, so it is never reached.
+    const CleanupOutcome outcome = CleanupOwnedNamespace(nsName);
+    if (outcome == CleanupOutcome::DeleteFailed)
+        throw LibError("Network namespace '" + nsName + "' could not be deleted.");
 }
 
 } // namespace nr::ue::tun

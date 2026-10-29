@@ -8,10 +8,10 @@
 
 #include "task.hpp"
 #include "cmd_handler.hpp"
-#include <cctype>
 #include <lib/nas/utils.hpp>
 #include <ue/nas/task.hpp>
 #include <ue/rls/task.hpp>
+#include <ue/tun/naming.hpp>
 #include <ue/tun/tun.hpp>
 #include <unistd.h>
 #include <utils/common.hpp>
@@ -20,33 +20,19 @@
 static constexpr const int SWITCH_OFF_TIMER_ID = 1;
 static constexpr const int SWITCH_OFF_DELAY = 500;
 
-static std::string SanitizeNamespaceToken(const std::string &value)
+// The namespace name for one PDU session. Each part is checked before anything is created,
+// and an unsafe part is refused rather than rewritten: turning something like 'p6ns7/x' into
+// 'p6ns7-x' would silently name a different namespace that may already exist and belong to
+// someone else, which is exactly how a preserved laboratory namespace gets deleted.
+static bool BuildNamespaceName(const nr::ue::UeConfig &config, const nr::ue::PduSession &pduSession,
+                               std::string &nsName, std::string &error)
 {
-    std::string sanitized;
-    sanitized.reserve(value.size());
-
-    for (char ch : value)
-    {
-        if (std::isalnum(static_cast<unsigned char>(ch)) || ch == '-' || ch == '_' || ch == '.')
-            sanitized.push_back(ch);
-        else
-            sanitized.push_back('-');
-    }
-
-    if (sanitized.empty())
-        return "default";
-
-    return sanitized;
-}
-
-static std::string BuildNamespaceName(const nr::ue::UeConfig &config, const nr::ue::PduSession &pduSession)
-{
-    std::string prefix = config.nsNamePrefix.value_or(cons::TunNamePrefix);
-    std::string identity = config.supi.has_value() ? config.supi->value : config.getNodeName();
-    std::string apn = pduSession.apn.value_or("default");
-    // Include the PSI so each PDU session gets a distinct namespace, even on the same APN.
-    return SanitizeNamespaceToken(prefix) + "-" + SanitizeNamespaceToken(identity) + "-" + SanitizeNamespaceToken(apn) +
-           "-psi" + std::to_string(pduSession.psi);
+    // The prefix is bounded by the configuration parser, and the identity is never empty: a
+    // parsed SUPI is 4 to 15 digits, and the fallback node name is a literal.
+    nsName = nr::ue::tun::ComposeNamespaceName(config.nsNamePrefix.value_or(cons::TunNamePrefix),
+                                               config.supi.has_value() ? config.supi->value : config.getNodeName(),
+                                               pduSession.apn.value_or("default"), pduSession.psi, error);
+    return !nsName.empty();
 }
 
 namespace nr::ue
@@ -220,10 +206,10 @@ void UeAppTask::setupTunInterface(const PduSession *pduSession)
         requestedNetmask = *m_base->config->tunNetmask;
     if (m_base->config->useNamespace)
     {
-        nsName = BuildNamespaceName(*m_base->config, *pduSession);
-        if (nsName.size() > 255)
+        std::string nameError;
+        if (!BuildNamespaceName(*m_base->config, *pduSession, nsName, nameError))
         {
-            m_logger->err("Connection could not setup. Namespace name is too long [%s].", nsName.c_str());
+            m_logger->err("Connection could not setup. %s.", nameError.c_str());
             return;
         }
     }
