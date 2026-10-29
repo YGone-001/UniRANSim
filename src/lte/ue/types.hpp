@@ -88,12 +88,32 @@ enum class BearerStatus
 
 const char *ToString(BearerStatus status);
 
+// A simulated cell this UE is authorized to reselect in ECM-IDLE. Both the
+// radio endpoint and the cell identity are fixed here at configuration time.
+// No received frame can name a different cell or a different endpoint, and the
+// endpoint being reachable is not by itself proof that the MME serves that
+// tracking area: the S1 Setup outcome is verified separately.
+struct RemoteCell
+{
+    enb::Plmn plmn;
+    uint16_t tac{};
+    std::string radioAddress;
+    uint16_t radioPort{};
+};
+
 struct LinkConfig
 {
     std::string localAddress;
     uint16_t localPort{};
     std::string enbAddress;
     uint16_t enbPort{};
+    // The serving cell's own tracking area code. The serving PLMN is the one
+    // the UE is configured for. A reselection compares its target against the
+    // resulting tracking area identity to tell a move within the same tracking
+    // area from a move out of it, and only the second calls for a Normal
+    // Tracking Area Update.
+    uint16_t servingTac{};
+    std::optional<RemoteCell> targetCell;
     int timeoutMs{15000};
 };
 
@@ -116,7 +136,12 @@ enum class LifecycleScenario
     TAU_PERIODIC,
     // Network-triggered service restoration: release S1, remain ECM-IDLE and
     // wait for a paging indication instead of starting Service Request locally.
-    PAGING
+    PAGING,
+    // Inter-eNB cell reselection in ECM-IDLE: release S1, move to the one
+    // configured trusted target cell, and continue the existing EPS session
+    // there. Whether that calls for a Normal Tracking Area Update is decided
+    // from the registered tracking area list, not from the scenario name.
+    IDLE_RESELECTION
 };
 
 struct LifecycleConfig

@@ -898,7 +898,8 @@ void EnbMultiplexer::handleRadioFrame(const uint8_t *data, size_t size, const In
             if (m_registry.findByPeer(peer) != nullptr)
                 throw lte::ue::link::DecodeError("A radio endpoint may not claim another active UE identity");
             if (radio.type != lte::ue::link::MessageType::NAS_UPLINK &&
-                radio.type != lte::ue::link::MessageType::SERVICE_REQUEST)
+                radio.type != lte::ue::link::MessageType::SERVICE_REQUEST &&
+                radio.type != lte::ue::link::MessageType::NAS_UPLINK_MOBILITY)
                 throw lte::ue::link::DecodeError("Data arrived before an LTE UE NAS context");
             entry = &m_registry.registerPeer(radio.ueId, peer);
         }
@@ -943,6 +944,33 @@ void EnbMultiplexer::handleRadioFrame(const uint8_t *data, size_t size, const In
                 m_registry.beginNewAttach(*entry);
                 startInitialUeMessage(*entry, std::move(radio.payload), std::nullopt);
             }
+        }
+        else if (radio.type == lte::ue::link::MessageType::NAS_UPLINK_MOBILITY)
+        {
+            // Uplink NAS that continues an existing EPS session over a new S1
+            // connection because the UE reselected this cell in ECM-IDLE. This
+            // is deliberately not the fresh-Attach branch above: a fresh Attach
+            // is a new logical session and tears down whatever EPS bearer
+            // context this eNB still holds, and reselecting into a cell is
+            // neither. The session's bearer contexts survive so the network can
+            // reconcile them; only the access epoch restarts here.
+            if (entry->s1Active())
+                throw lte::ue::link::DecodeError(
+                    "A mobility uplink opens a new S1 connection and cannot replace an active one");
+            if (radio.payload.size() <= 5)
+                throw lte::ue::link::DecodeError("A mobility uplink carries no NAS payload");
+            const uint32_t mTmsi = (static_cast<uint32_t>(radio.payload[1]) << 24U) |
+                                   (static_cast<uint32_t>(radio.payload[2]) << 16U) |
+                                   (static_cast<uint32_t>(radio.payload[3]) << 8U) | radio.payload[4];
+            if (mTmsi == 0)
+                throw lte::ue::link::DecodeError("A mobility uplink carries a zero M-TMSI");
+            // The access generation counts access epochs on this cell, and the
+            // UE restarts its own count when it reselects one. Restarting here
+            // keeps the two in step without touching the EPS bearer contexts,
+            // which belong to the session rather than to the cell.
+            entry->accessGeneration = 0;
+            std::vector<uint8_t> nasPdu(radio.payload.begin() + 5, radio.payload.end());
+            startInitialUeMessage(*entry, std::move(nasPdu), s1ap::STmsi{radio.payload[0], mTmsi});
         }
         else if (radio.type == lte::ue::link::MessageType::EPS_SESSION_DELETED)
         {

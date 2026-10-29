@@ -763,21 +763,39 @@ std::vector<uint8_t> EncodeDetachRequest(uint8_t ksi, const std::array<uint8_t, 
     return out;
 }
 
-std::vector<uint8_t> EncodeTauRequest(uint8_t ksi, const std::array<uint8_t, 11> &guti,
-                                      uint8_t defaultEbi, bool periodic)
+std::array<uint8_t, 2> EncodeEpsBearerContextStatus(const std::vector<uint8_t> &bearerIdentities)
 {
-    if (ksi > 6 || (guti[0] & 0x07U) != 0x06U || defaultEbi < 5 || defaultEbi > 15)
-        throw DecodeError("TAU Request requires a native EPS KSI, GUTI and default EBI");
+    if (bearerIdentities.empty())
+        throw DecodeError("The EPS bearer context status must report at least one EPS bearer context");
+    // TS 24.301 9.9.2.1: octet 1 carries EBI 0..7 and octet 2 carries
+    // EBI 8..15, with bit n representing EBI n within its octet. Only 5..15
+    // are assignable EPS bearer identities, and each context is reported once.
+    std::array<uint8_t, 2> status{};
+    for (const uint8_t ebi : bearerIdentities)
+    {
+        if (ebi < 5 || ebi > 15)
+            throw DecodeError("The EPS bearer context status may only report EPS bearer identities 5 to 15");
+        const uint8_t mask = static_cast<uint8_t>(1U << (ebi % 8U));
+        auto &octet = status[ebi / 8U];
+        if ((octet & mask) != 0)
+            throw DecodeError("The EPS bearer context status must not report an EPS bearer identity twice");
+        octet = static_cast<uint8_t>(octet | mask);
+    }
+    return status;
+}
+
+std::vector<uint8_t> EncodeTauRequest(uint8_t ksi, const std::array<uint8_t, 11> &guti,
+                                      const std::vector<uint8_t> &bearerIdentities, bool periodic)
+{
+    if (ksi > 6 || (guti[0] & 0x07U) != 0x06U)
+        throw DecodeError("TAU Request requires a native EPS KSI and GUTI");
+    const auto status = EncodeEpsBearerContextStatus(bearerIdentities);
     // EPS update type 0 is normal TAU; 3 is periodic TAU. Active flag remains
     // clear so the procedure itself does not claim a bearer restoration.
     const uint8_t updateType = periodic ? 0x03U : 0x00U;
     std::vector<uint8_t> out{EpsEmm, TauRequestType, static_cast<uint8_t>((ksi << 4U) | updateType),
                              static_cast<uint8_t>(guti.size())};
     out.insert(out.end(), guti.begin(), guti.end());
-    // TS 24.301 9.9.2.1: octet 3 carries EBI 0..7 and octet 4 carries
-    // EBI 8..15, with bit n representing EBI n within its octet.
-    std::array<uint8_t, 2> status{};
-    status[defaultEbi / 8U] = static_cast<uint8_t>(1U << (defaultEbi % 8U));
     out.insert(out.end(), {IeiBearerContextStatus, 0x02, status[0], status[1]});
     return out;
 }

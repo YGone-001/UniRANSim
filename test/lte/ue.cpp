@@ -157,6 +157,54 @@ TEST_CASE("lte/ue/config: lifecycle scenarios and bounded procedure controls are
     }
 }
 
+TEST_CASE("lte/ue/config: a reselection target cell is validated and demands a serving TAC")
+{
+    // A configuration that never reselects has no use for its own tracking area
+    // and keeps loading without one.
+    auto defaults = lte::ue::ParseConfig(ConfigText);
+    CHECK(defaults.link.servingTac == 0);
+    CHECK_FALSE(defaults.link.targetCell.has_value());
+
+    std::string served = ConfigText;
+    served += "  tac: 2\n";
+    CHECK(lte::ue::ParseConfig(served).link.servingTac == 2);
+
+    // Arriving somewhere else is only decidable against a known origin, so a
+    // target cell without the serving TAC is refused instead of guessed.
+    std::string targetOnly = ConfigText;
+    targetOnly += "  targetCell:\n    mcc: '460'\n    mnc: '02'\n    tac: 2\n"
+                  "    address: 127.0.0.8\n    port: 4997\n";
+    CHECK_THROWS(lte::ue::ParseConfig(targetOnly));
+
+    std::string complete = served + "  targetCell:\n    mcc: '460'\n    mnc: '02'\n    tac: 3\n"
+                                    "    address: 127.0.0.8\n    port: 4997\n";
+    auto configured = lte::ue::ParseConfig(complete);
+    REQUIRE(configured.link.targetCell.has_value());
+    CHECK(configured.link.servingTac == 2);
+    CHECK(configured.link.targetCell->plmn.mcc == "460");
+    CHECK(configured.link.targetCell->plmn.mnc == "02");
+    CHECK(configured.link.targetCell->tac == 3);
+    CHECK(configured.link.targetCell->radioAddress == "127.0.0.8");
+    CHECK(configured.link.targetCell->radioPort == 4997);
+
+    for (const char *bad : {"    mcc: '000'\n", "    mnc: '0'\n", "    tac: 0\n", "    tac: 65536\n",
+                            "    address: 127.0.0.999\n", "    port: 0\n"})
+    {
+        std::string invalid = served + "  targetCell:\n    mcc: '460'\n    mnc: '02'\n    tac: 3\n"
+                                       "    address: 127.0.0.8\n    port: 4997\n";
+        const std::string replacement = bad;
+        const auto field = invalid.find("    mcc: '460'\n", invalid.find("targetCell"));
+        const auto fieldName = replacement.substr(4, replacement.find(':') - 4);
+        const auto existing = invalid.find("    " + fieldName + ":", field);
+        invalid.replace(existing, invalid.find('\n', existing) - existing + 1, replacement);
+        CHECK_THROWS(lte::ue::ParseConfig(invalid));
+    }
+
+    std::string badServing = ConfigText;
+    badServing += "  tac: 0\n";
+    CHECK_THROWS(lte::ue::ParseConfig(badServing));
+}
+
 TEST_CASE("lte/ue/nas: OP derivation and stale SQN handling fail or succeed independently")
 {
     std::string withOp = ConfigText;

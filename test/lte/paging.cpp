@@ -849,12 +849,27 @@ TEST_CASE("lte/paging/ue: a page outside the assigned TAI list is ignored")
 
 TEST_CASE("lte/paging/ue: an unparseable TAI list cannot authorize a response")
 {
+    // A malformed assignment cannot become registered tracking areas at all,
+    // so no context can hold one to consult later.
+    std::vector<lte::ue::Tai> parsed;
+    CHECK_FALSE(lte::ue::ParseTaiList({0x40, 0x64}, parsed));
+    CHECK(parsed.empty());
+    lte::ue::MobilityContext fresh;
+    fresh.ecm = lte::ue::EcmState::CONNECTED;
+    CHECK_THROWS(fresh.onAttachComplete(5, {10, 45, 0, 9}, Guti(1, 0xC00007C4u), {0x40, 0x64}, 0x30));
+    CHECK(fresh.taiList.empty());
+    CHECK(fresh.emm == lte::ue::EmmState::DEREGISTERED);
+
+    // A context with nothing assigned authorizes no tracking area at all.
     auto context = IdleRegistered(Guti(1, 0xC00007C4u));
-    context.taiList = {0x40, 0x64}; // truncated assignment
+    context.taiList.clear();
     CHECK(lte::ue::EvaluatePaging(context, {"460", "02"}, Notification(1, 0xC00007C4u)) ==
           lte::ue::PagingMatch::AREA_MISMATCH);
+
+    // The raw form likewise refuses to authorize anything it cannot parse.
     CHECK_FALSE(lte::ue::TaiListContains({}, {"460", "02"}, 1));
     CHECK_FALSE(lte::ue::TaiListContains({0x00}, {"460", "02"}, 1));
+    CHECK_FALSE(lte::ue::TaiListContains({0x40, 0x64}, {"460", "02"}, 1));
 }
 
 TEST_CASE("lte/paging/ue: the TAI list parser accepts the Open5GS single-TAI assignment")

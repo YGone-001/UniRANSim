@@ -31,13 +31,17 @@ bool IsKnown(MessageType type)
            type == MessageType::PAGING_INDICATION || type == MessageType::DATA_UPLINK_BEARER ||
            type == MessageType::DATA_DOWNLINK_BEARER || type == MessageType::BEARER_ACTIVATED ||
            type == MessageType::DEDICATED_BEARER_RESTORED || type == MessageType::BEARER_TRANSPORT_READY ||
-           type == MessageType::EPS_SESSION_DELETED || type == MessageType::S1_ACCESS_LOST;
+           type == MessageType::EPS_SESSION_DELETED || type == MessageType::S1_ACCESS_LOST ||
+           type == MessageType::NAS_UPLINK_MOBILITY;
 }
 
 size_t MaximumPayload(MessageType type)
 {
     if (type == MessageType::NAS_UPLINK || type == MessageType::NAS_DOWNLINK)
         return MaxNasPduSize;
+    // MMEC || M-TMSI ahead of a full protected NAS PDU.
+    if (type == MessageType::NAS_UPLINK_MOBILITY)
+        return MaxNasPduSize + 5U;
     if (type == MessageType::DATA_UPLINK || type == MessageType::DATA_DOWNLINK)
         return MaxDataPduSize;
     // One octet of EPS bearer identity precedes the IPv4 payload.
@@ -66,6 +70,7 @@ std::vector<uint8_t> Encode(const Message &message)
         (message.type == MessageType::BEARER_READY && message.payload.size() != 5) ||
         (message.type == MessageType::SERVICE_REQUEST && message.payload.size() != 9) ||
         (message.type == MessageType::PAGING_INDICATION && message.payload.size() != 7) ||
+        (message.type == MessageType::NAS_UPLINK_MOBILITY && message.payload.size() <= 5) ||
         ((message.type == MessageType::BEARER_RELEASED ||
           message.type == MessageType::S1_CONTEXT_RELEASE_REQUEST ||
           message.type == MessageType::BEARER_ACTIVATED) && message.payload.size() != 1))
@@ -101,6 +106,7 @@ Message Decode(const uint8_t *data, size_t size)
         (type == MessageType::BEARER_READY && length != 5) ||
         (type == MessageType::SERVICE_REQUEST && length != 9) ||
         (type == MessageType::PAGING_INDICATION && length != 7) ||
+        (type == MessageType::NAS_UPLINK_MOBILITY && length <= 5) ||
         ((type == MessageType::BEARER_RELEASED || type == MessageType::S1_CONTEXT_RELEASE_REQUEST ||
           type == MessageType::BEARER_ACTIVATED) && length != 1))
         throw DecodeError("Malformed LTE radio-link payload length");
@@ -138,7 +144,8 @@ bool IsUplink(MessageType type)
     return type == MessageType::NAS_UPLINK || type == MessageType::DATA_UPLINK || type == MessageType::BEARER_READY ||
            type == MessageType::DATA_UPLINK_BEARER || type == MessageType::BEARER_ACTIVATED ||
            type == MessageType::BEARER_TRANSPORT_READY || type == MessageType::EPS_SESSION_DELETED ||
-           type == MessageType::S1_CONTEXT_RELEASE_REQUEST || type == MessageType::SERVICE_REQUEST;
+           type == MessageType::S1_CONTEXT_RELEASE_REQUEST || type == MessageType::SERVICE_REQUEST ||
+           type == MessageType::NAS_UPLINK_MOBILITY;
 }
 
 bool IsDownlink(MessageType type)

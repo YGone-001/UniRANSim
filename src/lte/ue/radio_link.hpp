@@ -63,7 +63,18 @@ enum class MessageType : uint8_t
     // MMEC(1)||M-TMSI(4)||served TAC(2). It carries no IMSI and no NAS
     // material, so a UE can only match it against the S-TMSI of its own
     // valid GUTI. This is a laboratory abstraction, not an RRC Paging message.
-    PAGING_INDICATION = 11
+    PAGING_INDICATION = 11,
+    // Uplink NAS that continues an existing EPS session over a new S1
+    // connection because the UE reselected a cell in ECM-IDLE. Payload:
+    // MMEC(1)||M-TMSI(4)||protected NAS, the same identity prefix the compact
+    // Service Request uses, and for the same reason: the eNB cannot read the
+    // protected NAS, so the UE states which session this belongs to.
+    //
+    // It is deliberately distinct from NAS_UPLINK. NAS_UPLINK on an endpoint
+    // with no S1 connection starts a fresh Attach, which is a new logical EPS
+    // session; this one is not, so the eNB must build the Initial UE Message
+    // without tearing down any EPS bearer context it still holds for the UE.
+    NAS_UPLINK_MOBILITY = 19
 };
 
 struct Message

@@ -29,6 +29,53 @@ struct UplinkBearerSelection
     bool accessReady{};
 };
 
+// The EPS bearer identities the UE still holds: the network-assigned default
+// plus every accepted dedicated context. The identities are read back out of
+// the live contexts instead of being assumed, so a default bearer outside 5..6
+// is still reported and a dedicated bearer the network released is not.
+inline std::vector<uint8_t> RetainedBearerIdentities(uint8_t defaultEbi,
+                                                     const std::vector<DedicatedBearerRuntime> &bearers)
+{
+    std::vector<uint8_t> identities{defaultEbi};
+    for (const auto &bearer : bearers)
+        identities.push_back(bearer.ebi);
+    return identities;
+}
+
+struct BearerReconciliation
+{
+    std::vector<DedicatedBearerRuntime> retained;
+    std::vector<uint8_t> released;
+};
+
+// The EPS bearer context status carried by a Tracking Area Update Accept is the
+// network's view of the session and it is authoritative: a dedicated context
+// the network no longer reports has been deactivated, so the UE must stop
+// claiming it exists instead of carrying it forward into the next procedure.
+// Losing the active default bearer is not a reconciliation but the end of the
+// session, and is refused rather than quietly downgraded.
+inline BearerReconciliation ReconcileRetainedBearers(const std::vector<DedicatedBearerRuntime> &bearers,
+                                                     uint16_t networkStatus, uint8_t defaultEbi)
+{
+    // Only 5..15 are assignable EPS bearer identities, and a bit outside the
+    // sixteen the status carries would shift past the end of the word.
+    if (defaultEbi < 5 || defaultEbi > 15)
+        throw nas::DecodeError("The network referred to an unassignable default bearer identity");
+    if ((networkStatus & static_cast<uint16_t>(1U << defaultEbi)) == 0)
+        throw nas::DecodeError("Tracking Area Update Accept removed the active default bearer");
+    BearerReconciliation result;
+    for (const auto &bearer : bearers)
+    {
+        if (bearer.ebi < 5 || bearer.ebi > 15)
+            throw nas::DecodeError("The network referred to an unassignable dedicated bearer identity");
+        if ((networkStatus & static_cast<uint16_t>(1U << bearer.ebi)) != 0)
+            result.retained.push_back(bearer);
+        else
+            result.released.push_back(bearer.ebi);
+    }
+    return result;
+}
+
 inline UplinkBearerSelection SelectUplinkBearer(uint8_t defaultEbi,
     const std::vector<DedicatedBearerRuntime> &bearers, const uint8_t *packet, size_t size)
 {

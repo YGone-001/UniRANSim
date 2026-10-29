@@ -17,6 +17,7 @@
 
 #include "lifecycle.hpp"
 #include "radio_link.hpp"
+#include "tai.hpp"
 #include "types.hpp"
 
 #include <array>
@@ -47,8 +48,10 @@ struct STmsi
 std::optional<STmsi> STmsiFromGuti(const std::array<uint8_t, 11> &guti);
 
 // True when `taiList` (raw TS 24.301 9.9.3.33 TAI list contents, without the
-// length octet) contains the given PLMN/TAC. Unparseable lists yield false so a
-// malformed assignment can never authorize a paging response.
+// length octet) contains the given PLMN/TAC. The value is fully parsed and
+// validated first, so membership rests on explicit tracking areas rather than
+// on a heuristic over the octets; an unparseable or partially valid list
+// yields false and can therefore never authorize a paging response.
 bool TaiListContains(const std::vector<uint8_t> &taiList, const enb::Plmn &plmn, uint16_t tac);
 
 // Outcome of evaluating one paging notification against the live UE context.

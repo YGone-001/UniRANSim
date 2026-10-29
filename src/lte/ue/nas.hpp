@@ -239,8 +239,18 @@ std::vector<uint8_t> EncodeDeactivateEpsBearerContextAccept(uint8_t epsBearerIde
                                                             uint8_t procedureTransactionId);
 
 std::vector<uint8_t> EncodeDetachRequest(uint8_t ksi, const std::array<uint8_t, 11> &guti, bool switchOff);
+
+// EPS bearer context status information element value (TS 24.301 9.9.2.1):
+// two octets in which bit n of the first octet reports EBI n for n in 0..7 and
+// bit n of the second reports EBI n for n in 8..15. Every EPS bearer context
+// the UE still holds must be reported; reporting only the default bearer would
+// tell the network that a retained dedicated context no longer exists.
+// Throws DecodeError when the set is empty, contains an identity outside
+// 5..15, or reports the same identity twice.
+std::array<uint8_t, 2> EncodeEpsBearerContextStatus(const std::vector<uint8_t> &bearerIdentities);
+
 std::vector<uint8_t> EncodeTauRequest(uint8_t ksi, const std::array<uint8_t, 11> &guti,
-                                      uint8_t defaultEbi, bool periodic);
+                                      const std::vector<uint8_t> &bearerIdentities, bool periodic);
 std::vector<uint8_t> EncodeTauComplete();
 
 } // namespace lte::ue::nas

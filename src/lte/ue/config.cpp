@@ -30,6 +30,24 @@ std::string Digits(const YAML::Node &node, const std::string &field, size_t mini
     return value;
 }
 
+// `field` is the prefix of the field names in the diagnostics, empty at the
+// root of the configuration. Both the configured PLMN and a reselection target
+// PLMN are checked here, so a target cannot smuggle in an identity the serving
+// configuration would have refused.
+enb::Plmn ParsePlmn(const YAML::Node &node, const std::string &field)
+{
+    enb::Plmn plmn;
+    plmn.mcc = Digits(node, "mcc", 3, 3);
+    plmn.mnc = Digits(node, "mnc", 2, 3);
+    const int mcc = std::stoi(plmn.mcc);
+    const int mnc = std::stoi(plmn.mnc);
+    if (mcc < 1 || mcc > 999)
+        throw std::runtime_error("Field '" + field + "mcc' must be in range 001..999");
+    if (mnc < 0 || mnc > (plmn.mnc.size() == 2 ? 99 : 999))
+        throw std::runtime_error("Field '" + field + "mnc' is out of range");
+    return plmn;
+}
+
 void ValidateApn(const std::string &apn)
 {
     size_t start{};
@@ -85,14 +103,7 @@ Config ParseNode(const YAML::Node &root)
 {
     Config config{};
     config.imsi = Digits(root, "imsi", 5, 15);
-    config.plmn.mcc = Digits(root, "mcc", 3, 3);
-    config.plmn.mnc = Digits(root, "mnc", 2, 3);
-    const int mcc = std::stoi(config.plmn.mcc);
-    const int mnc = std::stoi(config.plmn.mnc);
-    if (mcc < 1 || mcc > 999)
-        throw std::runtime_error("Field 'mcc' must be in range 001..999");
-    if (mnc < 0 || mnc > (config.plmn.mnc.size() == 2 ? 99 : 999))
-        throw std::runtime_error("Field 'mnc' is out of range");
+    config.plmn = ParsePlmn(root, "");
     if (config.imsi.rfind(config.plmn.mcc + config.plmn.mnc, 0) != 0)
         throw std::runtime_error("Field 'imsi' must begin with the configured MCC and MNC");
     if (yaml::HasField(root, "ueId"))
@@ -127,6 +138,8 @@ Config ParseNode(const YAML::Node &root)
             else if (scenario == "tau-normal") config.lifecycle.scenario = LifecycleScenario::TAU_NORMAL;
             else if (scenario == "tau-periodic") config.lifecycle.scenario = LifecycleScenario::TAU_PERIODIC;
             else if (scenario == "paging") config.lifecycle.scenario = LifecycleScenario::PAGING;
+            else if (scenario == "idle-reselection")
+                config.lifecycle.scenario = LifecycleScenario::IDLE_RESELECTION;
             else throw std::runtime_error("Field 'lifecycle.scenario' is not supported");
         }
         if (yaml::HasField(lifecycle, "triggerAfterMs"))
@@ -179,6 +192,25 @@ Config ParseNode(const YAML::Node &root)
     config.link.localPort = static_cast<uint16_t>(yaml::GetInt32(link, "localPort", 1, 65535));
     config.link.enbAddress = yaml::GetIpAddress(link, "address");
     config.link.enbPort = static_cast<uint16_t>(yaml::GetInt32(link, "port", 1, 65535));
+    // The serving tracking area is only ever consulted to decide whether
+    // arriving at a target cell calls for a Normal TAU, so a configuration that
+    // cannot reselect has no use for it and must keep loading without it.
+    if (yaml::HasField(link, "tac"))
+        config.link.servingTac = static_cast<uint16_t>(yaml::GetInt32(link, "tac", 1, 0xFFFF));
+    if (yaml::HasField(link, "targetCell"))
+    {
+        if (!yaml::HasField(link, "tac"))
+            throw std::runtime_error("Field 'enbLink.tac' is required when 'enbLink.targetCell' is configured");
+        const auto target = link["targetCell"];
+        if (!target || !target.IsMap())
+            throw std::runtime_error("Field 'enbLink.targetCell' must be a mapping");
+        RemoteCell cell;
+        cell.plmn = ParsePlmn(target, "enbLink.targetCell.");
+        cell.tac = static_cast<uint16_t>(yaml::GetInt32(target, "tac", 1, 0xFFFF));
+        cell.radioAddress = yaml::GetIpAddress(target, "address");
+        cell.radioPort = static_cast<uint16_t>(yaml::GetInt32(target, "port", 1, 65535));
+        config.link.targetCell = cell;
+    }
     if (yaml::HasField(link, "timeoutMs")) config.link.timeoutMs = yaml::GetInt32(link, "timeoutMs", 100, 60000);
     return config;
 }

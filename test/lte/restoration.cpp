@@ -149,7 +149,7 @@ ue::MobilityContext Mobility()
     m.defaultEbi = 5;
     m.assignedIpv4 = {10, 45, 0, 2};
     m.guti = std::array<uint8_t, 11>{0xF6, 0x64, 0xF0, 0x20, 0, 1, 1, 0x12, 0x34, 0x56, 0x78};
-    m.taiList = {0x40, 0x64, 0xF0, 0x20, 0, 1};
+    m.taiList = {{{"460", "02"}, 1}};
     return m;
 }
 

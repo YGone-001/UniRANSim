@@ -72,6 +72,22 @@ void SendProtected(udp::UdpServer &socket, const InetAddress &enb, uint32_t ueId
     security.ulNasCount = (security.ulNasCount + 1U) & 0xFFFFFFU;
 }
 
+// Protected uplink NAS that continues an existing EPS session over a new S1
+// connection at a reselected cell. The identity prefix is derived from the
+// UE's own valid GUTI, so the target eNB can address the Initial UE Message
+// without the UE presenting any identifier the source cell allocated.
+void SendMobilityNas(udp::UdpServer &socket, const InetAddress &enb, uint32_t ueId,
+                     const std::array<uint8_t, 11> &guti, const std::vector<uint8_t> &protectedNas)
+{
+    std::vector<uint8_t> payload;
+    payload.reserve(5 + protectedNas.size());
+    payload.push_back(guti[6]);
+    payload.insert(payload.end(), guti.begin() + 7, guti.end());
+    payload.insert(payload.end(), protectedNas.begin(), protectedNas.end());
+    auto frame = link::Encode({link::MessageType::NAS_UPLINK_MOBILITY, ueId, std::move(payload)});
+    socket.Send(enb, frame.data(), frame.size());
+}
+
 // Verifies and recovers a security-protected downlink NAS message, then records
 // the accepted DL COUNT. An unverified message never reaches the caller.
 std::vector<uint8_t> ReceiveProtected(SecurityContext &security, const std::vector<uint8_t> &message)
@@ -155,7 +171,8 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
         {
             scenarioTriggered = true;
             if (config.lifecycle.scenario == LifecycleScenario::SERVICE_REQUEST ||
-                config.lifecycle.scenario == LifecycleScenario::PAGING)
+                config.lifecycle.scenario == LifecycleScenario::PAGING ||
+                config.lifecycle.scenario == LifecycleScenario::IDLE_RESELECTION)
             {
                 auto request = link::Encode({link::MessageType::S1_CONTEXT_RELEASE_REQUEST, ueId,
                                              {mobility.defaultEbi}});
@@ -165,6 +182,9 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 if (config.lifecycle.scenario == LifecycleScenario::PAGING)
                     Log("INFO", "Controlled idle trigger sent an S1 Context Release Request; the UE will wait "
                                 "for a network paging indication instead of sending Service Request");
+                else if (config.lifecycle.scenario == LifecycleScenario::IDLE_RESELECTION)
+                    Log("INFO", "Controlled idle trigger sent an S1 Context Release Request; the UE will reselect "
+                                "the configured target cell once it reaches ECM-IDLE");
                 else
                     Log("INFO", "Controlled idle trigger sent a standards-based S1 Context Release Request");
             }
@@ -197,7 +217,9 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
             {
                 const bool periodic = config.lifecycle.scenario == LifecycleScenario::TAU_PERIODIC;
                 mobility.startTau(periodic);
-                auto plain = nas::EncodeTauRequest(security.ksi, *mobility.guti, mobility.defaultEbi, periodic);
+                auto plain = nas::EncodeTauRequest(
+                    security.ksi, *mobility.guti,
+                    RetainedBearerIdentities(mobility.defaultEbi, dedicatedBearers), periodic);
                 pendingWire = nas::Protect(security, true, false, plain);
                 SendNas(socket, enb, ueId, pendingWire);
                 security.ulNasCount = (security.ulNasCount + 1U) & 0xFFFFFFU;
@@ -289,6 +311,12 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
             }
             if (mobility.pending == PendingProcedure::SERVICE_REQUEST)
                 SendServiceRequest(socket, enb, ueId, *mobility.guti, pendingWire);
+            else if (mobility.emm == EmmState::REGISTERED && !mobility.mmeUeS1apId.has_value())
+                // A retransmission of a procedure that is still opening an S1
+                // connection has to leave by the same route the first one used.
+                // Once the MME has assigned an identifier the ordinary uplink
+                // NAS transport is the right route again.
+                SendMobilityNas(socket, enb, ueId, *mobility.guti, pendingWire);
             else
                 SendNas(socket, enb, ueId, pendingWire);
             ++procedureRetries;
@@ -437,6 +465,56 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                                          std::chrono::milliseconds(config.lifecycle.pagingWaitMs);
                         // Network-triggered scenario: stay idle until the MME pages.
                         Log("INFO", "Waiting for a network paging indication; no Service Request is sent locally");
+                    }
+                    else if (config.lifecycle.scenario == LifecycleScenario::IDLE_RESELECTION)
+                    {
+                        if (!config.link.targetCell.has_value())
+                            throw std::runtime_error(
+                                "The idle-reselection scenario needs a configured enbLink.targetCell");
+                        const auto &target = *config.link.targetCell;
+                        const Tai serving{config.plmn, config.link.servingTac};
+                        const Tai arriving{target.plmn, target.tac};
+                        // The cell being left keeps its S1AP identities, its
+                        // access TEIDs and its access generation. None of them
+                        // may be presented at the target.
+                        mobility.onCellReselected();
+                        enb = InetAddress(target.radioAddress, target.radioPort);
+                        Log("INFO", "ECM-IDLE cell reselection " + serving.plmn.toString() + "/" +
+                                        std::to_string(serving.tac) + " -> " + arriving.plmn.toString() + "/" +
+                                        std::to_string(arriving.tac) + " via " + target.radioAddress + ":" +
+                                        std::to_string(target.radioPort));
+
+                        // Whether the move calls for a Normal Tracking Area
+                        // Update is decided from the registered tracking area
+                        // list alone. Moving cells is not the trigger; moving
+                        // out of the registered area is.
+                        const auto decision = EvaluateServingTai(mobility, arriving);
+                        if (decision == TauDecision::NO_CHANGE)
+                        {
+                            Log("INFO", std::string("Target tracking area is in the registered list (") +
+                                            ToString(decision) + "); no Tracking Area Update is sent");
+                        }
+                        else if (decision == TauDecision::NORMAL_TAU)
+                        {
+                            mobility.startTau(false);
+                            auto plain = nas::EncodeTauRequest(
+                                security.ksi, *mobility.guti,
+                                RetainedBearerIdentities(mobility.defaultEbi, dedicatedBearers), false);
+                            pendingWire = nas::Protect(security, true, false, plain);
+                            SendMobilityNas(socket, enb, ueId, *mobility.guti, pendingWire);
+                            security.ulNasCount = (security.ulNasCount + 1U) & 0xFFFFFFU;
+                            procedureRetries = 0;
+                            procedureDeadline = std::chrono::steady_clock::now() +
+                                                std::chrono::milliseconds(config.lifecycle.procedureTimeoutMs);
+                            Log("INFO", "Protected Normal Tracking Area Update Request sent through the "
+                                        "reselected cell");
+                        }
+                        else
+                        {
+                            throw std::runtime_error(
+                                std::string("Cannot start a Normal Tracking Area Update after reselection: ") +
+                                ToString(decision));
+                        }
                     }
                     else
                     {
@@ -877,14 +955,21 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 if (mobility.pending != PendingProcedure::TAU_NORMAL &&
                     mobility.pending != PendingProcedure::TAU_PERIODIC)
                     throw nas::DecodeError("Unexpected Tracking Area Update Accept");
-                if (downlink.tauAccept.updateResult != 0)
-                    throw nas::DecodeError("Unsupported non-EPS-only Tracking Area Update result");
-                if (downlink.tauAccept.bearerContextStatus.has_value() &&
-                    ((*downlink.tauAccept.bearerContextStatus &
-                      static_cast<uint16_t>(1U << mobility.defaultEbi)) == 0))
-                    throw nas::DecodeError("Tracking Area Update Accept removed the active default bearer");
-                mobility.onTauAccepted(downlink.tauAccept.guti, downlink.tauAccept.taiList,
-                                       downlink.tauAccept.t3412);
+                if (downlink.tauAccept.bearerContextStatus.has_value())
+                {
+                    // The network's status is authoritative. An EPS bearer
+                    // context the UE still holds but the network no longer
+                    // reports has been deactivated, so the UE must stop
+                    // claiming it exists rather than carrying it forward.
+                    const auto reconciliation = ReconcileRetainedBearers(
+                        dedicatedBearers, *downlink.tauAccept.bearerContextStatus, mobility.defaultEbi);
+                    for (const uint8_t ebi : reconciliation.released)
+                        Log("INFO", "Dedicated EPS bearer " + std::to_string(ebi) +
+                                        " was not retained by the network and is no longer active");
+                    dedicatedBearers = reconciliation.retained;
+                }
+                mobility.onTauAccepted(downlink.tauAccept.updateResult, downlink.tauAccept.guti,
+                                       downlink.tauAccept.taiList, downlink.tauAccept.t3412);
                 pendingWire.clear();
                 if (downlink.tauAccept.guti.has_value())
                     SendProtected(socket, enb, ueId, security, false, nas::EncodeTauComplete());
@@ -959,10 +1044,13 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
             mobility.onAttachComplete(activeEbi, assignedIpv4, accept.guti, accept.taiList, accept.t3412);
             mobility.securityContextValid = security.securityActive;
             {
-                std::ostringstream taiHex;
-                taiHex << std::hex << std::uppercase << std::setfill('0');
-                for (uint8_t octet : mobility.taiList)
-                    taiHex << std::setw(2) << static_cast<int>(octet);
+                std::ostringstream taiText;
+                for (size_t i = 0; i < mobility.taiList.size(); ++i)
+                {
+                    if (i != 0)
+                        taiText << ',';
+                    taiText << mobility.taiList[i].plmn.toString() << '/' << mobility.taiList[i].tac;
+                }
                 std::string sTmsiText = "none";
                 if (mobility.guti.has_value())
                 {
@@ -977,7 +1065,7 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 }
                 Log("INFO", "Assigned EPS bearer EBI=" + std::to_string(activeEbi) + " IPv4=" +
                                 Ipv4ToString(assignedIpv4) + " S-TMSI{" + sTmsiText + "} TAI-list=" +
-                                taiHex.str());
+                                taiText.str());
             }
             try { tun = std::make_unique<TunDevice>(config.tun, assignedIpv4); }
             catch (const std::exception &e)
