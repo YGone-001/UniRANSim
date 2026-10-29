@@ -159,14 +159,16 @@ TEST_CASE("lte/mobility: a mobility uplink opens a fresh S1 connection and keeps
 
     // The logical EPS session is not the access. A reselected cell is a new
     // access to the same session, so nothing about the bearer contexts is torn
-    // down and the access epoch restarts alongside the new access. The access
+    // down and the access epoch restarts alongside the new access. That epoch
+    // is a real one, numbered one: zero is reserved for "no epoch at all" and
+    // every generation-bound message carrying it is refused. The access
     // transport itself is still gone and is restored later by the network, so
     // the default bearer is not signalling-established again yet.
     CHECK(entry.bearer.logicalConfirmed());
     CHECK(entry.bearer.logicalExists());
     CHECK_FALSE(entry.bearer.signalingEstablished());
     CHECK(entry.dedicatedBearers.size() == 2);
-    CHECK(entry.accessGeneration == 0);
+    CHECK(entry.accessGeneration == 1);
 }
 
 TEST_CASE("lte/mobility: a fresh Attach uplink still tears down the previous logical session")

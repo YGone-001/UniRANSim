@@ -8,6 +8,8 @@
 
 #include "lifecycle.hpp"
 
+#include "paging.hpp"
+
 namespace lte::ue
 {
 
@@ -130,11 +132,23 @@ void MobilityContext::validateAccessRestoration(uint8_t ebi, uint32_t generation
         throw LifecycleError("Invalid bearer restoration identity or generation");
     if (dedicated)
     {
-        if (ecm != EcmState::CONNECTED || pending != PendingProcedure::NONE)
+        // A dedicated bearer is restored on top of a default bearer that is
+        // already back. A Tracking Area Update that is still outstanding does
+        // not invalidate that restoration: it is answered by its own Accept and
+        // nothing about the retained bearers is settled before then. Detach
+        // and an unfinished Service Request still mean the default is not back.
+        if (ecm != EcmState::CONNECTED || pending == PendingProcedure::DETACH ||
+            pending == PendingProcedure::SERVICE_REQUEST)
             throw LifecycleError("Dedicated restoration precedes default service restoration");
     }
-    else if (pending != PendingProcedure::SERVICE_REQUEST || ecm != EcmState::IDLE)
-        throw LifecycleError("Default restoration has no pending Service Request");
+    else if (ecm != EcmState::IDLE ||
+             (pending != PendingProcedure::SERVICE_REQUEST && pending != PendingProcedure::TAU_NORMAL &&
+              pending != PendingProcedure::TAU_PERIODIC))
+        // A restored access is only an answer to a procedure that asked for
+        // one. A Tracking Area Update sent after a cell reselection is exactly
+        // such a procedure, so the new cell's bearer transport is restored
+        // while the Update is still waiting for its Accept.
+        throw LifecycleError("Default restoration has no pending access procedure");
 }
 
 void MobilityContext::beginNewAttach()
@@ -152,11 +166,16 @@ void MobilityContext::onCellReselected()
     // access generation with it. Presenting any of them at the target cell
     // would either reuse another cell's identifiers or use transport that no
     // longer exists.
+    //
+    // The new access epoch is numbered one rather than zero. Zero is the value
+    // of "no epoch at all", and every generation-bound message — a release, a
+    // restoration, a transport confirmation — is refused when it carries it, so
+    // the first epoch of a reselected cell has to be a real one.
     enbUeS1apId.reset();
     mmeUeS1apId.reset();
     enbTeid.reset();
     sgwTeid.reset();
-    accessGeneration = 0;
+    accessGeneration = 1;
     // The logical default and dedicated bearers are still held by the network;
     // only their access transport is gone, which is what ECM-IDLE means.
     if (bearer != EpsBearerState::INACTIVE)
@@ -191,6 +210,18 @@ void MobilityContext::onServiceRestored(bool userPlaneReady)
     pending = PendingProcedure::NONE;
 }
 
+void MobilityContext::onTauAccessRestored(bool userPlaneReady)
+{
+    if (emm != EmmState::REGISTERED || ecm != EcmState::IDLE || bearer != EpsBearerState::SIGNALING_ESTABLISHED ||
+        (pending != PendingProcedure::TAU_NORMAL && pending != PendingProcedure::TAU_PERIODIC))
+        throw LifecycleError("Unexpected access restoration during a Tracking Area Update");
+    ecm = EcmState::CONNECTED;
+    bearer = userPlaneReady ? EpsBearerState::USER_PLANE_READY : EpsBearerState::SIGNALING_ESTABLISHED;
+    // The Tracking Area Update stays pending. Only its Accept completes it, and
+    // reporting the restored access as an accepted update would claim an
+    // outcome that has not happened.
+}
+
 void MobilityContext::startDetach()
 {
     if (emm != EmmState::REGISTERED || pending != PendingProcedure::NONE)
@@ -213,10 +244,9 @@ void MobilityContext::startTau(bool periodic)
     pending = periodic ? PendingProcedure::TAU_PERIODIC : PendingProcedure::TAU_NORMAL;
 }
 
-void MobilityContext::onTauAccepted(uint8_t updateResult,
-                                    std::optional<std::array<uint8_t, 11>> newGuti,
-                                    std::optional<std::vector<uint8_t>> newTaiList,
-                                    std::optional<uint8_t> newT3412)
+MobilityContext::TauAcceptancePlan MobilityContext::planTauAccepted(
+    uint8_t updateResult, std::optional<std::array<uint8_t, 11>> newGuti,
+    std::optional<std::vector<uint8_t>> newTaiList, std::optional<uint8_t> newT3412) const
 {
     if (pending != PendingProcedure::TAU_NORMAL && pending != PendingProcedure::TAU_PERIODIC)
         throw LifecycleError("Unexpected Tracking Area Update Accept");
@@ -226,19 +256,46 @@ void MobilityContext::onTauAccepted(uint8_t updateResult,
     // would claim a CS-domain update that never took place.
     if (updateResult != 0)
         throw LifecycleError("Unsupported non-EPS-only Tracking Area Update result");
+    TauAcceptancePlan plan;
     // A newly assigned list is validated before it replaces the old one, so an
     // unreadable assignment can never shrink the registered area behind the
     // UE's back. The previous list survives an absent element untouched.
-    std::vector<Tai> authorized;
     if (newTaiList.has_value())
     {
+        std::vector<Tai> authorized;
         if (!ParseTaiList(*newTaiList, authorized))
             throw LifecycleError("The Tracking Area Update Accept tracking area list cannot be parsed");
+        plan.taiList = std::move(authorized);
     }
-    if (newGuti.has_value()) guti = *newGuti;
-    if (newTaiList.has_value()) taiList = std::move(authorized);
-    if (newT3412.has_value()) t3412 = *newT3412;
+    if (newGuti.has_value())
+    {
+        // An identity that cannot yield an S-TMSI is not a GUTI this UE could
+        // ever be paged under, so it is refused rather than stored as a
+        // registration identity that no paging could ever reach.
+        if (!STmsiFromGuti(*newGuti).has_value())
+            throw LifecycleError("The Tracking Area Update Accept GUTI is not a usable EPS GUTI");
+        plan.guti = *newGuti;
+        plan.completeRequired = true;
+    }
+    if (newT3412.has_value())
+        plan.t3412 = *newT3412;
+    return plan;
+}
+
+void MobilityContext::commitTauAccepted(const TauAcceptancePlan &plan)
+{
+    if (plan.guti.has_value()) guti = *plan.guti;
+    if (plan.taiList.has_value()) taiList = *plan.taiList;
+    if (plan.t3412.has_value()) t3412 = *plan.t3412;
     pending = PendingProcedure::NONE;
+}
+
+void MobilityContext::onTauAccepted(uint8_t updateResult,
+                                    std::optional<std::array<uint8_t, 11>> newGuti,
+                                    std::optional<std::vector<uint8_t>> newTaiList,
+                                    std::optional<uint8_t> newT3412)
+{
+    commitTauAccepted(planTauAccepted(updateResult, std::move(newGuti), std::move(newTaiList), newT3412));
 }
 
 void MobilityContext::onProcedureRejected()

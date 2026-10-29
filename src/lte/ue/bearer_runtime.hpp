@@ -76,6 +76,41 @@ inline BearerReconciliation ReconcileRetainedBearers(const std::vector<Dedicated
     return result;
 }
 
+struct TauAcceptance
+{
+    // Dedicated EPS bearer identities the network's status no longer reports.
+    // They are dropped from the live set and must never be claimed again.
+    std::vector<uint8_t> releasedDedicated;
+    // True when the Accept assigned a new GUTI and therefore owes the network a
+    // protected TAU Complete before the update is terminated.
+    bool completeRequired{};
+};
+
+// Applies a Tracking Area Update Accept to the trusted UE state in one step.
+//
+// The Accept is a single NAS message carrying several independent assignments:
+// an update result, a possible new GUTI, a possible new tracking area list, a
+// possible periodic timer and a possible bearer context status. Each of them is
+// validated, and the bearer reconciliation is computed, before any of them is
+// committed, so an Accept that is malformed in any one element leaves the
+// bearer set, the GUTI, the tracking areas and the pending procedure exactly as
+// they were. The commit itself cannot fail.
+inline TauAcceptance ApplyTauAccept(MobilityContext &mobility, std::vector<DedicatedBearerRuntime> &bearers,
+                                    const nas::TauAccept &accept)
+{
+    const auto plan = mobility.planTauAccepted(accept.updateResult, accept.guti, accept.taiList, accept.t3412);
+    TauAcceptance outcome;
+    outcome.completeRequired = plan.completeRequired;
+    if (accept.bearerContextStatus.has_value())
+    {
+        auto reconciliation = ReconcileRetainedBearers(bearers, *accept.bearerContextStatus, mobility.defaultEbi);
+        outcome.releasedDedicated = std::move(reconciliation.released);
+        bearers = std::move(reconciliation.retained);
+    }
+    mobility.commitTauAccepted(plan);
+    return outcome;
+}
+
 inline UplinkBearerSelection SelectUplinkBearer(uint8_t defaultEbi,
     const std::vector<DedicatedBearerRuntime> &bearers, const uint8_t *packet, size_t size)
 {

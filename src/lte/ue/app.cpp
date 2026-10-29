@@ -133,6 +133,12 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
     bool scenarioTriggered = false;
     bool idleReleaseRequested = false;
     std::vector<uint8_t> pendingWire;
+    // Which uplink route the outstanding NAS left by. A retransmission repeats
+    // that route: an uplink that opened a new S1 connection on a reselected
+    // cell is a mobility uplink, and re-sending it as an ordinary uplink NAS
+    // transport would present a different message to a cell that has no S1
+    // connection yet.
+    bool pendingWireViaMobility = false;
     int procedureRetries = 0;
     auto procedureDeadline = std::chrono::steady_clock::time_point::max();
     // Network-triggered paging bookkeeping. Nothing here can make the UE send a
@@ -193,6 +199,7 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 mobility.startDetach();
                 auto plain = nas::EncodeDetachRequest(security.ksi, *mobility.guti, config.lifecycle.switchOff);
                 pendingWire = nas::Protect(security, true, false, plain);
+                pendingWireViaMobility = false;
                 SendNas(socket, enb, ueId, pendingWire);
                 security.ulNasCount = (security.ulNasCount + 1U) & 0xFFFFFFU;
                 procedureDeadline = now + std::chrono::milliseconds(config.lifecycle.procedureTimeoutMs);
@@ -221,6 +228,7 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                     security.ksi, *mobility.guti,
                     RetainedBearerIdentities(mobility.defaultEbi, dedicatedBearers), periodic);
                 pendingWire = nas::Protect(security, true, false, plain);
+                pendingWireViaMobility = false;
                 SendNas(socket, enb, ueId, pendingWire);
                 security.ulNasCount = (security.ulNasCount + 1U) & 0xFFFFFFU;
                 procedureDeadline = now + std::chrono::milliseconds(config.lifecycle.procedureTimeoutMs);
@@ -267,6 +275,7 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 {
                     mobility.startServiceRequest();
                     pendingWire = nas::EncodeServiceRequest(security);
+                    pendingWireViaMobility = false;
                     SendServiceRequest(socket, enb, ueId, *mobility.guti, pendingWire);
                     security.ulNasCount = (security.ulNasCount + 1U) & 0xFFFFFFU;
                     ++recoveryAttempts;
@@ -284,7 +293,12 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
             }
         }
 
-        if (mobility.pending != PendingProcedure::NONE && !pendingWire.empty() && now >= procedureDeadline)
+        // A stop request wins over a deadline here as well. The guards above
+        // already establish that precedence for the idle-release and paging
+        // waits; a procedure that is still outstanding when the UE is asked to
+        // stop is abandoned at shutdown, not retransmitted into a timeout.
+        if (!shutdownRequested && mobility.pending != PendingProcedure::NONE && !pendingWire.empty() &&
+            now >= procedureDeadline)
         {
             if (procedureRetries >= config.lifecycle.maxRetries)
             {
@@ -311,11 +325,13 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
             }
             if (mobility.pending == PendingProcedure::SERVICE_REQUEST)
                 SendServiceRequest(socket, enb, ueId, *mobility.guti, pendingWire);
-            else if (mobility.emm == EmmState::REGISTERED && !mobility.mmeUeS1apId.has_value())
+            else if (pendingWireViaMobility)
                 // A retransmission of a procedure that is still opening an S1
                 // connection has to leave by the same route the first one used.
-                // Once the MME has assigned an identifier the ordinary uplink
-                // NAS transport is the right route again.
+                // This is decided from how the original left rather than from
+                // whether the MME has assigned an identifier yet, because the
+                // UE has never been told that identifier and a guess would
+                // change the message a reselected cell receives.
                 SendMobilityNas(socket, enb, ueId, *mobility.guti, pendingWire);
             else
                 SendNas(socket, enb, ueId, pendingWire);
@@ -501,6 +517,7 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                                 security.ksi, *mobility.guti,
                                 RetainedBearerIdentities(mobility.defaultEbi, dedicatedBearers), false);
                             pendingWire = nas::Protect(security, true, false, plain);
+                            pendingWireViaMobility = true;
                             SendMobilityNas(socket, enb, ueId, *mobility.guti, pendingWire);
                             security.ulNasCount = (security.ulNasCount + 1U) & 0xFFFFFFU;
                             procedureRetries = 0;
@@ -520,6 +537,7 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                     {
                         mobility.startServiceRequest();
                         pendingWire = nas::EncodeServiceRequest(security);
+                        pendingWireViaMobility = false;
                         SendServiceRequest(socket, enb, ueId, *mobility.guti, pendingWire);
                         security.ulNasCount = (security.ulNasCount + 1U) & 0xFFFFFFU;
                         procedureRetries = 0;
@@ -584,6 +602,7 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 if (!compact.has_value())
                     throw std::runtime_error("Accepted paging produced no compact Service Request");
                 pendingWire = std::move(*compact);
+                pendingWireViaMobility = false;
                 SendServiceRequest(socket, enb, ueId, *mobility.guti, pendingWire);
                 ++pagingServiceRequests;
                 pagingWaitArmed = false;
@@ -598,8 +617,24 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
             {
                 const auto restored = link::DecodeBearerRestoration(message.payload);
                 mobility.validateAccessRestoration(restored.first, restored.second, false);
-                mobility.onServiceRestored(tun != nullptr);
-                pendingWire.clear();
+                // A restoration answers the access, not every procedure that
+                // was carried over it. A Tracking Area Update that opened this
+                // connection is still waiting for its Accept, so it keeps its
+                // outstanding message and its deadline; reporting the restored
+                // transport as an accepted update would invent an outcome.
+                const bool tauOutstanding = mobility.pending == PendingProcedure::TAU_NORMAL ||
+                                            mobility.pending == PendingProcedure::TAU_PERIODIC;
+                if (tauOutstanding)
+                    mobility.onTauAccessRestored(tun != nullptr);
+                else
+                {
+                    mobility.onServiceRestored(tun != nullptr);
+                    pendingWire.clear();
+                }
+                // The S1 connection now exists, so an outstanding uplink no
+                // longer has to open one and its retransmissions travel as
+                // ordinary uplink NAS transport.
+                pendingWireViaMobility = false;
                 // Exactly one trigger owns a restoration. A page that won the
                 // race against an armed recovery timer is a paging restoration
                 // even though the timer had already been scheduled.
@@ -619,7 +654,7 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 if (tun)
                 {
                     auto readyFrame = link::Encode({link::MessageType::BEARER_TRANSPORT_READY, ueId,
-                        link::EncodeBearerRestoration(activeEbi, mobility.accessGeneration)});
+                        link::EncodeBearerTransportReady(activeEbi, mobility.accessGeneration, assignedIpv4)});
                     socket.Send(enb, readyFrame.data(), readyFrame.size());
                     Log("INFO", "State=ECM_CONNECTED; existing EPS bearer transport and user plane restored");
                 }
@@ -636,7 +671,9 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                     throw link::DecodeError("Restoration has no logical dedicated bearer or TUN");
                 auto candidate = *bearer;
                 candidate.restoreAccess(mobility, restored.first, restored.second);
-                auto ack = link::Encode({link::MessageType::BEARER_TRANSPORT_READY, ueId, message.payload});
+                auto ack = link::Encode({link::MessageType::BEARER_TRANSPORT_READY, ueId,
+                                         link::EncodeBearerTransportReady(restored.first, restored.second,
+                                                                          assignedIpv4)});
                 socket.Send(enb, ack.data(), ack.size());
                 *bearer = std::move(candidate);
                 Log("INFO", "Existing dedicated EBI=" + std::to_string(restored.first) +
@@ -955,26 +992,21 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 if (mobility.pending != PendingProcedure::TAU_NORMAL &&
                     mobility.pending != PendingProcedure::TAU_PERIODIC)
                     throw nas::DecodeError("Unexpected Tracking Area Update Accept");
-                if (downlink.tauAccept.bearerContextStatus.has_value())
-                {
-                    // The network's status is authoritative. An EPS bearer
-                    // context the UE still holds but the network no longer
-                    // reports has been deactivated, so the UE must stop
-                    // claiming it exists rather than carrying it forward.
-                    const auto reconciliation = ReconcileRetainedBearers(
-                        dedicatedBearers, *downlink.tauAccept.bearerContextStatus, mobility.defaultEbi);
-                    for (const uint8_t ebi : reconciliation.released)
-                        Log("INFO", "Dedicated EPS bearer " + std::to_string(ebi) +
-                                        " was not retained by the network and is no longer active");
-                    dedicatedBearers = reconciliation.retained;
-                }
-                mobility.onTauAccepted(downlink.tauAccept.updateResult, downlink.tauAccept.guti,
-                                       downlink.tauAccept.taiList, downlink.tauAccept.t3412);
+                // The Accept is one NAS message carrying several independent
+                // assignments. It is applied as one validated step, so an
+                // Accept that is malformed in any one of them cannot leave the
+                // bearer set, the GUTI or the tracking areas half-changed
+                // behind a rejected update.
+                const auto acceptance = ApplyTauAccept(mobility, dedicatedBearers, downlink.tauAccept);
+                for (const uint8_t ebi : acceptance.releasedDedicated)
+                    Log("INFO", "Dedicated EPS bearer " + std::to_string(ebi) +
+                                    " was not retained by the network and is no longer active");
                 pendingWire.clear();
-                if (downlink.tauAccept.guti.has_value())
+                pendingWireViaMobility = false;
+                if (acceptance.completeRequired)
                     SendProtected(socket, enb, ueId, security, false, nas::EncodeTauComplete());
                 Log("INFO", std::string("Tracking Area Update accepted; context preserved") +
-                                (downlink.tauAccept.guti.has_value() ? "; TAU Complete sent for new GUTI" : ""));
+                                (acceptance.completeRequired ? "; TAU Complete sent for new GUTI" : ""));
                 scenarioDeadline = std::chrono::steady_clock::time_point::max();
                 continue;
             }
@@ -1134,6 +1166,11 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
         // Reaching here with the wait still armed is only possible through the
         // stop request, so this is a shutdown and never a paging timeout.
         Log("INFO", "Paging wait abandoned at shutdown; no Service Request was sent");
+    if (mobility.pending != PendingProcedure::NONE)
+        // The same rule for a procedure rather than a wait: a stop request
+        // abandons it and reports it as abandoned, never as a timeout and
+        // never as a completion that did not happen.
+        Log("INFO", std::string(ToString(mobility.pending)) + " abandoned at shutdown; no outcome was invented");
     Log("INFO", "User-plane statistics: tun-ul=" + std::to_string(tunUplinkPackets) + "/" +
                     std::to_string(tunUplinkBytes) + " tun-dl=" + std::to_string(tunDownlinkPackets) + "/" +
                     std::to_string(tunDownlinkBytes) + " drops(malformed/inactive)=" +

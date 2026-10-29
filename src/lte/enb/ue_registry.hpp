@@ -11,6 +11,8 @@
 #include "types.hpp"
 #include "user_plane.hpp"
 
+#include <lte/ue/radio_link.hpp>
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -75,6 +77,22 @@ struct EnbUeEntry
     // Zero until the MME assigns one; never invented locally.
     uint32_t mmeUeS1apId{};
     uint32_t accessGeneration{};
+    // How the current S1 connection was opened. A mobility uplink continues an
+    // existing EPS session over a new S1 connection because the UE reselected
+    // this cell in ECM-IDLE, and that is not an Initial Attach: the session's
+    // bearer contexts survive and only the access epoch restarts.
+    bool mobilityBootstrap{};
+    // The bearer inventory the UE declared with that uplink: which E-RAB is its
+    // default bearer and which are dedicated, all taken from contexts its own
+    // NAS has already confirmed. A cell the UE reselected into holds no logical
+    // EPS bearer context of the session, and the E-RAB list of an Initial
+    // Context Setup Request names only identifiers and QoS and marks no roles,
+    // so without this declaration the roles could only be guessed from QCI or
+    // from the order of that list. The declaration is a claim about the UE's
+    // own session and can only ever restrict what the network offered: an E-RAB
+    // it does not name is not established for this UE, and one it names without
+    // the network offering it establishes nothing at all.
+    std::optional<lte::ue::link::BearerInventory> declaredBearers;
     DefaultBearerContext bearer{};
     // The default bearer remains named for Phase 6 source compatibility.
     // Together with these bounded contexts it forms the per-UE EPS bearer
@@ -131,7 +149,12 @@ class UeRegistry
 
     // Inserts a dedicated bearer only after validating that its linked default
     // EBI belongs to this exact UE and that capacity/EBI uniqueness hold.
-    BearerContext &addDedicatedBearer(EnbUeEntry &entry, const BearerParameters &parameters);
+    // `accessRestoration` marks the new context as a restoration of a bearer
+    // the UE's NAS already confirmed rather than a freshly activated one, which
+    // is how a dedicated E-RAB established by a fresh-target mobility bootstrap
+    // is confirmed generation-bound instead of being treated as a new bearer.
+    BearerContext &addDedicatedBearer(EnbUeEntry &entry, const BearerParameters &parameters,
+                                      bool accessRestoration = false);
     void releaseBearer(EnbUeEntry &entry, uint8_t ebi);
 
     // Allocates an eNB-UE-S1AP-ID unique among live contexts, skipping zero

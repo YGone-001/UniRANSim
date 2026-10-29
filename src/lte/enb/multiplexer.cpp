@@ -472,73 +472,155 @@ void EnbMultiplexer::onInitialContextSetupRequest(const uint8_t *data, size_t si
             return;
         }
     const bool restoring = entry->bearer.logicalExists();
+    const bool declared = entry->declaredBearers.has_value();
+    // A mobility uplink onto a cell that has never seen this session's Attach
+    // has to say which E-RAB is which. Without that the E-RAB list of an
+    // Initial Context Setup Request names only identifiers and QoS and marks no
+    // roles, so on such a target the roles could only be guessed from QCI or
+    // from the order of that list. Nothing is set up rather than guessed.
+    if (entry->mobilityBootstrap && !restoring && !declared)
+    {
+        fail("radioNetwork", 25);
+        return;
+    }
+    // A declaration that contradicts the logical bearer contexts this eNB still
+    // holds is not a description of this session, and neither side of the
+    // contradiction is believed.
+    if (declared && restoring && entry->declaredBearers->defaultEbi != entry->bearer.parameters().erabId)
+    {
+        fail("radioNetwork", 25);
+        return;
+    }
     // Initial Attach has one provisional default candidate; BEARER_READY must
     // confirm its identity against the UE's validated NAS. No NAS is decrypted
     // here. Multiple unknown roles cannot be inferred from order or QCI.
-    if ((!restoring && request.erabs.size() != 1) || entry->bearer.signalingEstablished() ||
+    if ((!restoring && !declared && request.erabs.size() != 1) || entry->bearer.signalingEstablished() ||
         (restoring && !entry->bearer.logicalConfirmed()))
     {
         fail("radioNetwork", 29);
         return;
     }
     auto candidate = *entry;
+    // Which E-RAB plays which role is decided before any of them is touched,
+    // and it is never decided by the order of the network's list: a dedicated
+    // bearer is defined on top of its default bearer, so the default is
+    // established first whatever order the MME listed its E-RABs in. Each
+    // outcome is recorded against the requested item, so the response still
+    // reports the E-RABs in the order the MME sent them.
+    const uint8_t defaultEbi = declared ? entry->declaredBearers->defaultEbi
+                              : restoring ? entry->bearer.parameters().erabId
+                                          : request.erabs.front().erabId;
+    std::vector<size_t> order;
+    order.reserve(request.erabs.size());
+    for (size_t index = 0; index < request.erabs.size(); ++index)
+        if (request.erabs[index].erabId == defaultEbi)
+            order.push_back(index);
+    for (size_t index = 0; index < request.erabs.size(); ++index)
+        if (request.erabs[index].erabId != defaultEbi)
+            order.push_back(index);
+    std::vector<std::optional<s1ap::ErabSetupItem>> establishedAt(request.erabs.size());
+    std::vector<std::optional<s1ap::ErabFailedItem>> failedAt(request.erabs.size());
     std::vector<s1ap::ErabSetupItem> established;
     std::vector<s1ap::ErabFailedItem> failed;
     established.reserve(8);
     failed.reserve(request.erabs.size());
-    const uint8_t defaultEbi = restoring ? entry->bearer.parameters().erabId : request.erabs.front().erabId;
+    size_t establishedCount = 0;
     bool defaultEstablished = false;
     bool nonGbrEstablished = false;
-    for (const auto &erab : request.erabs)
+    for (const size_t index : order)
     {
+        const auto &erab = request.erabs[index];
         const ErabQos qos{erab.qci, erab.priorityLevel, erab.preemptionCapability,
                           erab.preemptionVulnerability, erab.gbr};
         auto *bearer = m_registry.findBearer(candidate, erab.erabId);
+        // A declaration names the roles where one exists, the retained contexts
+        // name them where this eNB already holds them, and an Initial Attach has
+        // exactly one candidate, which is the default bearer of the new session
+        // and is confirmed later against the UE's validated NAS.
+        bool dedicatedRole = false;
+        if (declared)
+        {
+            const auto &inventory = *entry->declaredBearers;
+            if (erab.erabId == inventory.defaultEbi)
+                dedicatedRole = false;
+            else if (std::find(inventory.dedicatedEbis.begin(), inventory.dedicatedEbis.end(), erab.erabId) !=
+                     inventory.dedicatedEbis.end())
+                dedicatedRole = true;
+            else
+            {
+                // The network offered a bearer this UE never confirmed. Neither
+                // the offer nor the claim can make it true on its own, so it is
+                // not established for this UE.
+                failedAt[index] = s1ap::ErabFailedItem{erab.erabId, "radioNetwork", 30};
+                continue;
+            }
+        }
+        else if (restoring)
+            dedicatedRole = bearer != nullptr && bearer->kind() == BearerKind::DEDICATED;
         if (erab.erabId < 5 || erab.erabId > 15 || (restoring && bearer == nullptr))
         {
-            failed.push_back({erab.erabId, "radioNetwork", 30});
+            failedAt[index] = s1ap::ErabFailedItem{erab.erabId, "radioNetwork", 30};
             continue;
         }
-        if (established.size() >= 8)
+        if (establishedCount >= 8)
         {
-            failed.push_back({erab.erabId, "radioNetwork", 25});
+            failedAt[index] = s1ap::ErabFailedItem{erab.erabId, "radioNetwork", 25};
             continue;
         }
         if (!qos.valid() || (erab.erabId == defaultEbi && erab.qci <= 4))
         {
-            failed.push_back({erab.erabId, "radioNetwork", 27});
+            failedAt[index] = s1ap::ErabFailedItem{erab.erabId, "radioNetwork", 27};
             continue;
         }
         if (!erab.ipv4Transport || erab.transportLayerAddress[0] == 0 ||
             erab.transportLayerAddress[0] >= 224 || TeidFromBytes(erab.gtpTeid) == 0)
         {
-            failed.push_back({erab.erabId, "transport", 0});
+            failedAt[index] = s1ap::ErabFailedItem{erab.erabId, "transport", 0};
             continue;
         }
-        if (bearer == nullptr)
+        if (bearer == nullptr && !dedicatedRole)
             bearer = &candidate.bearer;
-        if (bearer->signalingEstablished() || (restoring && !bearer->logicalConfirmed()) ||
-            (bearer->kind() == BearerKind::DEDICATED && bearer->parameters().linkedDefaultEbi != defaultEbi))
+        if (bearer != nullptr &&
+            (bearer->signalingEstablished() || (restoring && !bearer->logicalConfirmed()) ||
+             (bearer->kind() == BearerKind::DEDICATED && bearer->parameters().linkedDefaultEbi != defaultEbi)))
         {
-            failed.push_back({erab.erabId, "radioNetwork", 29});
+            failedAt[index] = s1ap::ErabFailedItem{erab.erabId, "radioNetwork", 29};
             continue;
         }
         try
         {
             const uint32_t localTeid = m_registry.allocateLocalTeid();
-            bearer->establish({erab.erabId, erab.qci, entry->radioUeId, erab.transportLayerAddress,
-                               TeidFromBytes(erab.gtpTeid), localTeid,
-                               static_cast<uint8_t>(erab.erabId == defaultEbi ? 0 : defaultEbi), qos});
-            established.push_back({erab.erabId, ParseIpv4(m_config.s1uAddress), TeidToBytes(localTeid)});
+            const uint8_t linkedDefault = static_cast<uint8_t>(erab.erabId == defaultEbi ? 0 : defaultEbi);
+            if (bearer == nullptr)
+                // A dedicated E-RAB of a fresh-target mobility bootstrap: the UE
+                // declared it, so it is established on top of the default bearer
+                // established first above and marked as a restoration of a
+                // bearer its NAS already confirmed.
+                m_registry.addDedicatedBearer(candidate,
+                    {erab.erabId, erab.qci, entry->radioUeId, erab.transportLayerAddress,
+                     TeidFromBytes(erab.gtpTeid), localTeid, linkedDefault, qos}, true);
+            else
+                bearer->establish({erab.erabId, erab.qci, entry->radioUeId, erab.transportLayerAddress,
+                                   TeidFromBytes(erab.gtpTeid), localTeid, linkedDefault, qos},
+                                  restoring || declared);
+            establishedAt[index] = s1ap::ErabSetupItem{erab.erabId, ParseIpv4(m_config.s1uAddress),
+                                                       TeidToBytes(localTeid)};
+            ++establishedCount;
             defaultEstablished |= erab.erabId == defaultEbi;
             nonGbrEstablished |= erab.qci > 4;
         }
         catch (const std::exception &)
         {
             // Candidate is private; an unsuccessful item never becomes indexed.
-            failed.push_back({erab.erabId, "radioNetwork", 25});
+            failedAt[index] = s1ap::ErabFailedItem{erab.erabId, "radioNetwork", 25};
         }
     }
+    for (const auto &slot : establishedAt)
+        if (slot.has_value())
+            established.push_back(*slot);
+    for (const auto &slot : failedAt)
+        if (slot.has_value())
+            failed.push_back(*slot);
     if (!defaultEstablished || !nonGbrEstablished)
     {
         fail("radioNetwork", 25);
@@ -578,7 +660,11 @@ void EnbMultiplexer::onInitialContextSetupRequest(const uint8_t *data, size_t si
         throw;
     }
     // Always notify default first, regardless of the MME's E-RAB list order.
-    if (restoring)
+    // A fresh-target mobility bootstrap needs the same notification as a
+    // restoration on a cell that already held the contexts: in both cases the
+    // bearers are ones this UE's NAS has already confirmed, and the fresh
+    // transport of the target cell is what it is being told to confirm.
+    if (restoring || declared)
         sendRadio(*entry, lte::ue::link::MessageType::S1_CONTEXT_RESTORED,
                   lte::ue::link::EncodeBearerRestoration(defaultEbi, entry->accessGeneration));
     for (const auto &item : established)
@@ -588,7 +674,7 @@ void EnbMultiplexer::onInitialContextSetupRequest(const uint8_t *data, size_t si
             " QCI=" + std::to_string(bearer->parameters().qci) +
             " eNB-TEID=" + Hex(bearer->parameters().localTeid, 8) +
             " SGW-TEID=" + Hex(bearer->parameters().sgwTeid, 8));
-        if (restoring && item.erabId != defaultEbi)
+        if ((restoring || declared) && item.erabId != defaultEbi)
             sendRadio(*entry, lte::ue::link::MessageType::DEDICATED_BEARER_RESTORED,
                       lte::ue::link::EncodeBearerRestoration(item.erabId, entry->accessGeneration));
         const auto &requested = *std::find_if(request.erabs.begin(), request.erabs.end(),
@@ -640,11 +726,21 @@ void EnbMultiplexer::onErabSetupRequest(const uint8_t *data, size_t size)
         }
         try
         {
-            const bool restore = previous != nullptr;
+            // A dedicated bearer this eNB retained is re-established, and so is
+            // one the UE declared with a mobility uplink onto a cell that never
+            // saw its Attach: both are EPS bearers its NAS already confirmed,
+            // so the fresh transport is restored and generation-bound rather
+            // than announced as a brand-new bearer. An E-RAB the UE never
+            // confirmed is none of those and stays an ordinary new bearer.
+            const auto &declared = entry->declaredBearers;
+            const bool restore = previous != nullptr ||
+                                 (declared.has_value() &&
+                                  std::find(declared->dedicatedEbis.begin(), declared->dedicatedEbis.end(),
+                                            erab.erabId) != declared->dedicatedEbis.end());
             const uint32_t localTeid = m_registry.allocateLocalTeid();
             m_registry.addDedicatedBearer(candidate,
                 {erab.erabId, erab.qci, entry->radioUeId, erab.transportLayerAddress,
-                 TeidFromBytes(erab.gtpTeid), localTeid, entry->bearer.parameters().erabId, qos});
+                 TeidFromBytes(erab.gtpTeid), localTeid, entry->bearer.parameters().erabId, qos}, restore);
             established.push_back({erab.erabId, ParseIpv4(m_config.s1uAddress), TeidToBytes(localTeid)});
             if (restore)
                 retained[erab.erabId] = true;
@@ -899,7 +995,8 @@ void EnbMultiplexer::handleRadioFrame(const uint8_t *data, size_t size, const In
                 throw lte::ue::link::DecodeError("A radio endpoint may not claim another active UE identity");
             if (radio.type != lte::ue::link::MessageType::NAS_UPLINK &&
                 radio.type != lte::ue::link::MessageType::SERVICE_REQUEST &&
-                radio.type != lte::ue::link::MessageType::NAS_UPLINK_MOBILITY)
+                radio.type != lte::ue::link::MessageType::NAS_UPLINK_MOBILITY &&
+                radio.type != lte::ue::link::MessageType::NAS_UPLINK_MOBILITY_CONTEXT)
                 throw lte::ue::link::DecodeError("Data arrived before an LTE UE NAS context");
             entry = &m_registry.registerPeer(radio.ueId, peer);
         }
@@ -945,7 +1042,8 @@ void EnbMultiplexer::handleRadioFrame(const uint8_t *data, size_t size, const In
                 startInitialUeMessage(*entry, std::move(radio.payload), std::nullopt);
             }
         }
-        else if (radio.type == lte::ue::link::MessageType::NAS_UPLINK_MOBILITY)
+        else if (radio.type == lte::ue::link::MessageType::NAS_UPLINK_MOBILITY ||
+                 radio.type == lte::ue::link::MessageType::NAS_UPLINK_MOBILITY_CONTEXT)
         {
             // Uplink NAS that continues an existing EPS session over a new S1
             // connection because the UE reselected this cell in ECM-IDLE. This
@@ -957,7 +1055,17 @@ void EnbMultiplexer::handleRadioFrame(const uint8_t *data, size_t size, const In
             if (entry->s1Active())
                 throw lte::ue::link::DecodeError(
                     "A mobility uplink opens a new S1 connection and cannot replace an active one");
-            if (radio.payload.size() <= 5)
+            // The identity prefix is always five octets. A context-carrying
+            // uplink then declares the bearer inventory before its protected
+            // NAS, which is what lets a cell that has never seen the session's
+            // Attach tell the default bearer from the dedicated ones.
+            const bool declares = radio.type == lte::ue::link::MessageType::NAS_UPLINK_MOBILITY_CONTEXT;
+            lte::ue::link::BearerInventory inventory{};
+            size_t offset = 5;
+            if (declares)
+                offset += lte::ue::link::DecodeBearerInventory(radio.payload.data() + 5,
+                                                              radio.payload.size() - 5, inventory);
+            if (radio.payload.size() <= offset)
                 throw lte::ue::link::DecodeError("A mobility uplink carries no NAS payload");
             const uint32_t mTmsi = (static_cast<uint32_t>(radio.payload[1]) << 24U) |
                                    (static_cast<uint32_t>(radio.payload[2]) << 16U) |
@@ -967,9 +1075,13 @@ void EnbMultiplexer::handleRadioFrame(const uint8_t *data, size_t size, const In
             // The access generation counts access epochs on this cell, and the
             // UE restarts its own count when it reselects one. Restarting here
             // keeps the two in step without touching the EPS bearer contexts,
-            // which belong to the session rather than to the cell.
-            entry->accessGeneration = 0;
-            std::vector<uint8_t> nasPdu(radio.payload.begin() + 5, radio.payload.end());
+            // which belong to the session rather than to the cell. The new
+            // epoch is numbered one rather than zero: zero means "no epoch at
+            // all" and every generation-bound message carrying it is refused.
+            entry->accessGeneration = 1;
+            entry->mobilityBootstrap = true;
+            entry->declaredBearers = declares ? std::make_optional(inventory) : std::nullopt;
+            std::vector<uint8_t> nasPdu(radio.payload.begin() + offset, radio.payload.end());
             startInitialUeMessage(*entry, std::move(nasPdu), s1ap::STmsi{radio.payload[0], mTmsi});
         }
         else if (radio.type == lte::ue::link::MessageType::EPS_SESSION_DELETED)
@@ -984,14 +1096,27 @@ void EnbMultiplexer::handleRadioFrame(const uint8_t *data, size_t size, const In
         }
         else if (radio.type == lte::ue::link::MessageType::BEARER_TRANSPORT_READY)
         {
-            const auto restored = lte::ue::link::DecodeBearerRestoration(radio.payload);
-            auto *bearer = m_registry.findBearer(*entry, restored.first);
-            if (!entry->s1Active() || restored.second == 0 ||
-                restored.second != entry->accessGeneration || bearer == nullptr || !bearer->signalingEstablished() || !bearer->restorationPending())
+            const auto ready = lte::ue::link::DecodeBearerTransportReady(radio.payload.data(), radio.payload.size());
+            auto *bearer = m_registry.findBearer(*entry, ready.ebi);
+            if (!entry->s1Active() || ready.generation == 0 ||
+                ready.generation != entry->accessGeneration || bearer == nullptr || !bearer->signalingEstablished() || !bearer->restorationPending())
                 throw BearerError("Stale or unrequested bearer transport confirmation");
             if (bearer->kind() == BearerKind::DEDICATED && !entry->bearer.active())
                 throw BearerError("Dedicated transport confirmation precedes default readiness");
-            bearer->activateUe(entry->radioUeId, restored.first, entry->bearer.ueIpv4());
+            // The UE restates the PDN address its own NAS assigned, because a
+            // cell that never saw this session's Attach cannot learn it without
+            // decrypting NAS. It only ever confirms an address: one this eNB
+            // already holds is never replaced by a different claim, and a
+            // dedicated bearer names the address of its own default bearer.
+            std::array<uint8_t, 4> address = ready.ueIpv4.value_or(bearer->ueIpv4());
+            if (address == std::array<uint8_t, 4>{})
+                throw BearerError("Bearer transport confirmation names no UE address");
+            if (bearer->kind() == BearerKind::DEFAULT && bearer->ueIpv4() != std::array<uint8_t, 4>{} &&
+                address != bearer->ueIpv4())
+                throw BearerError("Bearer transport confirmation contradicts the assigned UE address");
+            if (bearer->kind() == BearerKind::DEDICATED && address != entry->bearer.ueIpv4())
+                throw BearerError("Dedicated transport confirmation contradicts the assigned UE address");
+            bearer->activateUe(entry->radioUeId, ready.ebi, address);
             if (bearer->kind() == BearerKind::DEFAULT)
             {
                 entry->s1 = UeS1State::BEARER_ACTIVE;

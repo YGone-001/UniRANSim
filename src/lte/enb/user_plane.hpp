@@ -56,7 +56,16 @@ class DefaultBearerContext
 {
   public:
     explicit DefaultBearerContext(BearerKind kind = BearerKind::DEFAULT) : m_kind(kind) {}
-    void establish(const BearerParameters &parameters);
+    // Establishes the access transport of one EPS bearer. `restoringAccess`
+    // marks the new access as a restoration of a logical bearer the UE's own
+    // NAS has already confirmed, which is what makes the UE confirm the fresh
+    // transport instead of treating it as a new bearer: it is true where this
+    // context already held the logical bearer and where the UE declared the
+    // bearer in its mobility uplink onto a cell that had never seen the
+    // session. Neither case is an Initial Attach candidate, whose identity is
+    // only confirmed later against the UE's validated NAS.
+    void establish(const BearerParameters &parameters, bool restoringAccess);
+    void establish(const BearerParameters &parameters) { establish(parameters, logicalExists()); }
     void activateUe(uint32_t ueId, uint8_t epsBearerIdentity, const std::array<uint8_t, 4> &ipv4Address);
     void validateUplink(uint32_t ueId, const uint8_t *packet, size_t size) const;
     void validateDownlink(uint32_t incomingTeid, const uint8_t *packet, size_t size) const;

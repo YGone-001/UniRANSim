@@ -32,7 +32,7 @@ bool IsKnown(MessageType type)
            type == MessageType::DATA_DOWNLINK_BEARER || type == MessageType::BEARER_ACTIVATED ||
            type == MessageType::DEDICATED_BEARER_RESTORED || type == MessageType::BEARER_TRANSPORT_READY ||
            type == MessageType::EPS_SESSION_DELETED || type == MessageType::S1_ACCESS_LOST ||
-           type == MessageType::NAS_UPLINK_MOBILITY;
+           type == MessageType::NAS_UPLINK_MOBILITY || type == MessageType::NAS_UPLINK_MOBILITY_CONTEXT;
 }
 
 size_t MaximumPayload(MessageType type)
@@ -42,15 +42,22 @@ size_t MaximumPayload(MessageType type)
     // MMEC || M-TMSI ahead of a full protected NAS PDU.
     if (type == MessageType::NAS_UPLINK_MOBILITY)
         return MaxNasPduSize + 5U;
+    // The same identity prefix, then the bounded bearer inventory ahead of the
+    // protected NAS PDU.
+    if (type == MessageType::NAS_UPLINK_MOBILITY_CONTEXT)
+        return MaxNasPduSize + 5U + 2U + MaxDeclaredDedicatedBearers;
     if (type == MessageType::DATA_UPLINK || type == MessageType::DATA_DOWNLINK)
         return MaxDataPduSize;
     // One octet of EPS bearer identity precedes the IPv4 payload.
     if (type == MessageType::DATA_UPLINK_BEARER || type == MessageType::DATA_DOWNLINK_BEARER)
         return MaxDataPduSize + 1U;
     if (type == MessageType::S1_CONTEXT_RELEASED || type == MessageType::S1_CONTEXT_RESTORED ||
-        type == MessageType::DEDICATED_BEARER_RESTORED || type == MessageType::BEARER_TRANSPORT_READY ||
+        type == MessageType::DEDICATED_BEARER_RESTORED ||
         type == MessageType::EPS_SESSION_DELETED || type == MessageType::S1_ACCESS_LOST)
         return 5;
+    // A bearer transport confirmation may additionally restate the PDN address.
+    if (type == MessageType::BEARER_TRANSPORT_READY)
+        return 9;
     if (type == MessageType::BEARER_ACTIVATED)
         return 1;
     if (type == MessageType::BEARER_READY)
@@ -71,6 +78,7 @@ std::vector<uint8_t> Encode(const Message &message)
         (message.type == MessageType::SERVICE_REQUEST && message.payload.size() != 9) ||
         (message.type == MessageType::PAGING_INDICATION && message.payload.size() != 7) ||
         (message.type == MessageType::NAS_UPLINK_MOBILITY && message.payload.size() <= 5) ||
+        (message.type == MessageType::NAS_UPLINK_MOBILITY_CONTEXT && message.payload.size() <= 7) ||
         ((message.type == MessageType::BEARER_RELEASED ||
           message.type == MessageType::S1_CONTEXT_RELEASE_REQUEST ||
           message.type == MessageType::BEARER_ACTIVATED) && message.payload.size() != 1))
@@ -78,9 +86,18 @@ std::vector<uint8_t> Encode(const Message &message)
     if ((message.type == MessageType::S1_CONTEXT_RELEASED || message.type == MessageType::S1_CONTEXT_RESTORED) &&
         message.payload.size() != 1 && message.payload.size() != 5)
         throw DecodeError("Invalid S1 restoration payload length");
-    if (message.type == MessageType::DEDICATED_BEARER_RESTORED || message.type == MessageType::BEARER_TRANSPORT_READY ||
+    if (message.type == MessageType::DEDICATED_BEARER_RESTORED ||
         message.type == MessageType::EPS_SESSION_DELETED || message.type == MessageType::S1_ACCESS_LOST)
         DecodeBearerRestoration(message.payload);
+    if (message.type == MessageType::BEARER_TRANSPORT_READY)
+        DecodeBearerTransportReady(message.payload.data(), message.payload.size());
+    if (message.type == MessageType::NAS_UPLINK_MOBILITY_CONTEXT)
+    {
+        BearerInventory inventory{};
+        const size_t consumed = DecodeBearerInventory(message.payload.data() + 5, message.payload.size() - 5, inventory);
+        if (consumed + 1 > message.payload.size() - 5)
+            throw DecodeError("A mobility uplink context carries no protected NAS");
+    }
     std::vector<uint8_t> out(HeaderSize + message.payload.size());
     out[0] = Version;
     out[1] = static_cast<uint8_t>(message.type);
@@ -107,15 +124,25 @@ Message Decode(const uint8_t *data, size_t size)
         (type == MessageType::SERVICE_REQUEST && length != 9) ||
         (type == MessageType::PAGING_INDICATION && length != 7) ||
         (type == MessageType::NAS_UPLINK_MOBILITY && length <= 5) ||
+        (type == MessageType::NAS_UPLINK_MOBILITY_CONTEXT && length <= 7) ||
         ((type == MessageType::BEARER_RELEASED || type == MessageType::S1_CONTEXT_RELEASE_REQUEST ||
           type == MessageType::BEARER_ACTIVATED) && length != 1))
         throw DecodeError("Malformed LTE radio-link payload length");
     if ((type == MessageType::S1_CONTEXT_RELEASED || type == MessageType::S1_CONTEXT_RESTORED) &&
         length != 1 && length != 5)
         throw DecodeError("Malformed S1 restoration payload length");
-    if (type == MessageType::DEDICATED_BEARER_RESTORED || type == MessageType::BEARER_TRANSPORT_READY ||
+    if (type == MessageType::DEDICATED_BEARER_RESTORED ||
         type == MessageType::EPS_SESSION_DELETED || type == MessageType::S1_ACCESS_LOST)
         DecodeBearerRestoration(std::vector<uint8_t>(data + HeaderSize, data + size));
+    if (type == MessageType::BEARER_TRANSPORT_READY)
+        DecodeBearerTransportReady(data + HeaderSize, length);
+    if (type == MessageType::NAS_UPLINK_MOBILITY_CONTEXT)
+    {
+        BearerInventory inventory{};
+        const size_t consumed = DecodeBearerInventory(data + HeaderSize + 5, length - 5, inventory);
+        if (consumed + 1 > length - 5)
+            throw DecodeError("A mobility uplink context carries no protected NAS");
+    }
     uint32_t ueId = (static_cast<uint32_t>(data[2]) << 24U) | (static_cast<uint32_t>(data[3]) << 16U) |
                     (static_cast<uint32_t>(data[4]) << 8U) | data[5];
     if (ueId == 0)
@@ -139,13 +166,88 @@ std::pair<uint8_t, uint32_t> DecodeBearerRestoration(const std::vector<uint8_t> 
             (static_cast<uint32_t>(payload[2]) << 16U) | (static_cast<uint32_t>(payload[3]) << 8U) | payload[4]};
 }
 
+std::vector<uint8_t> EncodeBearerTransportReady(uint8_t ebi, uint32_t generation,
+                                                const std::array<uint8_t, 4> &ueIpv4)
+{
+    auto payload = EncodeBearerRestoration(ebi, generation);
+    if (ueIpv4 == std::array<uint8_t, 4>{} || ueIpv4[0] == 0 || ueIpv4[0] >= 224)
+        throw DecodeError("Invalid restated UE IPv4 address");
+    payload.insert(payload.end(), ueIpv4.begin(), ueIpv4.end());
+    return payload;
+}
+
+BearerTransportReady DecodeBearerTransportReady(const uint8_t *data, size_t size)
+{
+    if (data == nullptr || (size != 5 && size != 9))
+        throw DecodeError("Invalid bearer transport confirmation payload");
+    const auto restored = DecodeBearerRestoration(std::vector<uint8_t>(data, data + 5));
+    BearerTransportReady ready{};
+    ready.ebi = restored.first;
+    ready.generation = restored.second;
+    if (size == 9)
+    {
+        const std::array<uint8_t, 4> address{{data[5], data[6], data[7], data[8]}};
+        if (address[0] == 0 || address[0] >= 224)
+            throw DecodeError("Invalid restated UE IPv4 address");
+        ready.ueIpv4 = address;
+    }
+    return ready;
+}
+
+std::vector<uint8_t> EncodeBearerInventory(const BearerInventory &inventory)
+{
+    if (inventory.defaultEbi < 5 || inventory.defaultEbi > 15)
+        throw DecodeError("Invalid declared default bearer identity");
+    if (inventory.dedicatedEbis.size() > MaxDeclaredDedicatedBearers)
+        throw DecodeError("Too many declared dedicated bearer identities");
+    std::vector<uint8_t> payload;
+    payload.reserve(2 + inventory.dedicatedEbis.size());
+    payload.push_back(inventory.defaultEbi);
+    payload.push_back(static_cast<uint8_t>(inventory.dedicatedEbis.size()));
+    uint8_t previous = inventory.defaultEbi;
+    for (const uint8_t ebi : inventory.dedicatedEbis)
+    {
+        if (ebi < 5 || ebi > 15 || ebi == inventory.defaultEbi || ebi <= previous)
+            throw DecodeError("Invalid declared dedicated bearer identity");
+        payload.push_back(ebi);
+        previous = ebi;
+    }
+    return payload;
+}
+
+size_t DecodeBearerInventory(const uint8_t *data, size_t size, BearerInventory &inventory)
+{
+    if (data == nullptr || size < 2)
+        throw DecodeError("Truncated bearer inventory");
+    const uint8_t defaultEbi = data[0];
+    const uint8_t count = data[1];
+    if (defaultEbi < 5 || defaultEbi > 15)
+        throw DecodeError("Invalid declared default bearer identity");
+    if (count > MaxDeclaredDedicatedBearers || size < 2U + count)
+        throw DecodeError("Truncated bearer inventory");
+    BearerInventory decoded{};
+    decoded.defaultEbi = defaultEbi;
+    decoded.dedicatedEbis.reserve(count);
+    uint8_t previous = defaultEbi;
+    for (uint8_t i = 0; i < count; ++i)
+    {
+        const uint8_t ebi = data[2 + i];
+        if (ebi < 5 || ebi > 15 || ebi == defaultEbi || ebi <= previous)
+            throw DecodeError("Invalid declared dedicated bearer identity");
+        decoded.dedicatedEbis.push_back(ebi);
+        previous = ebi;
+    }
+    inventory = std::move(decoded);
+    return 2U + count;
+}
+
 bool IsUplink(MessageType type)
 {
     return type == MessageType::NAS_UPLINK || type == MessageType::DATA_UPLINK || type == MessageType::BEARER_READY ||
            type == MessageType::DATA_UPLINK_BEARER || type == MessageType::BEARER_ACTIVATED ||
            type == MessageType::BEARER_TRANSPORT_READY || type == MessageType::EPS_SESSION_DELETED ||
            type == MessageType::S1_CONTEXT_RELEASE_REQUEST || type == MessageType::SERVICE_REQUEST ||
-           type == MessageType::NAS_UPLINK_MOBILITY;
+           type == MessageType::NAS_UPLINK_MOBILITY || type == MessageType::NAS_UPLINK_MOBILITY_CONTEXT;
 }
 
 bool IsDownlink(MessageType type)

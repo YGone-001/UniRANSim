@@ -148,7 +148,8 @@ const BearerContext *UeRegistry::findBearer(const EnbUeEntry &entry, uint8_t ebi
     return const_cast<UeRegistry *>(this)->findBearer(const_cast<EnbUeEntry &>(entry), ebi);
 }
 
-BearerContext &UeRegistry::addDedicatedBearer(EnbUeEntry &entry, const BearerParameters &parameters)
+BearerContext &UeRegistry::addDedicatedBearer(EnbUeEntry &entry, const BearerParameters &parameters,
+                                              bool accessRestoration)
 {
     if (parameters.erabId < 5 || parameters.erabId > 15 ||
         (findBearer(entry, parameters.erabId) != nullptr && findBearer(entry, parameters.erabId)->signalingEstablished()))
@@ -157,21 +158,22 @@ BearerContext &UeRegistry::addDedicatedBearer(EnbUeEntry &entry, const BearerPar
         throw RegistryError("Dedicated bearer references no valid default bearer");
     // A bearer retained across ECM-IDLE keeps its EBI but has no transport. The
     // network re-establishes that same bearer on Service Request, so reuse the
-    // context instead of rejecting it as a duplicate identity.
+    // context instead of rejecting it as a duplicate identity. It is always a
+    // restoration: its logical bearer is one this eNB already held.
     for (auto &retained : entry.dedicatedBearers)
     {
         if (retained.parameters().erabId == parameters.erabId && !retained.signalingEstablished())
         {
             if (!retained.logicalConfirmed())
                 throw RegistryError("Unconfirmed NAS bearer cannot be restored");
-            retained.establish(parameters);
+            retained.establish(parameters, true);
             return retained;
         }
     }
     if (entry.dedicatedBearers.size() >= EnbUeEntry::MaxDedicatedBearers)
         throw RegistryError("The per-UE dedicated bearer capacity is exhausted");
     BearerContext candidate(BearerKind::DEDICATED);
-    candidate.establish(parameters);
+    candidate.establish(parameters, accessRestoration);
     entry.dedicatedBearers.push_back(std::move(candidate));
     return entry.dedicatedBearers.back();
 }
@@ -308,6 +310,10 @@ void UeRegistry::releaseS1(EnbUeEntry &entry)
     // transport until a Service Request restores them.
     for (auto &dedicated : entry.dedicatedBearers)
         dedicated.releaseAccessTransport();
+    // The declaration described one access setup on this cell. The next uplink
+    // describes its own, so a stale inventory is never reused for it.
+    entry.mobilityBootstrap = false;
+    entry.declaredBearers.reset();
     entry.s1 = UeS1State::IDLE_RETAINED;
 }
 
@@ -326,6 +332,10 @@ void UeRegistry::deleteBearerContexts(EnbUeEntry &entry)
     entry.bearer.release();
     entry.dedicatedBearers.clear();
     entry.ueAmbr.reset();
+    // A declaration about a session whose bearer contexts are gone describes
+    // nothing that is still here.
+    entry.mobilityBootstrap = false;
+    entry.declaredBearers.reset();
 }
 
 void UeRegistry::beginNewAttach(EnbUeEntry &entry)

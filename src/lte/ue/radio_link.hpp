@@ -9,8 +9,10 @@
 // Minimal, LTE-specific NAS and IPv4 transport between the software UE and eNB.
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 #include <vector>
 #include <utility>
@@ -74,7 +76,27 @@ enum class MessageType : uint8_t
     // with no S1 connection starts a fresh Attach, which is a new logical EPS
     // session; this one is not, so the eNB must build the Initial UE Message
     // without tearing down any EPS bearer context it still holds for the UE.
-    NAS_UPLINK_MOBILITY = 19
+    NAS_UPLINK_MOBILITY = 19,
+    // The same mobility uplink, additionally declaring the bearer inventory the
+    // UE holds from its own NAS-confirmed contexts. Payload:
+    // MMEC(1)||M-TMSI(4)||defaultEbi(1)||dedicatedCount(1)||dedicatedEbi[count]
+    // ||protected NAS.
+    //
+    // A cell the UE reselected into has never seen the session's Attach, so it
+    // holds no logical EPS bearer context of its own and cannot tell the
+    // default bearer from the dedicated ones: the E-RAB list of an Initial
+    // Context Setup Request names only E-RAB identifiers and QoS and marks no
+    // roles, and inferring them from QCI or from the order of that list is
+    // guessing. This declaration supplies the roles the UE's own NAS already
+    // confirmed.
+    //
+    // It is a claim about the UE's session and it can only ever restrict what
+    // the network authorized: an E-RAB the declaration does not name is not
+    // established for this UE, and a declaration naming a bearer the network
+    // did not put in its E-RAB list establishes nothing at all. It therefore
+    // cannot make a network bearer true on its own, and it carries no
+    // subscriber key and no authentication material.
+    NAS_UPLINK_MOBILITY_CONTEXT = 20
 };
 
 struct Message
@@ -94,8 +116,55 @@ std::vector<uint8_t> Encode(const Message &message);
 Message Decode(const uint8_t *data, size_t size);
 std::vector<uint8_t> EncodeBearerRestoration(uint8_t ebi, uint32_t generation);
 std::pair<uint8_t, uint32_t> DecodeBearerRestoration(const std::vector<uint8_t> &payload);
+
+// A UE accepting the fresh transport of one restored bearer. It names the
+// bearer and the access epoch it confirms, and it restates the PDN address its
+// own NAS already assigned. A cell that never saw the session's Attach cannot
+// learn that address without decrypting NAS, and it is never invented here:
+// the UE only restates what it holds, and a cell that already knows the
+// address refuses any restatement that differs from it. No subscriber key and
+// no authentication material travels with it.
+struct BearerTransportReady
+{
+    uint8_t ebi{};
+    uint32_t generation{};
+    std::optional<std::array<uint8_t, 4>> ueIpv4;
+};
+
+std::vector<uint8_t> EncodeBearerTransportReady(uint8_t ebi, uint32_t generation,
+                                                const std::array<uint8_t, 4> &ueIpv4);
+// The two bounded forms: five octets naming only the bearer and the epoch, or
+// nine also restating the PDN address. Nothing else is a confirmation.
+BearerTransportReady DecodeBearerTransportReady(const uint8_t *data, size_t size);
+
 bool IsUplink(MessageType type);
 bool IsDownlink(MessageType type);
+
+// The bounded bearer inventory a NAS_UPLINK_MOBILITY_CONTEXT payload declares
+// alongside its NAS: the default EPS bearer identity the UE holds, plus the
+// dedicated identities on top of it. Every identity comes from a context the
+// UE's own NAS has already confirmed, so the set is known and finite.
+struct BearerInventory
+{
+    uint8_t defaultEbi{};
+    std::vector<uint8_t> dedicatedEbis;
+};
+
+// The declaration is a claim that travels over a simulated radio link, so its
+// encoding is bounded to the same capacity one UE can hold rather than to
+// whatever a datagram happens to carry.
+constexpr size_t MaxDeclaredDedicatedBearers = 7;
+
+// Encodes the inventory prefix of a NAS_UPLINK_MOBILITY_CONTEXT payload:
+// defaultEbi(1) || dedicatedCount(1) || dedicatedEbi[dedicatedCount].
+std::vector<uint8_t> EncodeBearerInventory(const BearerInventory &inventory);
+// Decodes that prefix and reports how many octets it occupies, so the protected
+// NAS that follows can be taken from the remainder. Throws DecodeError unless
+// the claim is exactly the bounded, ordered and unambiguous form
+// EncodeBearerInventory produces: an assignable default identity, at most
+// MaxDeclaredDedicatedBearers dedicated identities, each assignable, strictly
+// increasing and never the default one.
+size_t DecodeBearerInventory(const uint8_t *data, size_t size, BearerInventory &inventory);
 
 // Payload of one simulated paging occasion: the S-TMSI being paged plus the
 // served tracking area. Both the eNB fanout and the UE matching path share this

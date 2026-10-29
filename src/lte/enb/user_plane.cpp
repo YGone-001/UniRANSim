@@ -31,11 +31,11 @@ uint32_t AllocateLocalTeid()
     return value;
 }
 
-void DefaultBearerContext::establish(const BearerParameters &parameters)
+void DefaultBearerContext::establish(const BearerParameters &parameters, bool restoringAccess)
 {
     if (m_established)
         throw BearerError("An EPS bearer is already established");
-    if (logicalExists() && (parameters.erabId != m_parameters.erabId ||
+    if (logicalExists() && (!restoringAccess || parameters.erabId != m_parameters.erabId ||
         parameters.ueId != m_parameters.ueId || parameters.linkedDefaultEbi != m_parameters.linkedDefaultEbi))
         throw BearerError("Access restoration cannot replace a logical EPS bearer identity");
     if (parameters.erabId < 5 || parameters.erabId > 15 || parameters.qci == 0 || parameters.ueId == 0 ||
@@ -47,7 +47,7 @@ void DefaultBearerContext::establish(const BearerParameters &parameters)
         (parameters.linkedDefaultEbi < 5 || parameters.linkedDefaultEbi > 15 ||
          parameters.linkedDefaultEbi == parameters.erabId))
         throw BearerError("A dedicated bearer has an invalid linked default EBI");
-    m_restoringAccess = logicalExists();
+    m_restoringAccess = restoringAccess;
     m_parameters = parameters;
     m_established = true;
     m_ueReady = false;

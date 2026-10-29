@@ -336,7 +336,11 @@ TEST_CASE("lte/lifecycle: cell reselection retires the old cell's access and kee
     CHECK_FALSE(context.mmeUeS1apId.has_value());
     CHECK_FALSE(context.enbTeid.has_value());
     CHECK_FALSE(context.sgwTeid.has_value());
-    CHECK(context.accessGeneration == 0);
+    // The new access epoch is a real one, numbered one. Zero is reserved for
+    // "no epoch at all" and every generation-bound message carrying it is
+    // refused, so a target cell whose first epoch were zero could never be
+    // given a generation-bound restoration at all.
+    CHECK(context.accessGeneration == 1);
 
     // The session is not the cell. Registration, security, subscriber identity,
     // authorized tracking areas, the PDN address and the logical bearer all

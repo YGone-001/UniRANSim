@@ -109,9 +109,36 @@ struct MobilityContext
     void startServiceRequest();
     void onServiceRestored(bool userPlaneReady = true);
     void onServiceRestored(uint32_t enbId, uint32_t mmeId, uint32_t localTeid, uint32_t remoteTeid);
+    // Access transport restored while a Tracking Area Update is still
+    // outstanding. Unlike a Service Request restoration this does not complete
+    // any procedure: the Update is answered by its own Accept, and inventing an
+    // outcome here would report an update that has not happened.
+    void onTauAccessRestored(bool userPlaneReady);
     void startDetach();
     void onDetachAccepted();
     void startTau(bool periodic);
+    // The complete effect one Tracking Area Update Accept would have. It is
+    // produced only after every part of the Accept has been checked against the
+    // live context, and it holds the assignments rather than applying them, so
+    // a partially valid Accept cannot be half-applied: either the plan exists
+    // and committing it cannot fail, or nothing has changed at all.
+    struct TauAcceptancePlan
+    {
+        std::optional<std::array<uint8_t, 11>> guti;
+        std::optional<std::vector<Tai>> taiList;
+        std::optional<uint8_t> t3412;
+        // A newly assigned GUTI is only taken into use once the network has the
+        // protected TAU Complete that acknowledges it.
+        bool completeRequired{};
+    };
+    // Validates a Tracking Area Update Accept in full without touching any
+    // state. Throws on anything this UE would refuse to record.
+    [[nodiscard]] TauAcceptancePlan planTauAccepted(uint8_t updateResult,
+                                                    std::optional<std::array<uint8_t, 11>> newGuti,
+                                                    std::optional<std::vector<uint8_t>> newTaiList,
+                                                    std::optional<uint8_t> newT3412) const;
+    // Applies a previously planned acceptance. This cannot fail.
+    void commitTauAccepted(const TauAcceptancePlan &plan);
     // Completes a Tracking Area Update. `updateResult` is the EPS update result
     // the Accept carried, and only "TA updated" is an EPS-only update this UE
     // performs: one announcing a combined TA/LA update or a pre-Release 8 ISDN
