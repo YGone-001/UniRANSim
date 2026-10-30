@@ -241,6 +241,23 @@ size_t DecodeBearerInventory(const uint8_t *data, size_t size, BearerInventory &
     return 2U + count;
 }
 
+Message BuildMobilityContext(uint32_t ueId, const std::array<uint8_t, 11> &guti, const BearerInventory &inventory,
+                             const std::vector<uint8_t> &protectedNas)
+{
+    if (protectedNas.empty())
+        throw DecodeError("A mobility uplink context must carry a protected NAS");
+    // The declaration is encoded first, so an inventory the wire cannot express
+    // is refused before any frame exists rather than after one has been sent.
+    const auto declared = EncodeBearerInventory(inventory);
+    std::vector<uint8_t> payload;
+    payload.reserve(5 + declared.size() + protectedNas.size());
+    payload.push_back(guti[6]);
+    payload.insert(payload.end(), guti.begin() + 7, guti.end());
+    payload.insert(payload.end(), declared.begin(), declared.end());
+    payload.insert(payload.end(), protectedNas.begin(), protectedNas.end());
+    return {MessageType::NAS_UPLINK_MOBILITY_CONTEXT, ueId, std::move(payload)};
+}
+
 bool IsUplink(MessageType type)
 {
     return type == MessageType::NAS_UPLINK || type == MessageType::DATA_UPLINK || type == MessageType::BEARER_READY ||

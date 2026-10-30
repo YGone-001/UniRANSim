@@ -43,6 +43,30 @@ void LogState(State state)
     Log("INFO", std::string("State=") + ToString(state));
 }
 
+// Which simulated-radio message type is valid where. The three uplink NAS
+// routes are alternatives, not fallbacks of one another: no path ever swaps one
+// for another after the fact.
+//
+//   NAS_UPLINK  every uplink NAS the MME already has an S1 UE context for:
+//     Attach, Authentication and Security Mode, a standalone Normal or Periodic
+//     Tracking Area Update, Detach, the ESM of a dedicated bearer activation or
+//     modification, TAU Complete, and the retransmission of any of these.
+//
+//   NAS_UPLINK_MOBILITY_CONTEXT  the ECM-IDLE cell reselection bootstrap and
+//     nothing else: the single uplink that opens a new S1 connection at a cell
+//     whose UE registry is fresh, declaring beside its protected NAS the EPS
+//     bearer identities that cell has to restore. Its retransmissions repeat
+//     that exact frame while the new connection is still the one being opened,
+//     and travel as NAS_UPLINK once the MME has established the S1 UE context.
+//     There is no downgrade of this form to the legacy one.
+//
+//   NAS_UPLINK_MOBILITY  the identity-only ancestor of the form above. It stays
+//     decodable for wire compatibility and is selected by no current UE
+//     procedure: it declares no bearers, so a fresh target cannot restore from
+//     it.
+//
+//   SERVICE_REQUEST  the compact four-octet EPS Service Request, used by a
+//     Service Request and by the answer to a paging indication.
 void SendNas(udp::UdpServer &socket, const InetAddress &enb, uint32_t ueId, std::vector<uint8_t> nas)
 {
     auto frame = link::Encode({link::MessageType::NAS_UPLINK, ueId, std::move(nas)});
@@ -73,19 +97,21 @@ void SendProtected(udp::UdpServer &socket, const InetAddress &enb, uint32_t ueId
 }
 
 // Protected uplink NAS that continues an existing EPS session over a new S1
-// connection at a reselected cell. The identity prefix is derived from the
-// UE's own valid GUTI, so the target eNB can address the Initial UE Message
-// without the UE presenting any identifier the source cell allocated.
-void SendMobilityNas(udp::UdpServer &socket, const InetAddress &enb, uint32_t ueId,
-                     const std::array<uint8_t, 11> &guti, const std::vector<uint8_t> &protectedNas)
+// connection at a reselected cell. The frame carries the bearer inventory the
+// target has to restore beside the protected NAS it has to deliver, and the
+// identity prefix is derived from the UE's own valid GUTI, so the target eNB can
+// address the Initial UE Message without the UE presenting any identifier the
+// source cell allocated.
+//
+// The caller passes a frame that has already been built and validated: the
+// declaration is encoded before a frame exists, so an inventory the wire cannot
+// express is refused before anything is transmitted rather than after. Because
+// the whole frame travels through here, a retransmission repeats the same
+// message type, the same declaration bytes and the same protected NAS.
+void SendMobilityNas(udp::UdpServer &socket, const InetAddress &enb, const link::Message &frame)
 {
-    std::vector<uint8_t> payload;
-    payload.reserve(5 + protectedNas.size());
-    payload.push_back(guti[6]);
-    payload.insert(payload.end(), guti.begin() + 7, guti.end());
-    payload.insert(payload.end(), protectedNas.begin(), protectedNas.end());
-    auto frame = link::Encode({link::MessageType::NAS_UPLINK_MOBILITY, ueId, std::move(payload)});
-    socket.Send(enb, frame.data(), frame.size());
+    const auto wire = link::Encode(frame);
+    socket.Send(enb, wire.data(), wire.size());
 }
 
 // Verifies and recovers a security-protected downlink NAS message, then records
@@ -133,12 +159,14 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
     bool scenarioTriggered = false;
     bool idleReleaseRequested = false;
     std::vector<uint8_t> pendingWire;
-    // Which uplink route the outstanding NAS left by. A retransmission repeats
-    // that route: an uplink that opened a new S1 connection on a reselected
-    // cell is a mobility uplink, and re-sending it as an ordinary uplink NAS
-    // transport would present a different message to a cell that has no S1
-    // connection yet.
-    bool pendingWireViaMobility = false;
+    // The complete radio message an outstanding mobility uplink has to repeat.
+    // It is frozen when it first leaves the UE, so a retransmission repeats the
+    // same message type, the same declared bearer inventory and the same
+    // protected NAS instead of rebuilding the declaration from bearer state
+    // that may since have moved on. It is cleared the moment the MME has
+    // established the S1 UE context and later repeats can travel as ordinary
+    // uplink NAS transport.
+    std::optional<link::Message> pendingMobilityFrame;
     int procedureRetries = 0;
     auto procedureDeadline = std::chrono::steady_clock::time_point::max();
     // Network-triggered paging bookkeeping. Nothing here can make the UE send a
@@ -199,7 +227,7 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 mobility.startDetach();
                 auto plain = nas::EncodeDetachRequest(security.ksi, *mobility.guti, config.lifecycle.switchOff);
                 pendingWire = nas::Protect(security, true, false, plain);
-                pendingWireViaMobility = false;
+                pendingMobilityFrame.reset();
                 SendNas(socket, enb, ueId, pendingWire);
                 security.ulNasCount = (security.ulNasCount + 1U) & 0xFFFFFFU;
                 procedureDeadline = now + std::chrono::milliseconds(config.lifecycle.procedureTimeoutMs);
@@ -228,7 +256,7 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                     security.ksi, *mobility.guti,
                     RetainedBearerIdentities(mobility.defaultEbi, dedicatedBearers), periodic);
                 pendingWire = nas::Protect(security, true, false, plain);
-                pendingWireViaMobility = false;
+                pendingMobilityFrame.reset();
                 SendNas(socket, enb, ueId, pendingWire);
                 security.ulNasCount = (security.ulNasCount + 1U) & 0xFFFFFFU;
                 procedureDeadline = now + std::chrono::milliseconds(config.lifecycle.procedureTimeoutMs);
@@ -275,7 +303,7 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 {
                     mobility.startServiceRequest();
                     pendingWire = nas::EncodeServiceRequest(security);
-                    pendingWireViaMobility = false;
+                    pendingMobilityFrame.reset();
                     SendServiceRequest(socket, enb, ueId, *mobility.guti, pendingWire);
                     security.ulNasCount = (security.ulNasCount + 1U) & 0xFFFFFFU;
                     ++recoveryAttempts;
@@ -325,14 +353,16 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
             }
             if (mobility.pending == PendingProcedure::SERVICE_REQUEST)
                 SendServiceRequest(socket, enb, ueId, *mobility.guti, pendingWire);
-            else if (pendingWireViaMobility)
+            else if (pendingMobilityFrame.has_value())
                 // A retransmission of a procedure that is still opening an S1
-                // connection has to leave by the same route the first one used.
+                // connection repeats the very frame the first transmission sent.
                 // This is decided from how the original left rather than from
                 // whether the MME has assigned an identifier yet, because the
                 // UE has never been told that identifier and a guess would
-                // change the message a reselected cell receives.
-                SendMobilityNas(socket, enb, ueId, *mobility.guti, pendingWire);
+                // change the message a reselected cell receives. The frame is
+                // frozen, so the retry cannot rebuild the declared bearer
+                // inventory from state that has moved on since the first send.
+                SendMobilityNas(socket, enb, *pendingMobilityFrame);
             else
                 SendNas(socket, enb, ueId, pendingWire);
             ++procedureRetries;
@@ -513,12 +543,39 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                         else if (decision == TauDecision::NORMAL_TAU)
                         {
                             mobility.startTau(false);
-                            auto plain = nas::EncodeTauRequest(
-                                security.ksi, *mobility.guti,
-                                RetainedBearerIdentities(mobility.defaultEbi, dedicatedBearers), false);
-                            pendingWire = nas::Protect(security, true, false, plain);
-                            pendingWireViaMobility = true;
-                            SendMobilityNas(socket, enb, ueId, *mobility.guti, pendingWire);
+                            // The declaration is derived from the NAS-confirmed
+                            // bearer state and encoded before any frame exists,
+                            // so an inventory the wire cannot express is refused
+                            // here rather than transmitted as a claim a fresh
+                            // target would restore from. There is no fallback to
+                            // the identity-only mobility form: a target that
+                            // needs the declaration is never given an uplink
+                            // without one, and an unusable one stops the
+                            // procedure before any misleading frame exists.
+                            try
+                            {
+                                const auto inventory =
+                                    ValidateBearerInventory(mobility.defaultEbi, dedicatedBearers);
+                                auto plain = nas::EncodeTauRequest(
+                                    security.ksi, *mobility.guti,
+                                    RetainedBearerIdentities(mobility.defaultEbi, dedicatedBearers), false);
+                                pendingWire = nas::Protect(security, true, false, plain);
+                                pendingMobilityFrame =
+                                    link::BuildMobilityContext(ueId, *mobility.guti, inventory, pendingWire);
+                            }
+                            catch (const std::exception &e)
+                            {
+                                pendingWire.clear();
+                                pendingMobilityFrame.reset();
+                                Log("ERROR", std::string("Refusing to open the reselected cell without a valid "
+                                                         "bearer inventory: ") +
+                                                 e.what());
+                                return 1;
+                            }
+                            SendMobilityNas(socket, enb, *pendingMobilityFrame);
+                            // Exactly one uplink NAS COUNT opens the procedure.
+                            // The retransmissions repeat the frozen frame and
+                            // consume none of their own.
                             security.ulNasCount = (security.ulNasCount + 1U) & 0xFFFFFFU;
                             procedureRetries = 0;
                             procedureDeadline = std::chrono::steady_clock::now() +
@@ -537,7 +594,7 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                     {
                         mobility.startServiceRequest();
                         pendingWire = nas::EncodeServiceRequest(security);
-                        pendingWireViaMobility = false;
+                        pendingMobilityFrame.reset();
                         SendServiceRequest(socket, enb, ueId, *mobility.guti, pendingWire);
                         security.ulNasCount = (security.ulNasCount + 1U) & 0xFFFFFFU;
                         procedureRetries = 0;
@@ -602,7 +659,7 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 if (!compact.has_value())
                     throw std::runtime_error("Accepted paging produced no compact Service Request");
                 pendingWire = std::move(*compact);
-                pendingWireViaMobility = false;
+                pendingMobilityFrame.reset();
                 SendServiceRequest(socket, enb, ueId, *mobility.guti, pendingWire);
                 ++pagingServiceRequests;
                 pagingWaitArmed = false;
@@ -634,7 +691,7 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 // The S1 connection now exists, so an outstanding uplink no
                 // longer has to open one and its retransmissions travel as
                 // ordinary uplink NAS transport.
-                pendingWireViaMobility = false;
+                pendingMobilityFrame.reset();
                 // Exactly one trigger owns a restoration. A page that won the
                 // race against an armed recovery timer is a paging restoration
                 // even though the timer had already been scheduled.
@@ -1002,7 +1059,7 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                     Log("INFO", "Dedicated EPS bearer " + std::to_string(ebi) +
                                     " was not retained by the network and is no longer active");
                 pendingWire.clear();
-                pendingWireViaMobility = false;
+                pendingMobilityFrame.reset();
                 if (acceptance.completeRequired)
                     SendProtected(socket, enb, ueId, security, false, nas::EncodeTauComplete());
                 Log("INFO", std::string("Tracking Area Update accepted; context preserved") +

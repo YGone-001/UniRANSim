@@ -166,6 +166,20 @@ std::vector<uint8_t> EncodeBearerInventory(const BearerInventory &inventory);
 // increasing and never the default one.
 size_t DecodeBearerInventory(const uint8_t *data, size_t size, BearerInventory &inventory);
 
+// Builds the complete NAS_UPLINK_MOBILITY_CONTEXT message a reselected cell
+// receives: MMEC(1) || M-TMSI(4 BE) || bearer inventory || protected NAS.
+//
+// The identity prefix is derived from the UE's own valid GUTI, so the target
+// eNB can address the Initial UE Message without the UE presenting any
+// identifier the source cell allocated. The declaration is encoded before a
+// frame exists, so an inventory the wire cannot express and a mobility uplink
+// with no protected NAS are both refused here rather than transmitted as a
+// claim a target would act on. The protected NAS bytes are carried verbatim:
+// they are never rewritten or trimmed to make room for the declaration, and no
+// subscriber key or authentication vector is ever placed beside them.
+Message BuildMobilityContext(uint32_t ueId, const std::array<uint8_t, 11> &guti, const BearerInventory &inventory,
+                             const std::vector<uint8_t> &protectedNas);
+
 // Payload of one simulated paging occasion: the S-TMSI being paged plus the
 // served tracking area. Both the eNB fanout and the UE matching path share this
 // encoding, so a notification cannot be reinterpreted on the way.

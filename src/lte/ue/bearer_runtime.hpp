@@ -4,6 +4,9 @@
 #pragma once
 #include "lifecycle.hpp"
 #include "nas.hpp"
+#include "radio_link.hpp"
+
+#include <algorithm>
 
 namespace lte::ue
 {
@@ -40,6 +43,45 @@ inline std::vector<uint8_t> RetainedBearerIdentities(uint8_t defaultEbi,
     for (const auto &bearer : bearers)
         identities.push_back(bearer.ebi);
     return identities;
+}
+
+// The declaration a freshly reached cell needs before it can restore this
+// session: the network-assigned default EPS bearer identity plus every
+// dedicated identity the UE still holds. The identities are read back out of
+// the live NAS-confirmed contexts and out of nothing else, so a default the
+// network never assigned is reported rather than rounded to a plausible one, a
+// dedicated context the network released is no longer present at all, and no
+// QCI, E-RAB list order or earlier registry contents can leak into the claim.
+//
+// The claim is a set of identities, and the wire encodes it in ascending order,
+// so the dedicated identities are canonicalised here rather than presented in
+// whatever order the network happened to activate them in. Anything the
+// encoding cannot express — an unassigned default, a dedicated identity equal
+// to it or linked to a different default, a duplicate, or more identities than
+// one UE can hold — is refused here instead of being transmitted as a
+// declaration a target would act on. There is no fallback to a plainer form: a
+// fresh target that needs the declaration is never given a message without it.
+inline link::BearerInventory ValidateBearerInventory(uint8_t defaultEbi,
+                                                     const std::vector<DedicatedBearerRuntime> &bearers)
+{
+    if (defaultEbi < 5 || defaultEbi > 15)
+        throw LifecycleError("Cannot declare an unassigned default EPS bearer identity");
+    link::BearerInventory inventory;
+    inventory.defaultEbi = defaultEbi;
+    inventory.dedicatedEbis.reserve(bearers.size());
+    for (const auto &bearer : bearers)
+    {
+        if (bearer.ebi < 5 || bearer.ebi > 15 || bearer.ebi == defaultEbi || bearer.linkedEbi != defaultEbi)
+            throw LifecycleError("Cannot declare a dedicated EPS bearer that is not valid on this default bearer");
+        if (std::find(inventory.dedicatedEbis.begin(), inventory.dedicatedEbis.end(), bearer.ebi) !=
+            inventory.dedicatedEbis.end())
+            throw LifecycleError("Cannot declare a duplicated dedicated EPS bearer identity");
+        inventory.dedicatedEbis.push_back(bearer.ebi);
+    }
+    std::sort(inventory.dedicatedEbis.begin(), inventory.dedicatedEbis.end());
+    if (inventory.dedicatedEbis.size() > link::MaxDeclaredDedicatedBearers)
+        throw LifecycleError("Cannot declare more dedicated EPS bearer identities than one UE can hold");
+    return inventory;
 }
 
 struct BearerReconciliation
