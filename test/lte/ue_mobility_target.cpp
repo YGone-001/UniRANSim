@@ -32,6 +32,15 @@
 // they need the local user plane. Those legs are covered at the target in
 // test/lte/mobility_target.cpp and are reported as TUN-gated rather than
 // simulated.
+//
+// The third case in this file closes that gap for real. It runs the same
+// production UE and the same production target eNB, but it asks for an actual
+// kernel TUN device and moves real IPv4 datagrams through it in both
+// directions, so the transport confirmations of the target are produced by the
+// running UE rather than asserted at the target in isolation. It needs root, a
+// usable /dev/net/tun and a private network namespace, so it is decorated with
+// doctest::skip() and is only forced to run by the privileged CI job. See the
+// case itself for the exact contract it verifies.
 
 #include <ext/doctest/doctest.h>
 
@@ -41,9 +50,11 @@
 
 #include <lte/enb/codec.hpp>
 #include <lte/enb/config.hpp>
+#include <lte/enb/gtpu.hpp>
 #include <lte/enb/multiplexer.hpp>
 #include <lte/enb/ue_registry.hpp>
 #include <lte/enb/user_plane.hpp>
+#include <lte/ip_packet.hpp>
 #include <lte/ue/app.hpp>
 #include <lte/ue/config.hpp>
 #include <lte/ue/nas.hpp>
@@ -53,8 +64,13 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <set>
@@ -64,6 +80,15 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+#include <arpa/inet.h>
+#include <dirent.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 namespace
 {
@@ -84,7 +109,20 @@ using Clock = std::chrono::steady_clock;
 // reselected cell is the real target eNB on its own radio endpoint in tracking
 // area 460/02/2, so leaving the registered tracking area list is what forces
 // the reselection to open a new S1 connection there.
-std::string UeYaml(uint16_t uePort, uint16_t sourcePort, uint16_t targetPort, int procedureTimeoutMs, int maxRetries)
+// The children of the `tun:` mapping are supplied by the caller, so one case
+// can ask for the control-plane-only route that keeps the ordinary suite
+// non-root while the privileged case demands a real kernel TUN device.
+const char *const kControlPlaneOnlyTun = "  required: false\n  routes: ['192.168.5.7/24']";
+
+const char *const kPrivilegedTun =
+    "  required: true\n"
+    "  namePrefix: \"u13ad\"\n"
+    "  mtu: 1400\n"
+    "  routes:\n"
+    "    - \"198.18.0.2/32\"";
+
+std::string UeYaml(uint16_t uePort, uint16_t sourcePort, uint16_t targetPort, int procedureTimeoutMs, int maxRetries,
+                   const std::string &tunBlock = kControlPlaneOnlyTun)
 {
     std::ostringstream out;
     out << R"(imsi: '460020123456789'
@@ -113,8 +151,8 @@ enbLink:
        << targetPort << R"(
   timeoutMs: 10000
 tun:
-  required: false
-  routes: ['192.168.5.7/24']
+)"
+       << tunBlock << R"(
 lifecycle:
   scenario: idle-reselection
   triggerAfterMs: 1000
@@ -242,6 +280,299 @@ s1ap::ErabToBeSetupItem ErabWithNas(uint8_t ebi, uint8_t qci, uint32_t sgwTeid)
 }
 
 // ---------------------------------------------------------------------------
+// Kernel networking observation for the privileged case
+// ---------------------------------------------------------------------------
+
+// The privileged case moves real IPv4 traffic through a real kernel TUN, so it
+// has to be able to see what the kernel did: which interface the production UE
+// allocated, what address and MTU it was given, and which route points at it.
+// Everything here is read-only observation of the running kernel; the only
+// command ever executed is the one the sweep guard uses to undo a leftover
+// interface from a run that died before the production UE could release it.
+
+const char *const kTunPrefix = "u13ad";
+const char *const kTunRoute = "198.18.0.2/32";
+
+// The PDN address the Attach Accept assigns and the peer the UE's explicit
+// route names. The peer is not a local address: it is reached only through the
+// TUN, which is what makes the routing leg of the scenario real.
+constexpr std::array<uint8_t, 4> kPdnIpv4{10, 0, 0, 1};
+constexpr std::array<uint8_t, 4> kPeerIpv4{198, 18, 0, 2};
+constexpr uint16_t kApplicationPort = 47349;
+constexpr uint16_t kPeerPort = 47350;
+constexpr int kTunMtu = 1400;
+
+// /proc/net/route prints each IPv4 field as %08X of the little-endian memory
+// word, so 198.18.0.2 appears as 020012C6.
+std::string RouteHex(const std::array<uint8_t, 4> &address)
+{
+    char text[9];
+    std::snprintf(text, sizeof(text), "%02X%02X%02X%02X", address[3], address[2], address[1], address[0]);
+    return text;
+}
+
+std::vector<std::string> ListInterfaces(const std::string &prefix)
+{
+    std::vector<std::string> names;
+    struct if_nameindex *list = if_nameindex();
+    if (list == nullptr)
+        return names;
+    for (struct if_nameindex *item = list; item->if_name != nullptr; ++item)
+    {
+        const std::string name = item->if_name;
+        if (prefix.empty() || name.rfind(prefix, 0) == 0)
+            names.push_back(name);
+    }
+    if_freenameindex(list);
+    return names;
+}
+
+bool InterfaceExists(const std::string &name)
+{
+    if (name.empty())
+        return false;
+    const auto names = ListInterfaces("");
+    return std::find(names.begin(), names.end(), name) != names.end();
+}
+
+struct InterfaceAddress
+{
+    std::array<uint8_t, 4> address{};
+    int prefixLength{};
+};
+
+std::optional<InterfaceAddress> InterfaceIpv4(const std::string &name)
+{
+    struct ifaddrs *list = nullptr;
+    if (getifaddrs(&list) != 0)
+        return std::nullopt;
+    std::optional<InterfaceAddress> found;
+    for (struct ifaddrs *item = list; item != nullptr; item = item->ifa_next)
+    {
+        if (item->ifa_addr == nullptr || item->ifa_addr->sa_family != AF_INET || item->ifa_name == nullptr)
+            continue;
+        if (name != item->ifa_name)
+            continue;
+        InterfaceAddress out;
+        const auto *sin = reinterpret_cast<const sockaddr_in *>(item->ifa_addr);
+        const uint32_t raw = ntohl(sin->sin_addr.s_addr);
+        out.address = {static_cast<uint8_t>(raw >> 24U), static_cast<uint8_t>(raw >> 16U),
+                       static_cast<uint8_t>(raw >> 8U), static_cast<uint8_t>(raw)};
+        if (item->ifa_netmask != nullptr && item->ifa_netmask->sa_family == AF_INET)
+        {
+            const auto *mask = reinterpret_cast<const sockaddr_in *>(item->ifa_netmask);
+            uint32_t bits = ntohl(mask->sin_addr.s_addr);
+            int count = 0;
+            while (bits != 0)
+            {
+                count += static_cast<int>(bits & 1U);
+                bits >>= 1U;
+            }
+            out.prefixLength = count;
+        }
+        found = out;
+    }
+    freeifaddrs(list);
+    return found;
+}
+
+std::optional<int> InterfaceMtu(const std::string &name)
+{
+    if (name.empty() || name.size() >= IFNAMSIZ)
+        return std::nullopt;
+    ifreq ifr{};
+    std::memcpy(ifr.ifr_name, name.c_str(), name.size());
+    const int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0)
+        return std::nullopt;
+    const int ok = ioctl(fd, SIOCGIFMTU, &ifr);
+    close(fd);
+    if (ok < 0)
+        return std::nullopt;
+    return ifr.ifr_mtu;
+}
+
+bool RouteExists(const std::array<uint8_t, 4> &destination, const std::string &interfaceName)
+{
+    std::ifstream input("/proc/net/route");
+    if (!input)
+        return false;
+    std::string line;
+    std::getline(input, line); // column header
+    const std::string wanted = RouteHex(destination);
+    while (std::getline(input, line))
+    {
+        std::istringstream fields(line);
+        std::string iface, dest, gateway, flags, refCnt, use, metric, mask;
+        if (!(fields >> iface >> dest >> gateway >> flags >> refCnt >> use >> metric >> mask))
+            continue;
+        if (!interfaceName.empty() && iface != interfaceName)
+            continue;
+        if (dest == wanted)
+            return true;
+    }
+    return false;
+}
+
+std::vector<std::string> DefaultRouteLines()
+{
+    std::vector<std::string> lines;
+    std::ifstream input("/proc/net/route");
+    std::string line;
+    std::getline(input, line);
+    while (std::getline(input, line))
+    {
+        std::istringstream fields(line);
+        std::string iface, dest;
+        if (!(fields >> iface >> dest))
+            continue;
+        if (dest == "00000000")
+            lines.push_back(line);
+    }
+    return lines;
+}
+
+// The network namespace directory is whatever the host exposes; a run that
+// created none must leave it exactly as it found it.
+std::vector<std::string> ListNetworkNamespaces()
+{
+    std::vector<std::string> names;
+    DIR *directory = opendir("/var/run/netns");
+    if (directory == nullptr)
+        return names;
+    while (const dirent *entry = readdir(directory))
+    {
+        const std::string name = entry->d_name;
+        if (name != "." && name != "..")
+            names.push_back(name);
+    }
+    closedir(directory);
+    std::sort(names.begin(), names.end());
+    return names;
+}
+
+uint16_t OnesComplementSum(const uint8_t *data, size_t size)
+{
+    uint32_t sum = 0;
+    for (size_t i = 0; i + 1 < size; i += 2)
+        sum += (static_cast<uint32_t>(data[i]) << 8U) | data[i + 1];
+    if (size % 2 != 0)
+        sum += static_cast<uint32_t>(data[size - 1]) << 8U;
+    while ((sum >> 16U) != 0)
+        sum = (sum & 0xFFFFU) + (sum >> 16U);
+    return static_cast<uint16_t>(sum);
+}
+
+// A complete IPv4/UDP datagram with both checksums filled in. The kernel
+// validates both on the way into a TUN, so a packet without them is dropped
+// silently and could never reach the application socket it is addressed to.
+std::vector<uint8_t> BuildUdpIpv4(const std::array<uint8_t, 4> &source, const std::array<uint8_t, 4> &destination,
+                                  uint16_t sourcePort, uint16_t destinationPort, const std::vector<uint8_t> &payload)
+{
+    const size_t udpLength = 8 + payload.size();
+    const size_t totalLength = 20 + udpLength;
+    std::vector<uint8_t> packet(totalLength, 0);
+    packet[0] = 0x45;
+    packet[2] = static_cast<uint8_t>(totalLength >> 8U);
+    packet[3] = static_cast<uint8_t>(totalLength);
+    packet[6] = 0x40; // do not fragment, fragment offset zero
+    packet[8] = 64;
+    packet[9] = 17;
+    std::copy(source.begin(), source.end(), packet.begin() + 12);
+    std::copy(destination.begin(), destination.end(), packet.begin() + 16);
+    const uint16_t ipSum = static_cast<uint16_t>(~OnesComplementSum(packet.data(), 20));
+    packet[10] = static_cast<uint8_t>(ipSum >> 8U);
+    packet[11] = static_cast<uint8_t>(ipSum);
+
+    packet[20] = static_cast<uint8_t>(sourcePort >> 8U);
+    packet[21] = static_cast<uint8_t>(sourcePort);
+    packet[22] = static_cast<uint8_t>(destinationPort >> 8U);
+    packet[23] = static_cast<uint8_t>(destinationPort);
+    packet[24] = static_cast<uint8_t>(udpLength >> 8U);
+    packet[25] = static_cast<uint8_t>(udpLength);
+    std::copy(payload.begin(), payload.end(), packet.begin() + 28);
+
+    // The UDP checksum covers the IPv4 pseudo-header as well as the datagram.
+    std::vector<uint8_t> pseudo;
+    pseudo.insert(pseudo.end(), source.begin(), source.end());
+    pseudo.insert(pseudo.end(), destination.begin(), destination.end());
+    pseudo.push_back(0);
+    pseudo.push_back(17);
+    pseudo.push_back(static_cast<uint8_t>(udpLength >> 8U));
+    pseudo.push_back(static_cast<uint8_t>(udpLength));
+    pseudo.insert(pseudo.end(), packet.begin() + 20, packet.end());
+    uint16_t udpSum = static_cast<uint16_t>(~OnesComplementSum(pseudo.data(), pseudo.size()));
+    if (udpSum == 0)
+        udpSum = 0xFFFF;
+    packet[26] = static_cast<uint8_t>(udpSum >> 8U);
+    packet[27] = static_cast<uint8_t>(udpSum);
+    return packet;
+}
+
+// Only the interface names the privileged case is allowed to remove ever reach
+// the shell, and only through this guard.
+bool IsSweepableInterface(const std::string &name)
+{
+    if (name.rfind(kTunPrefix, 0) != 0 || name.size() <= std::strlen(kTunPrefix))
+        return false;
+    for (size_t i = std::strlen(kTunPrefix); i < name.size(); ++i)
+        if (name[i] < '0' || name[i] > '9')
+            return false;
+    return true;
+}
+
+// Undoes a TUN interface or route left behind by a run that aborted before the
+// production UE could release it, so a failed assertion never leaves the host
+// networking modified. A clean run removes nothing and records nothing.
+// A sweep command is best effort: a non-zero status simply means the resource
+// was already gone, and it must never become the run's verdict.
+void SweepCommand(const std::string &command)
+{
+    if (std::system(command.c_str()) != 0)
+        return;
+}
+
+class TunSweepGuard
+{
+  public:
+    TunSweepGuard() = default;
+    TunSweepGuard(const TunSweepGuard &) = delete;
+    TunSweepGuard &operator=(const TunSweepGuard &) = delete;
+
+    ~TunSweepGuard()
+    {
+        for (const auto &name : ListInterfaces(kTunPrefix))
+        {
+            if (!IsSweepableInterface(name))
+                continue;
+            swept.push_back(name);
+            SweepCommand("ip link del dev " + name + " >/dev/null 2>&1");
+        }
+        if (RouteExists(kPeerIpv4, std::string{}))
+        {
+            swept.push_back(kTunRoute);
+            SweepCommand(std::string("ip route del ") + kTunRoute + " >/dev/null 2>&1");
+        }
+    }
+
+    std::vector<std::string> swept;
+};
+
+// Decodes one captured radio frame without letting a malformed one escape as an
+// exception into the harness.
+std::optional<link::Message> DecodeRadio(const std::vector<uint8_t> &frame)
+{
+    try
+    {
+        return link::Decode(frame.data(), frame.size());
+    }
+    catch (const std::exception &)
+    {
+        return std::nullopt;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The laboratory: a real UE, a fake serving MME and a real target eNB
 // ---------------------------------------------------------------------------
 
@@ -253,15 +584,41 @@ s1ap::ErabToBeSetupItem ErabWithNas(uint8_t ebi, uint8_t qci, uint32_t sgwTeid)
 // running UE logs through std::cout, which LogCapture owns until finish(), and
 // an assertion reported into a captured stream is invisible. Every observation
 // is instead recorded and asserted after the capture has been released.
+// The ordinary cases drive the target's simulated-radio endpoint directly. The
+// privileged case relays that endpoint through a capturing one of its own, so
+// the exact frames the production UE writes become observable: every datagram
+// is forwarded verbatim in both directions and nothing is synthesised.
+struct LabOptions
+{
+    int procedureTimeoutMs{30000};
+    int maxRetries{2};
+    std::string tunBlock{kControlPlaneOnlyTun};
+    bool radioTap{false};
+};
+
 class Lab
 {
   public:
-    Lab(uint16_t uePort, uint16_t sourcePort, int procedureTimeoutMs = 30000, int maxRetries = 2)
+    Lab(uint16_t uePort, uint16_t sourcePort, const LabOptions &options)
         : m_capture(std::make_unique<lte::test::LogCapture>()), m_source("127.0.0.1", sourcePort)
     {
         m_target = std::make_unique<EnbMultiplexer>(TestEnbConfig(0x2C1, "127.0.0.3", 2), m_targetWire);
-        m_config = lte::ue::ParseConfig(UeYaml(uePort, sourcePort, m_target->ueLinkAddress().getPort(), procedureTimeoutMs,
-                                      maxRetries));
+        m_targetRadio = m_target->ueLinkAddress();
+        uint16_t targetRadioPort = m_targetRadio.getPort();
+        if (options.radioTap)
+        {
+            m_tap.emplace("127.0.0.1", 0);
+            targetRadioPort = m_tap->LocalAddress().getPort();
+        }
+        m_config = lte::ue::ParseConfig(UeYaml(uePort, sourcePort, targetRadioPort, options.procedureTimeoutMs,
+                                               options.maxRetries, options.tunBlock));
+    }
+
+    // The entry point the ordinary cases have always used; their wiring is
+    // untouched by the privileged one.
+    Lab(uint16_t uePort, uint16_t sourcePort, int procedureTimeoutMs = 30000, int maxRetries = 2)
+        : Lab(uePort, sourcePort, LabOptions{procedureTimeoutMs, maxRetries, kControlPlaneOnlyTun, false})
+    {
     }
 
     void scriptDedicated(std::vector<uint8_t> activate) { m_activate = std::move(activate); }
@@ -296,6 +653,7 @@ class Lab
         m_shutdown = true;
         if (m_ue.joinable())
             m_ue.join();
+        closeApplicationSocket();
     }
 
     // Drives both simulated endpoints until `done()` holds or the budget runs
@@ -309,7 +667,12 @@ class Lab
             while (pumpSource())
             {
             }
+            while (pumpTap())
+            {
+            }
             m_target->poll();
+            pumpSgw();
+            pumpApplication();
             if (done())
                 return true;
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -354,12 +717,156 @@ class Lab
         return drive([this] { return m_targetWire.count(kUplinkNasTransport) >= 1; }, timeoutMs);
     }
 
+    // The production UE has created its TUN and confirmed the default bearer
+    // towards the serving cell. The interface exists by the time this frame
+    // leaves the UE, so it is also the earliest point a real socket may be
+    // bound to the assigned PDN address.
+    bool driveUntilBearerReady(int timeoutMs = 8000)
+    {
+        return drive([this] { return m_readySeen; }, timeoutMs);
+    }
+
+    bool driveUntilHeldUplink(size_t count, int timeoutMs = 8000)
+    {
+        return drive([&] { return m_held.size() >= count; }, timeoutMs);
+    }
+
     // Blocks on the UE's own log line while the UE is still running. Nothing on
     // the network side needs pumping at that point.
     bool waitForUeLine(const std::string &needle, int timeoutMs = 8000)
     {
         return m_capture && m_capture->waitFor(needle, timeoutMs);
     }
+
+    // ---- privileged-case transport ----
+
+    // While held, uplink radio frames the production UE writes are recorded and
+    // queued instead of being handed to the target eNB. It is a delay on a real
+    // radio link, not a substitution: the queued octets are the UE's own and
+    // releaseHeld() forwards them unmodified. It is what lets a case observe
+    // the target in the window between its restoration notifications and the
+    // UE's confirmations of them.
+    void holdUplink(bool hold) { m_holdUplink = hold; }
+
+    // Releases the first `count` queued frames to the real target, the very
+    // octets the production UE wrote. Releasing one at a time is what lets a
+    // case see the target between the default bearer's confirmation and the
+    // dedicated bearer's.
+    void releaseHeld(size_t count)
+    {
+        if (!m_tap)
+            return note("no target radio relay is configured");
+        if (count > m_held.size())
+            count = m_held.size();
+        while (count-- > 0)
+        {
+            m_tap->Send(m_targetRadio, m_held.front().data(), m_held.front().size());
+            m_held.erase(m_held.begin());
+        }
+    }
+
+    void releaseHeld() { releaseHeld(m_held.size()); }
+
+    // Delivers one radio frame to the real target through the same dispatcher
+    // its own radio endpoint feeds. Only rejection probes are built this way: a
+    // positive bearer transport confirmation must come from the running UE.
+    void injectRadio(const InetAddress &peer, link::MessageType type, std::vector<uint8_t> payload)
+    {
+        const auto frame = link::Encode({type, m_config.ueId, std::move(payload)});
+        m_target->handleRadioFrame(frame.data(), frame.size(), peer);
+    }
+
+    void injectRadio(link::MessageType type, std::vector<uint8_t> payload)
+    {
+        if (!m_tap)
+            return note("no target radio relay is configured");
+        injectRadio(m_tap->LocalAddress(), type, std::move(payload));
+    }
+
+    // The network-side teardown: a real UE Context Release Command on the live
+    // target association. It drops the access transport and every local GTP-U
+    // TEID of the UE while retaining the logical EPS bearer identities, which
+    // is what an ECM-IDLE release is supposed to do.
+    void deliverUeContextRelease(uint32_t mmeUeS1apId = 500)
+    {
+        const auto *entry = m_target->registry().find(m_config.ueId);
+        if (entry == nullptr)
+            return note("the target registry holds no entry for the UE");
+        const auto pdu = s1ap::EncodeUeContextReleaseCommand(mmeUeS1apId, entry->enbUeS1apId, "radioNetwork", 20);
+        m_target->handleS1ap(pdu.data(), pdu.size(), 1);
+    }
+
+    // The test application is a real kernel UDP socket bound to the PDN
+    // address the network assigned: a datagram it sends is routed by the kernel
+    // into the UE's TUN, and a datagram the UE writes into that TUN is routed
+    // back to it. It cannot be bound before the TUN exists, because until then
+    // the address is not local to this host.
+    bool openApplicationSocket()
+    {
+        if (m_appFd >= 0)
+            return true;
+        m_appFd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (m_appFd < 0)
+        {
+            note("the test application could not create a UDP socket");
+            return false;
+        }
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_port = htons(kApplicationPort);
+        address.sin_addr.s_addr = htonl(0x0A000001u); // 10.0.0.1, the assigned PDN address
+        if (bind(m_appFd, reinterpret_cast<const sockaddr *>(&address), sizeof(address)) != 0)
+        {
+            note("the test application could not bind the assigned PDN address");
+            close(m_appFd);
+            m_appFd = -1;
+            return false;
+        }
+        return true;
+    }
+
+    void closeApplicationSocket()
+    {
+        if (m_appFd >= 0)
+        {
+            close(m_appFd);
+            m_appFd = -1;
+        }
+    }
+
+    bool sendApplicationDatagram(const std::vector<uint8_t> &payload)
+    {
+        if (m_appFd < 0)
+            return false;
+        sockaddr_in destination{};
+        destination.sin_family = AF_INET;
+        destination.sin_port = htons(kPeerPort);
+        destination.sin_addr.s_addr = htonl(0xC6120002u); // 198.18.0.2, reachable only through the TUN
+        const ssize_t sent = sendto(m_appFd, payload.data(), payload.size(), 0,
+                                    reinterpret_cast<const sockaddr *>(&destination), sizeof(destination));
+        return sent == static_cast<ssize_t>(payload.size());
+    }
+
+    // The test SGW endpoint. It binds exactly the address and port every E-RAB
+    // item authored here names as its transport layer, so the target's S1-U
+    // forwards uplink GTP-U to it and accepts downlink GTP-U from it.
+    void enableTestSgw() { m_sgw.emplace("127.0.0.2", 2152); }
+
+    void sendSgwDownlink(uint32_t teid, const std::vector<uint8_t> &ipPacket)
+    {
+        if (!m_sgw)
+            return note("the test SGW endpoint was never enabled");
+        const auto datagram = gtpu::EncodeTPdu(teid, ipPacket.data(), ipPacket.size());
+        m_sgw->Send(m_target->s1uAddress(), datagram.data(), datagram.size());
+    }
+
+    [[nodiscard]] const std::vector<std::vector<uint8_t>> &radioUplink() const { return m_radioUplink; }
+    [[nodiscard]] const std::vector<std::vector<uint8_t>> &heldUplink() const { return m_held; }
+    [[nodiscard]] const std::vector<std::vector<uint8_t>> &sgwDatagrams() const { return m_sgwDatagrams; }
+    [[nodiscard]] const std::vector<std::vector<uint8_t>> &applicationDatagrams() const { return m_appDatagrams; }
+    [[nodiscard]] bool readySeen() const { return m_readySeen; }
+    [[nodiscard]] uint8_t readyEbi() const { return m_readyEbi; }
+    [[nodiscard]] std::array<uint8_t, 4> readyIpv4() const { return m_readyIpv4; }
 
     // A network-authored Initial Context Setup Request against the live target
     // registry entry the UE's own mobility uplink created.
@@ -485,6 +992,75 @@ class Lab
         return true;
     }
 
+    // One datagram at the target radio relay. Everything the UE writes is
+    // recorded and forwarded verbatim to the real target eNB, and everything
+    // the target produces is relayed back to the UE's own endpoint, so the UE
+    // still sees its frames come from the cell it is attached to.
+    bool pumpTap()
+    {
+        if (!m_tap)
+            return false;
+        uint8_t buffer[link::MaxDataPduSize + link::HeaderSize];
+        InetAddress peer;
+        const int received = m_tap->Receive(buffer, sizeof(buffer), 1, peer);
+        if (received <= 0)
+            return false;
+        if (peer == m_targetRadio)
+        {
+            if (m_tapUeKnown)
+                m_tap->Send(m_tapUePeer, buffer, static_cast<size_t>(received));
+            return true;
+        }
+        if (!m_tapUeKnown)
+        {
+            m_tapUePeer = peer;
+            m_tapUeKnown = true;
+        }
+        else if (!(peer == m_tapUePeer))
+        {
+            note("the target radio relay saw an uplink from an unexpected endpoint");
+            return true;
+        }
+        std::vector<uint8_t> frame(buffer, buffer + received);
+        m_radioUplink.push_back(frame);
+        if (m_holdUplink)
+        {
+            m_held.push_back(std::move(frame));
+            return true;
+        }
+        m_tap->Send(m_targetRadio, frame.data(), frame.size());
+        return true;
+    }
+
+    void pumpSgw()
+    {
+        if (!m_sgw)
+            return;
+        uint8_t buffer[link::MaxDataPduSize + link::HeaderSize];
+        for (int budget = 4; budget > 0; --budget)
+        {
+            InetAddress peer;
+            const int received = m_sgw->Receive(buffer, sizeof(buffer), 0, peer);
+            if (received <= 0)
+                return;
+            m_sgwDatagrams.emplace_back(buffer, buffer + received);
+        }
+    }
+
+    void pumpApplication()
+    {
+        if (m_appFd < 0)
+            return;
+        uint8_t buffer[2048];
+        for (int budget = 4; budget > 0; --budget)
+        {
+            const ssize_t received = recv(m_appFd, buffer, sizeof(buffer), MSG_DONTWAIT);
+            if (received <= 0)
+                return;
+            m_appDatagrams.emplace_back(buffer, buffer + received);
+        }
+    }
+
     void sendToUe(link::MessageType type, std::vector<uint8_t> payload)
     {
         const auto frame = link::Encode({type, m_config.ueId, std::move(payload)});
@@ -511,6 +1087,21 @@ class Lab
             if (frame.payload.size() != 1)
                 return note("a bearer activation confirmation did not name one EPS bearer identity");
             m_activated.insert(frame.payload[0]);
+            return;
+        }
+        if (frame.type == link::MessageType::BEARER_READY)
+        {
+            // The real initial Attach is over and the production UE reports the
+            // bearer its own NAS confirmed, beside the local user plane it has
+            // just built. It is the only honest source for that identity: the
+            // serving cell never chose it.
+            if (frame.payload.size() != 5)
+                return note("a bearer-ready frame did not name one EPS bearer identity and one IPv4 address");
+            if (m_readySeen)
+                return note("the UE confirmed its default bearer twice");
+            m_readyEbi = frame.payload[0];
+            m_readyIpv4 = {frame.payload[1], frame.payload[2], frame.payload[3], frame.payload[4]};
+            m_readySeen = true;
             return;
         }
         if (frame.type != link::MessageType::NAS_UPLINK)
@@ -678,6 +1269,22 @@ class Lab
     std::atomic_bool m_shutdown{false};
     int m_exit{-1};
     std::thread m_ue;
+
+    // Privileged-case transport, all inert in the ordinary cases.
+    InetAddress m_targetRadio;
+    std::optional<udp::UdpServer> m_tap;
+    std::optional<udp::UdpServer> m_sgw;
+    InetAddress m_tapUePeer;
+    bool m_tapUeKnown{};
+    bool m_holdUplink{};
+    std::vector<std::vector<uint8_t>> m_radioUplink;
+    std::vector<std::vector<uint8_t>> m_held;
+    std::vector<std::vector<uint8_t>> m_sgwDatagrams;
+    std::vector<std::vector<uint8_t>> m_appDatagrams;
+    int m_appFd{-1};
+    bool m_readySeen{};
+    uint8_t m_readyEbi{};
+    std::array<uint8_t, 4> m_readyIpv4{};
 };
 
 } // namespace
@@ -849,4 +1456,402 @@ TEST_CASE("lte/ue_mobility_target: a repeated mobility uplink is refused by the 
     CHECK(Contains(lab.log, "Retransmitted TAU_NORMAL_PENDING, retry=1"));
     CHECK(Contains(lab.log, "TAU_NORMAL_PENDING timed out after bounded retransmissions"));
     CHECK_FALSE(Contains(lab.log, "Tracking Area Update accepted"));
+}
+
+// ---------------------------------------------------------------------------
+// The privileged case: a real kernel TUN and a real IPv4 round trip through it
+// ---------------------------------------------------------------------------
+
+TEST_CASE("lte/ue_mobility_target: real TUN mobility restoration and user-plane round trip" * doctest::skip())
+{
+    // This case must never be able to report itself as passed without having
+    // run. doctest::skip() keeps it out of the ordinary non-root suite, the
+    // privileged job forces it with --no-skip plus the marker checked below,
+    // and without that marker the body refuses outright rather than quietly
+    // doing nothing. The three things the run physically needs are verified
+    // before anything is built, so a machine that cannot be privileged fails
+    // here and leaves nothing behind.
+    if (std::getenv("UNIRANSIM_RUN_PRIVILEGED_TUN_TESTS") == nullptr)
+        FAIL("the privileged TUN integration case requires UNIRANSIM_RUN_PRIVILEGED_TUN_TESTS=1");
+    if (geteuid() != 0)
+        FAIL("the privileged TUN integration case must run as root");
+    if (access("/dev/net/tun", R_OK | W_OK) != 0)
+        FAIL("the privileged TUN integration case needs a usable /dev/net/tun");
+    std::fprintf(stderr, "UNIRANSIM-PRIVILEGED-TUN-EXECUTED\n");
+
+    const auto defaultRoutesBefore = DefaultRouteLines();
+    const auto netnsBefore = ListNetworkNamespaces();
+
+    // Declared before the lab so the lab is destroyed first: whatever a failed
+    // assertion leaves running is still undone by the guard's destructor. A
+    // clean run removes nothing and records nothing.
+    TunSweepGuard sweep;
+    if (!ListInterfaces(kTunPrefix).empty())
+        FAIL("the privileged TUN integration case needs an unused TUN name prefix");
+
+    LabOptions options;
+    options.procedureTimeoutMs = 30000;
+    options.maxRetries = 2;
+    options.tunBlock = kPrivilegedTun;
+    options.radioTap = true;
+    Lab lab(47345, 47346, options);
+    lab.enableTestSgw();
+    lab.scriptDedicated({6});
+    lab.startUe();
+
+    // A real EPS AKA, a real Attach, and a kernel TUN interface the production
+    // UE builds out of its own Attach Accept. The bearer-ready frame it then
+    // sends is the running UE's own report of the local user plane it just
+    // made; nothing in this test hands it a bearer transport confirmation.
+    const bool attached = lab.driveUntilSourceAttachComplete();
+    const bool bearerReady = lab.driveUntilBearerReady();
+
+    // What the kernel actually holds. The name is observed rather than
+    // predicted because the allocator picks the first free index for the
+    // configured prefix; the address, its prefix length, the MTU and the
+    // explicit route are exactly the ones the production code asked for.
+    const auto interfacesAfterAttach = ListInterfaces(kTunPrefix);
+    const bool oneTunCreated = interfacesAfterAttach.size() == 1;
+    const std::string tunName = oneTunCreated ? interfacesAfterAttach.front() : std::string{};
+    const auto tunAddress = InterfaceIpv4(tunName);
+    const bool tunAddressed = tunAddress.has_value() && tunAddress->address == kPdnIpv4 &&
+                              tunAddress->prefixLength == 32;
+    const auto tunMtu = InterfaceMtu(tunName);
+    const bool tunMtuSet = tunMtu.has_value() && *tunMtu == kTunMtu;
+    const bool tunRouted = RouteExists(kPeerIpv4, tunName);
+    const bool bearerNamed = lab.readySeen() && lab.readyEbi() == kDefaultEbi && lab.readyIpv4() == kPdnIpv4;
+
+    // The network activates one dedicated bearer on top of the default one and
+    // then releases the UE into ECM-IDLE, where it reselects into the target
+    // cell and opens it with its own mobility uplink.
+    const bool dedicated = lab.driveUntilDedicatedConfirmed({6});
+    const bool idle = lab.driveUntilIdleReleased();
+    const bool arrived = lab.driveUntilTargetInitialUeMessage();
+
+    // The interface survives the reselection: replacing the access replaces the
+    // S1 connection and the transport of the cell being left, not the local
+    // user plane of the EPS session.
+    const bool tunSurvivedReselection = InterfaceExists(tunName);
+
+    // The mobility uplink is the production UE's own, and the bearer inventory
+    // it declares is what the target restores against. Nothing about the UE's
+    // session exists on the target before that frame arrives.
+    std::optional<link::Message> mobilityContext;
+    for (const auto &frame : lab.radioUplink())
+    {
+        const auto decoded = DecodeRadio(frame);
+        if (decoded && decoded->type == link::MessageType::NAS_UPLINK_MOBILITY_CONTEXT)
+            mobilityContext = decoded;
+    }
+    const bool mobilityDeclared = mobilityContext.has_value();
+    auto *entry = lab.target().registry().find(lab.config().ueId);
+    const bool registered = entry != nullptr;
+    const bool inventoryDeclared = registered && entry->declaredBearers.has_value() &&
+                                   entry->declaredBearers->defaultEbi == kDefaultEbi &&
+                                   entry->declaredBearers->dedicatedEbis == std::vector<uint8_t>{6};
+    const bool freshTargetAccess =
+        registered && entry->mobilityBootstrap && entry->enbUeS1apId != 0 && entry->accessGeneration == 1;
+
+    // One network-authored Initial Context Setup Request naming both the
+    // default bearer and the dedicated bearer the UE declared, deliberately
+    // listed dedicated-first: the target establishes the default first
+    // whatever order the MME lists its E-RABs in, and then the dedicated one
+    // on top of it. The UE's two transport confirmations are held at the relay
+    // so the window between the target's restoration and the UE's confirmation
+    // of it can be inspected; they are the UE's own octets and are forwarded
+    // unmodified when that window closes.
+    lab.holdUplink(true);
+    lab.deliverIcsr({Erab(6, 7, 36), Erab(kDefaultEbi, 9, 30)});
+    const bool notificationsHeld = lab.driveUntilHeldUplink(2);
+
+    // Both held frames are the running UE's own, and it produced the default
+    // bearer's confirmation first because it answers the default restoration
+    // before the dedicated one that follows it.
+    std::optional<link::BearerTransportReady> firstReady;
+    std::optional<link::BearerTransportReady> secondReady;
+    if (notificationsHeld && lab.heldUplink().size() >= 2)
+    {
+        const auto first = DecodeRadio(lab.heldUplink()[0]);
+        const auto second = DecodeRadio(lab.heldUplink()[1]);
+        if (first && first->type == link::MessageType::BEARER_TRANSPORT_READY)
+        {
+            try
+            {
+                firstReady = link::DecodeBearerTransportReady(first->payload.data(), first->payload.size());
+            }
+            catch (const std::exception &)
+            {
+            }
+        }
+        if (second && second->type == link::MessageType::BEARER_TRANSPORT_READY)
+        {
+            try
+            {
+                secondReady = link::DecodeBearerTransportReady(second->payload.data(), second->payload.size());
+            }
+            catch (const std::exception &)
+            {
+            }
+        }
+    }
+    const bool confirmationsAreTheUes =
+        firstReady && secondReady && firstReady->ebi == kDefaultEbi && firstReady->generation == 1 &&
+        firstReady->ueIpv4 == kPdnIpv4 && secondReady->ebi == 6 && secondReady->generation == 1 &&
+        secondReady->ueIpv4 == kPdnIpv4;
+
+    entry = lab.target().registry().find(lab.config().ueId);
+    const bool restorationWindow = entry != nullptr && entry->bearer.signalingEstablished() &&
+                                   entry->bearer.restorationPending() && !entry->bearer.active() &&
+                                   entry->dedicatedBearers.size() == 1 &&
+                                   entry->dedicatedBearers.front().signalingEstablished() &&
+                                   entry->dedicatedBearers.front().restorationPending() &&
+                                   !entry->dedicatedBearers.front().active();
+    const uint32_t defaultLocalTeid = entry != nullptr ? entry->bearer.parameters().localTeid : 0;
+    const uint32_t dedicatedLocalTeid =
+        (entry != nullptr && !entry->dedicatedBearers.empty()) ? entry->dedicatedBearers.front().parameters().localTeid
+                                                              : 0;
+    const uint64_t rejectedBefore = lab.target().recoveryCounters().staleMessagesRejected;
+
+    // Every probe below is a frame the running UE cannot produce, injected at
+    // the target's own dispatcher purely to be refused while both bearers are
+    // established and still awaiting the confirmation the UE is holding. A
+    // stale access generation, a bearer it never requested, an identity its
+    // declaration does not contain, a dedicated confirmation offered before
+    // the default bearer is ready, a generation the target never issued, a
+    // confirmation naming no UE address at all, user-plane data offered before
+    // any bearer is active, and a frame from an endpoint that does not own
+    // this UE identity.
+    if (entry != nullptr)
+    {
+        lab.injectRadio(link::MessageType::BEARER_TRANSPORT_READY,
+                        link::EncodeBearerTransportReady(kDefaultEbi, 2, kPdnIpv4));
+        lab.injectRadio(link::MessageType::BEARER_TRANSPORT_READY,
+                        link::EncodeBearerTransportReady(9, 1, kPdnIpv4));
+        lab.injectRadio(link::MessageType::BEARER_TRANSPORT_READY,
+                        link::EncodeBearerTransportReady(7, 1, kPdnIpv4));
+        lab.injectRadio(link::MessageType::BEARER_TRANSPORT_READY, link::EncodeBearerTransportReady(6, 1, kPdnIpv4));
+        lab.injectRadio(link::MessageType::BEARER_TRANSPORT_READY,
+                        link::EncodeBearerTransportReady(kDefaultEbi, 0, kPdnIpv4));
+        lab.injectRadio(link::MessageType::BEARER_TRANSPORT_READY, link::EncodeBearerRestoration(kDefaultEbi, 1));
+        lab.injectRadio(link::MessageType::DATA_UPLINK,
+                        BuildUdpIpv4(kPdnIpv4, kPeerIpv4, kApplicationPort, kPeerPort, {'p', 'r', 'e'}));
+        lab.injectRadio(InetAddress("127.0.0.1", 47351), link::MessageType::BEARER_TRANSPORT_READY,
+                        link::EncodeBearerTransportReady(kDefaultEbi, 1, kPdnIpv4));
+    }
+    // A downlink GTP-U T-PDU under a TEID that resolves nowhere on this eNB:
+    // the class of TEID the cell the UE left held, which must never resolve on
+    // the cell it arrived at.
+    lab.sendSgwDownlink(0x51CE0001u, BuildUdpIpv4(kPeerIpv4, kPdnIpv4, kPeerPort, kApplicationPort, {'x'}));
+
+    // The two confirmations the running UE really produced, in the order it
+    // produced them: the default bearer's first, because the UE answers the
+    // default restoration before the dedicated one that follows it.
+    lab.releaseHeld(1);
+    const bool defaultConfirmed = lab.drive(
+        [&] {
+            auto *e = lab.target().registry().find(lab.config().ueId);
+            return e != nullptr && e->bearer.active();
+        },
+        8000);
+
+    // With the default bearer ready and the dedicated one still pending, the
+    // remaining two probes reach the checks they are named after instead of
+    // being refused earlier.
+    lab.injectRadio(link::MessageType::BEARER_TRANSPORT_READY,
+                    link::EncodeBearerTransportReady(6, 1, std::array<uint8_t, 4>{10, 0, 0, 99}));
+    lab.injectRadio(link::MessageType::BEARER_TRANSPORT_READY, link::EncodeBearerTransportReady(kDefaultEbi, 1, kPdnIpv4));
+
+    lab.releaseHeld(1);
+    const bool bothActive = lab.drive(
+        [&] {
+            auto *e = lab.target().registry().find(lab.config().ueId);
+            return e != nullptr && e->bearer.active() && !e->dedicatedBearers.empty() &&
+                   e->dedicatedBearers.front().active();
+        },
+        8000);
+    // The observation window is over: from here on the relay is a plain wire
+    // again and every frame the UE writes reaches the target without delay.
+    lab.holdUplink(false);
+
+    entry = lab.target().registry().find(lab.config().ueId);
+    const uint64_t rejectedByProbes =
+        lab.target().recoveryCounters().staleMessagesRejected - rejectedBefore;
+    const bool probesLeftBearersIntact =
+        entry != nullptr && entry->bearer.active() && entry->dedicatedBearers.size() == 1 &&
+        entry->dedicatedBearers.front().active() && entry->bearer.parameters().localTeid == defaultLocalTeid &&
+        entry->dedicatedBearers.front().parameters().localTeid == dedicatedLocalTeid &&
+        entry->bearer.counters().uplinkPackets == 0 && entry->bearer.counters().downlinkPackets == 0 &&
+        entry->counters.simulatedUplinkPackets == 0 && entry->counters.simulatedDownlinkPackets == 0 &&
+        lab.applicationDatagrams().empty() && lab.sgwDatagrams().empty();
+
+    // Real IPv4 uplink: the test application sends from the PDN address the
+    // network assigned, the kernel routes the datagram into the UE's own TUN,
+    // the production UE forwards it over the simulated radio link and the
+    // target encapsulates it for the SGW endpoint the E-RAB named.
+    const bool applicationOpen = lab.openApplicationSocket();
+    const std::string uplinkText = "uniransim lte user plane uplink";
+    const std::vector<uint8_t> uplinkPayload(uplinkText.begin(), uplinkText.end());
+    const bool applicationSent = applicationOpen && lab.sendApplicationDatagram(uplinkPayload);
+    const bool uplinkArrived = lab.drive([&] { return !lab.sgwDatagrams().empty(); }, 8000);
+
+    std::optional<link::Message> uplinkFrame;
+    for (const auto &frame : lab.radioUplink())
+    {
+        const auto decoded = DecodeRadio(frame);
+        if (decoded && decoded->type == link::MessageType::DATA_UPLINK)
+            uplinkFrame = decoded;
+    }
+    std::optional<lte::ip::PacketInfo> uplinkIp;
+    if (uplinkFrame)
+    {
+        try
+        {
+            uplinkIp = lte::ip::Validate(uplinkFrame->payload.data(), uplinkFrame->payload.size(), 2048);
+        }
+        catch (const std::exception &)
+        {
+        }
+    }
+    const bool uplinkAddressed =
+        uplinkIp.has_value() && uplinkIp->source == kPdnIpv4 && uplinkIp->destination == kPeerIpv4 &&
+        uplinkIp->protocol == 17;
+    const bool uplinkCarriedApplication = uplinkFrame.has_value() &&
+                                          uplinkFrame->payload.size() == 28 + uplinkPayload.size() &&
+                                          std::equal(uplinkPayload.begin(), uplinkPayload.end(),
+                                                     uplinkFrame->payload.begin() + 28);
+
+    std::optional<gtpu::Packet> uplinkGtp;
+    if (!lab.sgwDatagrams().empty())
+    {
+        try
+        {
+            uplinkGtp = gtpu::Decode(lab.sgwDatagrams().front().data(), lab.sgwDatagrams().front().size());
+        }
+        catch (const std::exception &)
+        {
+        }
+    }
+    const bool uplinkFramed = uplinkGtp.has_value() && uplinkGtp->messageType == gtpu::TPdu;
+    const bool uplinkOnSgwTeid = uplinkGtp.has_value() && uplinkGtp->teid == 30;
+    const bool uplinkByteIdentical =
+        uplinkGtp.has_value() && uplinkFrame.has_value() && uplinkGtp->payload == uplinkFrame->payload;
+
+    // The transport the target restored is its own: both local GTP-U TEIDs are
+    // freshly allocated for this access, distinct from each other and from the
+    // SGW-side TEIDs the network's E-RAB items named, so nothing the cell the
+    // UE left was using can resolve here.
+    const bool targetTeidsFresh = defaultLocalTeid != 0 && dedicatedLocalTeid != 0 &&
+                                  defaultLocalTeid != dedicatedLocalTeid && defaultLocalTeid != 30 &&
+                                  defaultLocalTeid != 36 && dedicatedLocalTeid != 30 && dedicatedLocalTeid != 36;
+
+    entry = lab.target().registry().find(lab.config().ueId);
+    const bool uplinkCounters = entry != nullptr && entry->bearer.counters().uplinkPackets == 1 &&
+                                entry->bearer.counters().uplinkBytes == (uplinkFrame ? uplinkFrame->payload.size() : 0) &&
+                                entry->counters.simulatedUplinkPackets == 1 && entry->counters.s1uUplinkPackets == 1;
+
+    // Real IPv4 downlink: the SGW endpoint sends a GTP-U T-PDU under the
+    // target's own local TEID, the target hands it to the UE over the simulated
+    // radio link, and the UE writes it into the kernel TUN, where the kernel
+    // delivers it to the application socket it is addressed to.
+    const std::string downlinkText = "uniransim lte user plane downlink";
+    const std::vector<uint8_t> downlinkPayload(downlinkText.begin(), downlinkText.end());
+    const auto downlinkIp = BuildUdpIpv4(kPeerIpv4, kPdnIpv4, kPeerPort, kApplicationPort, downlinkPayload);
+    const uint32_t downlinkTeid = entry != nullptr ? entry->bearer.parameters().localTeid : 0;
+    lab.sendSgwDownlink(downlinkTeid, downlinkIp);
+    const bool downlinkArrived = lab.drive([&] { return !lab.applicationDatagrams().empty(); }, 8000);
+    const bool downlinkDelivered = !lab.applicationDatagrams().empty() &&
+                                   lab.applicationDatagrams().front() == downlinkPayload;
+    const bool downlinkOnFreshTeid = downlinkTeid != 0 && downlinkTeid != 30;
+
+    entry = lab.target().registry().find(lab.config().ueId);
+    const bool downlinkCounters = entry != nullptr && entry->bearer.counters().downlinkPackets == 1 &&
+                                  entry->bearer.counters().downlinkBytes == downlinkIp.size() &&
+                                  entry->counters.simulatedDownlinkPackets == 1 &&
+                                  entry->counters.s1uDownlinkPackets == 1;
+
+    lab.closeApplicationSocket();
+    lab.shutdownUe();
+    const bool cleanShutdown = lab.exitCode() == 0 && Contains(lab.log, "LTE UE shutdown complete");
+    const bool userPlaneReported =
+        Contains(lab.log, "User-plane statistics: tun-ul=1/") && Contains(lab.log, " tun-dl=1/");
+
+    // Nothing the scenario built survives it. The UE released its own
+    // interface and its route when it shut down, and the network-side release
+    // of the access drops both TEIDs while retaining the logical bearer
+    // identities an idle UE is supposed to keep.
+    const bool tunReleased = tunName.empty() || !InterfaceExists(tunName);
+    const bool routeReleased = !RouteExists(kPeerIpv4, tunName);
+    lab.deliverUeContextRelease();
+    entry = lab.target().registry().find(lab.config().ueId);
+    const bool targetTransportGone =
+        entry != nullptr && !entry->bearer.signalingEstablished() && !entry->bearer.active() &&
+        entry->dedicatedBearers.size() == 1 && !entry->dedicatedBearers.front().signalingEstablished() &&
+        !entry->dedicatedBearers.front().active();
+    const bool teidsReleased = defaultLocalTeid != 0 && dedicatedLocalTeid != 0 &&
+                               lab.target().registry().findBearerByLocalTeid(defaultLocalTeid).entry == nullptr &&
+                               lab.target().registry().findBearerByLocalTeid(dedicatedLocalTeid).entry == nullptr;
+    lab.target().shutdown();
+    const bool noOrphanTun = ListInterfaces(kTunPrefix).empty();
+    const bool heldReleased = lab.heldUplink().empty();
+    const bool defaultRouteUntouched = DefaultRouteLines() == defaultRoutesBefore;
+    const bool namespacesUntouched = ListNetworkNamespaces() == netnsBefore;
+    const bool nothingSwept = sweep.swept.empty();
+
+    // The complete production log of the run, on stderr beside the sentinels.
+    // The UE logs through a stream the harness captures so its assertions stay
+    // visible, and a privileged run whose transcript is missing is not evidence
+    // of anything, so it is published here rather than only asserted against.
+    std::fprintf(stderr, "=== production log ===\n%s=== end of production log ===\n", lab.log.c_str());
+
+    REQUIRE(lab.problems().empty());
+    REQUIRE(attached);
+    REQUIRE(bearerReady);
+    REQUIRE(oneTunCreated);
+    CHECK(tunAddressed);
+    CHECK(tunMtuSet);
+    REQUIRE(tunRouted);
+    REQUIRE(bearerNamed);
+    REQUIRE(dedicated);
+    REQUIRE(idle);
+    REQUIRE(arrived);
+    CHECK(mobilityDeclared);
+    REQUIRE(registered);
+    CHECK(inventoryDeclared);
+    CHECK(freshTargetAccess);
+    CHECK(targetTeidsFresh);
+    CHECK(tunSurvivedReselection);
+    REQUIRE(notificationsHeld);
+    CHECK(confirmationsAreTheUes);
+    REQUIRE(restorationWindow);
+    CHECK(rejectedByProbes == 10);
+    REQUIRE(defaultConfirmed);
+    REQUIRE(bothActive);
+    CHECK(probesLeftBearersIntact);
+    REQUIRE(applicationOpen);
+    REQUIRE(applicationSent);
+    REQUIRE(uplinkArrived);
+    CHECK(uplinkFrame.has_value());
+    CHECK(uplinkAddressed);
+    CHECK(uplinkCarriedApplication);
+    CHECK(uplinkFramed);
+    CHECK(uplinkOnSgwTeid);
+    CHECK(uplinkByteIdentical);
+    CHECK(uplinkCounters);
+    REQUIRE(downlinkArrived);
+    REQUIRE(downlinkDelivered);
+    CHECK(downlinkOnFreshTeid);
+    CHECK(downlinkCounters);
+    REQUIRE(cleanShutdown);
+    CHECK(userPlaneReported);
+    REQUIRE(tunReleased);
+    REQUIRE(routeReleased);
+    REQUIRE(targetTransportGone);
+    REQUIRE(teidsReleased);
+    REQUIRE(noOrphanTun);
+    CHECK(heldReleased);
+    CHECK(defaultRouteUntouched);
+    CHECK(namespacesUntouched);
+    CHECK(nothingSwept);
+
+    std::fprintf(stderr, "UNIRANSIM-PRIVILEGED-TUN-COMPLETE\n");
 }

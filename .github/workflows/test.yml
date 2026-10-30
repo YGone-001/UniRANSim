@@ -82,3 +82,69 @@ jobs:
         with:
           name: coverage
           path: cmake-build-coverage/report/
+
+  # One privileged integration only, in its own job and its own network
+  # namespace, so the ordinary matrix stays unprivileged and this case cannot
+  # silently pass by running in the control-plane-only mode the rest of the
+  # suite deliberately uses. It needs a real kernel TUN device and the root
+  # capability to create one, which is what the runner's kernel provides and
+  # what a non-root suite must never assume.
+  privileged-tun:
+    name: Privileged LTE Mobility TUN Integration
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsctp-dev iproute2
+      - name: Configure
+        run: cmake -S . -B cmake-build-privileged -DCMAKE_BUILD_TYPE=Debug
+      - name: Build
+        run: cmake --build cmake-build-privileged --target nr-tests --parallel "$(nproc)"
+      - name: Verify the TUN device node
+        run: |
+          sudo modprobe tun
+          sudo test -c /dev/net/tun
+      - name: Verify root and a private network namespace
+        run: |
+          sudo bash -c 'test "$(id -u)" = "0"'
+          sudo unshare --net -- bash -c 'test "$(id -u)" = "0" && ip link set lo up && ip link show lo'
+      - name: Run the privileged TUN integration
+        run: |
+          sudo unshare --net -- bash -euo pipefail -c '
+            ip link set lo up
+            test "$(id -u)" = "0"
+            test -c /dev/net/tun
+            export UNIRANSIM_RUN_PRIVILEGED_TUN_TESTS=1
+            ./cmake-build-privileged/nr-tests \
+              --no-skip \
+              --test-case="lte/ue_mobility_target: real TUN mobility restoration and user-plane round trip" \
+              2>&1 | tee privileged-tun.log
+
+            # A skipped case never reaches its own body, so it prints neither
+            # sentinel and the job must not be able to call that a pass.
+            grep -q "UNIRANSIM-PRIVILEGED-TUN-EXECUTED" privileged-tun.log
+            grep -q "UNIRANSIM-PRIVILEGED-TUN-COMPLETE" privileged-tun.log
+            grep -Eq "test cases: +1 \| +1 passed \| 0 failed" privileged-tun.log
+
+            # The case must really have built a kernel TUN and moved IPv4
+            # through it in both directions. These come from the production
+            # target eNBs own per-UE user-plane statistics, so a run that fell
+            # back to control-plane-only mode reports zeros and fails here
+            # instead of being mistaken for a success.
+            grep -q "radio-ul=1/" privileged-tun.log
+            grep -q "s1u-ul=1/" privileged-tun.log
+            grep -q "radio-dl=1/" privileged-tun.log
+            grep -q "s1u-dl=1/" privileged-tun.log
+            grep -q "drops(malformed/unknown-teid)=0/1" privileged-tun.log
+            grep -q "UE Context Release Command received" privileged-tun.log
+            grep -q "Released S1 context of LTE UE" privileged-tun.log
+            ! grep -q "control-plane-only" privileged-tun.log
+          '
+      - name: Report
+        if: always()
+        run: |
+          if [ -f privileged-tun.log ]; then
+            { echo '```'; cat privileged-tun.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "The privileged TUN integration produced no log at all." >> "$GITHUB_STEP_SUMMARY"
+          fi
