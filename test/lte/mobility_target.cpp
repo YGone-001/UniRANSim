@@ -525,6 +525,54 @@ TEST_CASE("lte/mobility_target: a genuine TAU establishes no bearer at all")
     CHECK(DrainRadio(lab.ue).empty());
 }
 
+TEST_CASE("lte/mobility_target: an idle UE retained after a genuine TAU may still request service")
+{
+    TwoEnb lab;
+    EstablishOnSource(lab, {});
+    GoIdleOnSource(lab);
+    DrainRadio(lab.ue);
+    lab.targetWire.sent.clear();
+
+    // With the active flag clear the Update is carried to the MME and the
+    // network answers with a UE Context Release Command. This cell is asked for
+    // no bearer context, so it ends up holding none of the session's own.
+    ReselectToTarget(lab, BearerInventory{5, {}});
+    auto *entry = lab.target.registry().find(lab.ue.ueId);
+    REQUIRE(entry != nullptr);
+    const auto release = s1ap::EncodeUeContextReleaseCommand(500 + lab.ue.ueId, entry->enbUeS1apId, "nas", 0);
+    lab.target.handleS1ap(release.data(), release.size(), 1);
+    REQUIRE(entry->s1 == UeS1State::IDLE_RETAINED);
+    CHECK_FALSE(entry->bearer.logicalExists());
+    CHECK(entry->dedicatedBearers.empty());
+    // This access never carried bearer transport, so its release tells the UE
+    // nothing and the epoch count the two ends share does not move either.
+    CHECK(entry->accessGeneration == 1);
+
+    // A page through this cell would have the UE answer with a Service Request,
+    // and the frame is forwarded rather than refused: holding none of the
+    // session's bearers, this cell cannot decide what the request restores.
+    lab.targetWire.sent.clear();
+    DrainRadio(lab.ue);
+    SendRadio(lab.target, lab.ue, MessageType::SERVICE_REQUEST, {0x05, 0x12, 0x34, 0x56, 0x78, 0xC7, 0x00, 0xAA, 0xBB});
+    CHECK(entry->s1 == UeS1State::CONTEXT_PENDING);
+    CHECK(lab.targetWire.count(12) == 1);
+
+    // The network answers with the session's one bearer on a TEID of this cell,
+    // and this is a restoration rather than a new bearer: the UE has already
+    // confirmed the bearer in its own NAS and is asked to confirm this fresh
+    // transport, which is the only thing here that is new.
+    DeliverIcsr(lab, TargetIcsr(lab, {Item(5, 9, 30 + lab.ue.ueId)}));
+    REQUIRE(entry->bearer.signalingEstablished());
+    CHECK_FALSE(entry->bearer.logicalConfirmed());
+    CHECK(entry->bearer.restorationPending());
+    const auto frames = DrainRadio(lab.ue);
+    REQUIRE(CountType(frames, MessageType::S1_CONTEXT_RESTORED) == 1);
+    const auto restored = lte::ue::link::DecodeBearerRestoration(frames.front().payload);
+    CHECK(restored.first == 5);
+    CHECK(restored.second == entry->accessGeneration);
+    CHECK(restored.second != 0);
+}
+
 TEST_CASE("lte/mobility_target: a request without the declared default bearer is refused whole")
 {
     TwoEnb lab;

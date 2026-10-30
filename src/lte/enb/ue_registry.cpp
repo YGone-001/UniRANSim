@@ -289,7 +289,15 @@ void UeRegistry::bindLocalTeid(EnbUeEntry &entry, BearerContext &bearer, uint32_
 
 void UeRegistry::releaseS1(EnbUeEntry &entry)
 {
-    if (entry.s1 != UeS1State::IDLE_RETAINED && ++entry.accessGeneration == 0)
+    // The access generation numbers one cell's access epochs, and the two ends
+    // of the radio link hold that number in common. It advances when an access
+    // that carried bearer transport ends, because that is the one transition
+    // the UE is told about: the release names the bearer it is releasing. A
+    // context released before it ever carried any, such as the S1 connection a
+    // Tracking Area Update opens and the MME closes again, tells the UE
+    // nothing, and a silent advance is what puts the two counts out of step and
+    // makes the next generation-bound message look stale at the UE.
+    if (entry.s1 == UeS1State::BEARER_ACTIVE && ++entry.accessGeneration == 0)
         ++entry.accessGeneration;
     if (entry.enbUeS1apId != 0)
         m_byEnbUeS1apId.erase(entry.enbUeS1apId);
@@ -314,6 +322,9 @@ void UeRegistry::releaseS1(EnbUeEntry &entry)
     // describes its own, so a stale inventory is never reused for it.
     entry.mobilityBootstrap = false;
     entry.declaredBearers.reset();
+    // Releasing the access is what retains the UE: the session it may later
+    // ask service for is the one the network still holds for it.
+    entry.sessionRetained = true;
     entry.s1 = UeS1State::IDLE_RETAINED;
 }
 
@@ -336,6 +347,8 @@ void UeRegistry::deleteBearerContexts(EnbUeEntry &entry)
     // nothing that is still here.
     entry.mobilityBootstrap = false;
     entry.declaredBearers.reset();
+    // Nor is there a session left for this UE to ask service for.
+    entry.sessionRetained = false;
 }
 
 void UeRegistry::beginNewAttach(EnbUeEntry &entry)

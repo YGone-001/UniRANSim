@@ -93,6 +93,15 @@ struct EnbUeEntry
     // it does not name is not established for this UE, and one it names without
     // the network offering it establishes nothing at all.
     std::optional<lte::ue::link::BearerInventory> declaredBearers;
+    // Whether the network still holds this UE's EPS session. A cell the UE
+    // reselected into holds no bearer context of it at all, because a genuine
+    // TAU establishes none, and ECM-IDLE then drops the access transport, so
+    // neither the bearers nor the declaration is left to show that the session
+    // is still there. What is left is this, and it is what lets an idle UE
+    // whose session the MME holds ask for service again. The UE's own NAS
+    // deleting that session, or starting a new Attach, clears it: a deleted
+    // session holds nothing for anyone to restore.
+    bool sessionRetained{};
     DefaultBearerContext bearer{};
     // The default bearer remains named for Phase 6 source compatibility.
     // Together with these bounded contexts it forms the per-UE EPS bearer

@@ -473,6 +473,20 @@ void EnbMultiplexer::onInitialContextSetupRequest(const uint8_t *data, size_t si
         }
     const bool restoring = entry->bearer.logicalExists();
     const bool declared = entry->declaredBearers.has_value();
+    // A Service Request is a resume: the bearers it restores are ones the UE's
+    // own NAS has already confirmed and only their transport is new. On a cell
+    // the UE reached by Tracking Area Update this eNB holds none of them,
+    // because the Update established no bearer here, and ECM-IDLE has since
+    // dropped the access transport and with it the declaration. The MME is the
+    // one still holding the bearers, so nothing but this says the session being
+    // set up is that session and not a new one.
+    const bool resuming = entry->sessionRetained;
+    // Whether the transport being set up is a restoration the UE confirms
+    // rather than a new bearer it accepts. Which E-RAB plays which role is
+    // still decided by `restoring` and `declared` alone: a resumed session this
+    // cell holds nothing of and that named no inventory leaves those roles
+    // unknowable, and they are not guessed off the network's list.
+    const bool restoringTransport = restoring || declared || resuming;
     // A mobility uplink onto a cell that has never seen this session's Attach
     // has to say which E-RAB is which. Without that the E-RAB list of an
     // Initial Context Setup Request names only identifiers and QoS and marks no
@@ -602,7 +616,7 @@ void EnbMultiplexer::onInitialContextSetupRequest(const uint8_t *data, size_t si
             else
                 bearer->establish({erab.erabId, erab.qci, entry->radioUeId, erab.transportLayerAddress,
                                    TeidFromBytes(erab.gtpTeid), localTeid, linkedDefault, qos},
-                                  restoring || declared);
+                                  restoringTransport);
             establishedAt[index] = s1ap::ErabSetupItem{erab.erabId, ParseIpv4(m_config.s1uAddress),
                                                        TeidToBytes(localTeid)};
             ++establishedCount;
@@ -664,7 +678,7 @@ void EnbMultiplexer::onInitialContextSetupRequest(const uint8_t *data, size_t si
     // restoration on a cell that already held the contexts: in both cases the
     // bearers are ones this UE's NAS has already confirmed, and the fresh
     // transport of the target cell is what it is being told to confirm.
-    if (restoring || declared)
+    if (restoringTransport)
         sendRadio(*entry, lte::ue::link::MessageType::S1_CONTEXT_RESTORED,
                   lte::ue::link::EncodeBearerRestoration(defaultEbi, entry->accessGeneration));
     for (const auto &item : established)
@@ -674,7 +688,7 @@ void EnbMultiplexer::onInitialContextSetupRequest(const uint8_t *data, size_t si
             " QCI=" + std::to_string(bearer->parameters().qci) +
             " eNB-TEID=" + Hex(bearer->parameters().localTeid, 8) +
             " SGW-TEID=" + Hex(bearer->parameters().sgwTeid, 8));
-        if ((restoring || declared) && item.erabId != defaultEbi)
+        if (restoringTransport && item.erabId != defaultEbi)
             sendRadio(*entry, lte::ue::link::MessageType::DEDICATED_BEARER_RESTORED,
                       lte::ue::link::EncodeBearerRestoration(item.erabId, entry->accessGeneration));
         const auto &requested = *std::find_if(request.erabs.begin(), request.erabs.end(),
@@ -1013,8 +1027,17 @@ void EnbMultiplexer::handleRadioFrame(const uint8_t *data, size_t size, const In
         }
         else if (radio.type == lte::ue::link::MessageType::SERVICE_REQUEST)
         {
-            if (!entry->bearer.logicalConfirmed())
-                throw lte::ue::link::DecodeError("Service Request has no confirmed retained EPS session");
+            // An ECM-IDLE UE is kept in IDLE_RETAINED precisely so it can send
+            // this, and such an entry need not hold a confirmed bearer on this
+            // cell: a UE that arrived by a Tracking Area Update carried its
+            // session over NAS and this cell established no bearer for it at
+            // all. The MME holds the bearer contexts and is the one that
+            // decides what a Service Request restores, so the frame is
+            // forwarded for any UE whose session the network still holds. A
+            // session its own NAS has already deleted holds nothing to restore
+            // and is refused here.
+            if (!entry->bearer.logicalConfirmed() && !entry->sessionRetained)
+                throw lte::ue::link::DecodeError("Service Request has no retained EPS session");
             if (entry->s1Active())
                 throw lte::ue::link::DecodeError("Duplicate Service Request cannot replace a pending or active S1 context");
             const uint32_t mTmsi = (static_cast<uint32_t>(radio.payload[1]) << 24U) |
