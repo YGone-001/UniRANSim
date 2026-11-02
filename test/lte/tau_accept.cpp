@@ -113,6 +113,18 @@ DedicatedBearerRuntime Dedicated(uint8_t ebi, uint8_t qci, uint16_t port, std::v
     return bearer;
 }
 
+// One IPv4/UDP uplink with the given source port, the half of the packet the
+// uplink direction of a packet filter reads as its local port.
+std::vector<uint8_t> UdpUplink(uint16_t localPort)
+{
+    std::vector<uint8_t> packet{0x45, 0x00, 0x00, 0x1C, 0x00, 0x00, 0x00, 0x00, 0x40, 0x11, 0x00, 0x00,
+                                0x0A, 0x2D, 0x00, 0x02, 0xC0, 0x00, 0x02, 0x01, 0x00, 0x00, 0x00, 0x01,
+                                0x00, 0x08, 0x00, 0x00};
+    packet[20] = static_cast<uint8_t>(localPort >> 8U);
+    packet[21] = static_cast<uint8_t>(localPort);
+    return packet;
+}
+
 // A registered UE with one default bearer (EBI 5) and two dedicated bearers
 // (EBI 6 and 7), in the middle of a Normal Tracking Area Update.
 struct Ue
@@ -277,6 +289,39 @@ TEST_CASE("lte/tau_accept: a valid accept that drops one dedicated bearer commit
     expected.pending = PendingProcedure::NONE;
     expected.bearers = std::vector<BearerSnapshot>{before.bearers[0]};
     CHECK(Snapshot(ue.mobility, ue.bearers) == expected);
+}
+
+TEST_CASE("lte/tau_accept: a filter of a released dedicated bearer no longer claims its traffic")
+{
+    // The accepted bearer context status is authoritative, so the identity it
+    // drops is gone from the live set and its traffic classification goes with
+    // it. A packet the released bearer's filter used to claim is carried by the
+    // default bearer from then on, never by the released identity, and the next
+    // bearer inventory names only the bearers that still exist.
+    auto ue = PendingUe();
+
+    // Before the release the two filters are told apart by their local port.
+    const auto forSeven = UdpUplink(8000);
+    const auto forSix = UdpUplink(7000);
+    CHECK(lte::ue::SelectUplinkBearer(5, ue.bearers, forSeven.data(), forSeven.size()).ebi == 7);
+    CHECK(lte::ue::SelectUplinkBearer(5, ue.bearers, forSix.data(), forSix.size()).ebi == 6);
+
+    lte::ue::nas::TauAccept accept;
+    accept.updateResult = 0;
+    accept.bearerContextStatus = DropSeven;
+    const auto result = lte::ue::ApplyTauAccept(ue.mobility, ue.bearers, accept);
+    CHECK(result.releasedDedicated == std::vector<uint8_t>{7});
+
+    // The very packet EBI 7 used to claim is now the default bearer's, and the
+    // surviving dedicated bearer still claims only its own traffic.
+    CHECK(lte::ue::SelectUplinkBearer(5, ue.bearers, forSeven.data(), forSeven.size()).ebi == 5);
+    CHECK(lte::ue::SelectUplinkBearer(5, ue.bearers, forSix.data(), forSix.size()).ebi == 6);
+
+    // The released identity is never claimed again: the declaration that
+    // follows names the default bearer and the one dedicated bearer left.
+    const auto inventory = lte::ue::ValidateBearerInventory(ue.mobility.defaultEbi, ue.bearers);
+    CHECK(inventory.defaultEbi == 5);
+    CHECK(inventory.dedicatedEbis == std::vector<uint8_t>{6});
 }
 
 TEST_CASE("lte/tau_accept: an unsupported update result cannot release a bearer the status would drop")

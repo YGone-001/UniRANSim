@@ -351,9 +351,7 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 Log("ERROR", std::string(ToString(mobility.pending)) + " timed out after bounded retransmissions");
                 return 1;
             }
-            if (mobility.pending == PendingProcedure::SERVICE_REQUEST)
-                SendServiceRequest(socket, enb, ueId, *mobility.guti, pendingWire);
-            else if (pendingMobilityFrame.has_value())
+            if (pendingMobilityFrame.has_value())
                 // A retransmission of a procedure that is still opening an S1
                 // connection repeats the very frame the first transmission sent.
                 // This is decided from how the original left rather than from
@@ -362,7 +360,13 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 // change the message a reselected cell receives. The frame is
                 // frozen, so the retry cannot rebuild the declared bearer
                 // inventory from state that has moved on since the first send.
+                // It takes precedence over the compact form below because an
+                // answer to a page is a Service Request that also declared its
+                // inventory, and repeating it as the compact form would drop
+                // that declaration from the retry.
                 SendMobilityNas(socket, enb, *pendingMobilityFrame);
+            else if (mobility.pending == PendingProcedure::SERVICE_REQUEST)
+                SendServiceRequest(socket, enb, ueId, *mobility.guti, pendingWire);
             else
                 SendNas(socket, enb, ueId, pendingWire);
             ++procedureRetries;
@@ -659,8 +663,54 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 if (!compact.has_value())
                     throw std::runtime_error("Accepted paging produced no compact Service Request");
                 pendingWire = std::move(*compact);
-                pendingMobilityFrame.reset();
-                SendServiceRequest(socket, enb, ueId, *mobility.guti, pendingWire);
+                if (pendingWire.size() != 4)
+                    throw std::runtime_error("Compact Service Request NAS must be four octets");
+                // Whether this answer also declares the bearer inventory the UE
+                // holds. The declaration-carrying uplink is the one that opens
+                // the first access epoch of a cell, so it is used exactly when
+                // this UE's own epoch is that first one: the two counters are
+                // the same number and neither side is moved out of step. A page
+                // answered in any later epoch travels as the compact form,
+                // which announces no epoch of its own, because such a cell has
+                // already carried this UE's bearers and resolves their roles
+                // from the contexts it still holds.
+                //
+                // The first epoch is the one that needs the declaration. The
+                // answer opens an S1 connection at a cell that may never have
+                // seen this session's Attach and may hold none of its bearers:
+                // it reached this state through a Tracking Area Update that
+                // established no bearer here, and ECM-IDLE has since dropped
+                // the access transport and with it any earlier declaration. The
+                // MME answers with one Initial Context Setup Request naming
+                // every bearer the session still holds, and that list marks no
+                // roles, so the cell is told them here rather than left to
+                // infer them from QCI or from the order of the list. The
+                // compact Service Request travels beside the declaration
+                // unchanged, so the network still answers an ordinary
+                // four-octet EPS Service Request rather than a new procedure.
+                if (mobility.accessGeneration == 1)
+                {
+                    try
+                    {
+                        const auto inventory = ValidateBearerInventory(mobility.defaultEbi, dedicatedBearers);
+                        pendingMobilityFrame =
+                            link::BuildMobilityContext(ueId, *mobility.guti, inventory, pendingWire);
+                    }
+                    catch (const std::exception &e)
+                    {
+                        pendingWire.clear();
+                        pendingMobilityFrame.reset();
+                        throw std::runtime_error(std::string("Refusing to answer a page without a valid bearer "
+                                                             "inventory: ") +
+                                                 e.what());
+                    }
+                    SendMobilityNas(socket, enb, *pendingMobilityFrame);
+                }
+                else
+                {
+                    pendingMobilityFrame.reset();
+                    SendServiceRequest(socket, enb, ueId, *mobility.guti, pendingWire);
+                }
                 ++pagingServiceRequests;
                 pagingWaitArmed = false;
                 procedureRetries = 0;

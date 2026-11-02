@@ -223,6 +223,17 @@ class FakeMme
             frames.push_back("SERVICE_REQUEST");
             serviceRequestPayloads.push_back(frame.payload);
             return onServiceRequest(peer);
+        case link::MessageType::NAS_UPLINK_MOBILITY_CONTEXT:
+            // The same answer to a page, carrying the bearer inventory beside
+            // the compact Service Request. A cell reached in the first access
+            // epoch holds no bearer context of this session and cannot tell the
+            // default bearer from the dedicated ones, so the UE names them and
+            // the network is still answered with an ordinary four-octet EPS
+            // Service Request. It is one procedure either way, so it is counted
+            // and replayed here exactly as the compact form is.
+            frames.push_back("SERVICE_REQUEST_DECLARED");
+            serviceRequestPayloads.push_back(frame.payload);
+            return onServiceRequest(peer);
         default:
             frames.push_back("OTHER");
             fail("radio frame type is not part of the scripted Attach/paging exchange");
@@ -489,6 +500,44 @@ bool Contains(const std::string &log, const std::string &needle)
     return log.find(needle) != std::string::npos;
 }
 
+// How many radio frames the fake network saw under one name. The paging answer
+// is the interesting one: it is a single frame per page, and its type says
+// whether the UE also declared the bearer inventory it still holds.
+int CountFrames(const std::vector<std::string> &frames, const std::string &name)
+{
+    int count = 0;
+    for (const auto &frame : frames)
+        if (frame == name)
+            ++count;
+    return count;
+}
+
+// The three pieces a declaring paging answer is made of. The identity prefix
+// and the NAS tail are together exactly the body a compact SERVICE_REQUEST
+// frame carries; the bearer inventory sits between them and is the only part
+// the declaration adds.
+struct PagingAnswer
+{
+    std::vector<uint8_t> identity;
+    link::BearerInventory inventory;
+    std::vector<uint8_t> nas;
+};
+
+// Reads one NAS_UPLINK_MOBILITY_CONTEXT body the way the network side does, so
+// a test can tell "the declaration is additive" from "the Service Request was
+// replaced by something longer".
+PagingAnswer DecodePagingAnswer(const std::vector<uint8_t> &payload)
+{
+    REQUIRE(payload.size() > 5);
+    link::BearerInventory inventory{};
+    const size_t consumed = link::DecodeBearerInventory(payload.data() + 5, payload.size() - 5, inventory);
+    PagingAnswer answer;
+    answer.identity.assign(payload.begin(), payload.begin() + 5);
+    answer.inventory = std::move(inventory);
+    answer.nas.assign(payload.begin() + 5 + consumed, payload.end());
+    return answer;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -609,6 +658,90 @@ TEST_CASE("lte/paging/wait: a valid page disarms the window and a later stop is 
     CHECK(session.mme->failures.empty());
 }
 
+// ---------------------------------------------------------------------------
+// The form of the answer to a page
+// ---------------------------------------------------------------------------
+
+TEST_CASE("lte/paging/wait: an answer sent in the first access epoch declares the retained bearer inventory")
+{
+    // A page answered before this UE has ever been released on this cell is the
+    // first access epoch: the cell was reached through a Tracking Area Update
+    // that established no bearer here, so it holds no bearer context of this
+    // session and cannot tell a default E-RAB from a dedicated one. The MME's
+    // answer to the Service Request is one Initial Context Setup Request naming
+    // every bearer the session still holds, and that list marks no roles. The
+    // UE must therefore name them itself, beside an ordinary compact EPS
+    // Service Request.
+    Session session;
+    session.startAsync(UeConfig(47121, 47122, /*pagingWaitMs=*/30000), IdleAction::PageMatchingRestore, 47122);
+    REQUIRE(session.waitFor("Access restoration completed after a network paging indication"));
+    session.shutdown = true;
+    session.finish();
+
+    CHECK(session.exitCode == 0);
+    CHECK(session.mme->failures.empty());
+    // Exactly one answer to one page, and it is the declaring form. The compact
+    // form must not also be sent: that would be a second answer to one page and
+    // would leave the network with two Service Requests for one procedure.
+    CHECK(CountFrames(session.mme->frames, "SERVICE_REQUEST_DECLARED") == 1);
+    CHECK(CountFrames(session.mme->frames, "SERVICE_REQUEST") == 0);
+    REQUIRE(session.mme->serviceRequestPayloads.size() == 1);
+    // The declaration is additive. Read the body the way the network does and
+    // the identity prefix plus the NAS tail are exactly the nine octets a
+    // compact SERVICE_REQUEST frame carries, so the MME answers the procedure
+    // it already knows rather than a new one invented for this phase. Only the
+    // inventory between the two halves is new, and the NAS it precedes is the
+    // ordinary four-octet EPS Service Request, carried verbatim.
+    const auto answer = DecodePagingAnswer(session.mme->serviceRequestPayloads[0]);
+    CHECK(answer.identity == std::vector<uint8_t>{kMmeCode, 0xC0, 0x00, 0x01, 0x8E});
+    CHECK(answer.nas.size() == 4);
+    CHECK(answer.identity.size() + answer.nas.size() == 9);
+    // This scenario holds the default bearer and nothing on top of it, so the
+    // declaration names that one identity and no dedicated one.
+    CHECK(answer.inventory.defaultEbi == kDefaultEbi);
+    CHECK(answer.inventory.dedicatedEbis.empty());
+    CHECK(session.mme->serviceRequests == 1);
+}
+
+TEST_CASE("lte/paging/wait: a retransmitted answer repeats the frozen declaration instead of falling back to the compact form")
+{
+    // The network answers the page with silence, so the answer is retransmitted
+    // up to the configured bound. A retransmission of a procedure that is still
+    // opening an S1 connection must repeat the very frame the first
+    // transmission sent. It is decided from how the original left, not from
+    // whether an identifier has been assigned yet: the UE has never been told
+    // that identifier, and a guess would change the message a reselected cell
+    // receives. Falling back to the compact form on the retry would drop the
+    // declaration from exactly the transmission that may be the one the cell
+    // finally sees.
+    Session session;
+    session.run(UeConfig(47123, 47124, /*pagingWaitMs=*/30000, /*triggerAfterMs=*/100,
+                         /*procedureTimeoutMs=*/100, /*maxRetries=*/1),
+                IdleAction::PageMatchingNoRestore, 47124);
+
+    CHECK(session.exitCode == 1);
+    CHECK(Contains(session.log, "Paging-triggered service restoration failed after bounded retransmissions"));
+    CHECK(session.mme->failures.empty());
+    // The first transmission and the retry are the same declared frame, and the
+    // compact form is never substituted for it.
+    REQUIRE(session.mme->serviceRequestPayloads.size() == 2);
+    CHECK(CountFrames(session.mme->frames, "SERVICE_REQUEST_DECLARED") == 2);
+    CHECK(CountFrames(session.mme->frames, "SERVICE_REQUEST") == 0);
+    CHECK(session.mme->serviceRequestPayloads[0] == session.mme->serviceRequestPayloads[1]);
+    // Every transmission carries the whole declaration, and the NAS inside it
+    // is still the unchanged compact four-octet EPS Service Request.
+    for (const auto &payload : session.mme->serviceRequestPayloads)
+    {
+        const auto answer = DecodePagingAnswer(payload);
+        CHECK(answer.identity == std::vector<uint8_t>{kMmeCode, 0xC0, 0x00, 0x01, 0x8E});
+        CHECK(answer.nas.size() == 4);
+        CHECK(answer.identity.size() + answer.nas.size() == 9);
+        CHECK(answer.inventory.defaultEbi == kDefaultEbi);
+        CHECK(answer.inventory.dedicatedEbis.empty());
+    }
+    CHECK(session.mme->protectedUplinks == 2);
+}
+
 TEST_CASE("lte/paging/wait: shutdown while a paging Service Request is pending is still a shutdown")
 {
     Session session;
@@ -685,8 +818,8 @@ TEST_CASE("lte/paging/wait: a stop request and a paging-wait expiry are never re
 
 TEST_CASE("lte/paging/wait: an unanswered paging Service Request fails after bounded retransmissions")
 {
-    // The network answers the page with silence, so the compact Service Request
-    // is retransmitted up to the configured bound and then reported as an
+    // The network answers the page with silence, so the paging answer is
+    // retransmitted up to the configured bound and then reported as an
     // unresolved restoration. The paging window is far longer than the retry
     // budget, so this outcome cannot be the paging-wait expiry.
     Session session;
@@ -708,8 +841,11 @@ TEST_CASE("lte/paging/wait: an unanswered paging Service Request fails after bou
     CHECK_FALSE(Contains(session.log, "Paging wait abandoned at shutdown"));
     CHECK_FALSE(Contains(session.log, "State=ECM_CONNECTED"));
 
-    // Exactly one initial request and one retransmission; the retry repeats the
-    // same protected PDU rather than consuming another uplink NAS COUNT.
+    // Exactly one initial request and one retransmission, both of the declaring
+    // form this access epoch answers with; the retry repeats the same protected
+    // PDU rather than consuming another uplink NAS COUNT.
+    CHECK(CountFrames(session.mme->frames, "SERVICE_REQUEST_DECLARED") == 2);
+    CHECK(CountFrames(session.mme->frames, "SERVICE_REQUEST") == 0);
     REQUIRE(session.mme->serviceRequestPayloads.size() == 2);
     CHECK(session.mme->serviceRequestPayloads[0] == session.mme->serviceRequestPayloads[1]);
     CHECK(session.mme->protectedUplinks == 2);

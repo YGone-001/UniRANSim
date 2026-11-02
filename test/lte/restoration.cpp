@@ -597,12 +597,71 @@ TEST_CASE("restoration/lifecycle: standalone retained E-RAB setup reuses the sam
     CHECK(lab.entry.dedicatedBearers[0].active());
 }
 
+TEST_CASE("restoration/lifecycle: a shutdown during a dedicated bearer restoration leaves no half-open access")
+{
+    // The dedicated E-RAB is set up but the UE has not confirmed its transport
+    // yet, which is the window a shutdown has to survive. The access goes away
+    // and with it every transport identity and the claim that a restoration is
+    // still outstanding. The logical bearer the network still believes exists
+    // is retained rather than silently deactivated by an orderly shutdown.
+    Lab lab(1);
+    auto r = Request();
+    r.erabs.resize(1);
+    lab.request(r);
+    lab.ready(5);
+    s1ap::ErabSetupRequest setup{101, 1, {Request().erabs[1]}};
+    setup.erabs[0].nasPduPresent = true;
+    setup.erabs[0].nasPdu = {0x27, 0, 0, 0, 0, 1, 0}; // opaque synthetic protected NAS
+    auto bytes = s1ap::EncodeErabSetupRequest(setup);
+    lab.mux.handleS1ap(bytes.data(), bytes.size(), 1);
+    REQUIRE(lab.entry.dedicatedBearers.size() == 1);
+    REQUIRE(lab.entry.dedicatedBearers[0].restorationPending());
+    const auto defaultTeid = lab.entry.bearer.parameters().localTeid;
+    const auto dedicatedTeid = lab.entry.dedicatedBearers[0].parameters().localTeid;
+
+    lab.mux.shutdown();
+
+    // The radio identity is retained and the access is released cleanly.
+    CHECK(lab.mux.registry().size() == 1);
+    CHECK(lab.entry.s1 == UeS1State::IDLE_RETAINED);
+    CHECK(lab.mux.registry().findByEnbUeS1apId(lab.entry.enbUeS1apId) == nullptr);
+    CHECK(lab.entry.bearer.parameters().localTeid == 0);
+    REQUIRE(lab.entry.dedicatedBearers.size() == 1);
+    CHECK(lab.entry.dedicatedBearers[0].parameters().localTeid == 0);
+    CHECK(lab.mux.registry().findByLocalTeid(defaultTeid) == nullptr);
+    CHECK(lab.mux.registry().findByLocalTeid(dedicatedTeid) == nullptr);
+    // The logical bearer survives the access, and nothing still claims a
+    // restoration is in progress for it.
+    CHECK(lab.entry.dedicatedBearers[0].logicalExists());
+    CHECK_FALSE(lab.entry.dedicatedBearers[0].active());
+    CHECK_FALSE(lab.entry.dedicatedBearers[0].restorationPending());
+}
+
 TEST_CASE("restoration/lifecycle: full deletion removes retained contexts and prevents Service Request")
 {
     Lab lab(2, false);
     lab.uplink(link::MessageType::EPS_SESSION_DELETED, link::EncodeBearerRestoration(5, 1));
     CHECK_FALSE(lab.entry.bearer.logicalExists());
     CHECK(lab.entry.dedicatedBearers.empty());
+    lab.uplink(link::MessageType::SERVICE_REQUEST, {1, 0x12, 0x34, 0x56, 0x78, 0xC7, 0, 1, 2});
+    CHECK(lab.entry.s1 == UeS1State::IDLE_RETAINED);
+    CHECK(lab.sender.sent.empty());
+}
+
+TEST_CASE("restoration/lifecycle: a Service Request cannot open a session a new Attach has not confirmed")
+{
+    // A locally retained idle entry is not a confirmed EPS session. Beginning a
+    // new Attach removes the bearer contexts and with them any session the
+    // network still holds, so a Service Request arriving before that Attach has
+    // confirmed anything names a session that does not exist. It is refused
+    // rather than answered from state that has already been thrown away. The
+    // same entry without the Attach does forward it, which is what
+    // "genuine radio Service Request creates fresh S1 identity" pins and what
+    // makes this the distinction rather than a blanket refusal.
+    Lab lab(2, false);
+    lab.mux.registry().beginNewAttach(lab.entry);
+    CHECK_FALSE(lab.entry.bearer.logicalExists());
+    CHECK_FALSE(lab.entry.bearer.logicalConfirmed());
     lab.uplink(link::MessageType::SERVICE_REQUEST, {1, 0x12, 0x34, 0x56, 0x78, 0xC7, 0, 1, 2});
     CHECK(lab.entry.s1 == UeS1State::IDLE_RETAINED);
     CHECK(lab.sender.sent.empty());
