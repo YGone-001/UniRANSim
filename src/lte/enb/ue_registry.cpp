@@ -64,8 +64,11 @@ uint32_t TeidFromBytes(const std::array<uint8_t, 4> &value)
            (static_cast<uint32_t>(value[2]) << 8U) | value[3];
 }
 
-UeRegistry::UeRegistry(size_t maxUes) : m_maxUes(maxUes)
+UeRegistry::UeRegistry(size_t maxUes, std::function<uint32_t()> teidAllocator)
+    : m_maxUes(maxUes), m_allocTeid(std::move(teidAllocator))
 {
+    if (!m_allocTeid)
+        throw RegistryError("A local S1-U TEID allocator is required");
 }
 
 EnbUeEntry &UeRegistry::registerPeer(uint32_t radioUeId, const InetAddress &peer)
@@ -186,12 +189,12 @@ void UeRegistry::releaseBearer(EnbUeEntry &entry, uint8_t ebi)
         for (auto &dedicated : entry.dedicatedBearers)
         {
             if (dedicated.parameters().localTeid != 0)
-                m_byLocalTeid.erase(dedicated.parameters().localTeid);
+                retireLocalTeid(dedicated.parameters().localTeid);
             dedicated.release();
         }
         entry.dedicatedBearers.clear();
         if (entry.bearer.parameters().localTeid != 0)
-            m_byLocalTeid.erase(entry.bearer.parameters().localTeid);
+            retireLocalTeid(entry.bearer.parameters().localTeid);
         entry.bearer.release();
         return;
     }
@@ -200,7 +203,7 @@ void UeRegistry::releaseBearer(EnbUeEntry &entry, uint8_t ebi)
         if (it->parameters().erabId != ebi)
             continue;
         if (it->parameters().localTeid != 0)
-            m_byLocalTeid.erase(it->parameters().localTeid);
+            retireLocalTeid(it->parameters().localTeid);
         it->release();
         entry.dedicatedBearers.erase(it);
         return;
@@ -261,13 +264,23 @@ void UeRegistry::clearMmeUeS1apId(EnbUeEntry &entry)
 
 uint32_t UeRegistry::allocateLocalTeid()
 {
-    // The process-wide allocator never hands out zero; skipping identifiers
-    // that are still live also makes wraparound collision-free.
+    // The process-wide allocator never hands out zero and is monotonic across
+    // the whole process, so a value is not offered again before every later one
+    // has been used. Skipping the values that are still live or still
+    // remembered as retired closes the one case the monotonicity does not
+    // cover, the wraparound of the 32-bit sequence: an identifier that has been
+    // retired before must not be offered again while its record stands, or a
+    // delayed packet of the old tunnel would resolve against the new one.
     for (;;)
     {
-        const uint32_t candidate = AllocateLocalTeid();
-        if (m_byLocalTeid.count(candidate) == 0)
-            return candidate;
+        const uint32_t candidate = m_allocTeid();
+        if (candidate == 0)
+            continue;
+        if (m_byLocalTeid.count(candidate) != 0)
+            continue;
+        if (m_retiredTeids.contains(candidate))
+            continue;
+        return candidate;
     }
 }
 
@@ -285,6 +298,27 @@ void UeRegistry::bindLocalTeid(EnbUeEntry &entry, BearerContext &bearer, uint32_
     if (bearer.parameters().localTeid != teid)
         throw RegistryError("The bearer already owns a different local S1-U TEID");
     m_byLocalTeid.emplace(teid, &entry);
+    // A live identifier is by definition not retired. This only matters for an
+    // identifier assigned by hand that was retired earlier in the process, and
+    // leaving its record behind would keep the allocator from ever offering it
+    // while it is in fact in use.
+    m_retiredTeids.revive(teid);
+}
+
+bool UeRegistry::isRetiredTeid(uint32_t teid) const
+{
+    return m_retiredTeids.contains(teid);
+}
+
+void UeRegistry::retireLocalTeid(uint32_t teid)
+{
+    if (teid == 0)
+        return;
+    m_byLocalTeid.erase(teid);
+    // The identifier stops resolving and is remembered as retired, so a delayed
+    // G-PDU or a reordered End Marker naming it is reported as having outlived
+    // its tunnel rather than as naming a tunnel that was never issued.
+    m_retiredTeids.retire(teid);
 }
 
 void UeRegistry::releaseS1(EnbUeEntry &entry)
@@ -307,10 +341,10 @@ void UeRegistry::releaseS1(EnbUeEntry &entry)
     entry.mmeUeS1apId = 0;
     entry.sgwPeer = InetAddress{};
     if (entry.bearer.parameters().localTeid != 0)
-        m_byLocalTeid.erase(entry.bearer.parameters().localTeid);
+        retireLocalTeid(entry.bearer.parameters().localTeid);
     for (auto &dedicated : entry.dedicatedBearers)
         if (dedicated.parameters().localTeid != 0)
-            m_byLocalTeid.erase(dedicated.parameters().localTeid);
+            retireLocalTeid(dedicated.parameters().localTeid);
     entry.bearer.releaseAccessTransport();
     // ECM-IDLE drops access TEIDs, not EPS bearer contexts. Clearing the
     // dedicated contexts here would silently deactivate a bearer the network
@@ -332,7 +366,7 @@ void UeRegistry::unbindLocalTeid(EnbUeEntry &entry, uint32_t teid)
 {
     const auto it = m_byLocalTeid.find(teid);
     if (it != m_byLocalTeid.end() && it->second == &entry)
-        m_byLocalTeid.erase(it);
+        retireLocalTeid(teid);
 }
 
 void UeRegistry::deleteBearerContexts(EnbUeEntry &entry)

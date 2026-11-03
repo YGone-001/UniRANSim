@@ -19,7 +19,17 @@ namespace lte::enb::gtpu
 
 constexpr uint8_t EchoRequest = 1;
 constexpr uint8_t EchoResponse = 2;
+// TS 29.281 table 6.1-1. The End Marker names the tunnel whose payload stream
+// is ending, so it carries that tunnel's TEID and never a T-PDU. It is a
+// control message about a tunnel, not user-plane payload, and it is not a
+// handover authorisation.
+constexpr uint8_t EndMarker = 254;
 constexpr uint8_t TPdu = 255;
+
+// TS 29.281 table 7.3.2-1 lists Private Extension as the only optional
+// information element of an End Marker. Its type carries the MSB that marks a
+// TLV rather than a TV information element.
+constexpr uint8_t PrivateExtensionType = 0xFF;
 
 struct Packet
 {

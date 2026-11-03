@@ -16,6 +16,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -139,7 +140,11 @@ uint16_t SctpStreamForUe(int outboundStreams, uint32_t enbUeS1apId);
 class UeRegistry
 {
   public:
-    explicit UeRegistry(size_t maxUes);
+    // `teidAllocator` supplies raw local TEID candidates. It is the process-wide
+    // monotonic allocator in production; a test passes a deterministic sequence
+    // to drive the boundary and wraparound cases that a randomised 32-bit
+    // counter cannot reach on its own.
+    explicit UeRegistry(size_t maxUes, std::function<uint32_t()> teidAllocator = &AllocateLocalTeid);
 
     // Registers a simulated radio identity and its verified UDP peer. A
     // duplicate radio identity, an identity claimed from another endpoint, an
@@ -176,11 +181,19 @@ class UeRegistry
     void setMmeUeS1apId(EnbUeEntry &entry, uint32_t mmeUeS1apId);
     void clearMmeUeS1apId(EnbUeEntry &entry);
 
-    // Allocates a local S1-U TEID unique across concurrently active bearers
-    // and never zero.
+    // Allocates a local S1-U TEID unique across concurrently active bearers,
+    // never zero, and never one that is still remembered as retired. The last
+    // rule is what keeps a delayed packet of an old tunnel from resolving
+    // against the new tunnel that a re-used identifier would otherwise name.
     uint32_t allocateLocalTeid();
     void bindLocalTeid(EnbUeEntry &entry, uint32_t teid);
     void bindLocalTeid(EnbUeEntry &entry, BearerContext &bearer, uint32_t teid);
+
+    // Whether this local TEID names a tunnel that has already been retired.
+    // It answers only that: a false answer does not distinguish an identifier
+    // that was never issued from one whose retirement record has aged out.
+    [[nodiscard]] bool isRetiredTeid(uint32_t teid) const;
+    [[nodiscard]] const RetiredTeidLedger &retiredTeids() const { return m_retiredTeids; }
 
     // Releases the S1 connection of one UE: the S1AP identifiers and the local
     // GTP-U TEIDs stop resolving, logical bearers are retained, and the entry
@@ -206,8 +219,15 @@ class UeRegistry
     std::vector<EnbUeEntry *> all();
 
   private:
+    // Drops one local TEID from the live index and records it as retired. Every
+    // path that stops a tunnel from resolving goes through here, so a TEID can
+    // never become unresolvable without also becoming identifiable as retired.
+    void retireLocalTeid(uint32_t teid);
+
     size_t m_maxUes;
+    std::function<uint32_t()> m_allocTeid;
     uint32_t m_nextEnbUeS1apId{1};
+    RetiredTeidLedger m_retiredTeids;
     std::unordered_map<uint32_t, std::unique_ptr<EnbUeEntry>> m_byRadioUeId;
     // InetAddress has no std::hash specialization; its string form is unique.
     std::unordered_map<std::string, EnbUeEntry *> m_byPeer;

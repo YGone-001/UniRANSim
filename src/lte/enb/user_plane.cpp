@@ -31,6 +31,45 @@ uint32_t AllocateLocalTeid()
     return value;
 }
 
+RetiredTeidLedger::RetiredTeidLedger(size_t capacity) : m_capacity(capacity)
+{
+    if (m_capacity == 0)
+        throw std::invalid_argument("The retired-TEID ledger must keep at least one record");
+}
+
+bool RetiredTeidLedger::retire(uint32_t teid)
+{
+    if (teid == 0)
+        throw std::invalid_argument("A zero identifier is not a GTP-U tunnel identifier");
+    if (m_byTeid.count(teid) != 0)
+        return false;
+    const uint64_t order = m_nextOrder++;
+    m_byTeid.emplace(teid, order);
+    m_byOrder.emplace(order, teid);
+    while (m_byOrder.size() > m_capacity)
+    {
+        const auto oldest = m_byOrder.begin();
+        m_byTeid.erase(oldest->second);
+        m_byOrder.erase(oldest);
+        ++m_evictions;
+    }
+    return true;
+}
+
+bool RetiredTeidLedger::contains(uint32_t teid) const
+{
+    return m_byTeid.count(teid) != 0;
+}
+
+void RetiredTeidLedger::revive(uint32_t teid)
+{
+    const auto it = m_byTeid.find(teid);
+    if (it == m_byTeid.end())
+        return;
+    m_byOrder.erase(it->second);
+    m_byTeid.erase(it);
+}
+
 void DefaultBearerContext::establish(const BearerParameters &parameters, bool restoringAccess)
 {
     if (m_established)

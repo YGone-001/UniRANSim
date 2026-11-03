@@ -2,8 +2,9 @@
 
 Development and safety requirements for working in this repository. It records
 only what the repository itself establishes: the build and test entry points,
-what must never be committed, the commit style used on `develop`, and the
-constraints that apply when the LTE path is driven against a live EPC.
+what must never be committed, the commit style used on `develop`, the GTP-U
+message-handling rules the eNB receive path must keep, and the constraints that
+apply when the LTE path is driven against a live EPC.
 
 ## Layout
 
@@ -20,6 +21,10 @@ constraints that apply when the LTE path is driven against a live EPC.
 milestones. It is a roadmap, not a task list: its milestones stay
 `DEFERRED — NOT IMPLEMENTED — NOT BENCHMARKED` until they are deliberately
 taken on, and it is otherwise left alone.
+
+`docs/gtpu-end-marker-retired-tunnel-lifecycle.md` is the design record for the
+eNB GTP-U receive path: message types, End Marker rules, tunnel lifecycle and
+TEID reuse protection.
 
 ## Build and test
 
@@ -64,6 +69,56 @@ cannot run it. That is what makes a privileged case safe to keep in the tree.
   missing statistics line is not evidence of anything.
 - Tests may not close a requirement with a hand-built success state that skips
   the production transition under test.
+
+## GTP-U message handling
+
+The eNB S1-U receive path is `S1uEndpoint::handleDatagram`, and its dispatch is
+a safety boundary. These rules are what a change must not weaken.
+
+- `gtpu::Decode` accepts exactly four message types: Echo Request (1), Echo
+  Response (2), End Marker (254) and G-PDU (255). Anything else is rejected at
+  decode. Do not widen the whitelist without a rule for the new type in the
+  dispatch switch below.
+- The dispatch switch sends Echo Request to `handleEchoRequest`, End Marker to
+  `handleEndMarker`, and **only** G-PDU to `handleGPdu`. A G-PDU is the only
+  message type that may reach the UE link, the frame encoders or the user-plane
+  packet counters. Do not let a control message fall through into forwarding.
+- An End Marker carries the TEID of the tunnel whose payload stream is ending.
+  It is not a release, not a bearer transition and not a handover
+  authorisation: handling one must never release a bearer, advance an access
+  generation, or start any procedure. It is recorded and nothing else moves.
+  No code path generates or transmits an End Marker.
+- TEID rules differ per message type and must stay that way. A G-PDU needs a
+  non-zero TEID and a non-empty payload and may contain no information element.
+  An End Marker needs a non-zero TEID and, beyond an empty information-element
+  area, only well-formed Private Extension TLVs (type `0xFF`). Echo carries a
+  zero TEID. Reject rather than guess at anything else.
+- A local S1-U TEID is active (in `UeRegistry::m_byLocalTeid`), retired (in the
+  `RetiredTeidLedger`), or unknown. Every path that stops a tunnel from
+  resolving goes through `UeRegistry::retireLocalTeid`, so an identifier cannot
+  become unresolvable without also becoming identifiable as retired.
+- `UeRegistry::allocateLocalTeid` must keep refusing an identifier that is zero,
+  live, or still recorded as retired. That last rule is what stops a delayed
+  packet of an old tunnel from resolving against the new tunnel a re-used
+  identifier would name. The retired-TEID record is bounded and holds only the
+  identifier and its retirement order — no UE identity, peer address or
+  subscriber information.
+- A G-PDU whose TEID does not resolve is dropped and classified: retired TEID
+  is traffic that outlived its tunnel, unknown TEID is a packet that never had
+  one. Neither may create or disturb any bearer or UE state.
+- Peer identity is validated per bearer against `sgwAddress:2152` before
+  anything else happens, for control messages as well as for G-PDUs. Do not
+  move that check after a state change.
+
+The detail, including the genuine wire vector the tests are anchored on and the
+known limitation that an End Marker does not drain an active tunnel, is in
+`docs/gtpu-end-marker-retired-tunnel-lifecycle.md`. The cases live in
+`test/lte/gtpu_end_marker.cpp` and drive `handleDatagram` against loopback UDP
+endpoints:
+
+```bash
+./cmake-build-release/nr-tests --no-version --test-case="lte/gtpu/*,lte/enb/retired-teid*"
+```
 
 ## What must never be committed
 

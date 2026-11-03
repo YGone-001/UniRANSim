@@ -56,6 +56,27 @@ bool IsSupportedExtension(uint8_t type)
     constexpr std::array<uint8_t, 5> supported{{0x40, 0x85, 0xC0, 0xC1, 0xC2}};
     return std::find(supported.begin(), supported.end(), type) != supported.end();
 }
+
+// TS 29.281 table 7.3.2-1 admits exactly one optional information element in an
+// End Marker: Private Extension, a TLV whose type is 0xFF. An empty information
+// element area is the ordinary form. Anything else cannot be interpreted
+// safely and is rejected rather than guessed at, because the remainder of the
+// message is what tells a receiver which tunnel is ending.
+void ValidateEndMarkerIes(const uint8_t *ies, size_t size)
+{
+    size_t offset = 0;
+    while (offset < size)
+    {
+        if (size - offset < 2)
+            throw CodecError("Truncated GTP-U End Marker information element");
+        const size_t length = ies[offset + 1];
+        if (ies[offset] != PrivateExtensionType)
+            throw CodecError("Unsupported GTP-U End Marker information element");
+        if (size - offset - 2 < length)
+            throw CodecError("Truncated GTP-U End Marker information element");
+        offset += 2 + length;
+    }
+}
 } // namespace
 
 std::vector<uint8_t> EncodeTPdu(uint32_t teid, const uint8_t *payload, size_t payloadSize)
@@ -84,7 +105,7 @@ Packet Decode(const uint8_t *data, size_t size)
         throw CodecError("GTP-U protocol-type bit is not set");
     if ((data[0] & 0x08U) != 0)
         throw CodecError("Reserved GTP-U flag is set");
-    if (data[1] != TPdu && data[1] != EchoRequest && data[1] != EchoResponse)
+    if (data[1] != TPdu && data[1] != EndMarker && data[1] != EchoRequest && data[1] != EchoResponse)
         throw CodecError("Unsupported GTP-U message type");
 
     const size_t declaredLength = Read16(data + 2);
@@ -133,19 +154,41 @@ Packet Decode(const uint8_t *data, size_t size)
         }
     }
 
-    if (result.messageType == TPdu)
+    result.payload.assign(data + offset, data + size);
+
+    // Each message type carries a different amount of meaning in its TEID and
+    // in its remainder, so the rule is chosen per type rather than shared. A
+    // G-PDU names a tunnel and carries its payload; an End Marker names the
+    // tunnel that is ending and carries only optional information elements;
+    // Echo is addressed to the endpoint itself and names no tunnel at all.
+    switch (result.messageType)
     {
+    case TPdu:
         if (result.teid == 0)
             throw CodecError("GTP-U T-PDU has a zero TEID");
-        if (offset == size)
+        if (result.payload.empty())
             throw CodecError("GTP-U T-PDU has no payload");
-    }
-    else if (result.teid != 0)
-    {
-        throw CodecError("GTP-U Echo message has a non-zero TEID");
+        break;
+    case EndMarker:
+        if (result.teid == 0)
+            throw CodecError("GTP-U End Marker has a zero TEID");
+        // Table 7.3.2-1 admits only the optional Private Extension. The
+        // information-element area is validated and then withheld from the
+        // caller: an End Marker carries no user-plane payload, and publishing
+        // its tail as one would let a caller forward the end of a control
+        // message to a UE.
+        ValidateEndMarkerIes(result.payload.data(), result.payload.size());
+        result.payload.clear();
+        break;
+    case EchoRequest:
+    case EchoResponse:
+        if (result.teid != 0)
+            throw CodecError("GTP-U Echo message has a non-zero TEID");
+        break;
+    default:
+        throw CodecError("Unsupported GTP-U message type");
     }
 
-    result.payload.assign(data + offset, data + size);
     return result;
 }
 

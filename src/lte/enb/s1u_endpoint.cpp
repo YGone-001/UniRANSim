@@ -65,29 +65,107 @@ void S1uEndpoint::handleDatagram(const uint8_t *data, size_t size, const InetAdd
         return;
     }
 
-    // Echo is a GTP-U control message of the endpoint itself; it is answered
-    // directly and never forwarded to a UE bearer or TUN interface.
-    if (packet.messageType == gtpu::EchoRequest)
+    // GTP-U control messages are dispatched before any bearer is selected and
+    // cannot reach the G-PDU forwarding path below. A G-PDU is the only message
+    // type that is delivered to a UE.
+    switch (packet.messageType)
     {
-        if (!packet.sequenceNumber.has_value())
-        {
-            ++m_counters.malformedDrops;
-            Log("WARN", "Dropped GTP-U Echo Request without a sequence number");
-            return;
-        }
-        auto response = gtpu::EncodeEchoResponse(*packet.sequenceNumber);
-        m_socket->TrySend(peer, response.data(), response.size());
-        ++m_counters.echoRequests;
+    case gtpu::EchoRequest:
+        handleEchoRequest(packet, peer);
+        return;
+    case gtpu::EchoResponse:
+        return;
+    case gtpu::EndMarker:
+        handleEndMarker(packet, peer);
+        return;
+    case gtpu::TPdu:
+        break;
+    default:
+        // Unreachable: Decode admits only the four types above. Kept so that a
+        // future message type cannot silently fall through into G-PDU
+        // forwarding and reach a UE.
+        ++m_counters.unsupportedMessageDrops;
+        Log("WARN", "Dropped GTP-U message of unsupported type " + std::to_string(packet.messageType));
         return;
     }
-    if (packet.messageType == gtpu::EchoResponse)
-        return;
+    handleGPdu(packet, peer);
+}
 
+void S1uEndpoint::handleEchoRequest(const gtpu::Packet &packet, const InetAddress &peer)
+{
+    // Echo is a GTP-U control message of the endpoint itself; it is answered
+    // directly and never forwarded to a UE bearer or TUN interface.
+    if (!packet.sequenceNumber.has_value())
+    {
+        ++m_counters.malformedDrops;
+        Log("WARN", "Dropped GTP-U Echo Request without a sequence number");
+        return;
+    }
+    auto response = gtpu::EncodeEchoResponse(*packet.sequenceNumber);
+    m_socket->TrySend(peer, response.data(), response.size());
+    ++m_counters.echoRequests;
+}
+
+void S1uEndpoint::handleEndMarker(const gtpu::Packet &packet, const InetAddress &peer)
+{
+    // TS 29.281 7.3.2: the End Marker indicates the end of the payload stream
+    // on one GTP-U tunnel. It carries no T-PDU, so it is never forwarded to a
+    // UE and never counted as user-plane traffic in either direction.
+    //
+    // It is also not an instruction to this eNB. An End Marker on a tunnel that
+    // is still up does not release that tunnel, does not move its bearer and
+    // does not authorise a handover: this phase recognises and records it and
+    // leaves the tunnel exactly as it was. The retirement of a tunnel is the
+    // explicit S1 release path, not this message.
+    ++m_counters.endMarkers;
+    const auto location = m_registry.findBearerByLocalTeid(packet.teid);
+    if (location.entry != nullptr && location.bearer != nullptr)
+    {
+        if (peer != InetAddress(Ipv4ToString(location.bearer->parameters().sgwAddress), 2152))
+        {
+            ++location.entry->counters.unexpectedPeerDrops;
+            Log("WARN", "Dropped GTP-U End Marker from unexpected peer " + peer.toString());
+            return;
+        }
+        ++m_counters.endMarkerActiveTunnels;
+        location.bearer->recordEndMarker();
+        Log("INFO", "GTP-U End Marker for active tunnel TEID " + Hex(packet.teid, 8) + " on LTE UE " +
+                        std::to_string(location.entry->radioUeId) +
+                        "; the tunnel is left established and no bearer is moved");
+        return;
+    }
+    if (m_registry.isRetiredTeid(packet.teid))
+    {
+        // The natural case: the peer is announcing the end of a tunnel whose
+        // access transport this eNB already released. A repeat of the same
+        // announcement lands here too and changes nothing at all.
+        ++m_counters.endMarkerRetiredTunnels;
+        Log("INFO", "GTP-U End Marker for retired tunnel TEID " + Hex(packet.teid, 8));
+        return;
+    }
+    ++m_counters.endMarkerUnknownTunnels;
+    Log("WARN", "Dropped GTP-U End Marker for unknown TEID " + Hex(packet.teid, 8));
+}
+
+void S1uEndpoint::handleGPdu(const gtpu::Packet &packet, const InetAddress &peer)
+{
     const auto location = m_registry.findBearerByLocalTeid(packet.teid);
     EnbUeEntry *entry = location.entry;
     BearerContext *bearer = location.bearer;
     if (entry == nullptr || bearer == nullptr)
     {
+        // A delayed G-PDU for a tunnel that has already been retired is a
+        // different event from one that names a TEID which was never issued:
+        // the first is traffic that outlived its tunnel, the second is a packet
+        // that never had one. Neither may reach a UE, and neither may create or
+        // disturb any bearer state, so nothing here is written anywhere except
+        // the drop counter.
+        if (m_registry.isRetiredTeid(packet.teid))
+        {
+            ++m_counters.retiredTeidDrops;
+            Log("WARN", "Dropped S1-U T-PDU for retired TEID " + Hex(packet.teid, 8));
+            return;
+        }
         ++m_counters.unknownTeidDrops;
         Log("WARN", "Dropped S1-U T-PDU with unknown/stale TEID " + Hex(packet.teid, 8));
         return;
