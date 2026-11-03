@@ -47,6 +47,11 @@ const char *ToString(PendingProcedure procedure)
     return "UNKNOWN_PENDING_PROCEDURE";
 }
 
+const char *ToString(AccessBootstrap bootstrap)
+{
+    return bootstrap == AccessBootstrap::ROLES_RETAINED ? "ROLES_RETAINED" : "DECLARE_REQUIRED";
+}
+
 void MobilityContext::onAttachComplete(uint8_t ebi, const std::array<uint8_t, 4> &ipv4,
                                        std::optional<std::array<uint8_t, 11>> assignedGuti,
                                        const std::vector<uint8_t> &assignedTaiList, uint8_t periodicTimer)
@@ -89,6 +94,10 @@ void MobilityContext::onBearerTransportEstablished(uint32_t localTeid, uint32_t 
     enbTeid = localTeid;
     sgwTeid = remoteTeid;
     bearer = EpsBearerState::USER_PLANE_READY;
+    // The endpoint has just set up this session's bearer transport, so it now
+    // holds the bearer roles a later Service Request would otherwise have to
+    // declare. This is the only evidence the classification is ever built from.
+    accessBootstrap = AccessBootstrap::ROLES_RETAINED;
 }
 
 void MobilityContext::onUserPlaneReady()
@@ -96,6 +105,7 @@ void MobilityContext::onUserPlaneReady()
     if (emm != EmmState::REGISTERED || ecm != EcmState::CONNECTED || defaultEbi == 0)
         throw LifecycleError("Invalid UE user-plane activation");
     bearer = EpsBearerState::USER_PLANE_READY;
+    accessBootstrap = AccessBootstrap::ROLES_RETAINED;
 }
 
 void MobilityContext::onS1ContextReleased()
@@ -154,6 +164,9 @@ void MobilityContext::validateAccessRestoration(uint8_t ebi, uint32_t generation
 void MobilityContext::beginNewAttach()
 {
     accessGeneration = 0;
+    // A fresh Attach is a new logical session, so whatever roles a previous
+    // session's access left with a cell describe nothing this UE still holds.
+    accessBootstrap = AccessBootstrap::DECLARE_REQUIRED;
 }
 
 void MobilityContext::onCellReselected()
@@ -176,6 +189,12 @@ void MobilityContext::onCellReselected()
     enbTeid.reset();
     sgwTeid.reset();
     accessGeneration = 1;
+    // The endpoint being arrived at is not the one that confirmed this session's
+    // bearer roles, so a Service Request here has to declare them. This is the
+    // one point where the classification is reset without the roles being
+    // deleted: they still exist in the network, and it is the new cell that has
+    // never been told which E-RAB plays which role.
+    accessBootstrap = AccessBootstrap::DECLARE_REQUIRED;
     // The logical default and dedicated bearers are still held by the network;
     // only their access transport is gone, which is what ECM-IDLE means.
     if (bearer != EpsBearerState::INACTIVE)
@@ -208,6 +227,7 @@ void MobilityContext::onServiceRestored(bool userPlaneReady)
     ecm = EcmState::CONNECTED;
     bearer = userPlaneReady ? EpsBearerState::USER_PLANE_READY : EpsBearerState::SIGNALING_ESTABLISHED;
     pending = PendingProcedure::NONE;
+    accessBootstrap = AccessBootstrap::ROLES_RETAINED;
 }
 
 void MobilityContext::onTauAccessRestored(bool userPlaneReady)
@@ -220,6 +240,7 @@ void MobilityContext::onTauAccessRestored(bool userPlaneReady)
     // The Tracking Area Update stays pending. Only its Accept completes it, and
     // reporting the restored access as an accepted update would claim an
     // outcome that has not happened.
+    accessBootstrap = AccessBootstrap::ROLES_RETAINED;
 }
 
 void MobilityContext::startDetach()

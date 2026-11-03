@@ -60,7 +60,7 @@ using Clock = std::chrono::steady_clock;
 // The 3GPP TS 35.208 test subscriber, identical to test/lte/ue.cpp. It is
 // fixture data only; no subscription is created and no HSS is consulted.
 std::string UeConfig(uint16_t uePort, uint16_t mmePort, int pagingWaitMs, int triggerAfterMs = 100,
-                     int procedureTimeoutMs = 5000, int maxRetries = 3)
+                     int procedureTimeoutMs = 5000, int maxRetries = 3, int idleRounds = 1)
 {
     std::ostringstream out;
     out << R"(imsi: '460020123456789'
@@ -93,6 +93,8 @@ lifecycle:
        << maxRetries << R"(
   pagingWaitMs: )"
        << pagingWaitMs << R"(
+  idleRounds: )"
+       << idleRounds << R"(
   recoveryDelayMs: 0
   recoveryRetryMs: 5000
   recoveryMaxAttempts: 0
@@ -123,7 +125,18 @@ enum class IdleAction
     // Request in flight so a stop request can be tested against it.
     PageMatchingNoRestore,
     // One matching page, then complete the restoration.
-    PageMatchingRestore
+    PageMatchingRestore,
+    // One matching page per round, restoring every one and then releasing the
+    // access again so the next round starts from ECM-IDLE. `cycles` rounds in
+    // total. Each round advances the access generation the way a real eNB
+    // does: the release that ends an epoch carries the next number, and the
+    // restoration that answers a page restates the epoch it belongs to.
+    PageRepeated,
+    // The same repeated rounds, except that the access between them ends in an
+    // unexpected loss of the eNB's S1-MME association rather than in a UE
+    // Context Release. The session, the security context and the paging
+    // behaviour must be identical either way.
+    PageRepeatedAfterLoss
 };
 
 // Minimal peer for the simulated radio link. It completes a real EPS Attach
@@ -142,8 +155,25 @@ class FakeMme
 
     void start(const Config &config, IdleAction action)
     {
+        start(config, action, 1, 1);
+    }
+
+    // `cycles` is how many page/restore/release rounds the scripted network
+    // drives. One is the single-paging behaviour every older test uses.
+    // `restoreCycles` says how many of those rounds the network actually
+    // answers with a bearer restoration. The last rounds can be left
+    // unanswered instead, which is the only way a later-epoch Service Request
+    // retransmission is observable at all.
+    void start(const Config &config, IdleAction action, int cycles, int restoreCycles)
+    {
         m_config = config;
         m_action = action;
+        m_cycles = cycles;
+        m_restoreCycles = restoreCycles;
+        m_generation = 0;
+        m_completedCycles = 0;
+        m_round = 0;
+        m_answeredRound = 0;
         m_thread = std::thread([this] { run(); });
     }
 
@@ -168,6 +198,33 @@ class FakeMme
     bool releaseSeen{};
     bool pagingSent{};
     bool restoreSent{};
+    // The access generation each S1 release presented to the UE, and the one
+    // each restoration restated. A repeated-access test proves the pairing is
+    // exact: release n hands the UE generation n and restoration n answers
+    // with generation n, so no cycle reuses a previous epoch's number.
+    std::vector<uint32_t> releaseGenerations;
+    std::vector<uint32_t> restoreGenerations;
+    // How many access rounds the network actually completed. A round the
+    // network left unanswered is not a completed one, and the retransmissions
+    // of its Service Request are not further rounds.
+    int completedCycles{};
+
+    // The access epoch the network currently presents. It advances exactly
+    // when an access that carried bearer transport ends, which is the one
+    // transition the UE is told about.
+    uint32_t generation() const
+    {
+        return m_generation;
+    }
+
+    // Lets a test deliver a further page after the scripted one, through the
+    // same radio endpoint the network already used, so a duplicate page is
+    // indistinguishable from a real one on the wire.
+    void sendPageNow(const link::PagingNotification &notification)
+    {
+        pagingSent = true;
+        send(link::MessageType::PAGING_INDICATION, link::EncodePagingNotification(notification), m_uePeer);
+    }
 
   private:
     void fail(const std::string &reason)
@@ -187,6 +244,7 @@ class FakeMme
                 const int received = m_socket.Receive(buffer, sizeof(buffer), 20, peer);
                 if (received <= 0)
                     continue;
+                m_uePeer = peer;
                 const auto frame = link::Decode(buffer, static_cast<size_t>(received));
                 if (frame.ueId != m_config.ueId)
                 {
@@ -297,11 +355,24 @@ class FakeMme
         return true;
     }
 
+    // Ends the current access epoch and returns the number the UE is told
+    // about. A real eNB advances the epoch exactly when an access that carried
+    // bearer transport ends, and the notification names the new number, so
+    // every generation-bound confirmation of the next epoch is compared
+    // against one this UE has never seen.
+    uint32_t endAccessEpoch()
+    {
+        if (++m_generation == 0)
+            ++m_generation;
+        releaseGenerations.push_back(m_generation);
+        return m_generation;
+    }
+
     bool onReleaseRequest(const InetAddress &peer)
     {
         releaseSeen = true;
         send(link::MessageType::S1_CONTEXT_RELEASED,
-             link::EncodeBearerRestoration(kDefaultEbi, 1), peer);
+             link::EncodeBearerRestoration(kDefaultEbi, endAccessEpoch()), peer);
         if (m_action == IdleAction::StaySilent || m_action == IdleAction::PageForeign)
         {
             if (m_action == IdleAction::PageForeign)
@@ -320,15 +391,72 @@ class FakeMme
         ++serviceRequests;
         if (m_action == IdleAction::PageMatchingRestore)
         {
-            send(link::MessageType::S1_CONTEXT_RESTORED, link::EncodeBearerRestoration(kDefaultEbi, 1), peer);
+            send(link::MessageType::S1_CONTEXT_RESTORED, link::EncodeBearerRestoration(kDefaultEbi, m_generation),
+                 peer);
+            restoreGenerations.push_back(m_generation);
             restoreSent = true;
+            ++m_completedCycles;
+            completedCycles = m_completedCycles;
         }
+        else if (m_action == IdleAction::PageRepeated || m_action == IdleAction::PageRepeatedAfterLoss)
+        {
+            // A retransmission repeats the frozen Service Request of the round
+            // that is still outstanding. It is not a new page and not a new
+            // access epoch, so the network neither answers it again nor counts
+            // it as a completed round.
+            if (m_answeredRound == m_round)
+                return true;
+            m_answeredRound = m_round;
+            // Only the rounds the network chose to answer carry a restoration.
+            // The rest are left outstanding so the UE's bounded retransmission
+            // runs against a Service Request of a later access epoch.
+            const bool restored = m_round <= m_restoreCycles;
+            if (restored)
+            {
+                send(link::MessageType::S1_CONTEXT_RESTORED, link::EncodeBearerRestoration(kDefaultEbi, m_generation),
+                     peer);
+                restoreGenerations.push_back(m_generation);
+                restoreSent = true;
+                ++m_completedCycles;
+                completedCycles = m_completedCycles;
+                // A round is only ever followed by another one once this round
+                // actually completed an access, because the next page has to
+                // start from ECM-IDLE.
+                if (m_completedCycles < m_cycles)
+                    return releaseAndPageAgain(peer);
+            }
+        }
+        return true;
+    }
+
+    // After a restoration has completed, the network drops the access again,
+    // exactly as it would on user inactivity, and pages for the next round.
+    // The UE is never asked to re-Attach and never told to reselect.
+    bool releaseAndPageAgain(const InetAddress &peer)
+    {
+        // Let the UE finish recording the restoration before the release lands.
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        const uint32_t generation = endAccessEpoch();
+        if (m_action == IdleAction::PageRepeatedAfterLoss)
+            // This access does not end in a UE Context Release at all: the
+            // eNB's S1-MME association is lost and the access transport dies
+            // with it. It carries the same generation-bound identity because
+            // the same access epoch is ending either way.
+            send(link::MessageType::S1_ACCESS_LOST, link::EncodeBearerRestoration(kDefaultEbi, generation), peer);
+        else
+            send(link::MessageType::S1_CONTEXT_RELEASED, link::EncodeBearerRestoration(kDefaultEbi, generation), peer);
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        sendPage(peer, kMmeCode, kMTmsi);
         return true;
     }
 
     void sendPage(const InetAddress &peer, uint8_t mmeCode, uint32_t mTmsi)
     {
         pagingSent = true;
+        // Every page opens one access round: one page, one Service Request
+        // answer and at most one restoration, however often that answer is
+        // retransmitted before the network replies.
+        ++m_round;
         link::PagingNotification page;
         page.mmeCode = mmeCode;
         page.mTmsi = mTmsi;
@@ -417,6 +545,13 @@ class FakeMme
 
     Config m_config;
     IdleAction m_action{IdleAction::StaySilent};
+    int m_cycles{1};
+    int m_restoreCycles{1};
+    uint32_t m_generation{0};
+    int m_completedCycles{0};
+    int m_round{0};
+    int m_answeredRound{0};
+    InetAddress m_uePeer;
     udp::UdpServer m_socket;
     SecurityContext m_security{};
     std::thread m_thread;
@@ -438,10 +573,20 @@ struct Session
 
     void run(const std::string &yaml, IdleAction action, uint16_t mmePort)
     {
+        run(yaml, action, mmePort, 1, 1);
+    }
+
+    void run(const std::string &yaml, IdleAction action, uint16_t mmePort, int cycles)
+    {
+        run(yaml, action, mmePort, cycles, cycles);
+    }
+
+    void run(const std::string &yaml, IdleAction action, uint16_t mmePort, int cycles, int restoreCycles)
+    {
         const auto config = ParseConfig(yaml);
         capture = std::make_unique<lte::test::LogCapture>();
         mme = std::make_unique<FakeMme>("127.0.0.1", mmePort);
-        mme->start(config, action);
+        mme->start(config, action, cycles, restoreCycles);
 
         const auto started = Clock::now();
         std::thread ue([&] { exitCode = lte::ue::Run(config, shutdown); });
@@ -458,10 +603,20 @@ struct Session
     // against a known paging-wait state.
     void startAsync(const std::string &yaml, IdleAction action, uint16_t mmePort)
     {
+        startAsync(yaml, action, mmePort, 1, 1);
+    }
+
+    void startAsync(const std::string &yaml, IdleAction action, uint16_t mmePort, int cycles)
+    {
+        startAsync(yaml, action, mmePort, cycles, cycles);
+    }
+
+    void startAsync(const std::string &yaml, IdleAction action, uint16_t mmePort, int cycles, int restoreCycles)
+    {
         const auto config = ParseConfig(yaml);
         capture = std::make_unique<lte::test::LogCapture>();
         mme = std::make_unique<FakeMme>("127.0.0.1", mmePort);
-        mme->start(config, action);
+        mme->start(config, action, cycles, restoreCycles);
         m_config = config;
         m_started = Clock::now();
         m_ue = std::thread([this] { exitCode = lte::ue::Run(m_config, shutdown); });
@@ -470,6 +625,14 @@ struct Session
     bool waitFor(const std::string &needle, int timeoutMs = 8000)
     {
         return capture->waitFor(needle, timeoutMs);
+    }
+
+    // Waits for the `count`-th appearance of `needle`. A repeated-access test
+    // has to hold the UE alive until its last access epoch has completed, and
+    // waiting for the first of several identical events would stop it early.
+    bool waitForOccurrences(const std::string &needle, int count, int timeoutMs = 8000)
+    {
+        return capture->waitForOccurrences(needle, count, timeoutMs);
     }
 
     void finish()
@@ -509,6 +672,16 @@ int CountFrames(const std::vector<std::string> &frames, const std::string &name)
     for (const auto &frame : frames)
         if (frame == name)
             ++count;
+    return count;
+}
+
+// How often a log line appears, so a repeated-access test can prove an event
+// happened once per cycle and not once per retransmission or not at all.
+int CountOccurrences(const std::string &log, const std::string &needle)
+{
+    int count = 0;
+    for (size_t at = log.find(needle); at != std::string::npos; at = log.find(needle, at + needle.size()))
+        ++count;
     return count;
 }
 
@@ -638,8 +811,12 @@ TEST_CASE("lte/paging/wait: a valid page disarms the window and a later stop is 
     session.finish();
 
     CHECK(session.exitCode == 0);
-    CHECK(Contains(session.log, "Paging identity matched (MMEC=1); compact EPS Service Request sent for the "
-                                "network-triggered restoration"));
+    // This fixture runs without a local user plane, so the UE never sent the
+    // BEARER_READY that would confirm this cell's bearer roles. The answer is
+    // therefore the declaring form, and the log names the form it actually
+    // sent instead of always claiming the compact one.
+    CHECK(Contains(session.log, "Paging identity matched (MMEC=1); bearer-inventory Service Request sent for the "
+                                "network-triggered restoration (bootstrap=DECLARE_REQUIRED)"));
     CHECK(Contains(session.log, "Access restoration completed after a network paging indication"));
     CHECK_FALSE(Contains(session.log, "Timed out waiting for a network paging indication"));
     // The wait was disarmed by the accepted page, so the shutdown tail must
@@ -662,16 +839,21 @@ TEST_CASE("lte/paging/wait: a valid page disarms the window and a later stop is 
 // The form of the answer to a page
 // ---------------------------------------------------------------------------
 
-TEST_CASE("lte/paging/wait: an answer sent in the first access epoch declares the retained bearer inventory")
+TEST_CASE("lte/paging/wait: an answer at a cell that never confirmed this session's bearer roles declares the "
+          "inventory")
 {
-    // A page answered before this UE has ever been released on this cell is the
-    // first access epoch: the cell was reached through a Tracking Area Update
-    // that established no bearer here, so it holds no bearer context of this
-    // session and cannot tell a default E-RAB from a dedicated one. The MME's
-    // answer to the Service Request is one Initial Context Setup Request naming
-    // every bearer the session still holds, and that list marks no roles. The
-    // UE must therefore name them itself, beside an ordinary compact EPS
-    // Service Request.
+    // The declaring form is chosen from what the endpoint being answered has
+    // been confirmed to hold, not from the access generation. This fixture
+    // attaches without a local user plane, so the UE never sent the
+    // BEARER_READY that would confirm this cell's bearer roles, and the cell
+    // has never told the UE it holds them. The MME's answer to the Service
+    // Request is one Initial Context Setup Request naming every bearer the
+    // session still holds, and that list marks no roles. The UE must therefore
+    // name them itself, beside an ordinary compact EPS Service Request.
+    //
+    // The generation here is the same one a retained cell would present, so
+    // the fact that this answer declares proves the counter does not decide
+    // the form on its own.
     Session session;
     session.startAsync(UeConfig(47121, 47122, /*pagingWaitMs=*/30000), IdleAction::PageMatchingRestore, 47122);
     REQUIRE(session.waitFor("Access restoration completed after a network paging indication"));
@@ -701,6 +883,225 @@ TEST_CASE("lte/paging/wait: an answer sent in the first access epoch declares th
     CHECK(answer.inventory.defaultEbi == kDefaultEbi);
     CHECK(answer.inventory.dedicatedEbis.empty());
     CHECK(session.mme->serviceRequests == 1);
+}
+
+// ---------------------------------------------------------------------------
+// Repeated ECM-IDLE access epochs of one EPS registration
+// ---------------------------------------------------------------------------
+
+TEST_CASE("lte/paging/wait: three consecutive paging restorations of one registration never re-Attach")
+{
+    // The decisive repeated-access result at the UE level: one real Attach,
+    // then three independent network-paged restorations, with the network
+    // dropping the access again after each one so the next page starts from
+    // ECM-IDLE. No new Attach is permitted between the cycles, and none is
+    // sent: the only unprotected uplinks remain the two of the original Attach
+    // exchange.
+    //
+    // The UE is held alive until the third restoration has actually completed,
+    // because a finished restoration leaves the UE in ECM-CONNECTED rather than
+    // ending the run, and a stop request is the only honest way to end it.
+    Session session;
+    session.startAsync(UeConfig(47125, 47126, /*pagingWaitMs=*/30000), IdleAction::PageRepeated, 47126, /*cycles=*/3);
+    REQUIRE(session.waitForOccurrences("Access restoration completed after a network paging indication", 3));
+    session.shutdown = true;
+    session.finish();
+
+    CHECK(session.exitCode == 0);
+    CHECK(session.mme->failures.empty());
+    CHECK(session.mme->attachComplete);
+    // Three pages, three answers, three restorations.
+    CHECK(session.mme->serviceRequests == 3);
+    CHECK(session.mme->restoreGenerations == std::vector<uint32_t>{1, 2, 3});
+    // Each access epoch is numbered once and the restoration of that epoch
+    // restates the same number. The UE never sees a cycle reuse a previous
+    // epoch's identifier, and the network never advances the number without an
+    // access ending.
+    CHECK(session.mme->releaseGenerations == std::vector<uint32_t>{1, 2, 3});
+    CHECK(session.mme->completedCycles == 3);
+    // No second Attach: the only unprotected uplinks are the Authentication
+    // Response and the Attach Complete of the one registration.
+    CHECK(session.mme->protectedUplinks == 2);
+    CHECK(CountOccurrences(session.log, "State=ATTACH_REQUEST_SENT") == 1);
+    CHECK(CountOccurrences(session.log, "State=EPS_REGISTERED") == 1);
+    CHECK(CountOccurrences(session.log, "Access restoration completed after a network paging indication") == 3);
+    // Exactly one answer per page, never two.
+    CHECK(CountFrames(session.mme->frames, "SERVICE_REQUEST") +
+              CountFrames(session.mme->frames, "SERVICE_REQUEST_DECLARED") ==
+          3);
+    CHECK(CountOccurrences(session.log, "Paging statistics: indications=3 matched=3 ignored=0") == 1);
+    // Every answer is an ordinary EPS Service Request under the one security
+    // context. The NAS COUNT advances once per answer and never twice for one
+    // procedure: three answers on top of the two Attach messages leave the next
+    // count at five.
+    REQUIRE(session.mme->serviceRequestPayloads.size() == 3);
+    for (const auto &payload : session.mme->serviceRequestPayloads)
+    {
+        REQUIRE(payload.size() >= 9);
+        // The five-octet S-TMSI prefix is the same in both answer forms.
+        CHECK(std::vector<uint8_t>(payload.begin(), payload.begin() + 5) ==
+              std::vector<uint8_t>{kMmeCode, 0xC0, 0x00, 0x01, 0x8E});
+    }
+    CHECK(Contains(session.log, "NAS security counts: UL-next=5"));
+
+    // The form of those three answers is decided from what the cell being
+    // answered has been confirmed to hold, never from the access generation.
+    // This fixture never sent the BEARER_READY that would confirm the cell's
+    // bearer roles, so the first answer declares them; the restoration that
+    // follows is a confirmed bearer access at that same cell and is itself the
+    // confirmation, so the second and third answers are compact. Their
+    // generations are 2 and 3 while the first is 1, and the form still follows
+    // the confirmed roles alone — a cell that has never confirmed them is
+    // answered with the declaration at any generation.
+    CHECK(CountFrames(session.mme->frames, "SERVICE_REQUEST_DECLARED") == 1);
+    CHECK(CountFrames(session.mme->frames, "SERVICE_REQUEST") == 2);
+    // The declared answer is still an ordinary Service Request with an
+    // additive inventory, so the network answers one procedure either way.
+    const auto first = DecodePagingAnswer(session.mme->serviceRequestPayloads[0]);
+    CHECK(first.inventory.defaultEbi == kDefaultEbi);
+    CHECK(first.identity.size() + first.nas.size() == 9);
+    // The compact answers carry no inventory at all: their whole body is the
+    // identity prefix and the four-octet NAS.
+    CHECK(session.mme->serviceRequestPayloads[1].size() == 9);
+    CHECK(session.mme->serviceRequestPayloads[2].size() == 9);
+    CHECK(Contains(session.log, "bootstrap=DECLARE_REQUIRED"));
+    CHECK(Contains(session.log, "bootstrap=ROLES_RETAINED"));
+}
+
+TEST_CASE("lte/paging/wait: a configured run of repeated idle periods drives each restoration itself")
+{
+    // The scenario driver, not the network, is what opens the second and third
+    // access epochs in a live run: it releases S1 again once the previous
+    // restoration has genuinely completed. This pins that the driver really
+    // repeats — three release requests from one registration, three pages, three
+    // restorations — instead of firing its controlled idle trigger once and
+    // leaving the later epochs to whoever happens to send a frame.
+    Session session;
+    session.startAsync(UeConfig(47137, 47138, /*pagingWaitMs=*/30000, /*triggerAfterMs=*/100,
+                                /*procedureTimeoutMs=*/5000, /*maxRetries=*/3, /*idleRounds=*/3),
+                       IdleAction::PageMatchingRestore, 47138);
+    REQUIRE(session.waitForOccurrences("Access restoration completed after a network paging indication", 3));
+    session.shutdown = true;
+    session.finish();
+
+    CHECK(session.exitCode == 0);
+    CHECK(session.mme->failures.empty());
+    CHECK(session.mme->attachComplete);
+    // One registration, three epochs it asked for, three the network restored.
+    CHECK(CountOccurrences(session.log, "State=ATTACH_REQUEST_SENT") == 1);
+    CHECK(CountOccurrences(session.log, "State=EPS_REGISTERED") == 1);
+    CHECK(session.mme->protectedUplinks == 2);
+    CHECK(CountFrames(session.mme->frames, "S1_CONTEXT_RELEASE_REQUEST") == 3);
+    CHECK(session.mme->releaseGenerations == std::vector<uint32_t>{1, 2, 3});
+    CHECK(session.mme->serviceRequests == 3);
+    CHECK(session.mme->restoreGenerations == std::vector<uint32_t>{1, 2, 3});
+    CHECK(session.mme->completedCycles == 3);
+    // The first two rounds announce the next one; the last one is the end of
+    // the configured run and schedules nothing further.
+    CHECK(CountOccurrences(session.log, "Controlled idle period 1 of 3 completed; the next one is scheduled") == 1);
+    CHECK(CountOccurrences(session.log, "Controlled idle period 2 of 3 completed; the next one is scheduled") == 1);
+    CHECK_FALSE(Contains(session.log, "Controlled idle period 3 of 3"));
+    CHECK(CountOccurrences(session.log, "Access restoration completed after a network paging indication") == 3);
+    CHECK(CountOccurrences(session.log, "Paging statistics: indications=3 matched=3 ignored=0") == 1);
+    // Every epoch is answered once, and the form still follows the confirmed
+    // bearer roles: this fixture confirms them through the first restoration,
+    // so only that first answer needs the declaration.
+    REQUIRE(session.mme->serviceRequestPayloads.size() == 3);
+    CHECK(CountFrames(session.mme->frames, "SERVICE_REQUEST_DECLARED") == 1);
+    CHECK(CountFrames(session.mme->frames, "SERVICE_REQUEST") == 2);
+    CHECK(session.mme->serviceRequestPayloads[1].size() == 9);
+    CHECK(session.mme->serviceRequestPayloads[2].size() == 9);
+}
+
+TEST_CASE("lte/paging/wait: a retransmitted answer of a later epoch repeats the compact form and no new COUNT")
+{
+    // A retry of a compact answer is still the compact form. Dropping to a
+    // different frame type on the retry would change the message the network
+    // sees mid-procedure, and rebuilding it would consume a second uplink NAS
+    // COUNT for one Service Request.
+    //
+    // The compact form is only ever chosen at an epoch whose cell has already
+    // confirmed the bearer roles, so the first round here is answered and
+    // restored — that restoration is the confirmation — and the second round is
+    // the one left outstanding. Everything the retry is decided from therefore
+    // belongs to a later access epoch, and nothing about it may fall back to
+    // the declaration.
+    Session session;
+    session.run(UeConfig(47129, 47130, /*pagingWaitMs=*/30000, /*triggerAfterMs=*/100,
+                         /*procedureTimeoutMs=*/250, /*maxRetries=*/2),
+                IdleAction::PageRepeated, 47130, /*cycles=*/2, /*restoreCycles=*/1);
+
+    CHECK(session.exitCode == 1);
+    CHECK(Contains(session.log, "Paging-triggered service restoration failed after bounded retransmissions"));
+    CHECK(session.mme->failures.empty());
+    // Only the first round completed an access; the second was left
+    // outstanding and is the one whose answer was retransmitted. Neither the
+    // round nor the epoch is reopened by a retry: the network completed one
+    // restoration at generation 1 and released once more for generation 2.
+    CHECK(session.mme->completedCycles == 1);
+    CHECK(session.mme->restoreGenerations == std::vector<uint32_t>{1});
+    CHECK(session.mme->releaseGenerations == std::vector<uint32_t>{1, 2});
+    REQUIRE(session.mme->serviceRequestPayloads.size() == 4);
+    // The first round declares and the second answers compact, with its two
+    // retransmissions repeating exactly that frame.
+    CHECK(CountFrames(session.mme->frames, "SERVICE_REQUEST_DECLARED") == 1);
+    CHECK(CountFrames(session.mme->frames, "SERVICE_REQUEST") == 3);
+    CHECK(session.mme->serviceRequestPayloads[1] == session.mme->serviceRequestPayloads[2]);
+    CHECK(session.mme->serviceRequestPayloads[1] == session.mme->serviceRequestPayloads[3]);
+    CHECK(session.mme->serviceRequestPayloads[1].size() == 9);
+    // A Service Request is its own radio frame rather than a protected NAS
+    // uplink, so the two Attach messages are the only uplinks the network side
+    // ever unprotected. The retransmissions consumed no second uplink NAS COUNT
+    // either: the whole Service Request body is frozen at its first
+    // transmission and the retry repeats it byte for byte, so the NAS sequence
+    // number inside it cannot have advanced.
+    CHECK(session.mme->protectedUplinks == 2);
+    CHECK(session.mme->lastUplinkCount == 1);
+    CHECK(CountOccurrences(session.log, "Retransmitted SERVICE_REQUEST_PENDING") == 2);
+}
+
+TEST_CASE("lte/paging/wait: a duplicate page during a pending restoration starts no second procedure")
+{
+    // The network may page more than once while one Service Request is still
+    // outstanding. The second page must not start a second procedure, must not
+    // consume a second NAS COUNT and must not replace the frame the first
+    // answer already sent.
+    //
+    // It is refused as a page for a UE that already has an access procedure
+    // running, which is the earlier and stricter of the two duplicate guards:
+    // a page is only ever evaluated for a UE in ECM-IDLE with no pending
+    // procedure, so the second one never reaches the trigger arbitration at
+    // all. The alternative reason for refusing a page — another restoration
+    // trigger already owning the access — is reserved for a page racing an
+    // armed access-recovery timer.
+    Session session;
+    session.startAsync(UeConfig(47131, 47132, /*pagingWaitMs=*/30000), IdleAction::PageMatchingNoRestore, 47132);
+    // Wait until the first answer has left the UE, then page again from the
+    // test thread through the same radio endpoint the network uses.
+    REQUIRE(session.waitFor("Paging identity matched (MMEC=1)"));
+    link::PagingNotification page;
+    page.mmeCode = kMmeCode;
+    page.mTmsi = kMTmsi;
+    page.tac = kServedTac;
+    session.mme->sendPageNow(page);
+    // Give the duplicate a moment to arrive before shutting down.
+    REQUIRE(session.waitFor("Paging indication ignored: PROCEDURE_PENDING"));
+    session.shutdown = true;
+    session.finish();
+
+    CHECK(session.exitCode == 0);
+    CHECK(session.mme->failures.empty());
+    CHECK(Contains(session.log, "Paging indication ignored: PROCEDURE_PENDING"));
+    CHECK_FALSE(Contains(session.log, "another trigger already owns the pending restoration"));
+    // One answer on the wire for one accepted page; the duplicate produced
+    // neither a second frame nor a second NAS COUNT.
+    CHECK(CountFrames(session.mme->frames, "SERVICE_REQUEST_DECLARED") == 1);
+    CHECK(CountFrames(session.mme->frames, "SERVICE_REQUEST") == 0);
+    CHECK(session.mme->serviceRequests == 1);
+    CHECK(session.mme->protectedUplinks == 2);
+    // Both pages are counted, and only one of them was matched and answered.
+    CHECK(Contains(session.log, "Paging statistics: indications=2 matched=1 ignored=1 duplicate-trigger-suppressed=0 "
+                                "service-requests=1 restorations=0 restoration-failures=0"));
 }
 
 TEST_CASE("lte/paging/wait: a retransmitted answer repeats the frozen declaration instead of falling back to the compact form")
@@ -758,6 +1159,75 @@ TEST_CASE("lte/paging/wait: shutdown while a paging Service Request is pending i
     CHECK(session.mme->serviceRequests == 1);
     CHECK_FALSE(session.mme->restoreSent);
     CHECK(session.mme->failures.empty());
+}
+
+TEST_CASE("lte/paging/wait: a stop request during a later restoration is a shutdown, not a restoration failure")
+{
+    // The same rule one access epoch on: the first page was answered and its
+    // access really completed, and the second is still outstanding when the UE
+    // is asked to stop. A stop request wins over that procedure's deadline too,
+    // so the run reports a shutdown rather than a failed second restoration,
+    // and it does not pretend the outstanding one ever completed.
+    Session session;
+    session.startAsync(UeConfig(47133, 47134, /*pagingWaitMs=*/30000), IdleAction::PageRepeated, 47134,
+                       /*cycles=*/2, /*restoreCycles=*/1);
+    // Round two answers compact because round one's restoration confirmed the
+    // cell's bearer roles, and this is the last thing the UE does before the
+    // stop lands.
+    REQUIRE(session.waitFor("compact EPS Service Request sent for the network-triggered restoration"));
+    session.shutdown = true;
+    session.finish();
+
+    CHECK(session.exitCode == 0);
+    CHECK(Contains(session.log, "LTE UE shutdown complete"));
+    CHECK(Contains(session.log, "SERVICE_REQUEST_PENDING abandoned at shutdown; no outcome was invented"));
+    CHECK_FALSE(Contains(session.log, "Paging-triggered service restoration failed after bounded retransmissions"));
+    CHECK_FALSE(Contains(session.log, "Timed out waiting for a network paging indication"));
+    // One restoration really happened and the second is not reported as one.
+    CHECK(CountOccurrences(session.log, "Access restoration completed after a network paging indication") == 1);
+    CHECK(CountFrames(session.mme->frames, "SERVICE_REQUEST_DECLARED") == 1);
+    CHECK(CountFrames(session.mme->frames, "SERVICE_REQUEST") == 1);
+    CHECK(session.mme->completedCycles == 1);
+    CHECK(session.mme->restoreGenerations == std::vector<uint32_t>{1});
+    CHECK(session.mme->releaseGenerations == std::vector<uint32_t>{1, 2});
+    CHECK(session.mme->protectedUplinks == 2);
+    CHECK(session.mme->failures.empty());
+    CHECK(Contains(session.log, "Paging statistics: indications=2 matched=2 ignored=0 duplicate-trigger-suppressed=0 "
+                                "service-requests=2 restorations=1 restoration-failures=0"));
+}
+
+TEST_CASE("lte/paging/wait: an unexpected S1 access loss inside a later cycle is not a new registration")
+{
+    // The access between two paging restorations does not always end in a UE
+    // Context Release. When the serving eNB's S1-MME association is lost the
+    // access transport dies with it and no release procedure ran at all. That
+    // is an internal simulator indication rather than a NAS or S1AP message,
+    // and it must leave exactly what a release leaves: one EPS registration in
+    // ECM-IDLE that the next page can still restore, with no re-Attach and no
+    // change to the security context or the bearer identities.
+    Session session;
+    session.startAsync(UeConfig(47135, 47136, /*pagingWaitMs=*/30000), IdleAction::PageRepeatedAfterLoss, 47136,
+                       /*cycles=*/3);
+    REQUIRE(session.waitForOccurrences("Access restoration completed after a network paging indication", 3));
+    session.shutdown = true;
+    session.finish();
+
+    CHECK(session.exitCode == 0);
+    CHECK(session.mme->failures.empty());
+    // Every access epoch but the last ended in an unexpected loss, and every
+    // one of them was still followed by a working page and restoration.
+    CHECK(CountOccurrences(session.log, "S1 access transport lost unexpectedly") == 2);
+    CHECK(session.mme->completedCycles == 3);
+    CHECK(session.mme->serviceRequests == 3);
+    CHECK(session.mme->restoreGenerations == std::vector<uint32_t>{1, 2, 3});
+    CHECK(session.mme->releaseGenerations == std::vector<uint32_t>{1, 2, 3});
+    // No second Attach through any of it: the only unprotected uplinks remain
+    // the two of the original Attach exchange.
+    CHECK(session.mme->protectedUplinks == 2);
+    CHECK(CountOccurrences(session.log, "State=ATTACH_REQUEST_SENT") == 1);
+    CHECK(CountOccurrences(session.log, "State=EPS_REGISTERED") == 1);
+    CHECK(CountOccurrences(session.log, "Access restoration completed after a network paging indication") == 3);
+    CHECK(Contains(session.log, "Paging statistics: indications=3 matched=3 ignored=0"));
 }
 
 // ---------------------------------------------------------------------------
@@ -829,7 +1299,8 @@ TEST_CASE("lte/paging/wait: an unanswered paging Service Request fails after bou
 
     CHECK(session.exitCode == 1);
     CHECK(Contains(session.log, "Paging identity matched (MMEC=1)"));
-    CHECK(Contains(session.log, "compact EPS Service Request sent for the network-triggered restoration"));
+    CHECK(Contains(session.log, "bearer-inventory Service Request sent for the network-triggered restoration "
+                                "(bootstrap=DECLARE_REQUIRED)"));
     CHECK(Contains(session.log, "Retransmitted SERVICE_REQUEST_PENDING, retry=1"));
     // The failure is attributed to the paging trigger and named as a bounded
     // retransmission outcome, never as a paging-wait timeout and never as a

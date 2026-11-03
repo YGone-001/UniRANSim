@@ -157,6 +157,10 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
     uint64_t recoveryFailures = 0;
     auto recoveryDeadline = std::chrono::steady_clock::time_point::max();
     bool scenarioTriggered = false;
+    // Controlled idle periods already completed by this EPS registration. A
+    // round ends when the access it opened has genuinely been restored, so the
+    // rounds are consecutive epochs of one registration and never overlap.
+    int scenarioRoundsDone = 0;
     bool idleReleaseRequested = false;
     std::vector<uint8_t> pendingWire;
     // The complete radio message an outstanding mobility uplink has to repeat.
@@ -201,7 +205,8 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
     while (!shutdownRequested && (mobility.emm == EmmState::REGISTERED || std::chrono::steady_clock::now() < deadline))
     {
         const auto now = std::chrono::steady_clock::now();
-        if (mobility.emm == EmmState::REGISTERED && !scenarioTriggered && now >= scenarioDeadline)
+        if (mobility.emm == EmmState::REGISTERED && !scenarioTriggered &&
+            scenarioRoundsDone < config.lifecycle.idleRounds && now >= scenarioDeadline)
         {
             scenarioTriggered = true;
             if (config.lifecycle.scenario == LifecycleScenario::SERVICE_REQUEST ||
@@ -521,6 +526,18 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                         if (!config.link.targetCell.has_value())
                             throw std::runtime_error(
                                 "The idle-reselection scenario needs a configured enbLink.targetCell");
+                        // Only the first round moves. The later rounds of the
+                        // same registration are idle access epochs on the cell
+                        // that move reached, and reselecting it again would
+                        // retire an access that is genuinely still the serving
+                        // one and demand a bearer inventory from a cell that
+                        // has already been confirmed to hold the session.
+                        if (scenarioRoundsDone > 0)
+                        {
+                            Log("INFO", "Controlled idle trigger released S1 on the reselected cell; the UE "
+                                        "will wait for a network paging indication");
+                            continue;
+                        }
                         const auto &target = *config.link.targetCell;
                         const Tai serving{config.plmn, config.link.servingTac};
                         const Tai arriving{target.plmn, target.tac};
@@ -666,29 +683,26 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 if (pendingWire.size() != 4)
                     throw std::runtime_error("Compact Service Request NAS must be four octets");
                 // Whether this answer also declares the bearer inventory the UE
-                // holds. The declaration-carrying uplink is the one that opens
-                // the first access epoch of a cell, so it is used exactly when
-                // this UE's own epoch is that first one: the two counters are
-                // the same number and neither side is moved out of step. A page
-                // answered in any later epoch travels as the compact form,
-                // which announces no epoch of its own, because such a cell has
-                // already carried this UE's bearers and resolves their roles
-                // from the contexts it still holds.
+                // holds is decided from what the endpoint being answered has
+                // already been confirmed to hold, never from the access
+                // generation. The generation numbers that endpoint's access
+                // epochs and is shared with it so stale confirmations can be
+                // refused; it says nothing about whether the endpoint still
+                // knows which E-RAB is the default bearer. The endpoint that
+                // carried this session's Attach, or any later confirmed bearer
+                // access, and has since released it keeps those roles, and a
+                // compact EPS Service Request is enough. An endpoint that has
+                // never completed such an access — a cell reached by an
+                // ECM-IDLE reselection, whose Tracking Area Update established
+                // no bearer here — holds none of them, and the MME's Initial
+                // Context Setup Request marks no roles in its E-RAB list, so
+                // the cell is told them here rather than left to infer them
+                // from QCI or from the order of that list.
                 //
-                // The first epoch is the one that needs the declaration. The
-                // answer opens an S1 connection at a cell that may never have
-                // seen this session's Attach and may hold none of its bearers:
-                // it reached this state through a Tracking Area Update that
-                // established no bearer here, and ECM-IDLE has since dropped
-                // the access transport and with it any earlier declaration. The
-                // MME answers with one Initial Context Setup Request naming
-                // every bearer the session still holds, and that list marks no
-                // roles, so the cell is told them here rather than left to
-                // infer them from QCI or from the order of the list. The
-                // compact Service Request travels beside the declaration
+                // The compact Service Request travels beside the declaration
                 // unchanged, so the network still answers an ordinary
                 // four-octet EPS Service Request rather than a new procedure.
-                if (mobility.accessGeneration == 1)
+                if (mobility.accessBootstrap == AccessBootstrap::DECLARE_REQUIRED)
                 {
                     try
                     {
@@ -705,19 +719,25 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                                                  e.what());
                     }
                     SendMobilityNas(socket, enb, *pendingMobilityFrame);
+                    Log("INFO", "Paging identity matched (MMEC=" + std::to_string(notification.mmeCode) +
+                                    "); bearer-inventory Service Request sent for the network-triggered "
+                                    "restoration (bootstrap=" +
+                                    ToString(mobility.accessBootstrap) + ")");
                 }
                 else
                 {
                     pendingMobilityFrame.reset();
                     SendServiceRequest(socket, enb, ueId, *mobility.guti, pendingWire);
+                    Log("INFO", "Paging identity matched (MMEC=" + std::to_string(notification.mmeCode) +
+                                    "); compact EPS Service Request sent for the network-triggered "
+                                    "restoration (bootstrap=" +
+                                    ToString(mobility.accessBootstrap) + ")");
                 }
                 ++pagingServiceRequests;
                 pagingWaitArmed = false;
                 procedureRetries = 0;
                 procedureDeadline = std::chrono::steady_clock::now() +
                                     std::chrono::milliseconds(config.lifecycle.procedureTimeoutMs);
-                Log("INFO", "Paging identity matched (MMEC=" + std::to_string(notification.mmeCode) +
-                                "); compact EPS Service Request sent for the network-triggered restoration");
                 continue;
             }
             if (message.type == link::MessageType::S1_CONTEXT_RESTORED)
@@ -745,7 +765,8 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 // Exactly one trigger owns a restoration. A page that won the
                 // race against an armed recovery timer is a paging restoration
                 // even though the timer had already been scheduled.
-                switch (restorationTrigger.takeRestored())
+                const auto owner = restorationTrigger.takeRestored();
+                switch (owner)
                 {
                 case RestorationOwner::PAGING:
                     ++pagingRestorations;
@@ -757,6 +778,24 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                     break;
                 case RestorationOwner::NONE:
                     break;
+                }
+                // A controlled idle period of the scenario driver is over the
+                // moment the access it opened has been restored. Only a
+                // network-triggered restoration completes one: a recovery that
+                // ran on its own timer is not a round the driver asked for, so
+                // it neither counts as one nor skips one.
+                if (scenarioTriggered && owner == RestorationOwner::PAGING)
+                {
+                    scenarioTriggered = false;
+                    ++scenarioRoundsDone;
+                    scenarioDeadline = scenarioRoundsDone < config.lifecycle.idleRounds
+                                           ? std::chrono::steady_clock::now() +
+                                                 std::chrono::milliseconds(config.lifecycle.triggerAfterMs)
+                                           : std::chrono::steady_clock::time_point::max();
+                    if (scenarioRoundsDone < config.lifecycle.idleRounds)
+                        Log("INFO", "Controlled idle period " + std::to_string(scenarioRoundsDone) + " of " +
+                                        std::to_string(config.lifecycle.idleRounds) +
+                                        " completed; the next one is scheduled");
                 }
                 if (tun)
                 {

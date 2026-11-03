@@ -191,11 +191,19 @@ struct TwoEnb
 // Request, the UE's bearer-ready confirmation, and one network-authored E-RAB
 // Setup Request per dedicated bearer. Nothing is written into the source
 // registry by hand either.
+void EstablishOnSource(TwoEnb &lab, FakeUe &ue, const std::vector<uint8_t> &dedicatedEbis,
+                       std::vector<uint32_t> *accessTeids);
+
 void EstablishOnSource(TwoEnb &lab, const std::vector<uint8_t> &dedicatedEbis,
                        std::vector<uint32_t> *accessTeids = nullptr)
 {
+    EstablishOnSource(lab, lab.ue, dedicatedEbis, accessTeids);
+}
+
+void EstablishOnSource(TwoEnb &lab, FakeUe &ue, const std::vector<uint8_t> &dedicatedEbis,
+                       std::vector<uint32_t> *accessTeids)
+{
     auto &source = lab.source;
-    auto &ue = lab.ue;
     SendRadio(source, ue, MessageType::NAS_UPLINK, {0x41, 0x01, 0x02, 0x03});
     auto *entry = source.registry().find(ue.ueId);
     REQUIRE(entry != nullptr);
@@ -303,6 +311,86 @@ void Confirm(EnbMultiplexer &mux, const FakeUe &ue, uint8_t ebi, uint32_t genera
 void ConfirmOnTarget(TwoEnb &lab, uint8_t ebi, uint32_t generation)
 {
     Confirm(lab.target, lab.ue, ebi, generation, PdnAddress(lab.ue.ueId));
+}
+
+// The exact body a UE sends when it answers a page with an ordinary compact EPS
+// Service Request: the five-octet S-TMSI and the four-octet protected NAS. It
+// carries no bearer inventory at all, which is the whole point of the compact
+// form and only ever safe at a cell that has already been confirmed to hold
+// this session's bearer roles.
+std::vector<uint8_t> CompactServiceRequest()
+{
+    return {0x05, 0xC0, 0x00, 0x01, 0x8E, 0xC7, 0x00, 0xAA, 0xBB};
+}
+
+// The per-access local TEIDs a live UE context is using, default bearer first
+// and then the dedicated ones in the order the entry holds them.
+std::vector<uint32_t> AccessTeids(const EnbUeEntry &entry)
+{
+    std::vector<uint32_t> teids{entry.bearer.parameters().localTeid};
+    for (const auto &dedicated : entry.dedicatedBearers)
+        teids.push_back(dedicated.parameters().localTeid);
+    return teids;
+}
+
+// Runs `epochs` further access epochs of one EPS session at the cell that
+// already carries it. Each epoch is a compact Service Request answering a page,
+// a network-authored Initial Context Setup Request, the UE's confirmations of
+// the fresh transport and one more release. The UE never re-Attaches and never
+// declares anything here: this cell confirmed the bearer roles at the Attach
+// and has kept them through every release, which is exactly what makes the
+// compact form sufficient and lets the roles come from the retained context
+// rather than from the order of the network's E-RAB list.
+void RunServiceEpochs(TwoEnb &lab, FakeUe &ue, const std::vector<uint8_t> &dedicatedEbis, int epochs,
+                      std::vector<std::vector<uint32_t>> *teids = nullptr)
+{
+    for (int epoch = 0; epoch < epochs; ++epoch)
+    {
+        DrainRadio(ue);
+        SendRadio(lab.source, ue, MessageType::SERVICE_REQUEST, CompactServiceRequest());
+        auto *entry = lab.source.registry().find(ue.ueId);
+        REQUIRE(entry != nullptr);
+        REQUIRE(entry->s1 == UeS1State::CONTEXT_PENDING);
+        REQUIRE_FALSE(entry->declaredBearers.has_value());
+
+        s1ap::InitialContextSetupRequest request{};
+        request.mmeUeS1apId = 200 + ue.ueId;
+        request.enbUeS1apId = entry->enbUeS1apId;
+        request.ueAmbrUl = 1000;
+        request.ueAmbrDl = 2000;
+        // The dedicated bearers are listed before the default one on purpose.
+        // Which E-RAB plays which role is decided by what this cell retained,
+        // and a network list ordered differently must not be believed.
+        for (const uint8_t ebi : dedicatedEbis)
+            request.erabs.push_back(Item(ebi, 7, 30 + ue.ueId + ebi));
+        request.erabs.push_back(Item(5, 9, 30 + ue.ueId));
+        const auto pdu = s1ap::EncodeInitialContextSetupRequest(request);
+        lab.source.handleS1ap(pdu.data(), pdu.size(), 1);
+
+        REQUIRE(entry->bearer.signalingEstablished());
+        REQUIRE(entry->bearer.restorationPending());
+        REQUIRE(entry->bearer.parameters().erabId == 5);
+        REQUIRE(entry->dedicatedBearers.size() == dedicatedEbis.size());
+        for (const uint8_t ebi : dedicatedEbis)
+            REQUIRE(lab.source.registry().findBearer(*entry, ebi) != nullptr);
+        if (teids != nullptr)
+            teids->push_back(AccessTeids(*entry));
+
+        // Every bearer of the restored access is announced with the epoch this
+        // access belongs to, and the UE confirms each one against that epoch.
+        const auto frames = DrainRadio(ue);
+        REQUIRE(CountType(frames, MessageType::S1_CONTEXT_RESTORED) == 1);
+        REQUIRE(CountType(frames, MessageType::DEDICATED_BEARER_RESTORED) == dedicatedEbis.size());
+        for (const auto &frame : frames)
+        {
+            const auto restored = lte::ue::link::DecodeBearerRestoration(frame.payload);
+            REQUIRE(restored.second == entry->accessGeneration);
+            REQUIRE(restored.second != 0);
+            Confirm(lab.source, ue, restored.first, restored.second, PdnAddress(ue.ueId));
+        }
+        REQUIRE(entry->bearer.active());
+        GoIdle(lab.source, ue, 200 + ue.ueId);
+    }
 }
 } // namespace
 
@@ -1028,4 +1116,163 @@ TEST_CASE("lte/mobility_target: a stale frame from the previous access is refuse
     CHECK_FALSE(entry->bearer.active());
     CHECK(entry->s1 == UeS1State::CONTEXT_ESTABLISHED);
     CHECK(lab.target.recoveryCounters().staleMessagesRejected >= rejected + 2);
+}
+
+TEST_CASE("lte/mobility_target: repeated compact Service Requests at a retained cell restore fresh transport each epoch")
+{
+    // The cell that carried the Attach confirmed this session's bearer roles
+    // and has kept them through every access release, so each further access
+    // epoch is an ordinary compact EPS Service Request with no declaration at
+    // all. That is the compact form this phase exists to reach, and it is
+    // reached here on the production eNB rather than on a UE-side rule alone.
+    //
+    // The roles of every restored access come from the retained default bearer
+    // and not from the order of the network's E-RAB list, the epoch of each
+    // restoration is the epoch that access belongs to, and no transport of one
+    // epoch is ever reused by the next.
+    TwoEnb lab;
+    std::vector<std::vector<uint32_t>> epochs;
+    EstablishOnSource(lab, {6, 7}, &epochs.emplace_back());
+    GoIdleOnSource(lab);
+    REQUIRE(lab.source.registry().find(lab.ue.ueId)->accessGeneration == 1);
+
+    RunServiceEpochs(lab, lab.ue, {6, 7}, 2, &epochs);
+    auto *entry = lab.source.registry().find(lab.ue.ueId);
+    REQUIRE(entry != nullptr);
+
+    // The one registration produced three accesses and no second Attach: the
+    // source registry still holds exactly one UE context and the same confirmed
+    // default bearer identity throughout.
+    CHECK(entry->accessGeneration == 3);
+    CHECK(entry->bearer.logicalConfirmed());
+    CHECK(entry->bearer.parameters().erabId == 5);
+    CHECK(entry->s1 == UeS1State::IDLE_RETAINED);
+    CHECK(lab.source.registry().size() == 1);
+
+    // Three accesses, three disjoint sets of local TEIDs, and every one of them
+    // retired when its own access ended. A TEID that answered one epoch is not
+    // the TEID of any other, and after the release that closed each epoch none
+    // of them resolves to a bearer on this cell any more.
+    REQUIRE(epochs.size() == 3);
+    for (size_t left = 0; left < epochs.size(); ++left)
+    {
+        REQUIRE(epochs[left].size() == 3);
+        for (const uint32_t teid : epochs[left])
+        {
+            CHECK(teid != 0);
+            CHECK(lab.source.registry().findByLocalTeid(teid) == nullptr);
+        }
+        for (size_t right = left + 1; right < epochs.size(); ++right)
+            CHECK(epochs[left] != epochs[right]);
+    }
+}
+
+TEST_CASE("lte/mobility_target: a compact Service Request is refused at a cell that holds none of the session")
+{
+    // The source cell has really carried several access epochs of this session
+    // and counts them. The target cell has never seen the session at all. A
+    // compact Service Request names the session but says nothing about its
+    // bearers, so at a cell holding none of them there is nothing to restore it
+    // from: it is refused before any S1AP message is produced. How many access
+    // epochs another cell reached is not evidence about this one.
+    //
+    // The declaring form is what such a target has to be sent, and it works.
+    TwoEnb lab;
+    std::vector<std::vector<uint32_t>> epochs;
+    EstablishOnSource(lab, {6}, &epochs.emplace_back());
+    GoIdleOnSource(lab);
+    RunServiceEpochs(lab, lab.ue, {6}, 2, &epochs);
+    const auto *sourceEntry = lab.source.registry().find(lab.ue.ueId);
+    REQUIRE(sourceEntry != nullptr);
+    REQUIRE(sourceEntry->accessGeneration == 3);
+    REQUIRE(lab.target.registry().find(lab.ue.ueId) == nullptr);
+
+    lab.targetWire.sent.clear();
+    DrainRadio(lab.ue);
+    SendRadio(lab.target, lab.ue, MessageType::SERVICE_REQUEST, CompactServiceRequest());
+    CHECK(lab.target.recoveryCounters().staleMessagesRejected == 1);
+    CHECK(lab.targetWire.sent.empty());
+    // The radio endpoint is registered and nothing more: no S1 context was
+    // opened for it and none of this session's bearer roles arrived with it.
+    const auto *fresh = lab.target.registry().find(lab.ue.ueId);
+    REQUIRE(fresh != nullptr);
+    CHECK_FALSE(fresh->s1Active());
+    CHECK_FALSE(fresh->bearer.logicalExists());
+    CHECK_FALSE(fresh->sessionRetained);
+
+    // The same target accepts the answer that declares the bearer inventory,
+    // and takes the roles from that declaration.
+    ReselectToTarget(lab, BearerInventory{5, {6}});
+    auto *entry = lab.target.registry().find(lab.ue.ueId);
+    REQUIRE(entry != nullptr);
+    REQUIRE(entry->declaredBearers.has_value());
+    DeliverIcsr(lab, TargetIcsr(lab, {Item(5, 9, 30), Item(6, 7, 31)}));
+    REQUIRE(entry->bearer.signalingEstablished());
+    CHECK(entry->bearer.parameters().erabId == 5);
+    REQUIRE(entry->dedicatedBearers.size() == 1);
+    CHECK(entry->dedicatedBearers[0].parameters().erabId == 6);
+    CHECK(entry->bearer.restorationPending());
+    const auto frames = DrainRadio(lab.ue);
+    CHECK(CountType(frames, MessageType::S1_CONTEXT_RESTORED) == 1);
+    CHECK(CountType(frames, MessageType::DEDICATED_BEARER_RESTORED) == 1);
+}
+
+TEST_CASE("lte/mobility_target: another UE's repeated restorations leave a separate UE's context untouched")
+{
+    // Two EPS sessions live at the same cell. One of them runs three access
+    // epochs of paging restoration while the other simply stays connected, and
+    // none of the first one's restorations may reach into the second one's S1AP
+    // identity, access generation, bearer roles or transport.
+    TwoEnb lab;
+    FakeUe second{2};
+    std::vector<std::vector<uint32_t>> epochs;
+    EstablishOnSource(lab, {6, 7}, &epochs.emplace_back());
+    EstablishOnSource(lab, second, {}, nullptr);
+    GoIdleOnSource(lab);
+
+    auto *untouched = lab.source.registry().find(second.ueId);
+    REQUIRE(untouched != nullptr);
+    REQUIRE(untouched->s1 == UeS1State::BEARER_ACTIVE);
+    const uint32_t untouchedGeneration = untouched->accessGeneration;
+    const uint32_t untouchedTeid = untouched->bearer.parameters().localTeid;
+    const uint32_t untouchedEnbUeS1apId = untouched->enbUeS1apId;
+
+    RunServiceEpochs(lab, lab.ue, {6, 7}, 2, &epochs);
+    auto *restored = lab.source.registry().find(lab.ue.ueId);
+    REQUIRE(restored != nullptr);
+    REQUIRE(restored->accessGeneration == 3);
+
+    // The separate UE is byte for byte where it was: the same access epoch, the
+    // same S1AP identity, the same bearer transport and still forwardable.
+    CHECK(lab.source.registry().find(second.ueId) == untouched);
+    CHECK(untouched->accessGeneration == untouchedGeneration);
+    CHECK(untouched->enbUeS1apId == untouchedEnbUeS1apId);
+    CHECK(untouched->bearer.parameters().localTeid == untouchedTeid);
+    CHECK(untouched->bearer.parameters().erabId == 5);
+    CHECK(untouched->bearer.active());
+    CHECK(untouched->dedicatedBearers.empty());
+    CHECK(untouched->s1 == UeS1State::BEARER_ACTIVE);
+    CHECK(untouched->bearer.logicalConfirmed());
+
+    // And it is still a usable session of its own: it can take its own access
+    // down and restore it on its own epoch, which is numbered for it alone.
+    GoIdle(lab.source, second, 200 + second.ueId);
+    SendRadio(lab.source, second, MessageType::SERVICE_REQUEST, CompactServiceRequest());
+    REQUIRE(untouched->s1 == UeS1State::CONTEXT_PENDING);
+    s1ap::InitialContextSetupRequest request{};
+    request.mmeUeS1apId = 200 + second.ueId;
+    request.enbUeS1apId = untouched->enbUeS1apId;
+    request.ueAmbrUl = 1000;
+    request.ueAmbrDl = 2000;
+    request.erabs = {Item(5, 9, 30 + second.ueId)};
+    const auto pdu = s1ap::EncodeInitialContextSetupRequest(request);
+    lab.source.handleS1ap(pdu.data(), pdu.size(), 1);
+    REQUIRE(untouched->bearer.restorationPending());
+    const auto frames = DrainRadio(second);
+    REQUIRE(CountType(frames, MessageType::S1_CONTEXT_RESTORED) == 1);
+    const auto announced = lte::ue::link::DecodeBearerRestoration(frames.front().payload);
+    CHECK(announced.second == untouched->accessGeneration);
+    CHECK(announced.second == 1);
+    Confirm(lab.source, second, 5, announced.second, PdnAddress(second.ueId));
+    CHECK(untouched->bearer.active());
 }

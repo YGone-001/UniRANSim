@@ -154,6 +154,14 @@ struct LifecycleConfig
     // Bounded wait for the first network paging indication in the paging
     // scenario. A timeout is reported as a failure, never as paging success.
     int pagingWaitMs{60000};
+    // How many controlled idle periods the scenario driver performs instead of
+    // one. Each round releases S1, returns to ECM-IDLE and completes when the
+    // access has genuinely been restored, so the repeated ECM-IDLE access
+    // epochs of one EPS registration can be driven without a fresh Attach. Only
+    // the paging and idle-reselection scenarios repeat: a round there ends in a
+    // network-triggered restoration, and for idle-reselection only the first
+    // round moves to the configured target cell.
+    int idleRounds{1};
     // Access restoration after an unexpected S1-MME association loss. The UE
     // retains its EPS registration and sends a genuine compact Service Request
     // after this delay; it never re-Attaches silently. Zero disables the

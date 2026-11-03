@@ -54,6 +54,21 @@ class LogCapture
                                 [&] { return m_text.find(needle) != std::string::npos; });
     }
 
+    // Blocks until the sink holds `needle` at least `count` times, or the
+    // timeout elapses. A repeated-access test needs the third of three
+    // identical events, and waiting for the first would shut the UE down while
+    // two of its access epochs are still to come.
+    bool waitForOccurrences(const std::string &needle, int count, int timeoutMs)
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        return m_ready.wait_for(lock, std::chrono::milliseconds(timeoutMs), [&] {
+            int seen = 0;
+            for (size_t at = m_text.find(needle); at != std::string::npos; at = m_text.find(needle, at + needle.size()))
+                ++seen;
+            return seen >= count;
+        });
+    }
+
     void append(const char *data, std::streamsize count)
     {
         {

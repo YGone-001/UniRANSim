@@ -46,10 +46,42 @@ enum class PendingProcedure
     TAU_PERIODIC
 };
 
+// Whether the radio endpoint this UE is currently speaking to has to be told
+// which E-RAB is its default bearer and which are dedicated, or already holds
+// those roles confirmed from an earlier access of this EPS session.
+//
+// This is deliberately not the access-generation counter. That counter numbers
+// a cell's access epochs and is shared with the eNB so generation-bound
+// confirmations can be refused when they are stale; it says nothing about what
+// the cell still retains. The first epoch of the cell that carried this UE's
+// Attach and has since released it is epoch one on both sides and yet the cell
+// keeps the confirmed bearer roles, while a cell reached by an ECM-IDLE
+// reselection also restarts the epoch and holds none of them. Choosing the
+// radio form from the counter conflates those two, so the form is chosen from
+// this classification instead.
+//
+// The classification is built only from transitions the network has actually
+// confirmed to this UE: a bearer-establishing access sets it, an access release
+// leaves it alone because that is what retains the roles, and arriving at a
+// cell or starting a new Attach clears it. Nothing about QCI, E-RAB order, TEID
+// values or a radio claim is consulted.
+enum class AccessBootstrap
+{
+    // This endpoint has not completed a confirmed bearer access of this
+    // session, or its bearer roles were deleted. A Service Request from here
+    // has to carry the bearer inventory beside the protected NAS.
+    DECLARE_REQUIRED,
+    // This endpoint completed a confirmed bearer-establishing access of this
+    // session and has retained the roles through the access release. A compact
+    // EPS Service Request is enough.
+    ROLES_RETAINED
+};
+
 const char *ToString(EmmState state);
 const char *ToString(EcmState state);
 const char *ToString(EpsBearerState state);
 const char *ToString(PendingProcedure procedure);
+const char *ToString(AccessBootstrap bootstrap);
 
 class LifecycleError : public std::runtime_error
 {
@@ -77,6 +109,10 @@ struct MobilityContext
     uint8_t t3412{};
     uint8_t defaultEbi{};
     uint32_t accessGeneration{};
+    // What the radio endpoint currently serving this UE has to be told about
+    // its bearer roles. See AccessBootstrap above for why it is not the
+    // access-generation counter.
+    AccessBootstrap accessBootstrap{AccessBootstrap::DECLARE_REQUIRED};
     std::array<uint8_t, 4> assignedIpv4{};
 
     std::optional<uint32_t> enbUeS1apId;

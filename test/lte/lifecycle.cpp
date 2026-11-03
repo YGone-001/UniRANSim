@@ -356,6 +356,87 @@ TEST_CASE("lte/lifecycle: cell reselection retires the old cell's access and kee
     CHECK(context.pending == lte::ue::PendingProcedure::NONE);
 }
 
+TEST_CASE("lte/lifecycle: the paging answer form is decided by confirmed bearer roles, not by the access generation")
+{
+    // The cell that carried this session's Attach and has since released its
+    // first access is epoch one on both sides and still holds the confirmed
+    // bearer roles: the release kept them. A cell reached by an ECM-IDLE
+    // reselection is also epoch one and holds none of them. Two endpoints at
+    // the same access generation with opposite answers, so the counter cannot
+    // be what decides which Service Request form they are sent.
+    auto retainedCell = Registered();
+    retainedCell.acceptAccessRelease(5, 1);
+    CHECK(retainedCell.accessGeneration == 1);
+    CHECK(retainedCell.accessBootstrap == lte::ue::AccessBootstrap::ROLES_RETAINED);
+
+    auto freshCell = Registered();
+    freshCell.onS1ContextReleased();
+    freshCell.onCellReselected();
+    CHECK(freshCell.accessGeneration == 1);
+    CHECK(freshCell.accessBootstrap == lte::ue::AccessBootstrap::DECLARE_REQUIRED);
+}
+
+TEST_CASE("lte/lifecycle: an access that never confirmed the bearer roles keeps requiring the declaration")
+{
+    lte::ue::MobilityContext context;
+    context.ecm = lte::ue::EcmState::CONNECTED;
+    context.securityContextValid = true;
+    context.onAttachComplete(5, {10, 45, 0, 5}, Guti(), AssignedTaiList(), 0x30);
+    // Registration alone confirms no bearer roles. A control-plane-only Attach
+    // never sets up bearer transport, so the cell is never told which E-RAB is
+    // the default bearer and cannot be answered with the compact form. The
+    // first Service Request from here carries the inventory at generation one
+    // or any other, and only a later confirmed bearer access changes that.
+    CHECK(context.accessBootstrap == lte::ue::AccessBootstrap::DECLARE_REQUIRED);
+    context.acceptAccessRelease(5, 1);
+    CHECK(context.accessGeneration == 1);
+    CHECK(context.accessBootstrap == lte::ue::AccessBootstrap::DECLARE_REQUIRED);
+}
+
+TEST_CASE("lte/lifecycle: a retained access keeps its roles and a new session or cell drops them")
+{
+    // A confirmed bearer access is the only thing that ever establishes the
+    // classification, and releasing that access is what keeps it.
+    auto context = Registered();
+    CHECK(context.accessBootstrap == lte::ue::AccessBootstrap::ROLES_RETAINED);
+    context.onS1ContextEstablished(41, 42);
+    context.onBearerTransportEstablished(1001, 2001);
+    CHECK(context.accessBootstrap == lte::ue::AccessBootstrap::ROLES_RETAINED);
+    context.acceptAccessRelease(5, 1);
+    CHECK(context.accessBootstrap == lte::ue::AccessBootstrap::ROLES_RETAINED);
+
+    // A Tracking Area Update that restores the access is a confirmed bearer
+    // access in its own right, and it leaves the update itself outstanding.
+    context.startTau(false);
+    context.onTauAccessRestored(true);
+    CHECK(context.accessBootstrap == lte::ue::AccessBootstrap::ROLES_RETAINED);
+    CHECK(context.pending == lte::ue::PendingProcedure::TAU_NORMAL);
+    context.onTauAccepted(0, std::nullopt, std::nullopt, std::nullopt);
+
+    // So is a Service Request restoration, which is what makes every later
+    // access epoch at this same cell answer compact.
+    context.acceptAccessRelease(5, 2);
+    context.startServiceRequest();
+    context.onServiceRestored(true);
+    CHECK(context.accessBootstrap == lte::ue::AccessBootstrap::ROLES_RETAINED);
+
+    // Arriving at another cell drops the classification without deleting
+    // anything: the roles still exist in the network and this session still
+    // holds them, and it is the new endpoint that has never been told which
+    // E-RAB plays which role.
+    context.acceptAccessRelease(5, 3);
+    context.onCellReselected();
+    CHECK(context.accessBootstrap == lte::ue::AccessBootstrap::DECLARE_REQUIRED);
+    CHECK(context.defaultEbi == 5);
+    CHECK(context.emm == lte::ue::EmmState::REGISTERED);
+
+    // A fresh Attach is a new logical session, so nothing a previous session's
+    // access confirmed describes what this endpoint holds now.
+    context.beginNewAttach();
+    CHECK(context.accessBootstrap == lte::ue::AccessBootstrap::DECLARE_REQUIRED);
+    CHECK(context.accessGeneration == 0);
+}
+
 TEST_CASE("lte/bearer-runtime: the network bearer context status decides which contexts survive")
 {
     using lte::ue::DedicatedBearerRuntime;

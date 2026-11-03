@@ -150,6 +150,16 @@ Config ParseNode(const YAML::Node &root)
             config.lifecycle.maxRetries = yaml::GetInt32(lifecycle, "maxRetries", 0, 10);
         if (yaml::HasField(lifecycle, "pagingWaitMs"))
             config.lifecycle.pagingWaitMs = yaml::GetInt32(lifecycle, "pagingWaitMs", 100, 600000);
+        if (yaml::HasField(lifecycle, "idleRounds"))
+            config.lifecycle.idleRounds = yaml::GetInt32(lifecycle, "idleRounds", 1, 8);
+        // A repeated round only means something where a round ends in a
+        // network-triggered restoration. Asking for rounds of an attach, a
+        // detach or a self-started update would describe behaviour the
+        // scenarios do not have, so it is refused rather than silently run once.
+        if (config.lifecycle.idleRounds > 1 && config.lifecycle.scenario != LifecycleScenario::PAGING &&
+            config.lifecycle.scenario != LifecycleScenario::IDLE_RESELECTION)
+            throw std::runtime_error("Field 'lifecycle.idleRounds' is valid only for the paging and "
+                                     "idle-reselection scenarios");
         // Zero recoveryDelayMs disables the UE-initiated recovery path, which
         // leaves network-initiated Paging as the only restoration trigger.
         if (yaml::HasField(lifecycle, "recoveryDelayMs"))

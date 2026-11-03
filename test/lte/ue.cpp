@@ -155,6 +155,28 @@ TEST_CASE("lte/ue/config: lifecycle scenarios and bounded procedure controls are
         outOfRange += "\n";
         CHECK_THROWS(lte::ue::ParseConfig(outOfRange));
     }
+
+    // Repeated controlled idle periods only describe something for the
+    // scenarios whose round ends in a network-triggered restoration, and the
+    // count is bounded like the other deadline controls.
+    CHECK(defaults.lifecycle.idleRounds == 1);
+    std::string rounds = ConfigText;
+    rounds += "\nlifecycle:\n  scenario: paging\n  idleRounds: 3\n";
+    CHECK(lte::ue::ParseConfig(rounds).lifecycle.idleRounds == 3);
+    std::string reselectionRounds = ConfigText;
+    reselectionRounds += "\nlifecycle:\n  scenario: idle-reselection\n  idleRounds: 2\n";
+    CHECK(lte::ue::ParseConfig(reselectionRounds).lifecycle.idleRounds == 2);
+    for (const char *bound : {"0", "9"})
+    {
+        std::string outOfRounds = ConfigText;
+        outOfRounds += "\nlifecycle:\n  scenario: paging\n  idleRounds: ";
+        outOfRounds += bound;
+        outOfRounds += "\n";
+        CHECK_THROWS(lte::ue::ParseConfig(outOfRounds));
+    }
+    std::string wrongScenario = ConfigText;
+    wrongScenario += "\nlifecycle:\n  scenario: tau-periodic\n  idleRounds: 2\n";
+    CHECK_THROWS(lte::ue::ParseConfig(wrongScenario));
 }
 
 TEST_CASE("lte/ue/config: a reselection target cell is validated and demands a serving TAC")
