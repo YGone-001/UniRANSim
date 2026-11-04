@@ -16,19 +16,66 @@
 namespace lte::enb
 {
 
-uint32_t AllocateLocalTeid()
+TeidSequence::TeidSequence(uint32_t seed, uint64_t window) : m_seed(seed), m_window(window)
+{
+    if (m_window == 0)
+        throw std::invalid_argument("A TEID sequence must have a non-zero issuance window");
+}
+
+uint32_t TeidSequence::next()
 {
     // Process-wide monotonic allocation prevents an old downlink packet from a
-    // released context matching the next Attach. Zero is permanently skipped.
-    static std::atomic<uint32_t> next{[] {
+    // released context matching the next Attach.
+    //
+    // A 64-bit step counter is used rather than a 32-bit one so that the end of
+    // the window can be recognised at all. The wire value is `seed + step + 1`
+    // in 32-bit modular arithmetic, so the arithmetic is explicitly modulo
+    // 2^32 and cannot silently truncate a wider counter.
+    //
+    // Over the window the values walk `window` consecutive 32-bit patterns, so
+    // every one of them is distinct and no identifier is ever issued twice.
+    // Zero is reserved and is not issued: the step that would have produced it
+    // is spent and never reused, which costs at most one step and cannot cause
+    // a repeat because each step is reserved by exactly one caller.
+    //
+    // Exhaustion fails closed: a TeidExhausted is thrown and no identifier is
+    // returned. The counter is never advanced past the window, so the sequence
+    // cannot wrap open again.
+    //
+    // The guarantee is process-lifetime only. Nothing is persisted, so a later
+    // run may issue an identifier an earlier run used, and no cross-restart
+    // uniqueness is claimed.
+    for (;;)
+    {
+        // Reserve one step at a time. The counter is never advanced past the
+        // end of the window, so exhaustion is sticky, and two threads never
+        // reserve the same step.
+        uint64_t step = m_steps.load(std::memory_order_relaxed);
+        for (;;)
+        {
+            if (step >= m_window)
+                throw TeidExhausted("The local S1-U TEID issuance window is exhausted");
+            if (m_steps.compare_exchange_weak(step, step + 1U, std::memory_order_relaxed))
+                break;
+        }
+        const uint32_t candidate = m_seed + static_cast<uint32_t>(step + 1U);
+        if (candidate == 0)
+            continue;
+        return candidate;
+    }
+}
+
+uint32_t AllocateLocalTeid()
+{
+    // The one production sequence. Its window is the whole non-zero 32-bit
+    // space, so the no-reissue guarantee lasts the life of the process and is
+    // not derived from any record of what has already been given out.
+    static TeidSequence sequence{[] {
         std::random_device random;
-        uint32_t seed = (static_cast<uint32_t>(random()) << 16U) ^ static_cast<uint32_t>(random());
-        return seed == 0 ? 1U : seed;
+        const uint32_t value = (static_cast<uint32_t>(random()) << 16U) ^ static_cast<uint32_t>(random());
+        return value == 0 ? 1U : value;
     }()};
-    uint32_t value = next.fetch_add(1U, std::memory_order_relaxed);
-    if (value == 0)
-        value = next.fetch_add(1U, std::memory_order_relaxed);
-    return value;
+    return sequence.next();
 }
 
 RetiredTeidLedger::RetiredTeidLedger(size_t capacity) : m_capacity(capacity)
@@ -59,15 +106,6 @@ bool RetiredTeidLedger::retire(uint32_t teid)
 bool RetiredTeidLedger::contains(uint32_t teid) const
 {
     return m_byTeid.count(teid) != 0;
-}
-
-void RetiredTeidLedger::revive(uint32_t teid)
-{
-    const auto it = m_byTeid.find(teid);
-    if (it == m_byTeid.end())
-        return;
-    m_byOrder.erase(it->second);
-    m_byTeid.erase(it);
 }
 
 void DefaultBearerContext::establish(const BearerParameters &parameters, bool restoringAccess)

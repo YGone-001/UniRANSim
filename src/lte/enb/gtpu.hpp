@@ -28,7 +28,11 @@ constexpr uint8_t TPdu = 255;
 
 // TS 29.281 table 7.3.2-1 lists Private Extension as the only optional
 // information element of an End Marker. Its type carries the MSB that marks a
-// TLV rather than a TV information element.
+// TLV rather than a TV information element. Figure 8.6-1 gives its layout as
+// Type, a 16-bit Length, a 16-bit Extension Identifier and a variable
+// Extension Value; section 8.1 makes Length count everything after the Type
+// and Length fields, so Length is at least two and the element is 3 + Length
+// octets long.
 constexpr uint8_t PrivateExtensionType = 0xFF;
 
 struct Packet

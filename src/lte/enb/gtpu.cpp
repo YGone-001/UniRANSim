@@ -57,24 +57,49 @@ bool IsSupportedExtension(uint8_t type)
     return std::find(supported.begin(), supported.end(), type) != supported.end();
 }
 
-// TS 29.281 table 7.3.2-1 admits exactly one optional information element in an
-// End Marker: Private Extension, a TLV whose type is 0xFF. An empty information
-// element area is the ordinary form. Anything else cannot be interpreted
-// safely and is rejected rather than guessed at, because the remainder of the
-// message is what tells a receiver which tunnel is ending.
+// TS 29.281 figure 8.6-1 fixes the Private Extension wire layout, identically
+// in V9.3.0 and V14.0.0:
+//
+//   octet 1     Type = 255
+//   octets 2-3  Length              (16-bit, network byte order)
+//   octets 4-5  Extension Identifier (16-bit, network byte order)
+//   octets 6-m  Extension Value     (variable, opaque vendor data)
+//
+// Section 8.1 defines Length as the size of the information element excluding
+// Type and Length themselves, so Length counts the Extension Identifier and the
+// whole Extension Value and is therefore at least two. The information element
+// occupies 3 + Length octets in total. Section 8.6 permits more than one
+// Private Extension in a message, so the walk repeats.
+//
+// An empty information-element area is the ordinary form of an End Marker.
+// Anything else cannot be interpreted safely and is rejected rather than
+// guessed at: the information elements of a control message are never
+// user-plane payload, and the Extension Identifier is an IANA Private
+// Enterprise Number, not a TEID, a bearer identifier or a UE identifier. The
+// Extension Value is vendor-specific and is never read as an IP packet.
 void ValidateEndMarkerIes(const uint8_t *ies, size_t size)
 {
     size_t offset = 0;
     while (offset < size)
     {
-        if (size - offset < 2)
+        // Type and the two Length octets must all be present before anything
+        // can be said about the information element at all.
+        if (size - offset < 3)
             throw CodecError("Truncated GTP-U End Marker information element");
-        const size_t length = ies[offset + 1];
         if (ies[offset] != PrivateExtensionType)
             throw CodecError("Unsupported GTP-U End Marker information element");
-        if (size - offset - 2 < length)
+        // `length` is at most 0xFFFF and `total` therefore at most 65538, so
+        // neither the addition nor the comparison below can overflow size_t.
+        const size_t length = Read16(ies + offset + 1);
+        if (length < 2)
+            throw CodecError("GTP-U Private Extension is shorter than its Extension Identifier");
+        const size_t total = 3 + length;
+        if (total > size - offset)
             throw CodecError("Truncated GTP-U End Marker information element");
-        offset += 2 + length;
+        // Structurally consumed only: a vendor/enterprise number that carries
+        // no meaning this eNB must act on.
+        (void)Read16(ies + offset + 3);
+        offset += total;
     }
 }
 } // namespace
@@ -120,6 +145,26 @@ Packet Decode(const uint8_t *data, size_t size)
     const bool hasExtension = (data[0] & ExtensionFlag) != 0;
     const bool hasSequence = (data[0] & SequenceFlag) != 0;
     const bool hasNPdu = (data[0] & NPduFlag) != 0;
+
+    // Strict LTE compatibility profile for the End Marker.
+    //
+    // TS 29.281 V14.0.0 (Release 14) §5.1, Sequence number flag (S): "In an End
+    // marker message the S flag shall be set to '0'." V9.3.0 (Release 9) §5.1
+    // has no End Marker rule at all — it names only Echo Request, Echo
+    // Response, Error Indication and Supported Extension Headers Notification
+    // as messages whose S flag shall be '1', and G-PDUs, where the flag should
+    // be '0'. The change history records CR 0033 "End Marker message"
+    // (CT#50, 2010-12) as the End Marker change taking 9.3.0 to 10.0.0.
+    //
+    // So the requirement is a later release's, and it is adopted here
+    // deliberately as the receive profile for the LTE EPC End Marker: a
+    // conforming Release 14 sender never sets it, and accepting a set flag
+    // would fix non-conforming behaviour in place. No runtime switch is offered
+    // to keep the older, laxer reading. The E, PN and extension-header rules
+    // are unchanged, because no End Marker-specific rule restricts them.
+    if (result.messageType == EndMarker && hasSequence)
+        throw CodecError("GTP-U End Marker must not carry a sequence number");
+
     if (hasExtension || hasSequence || hasNPdu)
     {
         if (size - offset < OptionalFieldsSize)

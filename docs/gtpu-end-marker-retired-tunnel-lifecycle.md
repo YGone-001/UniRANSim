@@ -64,19 +64,66 @@ release path described in §6 below.
 * an extension-header chain is well formed, is at most 16 entries long, and
   uses only the supported types `0x40`, `0x85`, `0xC0`, `0xC1`, `0xC2`.
 
+**End Marker S flag.** TS 29.281 V14.0.0 §5.1 states: *"In an End marker
+message the S flag shall be set to '0'."* This implementation adopts that as
+a strict LTE receive profile: an End Marker whose S flag is set is refused at
+decode, and there is no runtime compatibility switch that relaxes it. The rule
+is deliberately a later release's requirement rather than a back-dated one.
+V9.3.0 (Release 9) §5.1 lists the messages whose S flag shall be '1' — Echo
+Request, Echo Response, Error Indication and Supported Extension Headers
+Notification — and the messages for which it should be '0', and it is simply
+silent about the End Marker, which that release did not yet carry. The change
+history records CR 0033 *"End Marker message"* (CT#50, December 2010) taking
+9.3.0 to 10.0.0; the V10.0.0 text itself was not available to this record, so
+no claim is made about the exact wording of that release. The E and PN flags
+and the extension-header rules are unchanged by this policy, because no End
+Marker-specific rule in the specification restricts them.
+
 Per type it then applies the TEID rule:
 
 * **G-PDU** — non-zero TEID and a non-empty payload. TS 29.281 §7.1: *"A G-PDU
   shall not include any information element."*
 * **End Marker** — non-zero TEID, and the remainder must be empty or a
-  sequence of well-formed Private Extension TLVs (type `0xFF`, one-octet
-  length, that many value octets). Any other information-element type, a
-  truncated type-length pair, or a value that overruns the message is
-  rejected. The information-element area is validated and then withheld from
-  the caller, so `Packet::payload` is empty for an End Marker and can never be
-  mistaken for user-plane data.
+  sequence of well-formed Private Extension information elements. The
+  information-element area is validated and then withheld from the caller, so
+  `Packet::payload` is empty for an End Marker and can never be mistaken for
+  user-plane data.
 * **Echo Request / Echo Response** — zero TEID (TS 29.281 §7.2 addresses them
   to the endpoint itself).
+
+### Private Extension wire form
+
+TS 29.281 figure 8.6-1 gives the Private Extension this shape (identical in
+V9.3.0 and V14.0.0):
+
+| Octets | Field |
+|---|---|
+| 1 | Type = 255 (decimal, `0xFF`) |
+| 2–3 | **Length**, 16-bit, network byte order |
+| 4–5 | **Extension Identifier**, 16-bit, network byte order |
+| 6–m | **Extension Value**, variable, opaque |
+
+§8.1: *"The Length field contains the length of the information element
+excluding the Type and Length field."* Length therefore counts the Extension
+Identifier **and** the whole Extension Value, so a valid element has
+`Length >= 2` and occupies `3 + Length` octets in total. §8.6: the Extension
+Identifier *"is a value defined in the Private Enterprise number list in the
+most recent 'Assigned Numbers' RFC"* — an IANA Private Enterprise Number, not
+a TEID, a bearer identifier or a UE identifier. It is validated structurally
+and never interpreted. *"A signalling message may include more than one
+information element of the Private Extension type."*
+
+Two worked shapes: the minimal element `FF 00 02 12 34` (Length 2, Extension
+Identifier `0x1234`, empty Extension Value), and `FF 00 04 12 34 AA BB`
+(Length 4, the same identifier, a two-octet Extension Value).
+
+The decoder walks the area on that basis: fewer than three octets left is a
+truncated element; a Length below 2 is shorter than its own Extension
+Identifier; `3 + Length` running past the end of the area is an overrun; and a
+type other than `0xFF` is unsupported. The older one-octet-length reading of
+this element is wrong and is not what the code accepts: it would read
+`FF 02 AA BB` as a complete element of Length 2, whereas the specification
+reads it as Length `0x02AA` and rejects it as truncated.
 
 ## 4. Dispatch: G-PDU and control messages are separate
 
@@ -128,43 +175,80 @@ the identifier as retired:
 * `releaseBearer` — an E-RAB Release Command deletes one bearer or, for the
   default EBI, the whole PDN connection.
 * `deleteBearerContexts` — the UE's NAS deletes the session.
-* `unbindLocalTeid` — also used to roll back an Initial Context Setup whose
-  response could not be transmitted. A TEID that never became forwardable is
-  still retired, so it is never offered again.
+* `unbindLocalTeid` — releases this entry's local TEID. For a live mapping it
+  retires the identifier through `retireLocalTeid`. For a value that is not a
+  live mapping of this entry — the rollback of an Initial Context Setup whose
+  response could not be transmitted — it drops the reservation instead, and
+  retires nothing, because no tunnel of this registry ever existed to retire.
+  Either way the identifier is never offered again (§7).
 
 `DefaultBearerContext::releaseAccessTransport` then zeroes `localTeid`,
 `sgwTeid` and `sgwAddress` on the bearer itself.
 
 ## 7. TEID allocation and reuse protection
 
-`AllocateLocalTeid()` (`src/lte/enb/user_plane.cpp`) is a process-wide
-monotonic `std::atomic<uint32_t>` counter seeded at random, with zero
-permanently skipped. Within one process a value is therefore never offered
-again before every later value has been used.
+A wire TEID is 32 bits and zero is reserved, so at most `2^32 - 1` distinct
+identifiers exist. `TeidSequence` (`src/lte/enb/user_plane.cpp`) hands them
+out over a bounded issuance window and cannot hand one out twice.
 
-`UeRegistry::allocateLocalTeid()` wraps it and refuses a candidate that is
+* The sequence is seeded at random and advances a 64-bit **step** counter. The
+  value for step *n* is `seed + n + 1` in explicitly 32-bit modular
+  arithmetic, so consecutive steps name consecutive 32-bit patterns and all of
+  them are distinct.
+* Zero is reserved and is never returned. The step that would have produced it
+  is spent rather than retried, so it cannot be reserved twice and cannot
+  cause a repeat. This costs at most one step.
+* A step is reserved with a compare-exchange, so two callers never take the
+  same step, and the counter is never advanced past the end of the window.
+* **Exhaustion fails closed.** Once the window is spent, `next()` throws
+  `TeidExhausted` and returns nothing. It never returns zero, never returns a
+  previously issued value, never overwrites a live mapping and never clears a
+  retirement record. Because the counter stops at the window, exhaustion is
+  sticky: the sequence cannot wrap open again.
 
-* zero, or
-* already live in `m_byLocalTeid`, or
-* still recorded as retired in the `RetiredTeidLedger`.
+`AllocateLocalTeid()` is the one production sequence, with the whole non-zero
+32-bit space as its window. **The no-reissue guarantee is process-lifetime
+only.** Nothing is persisted, so a later run may issue an identifier an
+earlier run used, and no cross-restart uniqueness is claimed.
 
-The last rule is the one that matters for reuse. Without it, the 32-bit
-sequence could wrap round to an identifier whose tunnel has been retired, and a
-delayed packet of the old tunnel would then resolve against the new one. With
-it, an identifier is not re-issued while its retirement record stands.
+### The reservation contract
 
-The ledger is bounded (`RetiredTeidLedger::DefaultCapacity`, 4096). When it is
-full the longest-retired record is dropped first. That cannot cause a
-misdelivery: it only ages a very late packet's classification from "retired"
-back to "unknown", and the monotonic allocator still does not re-offer the
-evicted value before its own later turn in the sequence.
+Uniqueness comes from the allocator alone. `UeRegistry` does not keep a
+history of what has been issued; it keeps only the values currently in flight.
 
-The ledger records only the identifier and the order in which it was retired.
-It holds no UE identity, no peer address and no subscriber information.
+* `allocateLocalTeid()` draws a candidate and **reserves** it. It refuses a
+  candidate that is zero, already live in `m_byLocalTeid`, or still recorded
+  as retired in the `RetiredTeidLedger`, and it is bounded so that a
+  pathological injected allocator fails deterministically rather than looping.
+* `bindLocalTeid()` accepts **only** a value this registry reserved. It
+  refuses a zero identifier, a value that is not reserved, a value already
+  owned by another bearer, and — absolutely — a value still recorded as
+  retired.
+* A reservation is consumed by a bind, dropped by an `unbindLocalTeid`
+  rollback, and dropped defensively by `retireLocalTeid`. A failed
+  establishment therefore leaks nothing and leaves no half-built bearer.
 
-`bindLocalTeid` drops any retirement record for the identifier it binds, since
-a live identifier is by definition not retired. That is what keeps a
-hand-assigned identifier from being shadowed by a stale record.
+Without the reservation check, `bindLocalTeid` would be an open setter and any
+caller could attach an identifier of its own choosing, bypassing the
+allocator's no-reissue guarantee. There is deliberately **no revival API**:
+nothing withdraws a retirement record, and a retired identifier is never
+rebound to a live tunnel, so a delayed packet of an old tunnel can never
+resolve against a new one.
+
+### The ledger is an observation aid
+
+`RetiredTeidLedger` (`DefaultCapacity`, 4096) records only the identifier and
+the order in which it was retired. It holds no UE identity, no peer address
+and no subscriber information. When it is full the longest-retired record is
+dropped first.
+
+**It is not an allocation guarantee and the code does not rely on `contains()`
+to decide eligibility.** After a record ages out the identifier is still
+unusable: it is not reserved, so it cannot be bound, and the allocator is
+monotonic and has already spent its step, so it is never offered again. What
+eviction does change is only the *classification* of a very late packet, which
+moves from "traffic that outlived its tunnel" back to "a packet that never had
+one". Neither is delivered.
 
 ## 8. Delayed and stale packets
 
@@ -241,21 +325,27 @@ and no state is created on any UE either way.
 
 `test/lte/gtpu_end_marker.cpp` holds the End Marker and retired-tunnel cases:
 the genuine capture vector; header, optional-field and information-element
-validation; the per-type TEID and payload rules; the ledger's own behaviour;
-retirement through S1 release and through an E-RAB release; allocator refusal
-of live and retired values across a wraparound; delayed-G-PDU isolation;
-TEID-reuse isolation; duplicate and unexpected-peer End Markers; bearer
+validation including the S-flag policy and the Private Extension wire form; the
+per-type TEID and payload rules; the ledger's own behaviour; retirement through
+S1 release and through an E-RAB release; the reservation contract and its
+refusals; the issuance window, its exhaustion and concurrent draws; delayed
+G-PDU and delayed End Marker isolation both before and after a retirement
+record has aged out; duplicate and unexpected-peer End Markers; bearer
 readiness; the endpoint's own guards; and multi-UE isolation. The tests drive
 `S1uEndpoint::handleDatagram` directly against loopback UDP endpoints, so a
 datagram either reaches a UE endpoint or it does not — that is what makes "the
 End Marker never reaches the TUN" an observation rather than an assertion about
 counters.
 
-Line coverage of these four source files is 92.8% (605 of 652 lines). What is
+The tests reach the window boundary and the eviction path through the same
+code a bearer runs: `TeidSequence` is the sequence `AllocateLocalTeid()`
+itself instantiates, and the ledger capacity is a constructor parameter that
+only a test lowers.
+
+Line coverage of these four source files is 93.7% (612 of 653 lines). What is
 left uncovered is either pre-existing error handling outside this record, the
-two `default:` dispatch branches that the message-type whitelist makes
-unreachable, or the defensive `retireLocalTeid(0)` early return that no public
-call can reach.
+`default:` dispatch branch that the message-type whitelist makes unreachable,
+or defensive early returns that no public call can reach.
 
 Existing suites (`test/lte/multi_ue.cpp`, `test/lte/restoration.cpp`,
 `test/lte/modify.cpp`, `test/lte/user_plane.cpp`) cover the bearer lifecycle
@@ -277,7 +367,10 @@ and the TEID-index invariants this record relies on.
   captured vector.
 * **The retired-TEID ledger is bounded.** An identifier whose record has aged
   out is classified as an unknown TEID rather than a retired one. It is still
-  never delivered, and it is still never re-issued early (§7).
+  never delivered, and it is still never re-issued (§7).
+* **TEID uniqueness is process-lifetime only.** Nothing is persisted, so a
+  later run may issue an identifier an earlier run used. No cross-restart
+  uniqueness is claimed or provided.
 * **No live-lab End Marker claim.** Whether a genuine Open5GS End Marker is
   observed in a given live capture is recorded per capture and is not implied
   by this record.

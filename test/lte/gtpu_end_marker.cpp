@@ -17,7 +17,12 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <deque>
 #include <functional>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <unordered_set>
 #include <vector>
 
 namespace
@@ -50,11 +55,21 @@ std::vector<uint8_t> EndMarkerWire(uint32_t teid, std::vector<uint8_t> ies = {})
     return wire;
 }
 
-// A Private Extension information element, TS 29.281 8.1: a TLV whose type
-// carries the MSB that distinguishes it from a TV information element.
-std::vector<uint8_t> PrivateExtension(std::vector<uint8_t> value)
+// A Private Extension information element, TS 29.281 figure 8.6-1: Type, a
+// 16-bit Length, a 16-bit Extension Identifier and the opaque Extension Value.
+// Section 8.1 makes Length count everything after the Type and Length fields,
+// so it is the Extension Identifier plus the Extension Value and is at least
+// two. The whole element is therefore 3 + Length octets.
+//
+// This helper encodes that shape and nothing else. It is deliberately not used
+// by the malformed-vector tests: those build their octets by hand so that a bug
+// in a fixture can never be mistaken for the behaviour under test.
+std::vector<uint8_t> PrivateExtension(uint16_t identifier, std::vector<uint8_t> value = {})
 {
-    std::vector<uint8_t> ie{gtpu::PrivateExtensionType, static_cast<uint8_t>(value.size())};
+    const size_t length = 2 + value.size();
+    std::vector<uint8_t> ie{gtpu::PrivateExtensionType, static_cast<uint8_t>((length >> 8U) & 0xFFU),
+                            static_cast<uint8_t>(length & 0xFFU), static_cast<uint8_t>((identifier >> 8U) & 0xFFU),
+                            static_cast<uint8_t>(identifier & 0xFFU)};
     ie.insert(ie.end(), value.begin(), value.end());
     return ie;
 }
@@ -85,7 +100,28 @@ struct Lab
     udp::UdpServer ueLink{"127.0.0.1", 0};
     udp::UdpServer ueA{"127.0.0.1", 0};
     udp::UdpServer ueB{"127.0.0.1", 0};
-    UeRegistry registry{8};
+    // The identifiers this test wants are supplied *by the allocator*, not
+    // assigned to a bearer by hand. `attach` queues the identifier it wants,
+    // the registry's allocator returns it, and the binder accepts it because it
+    // was reserved. A test can therefore still name a specific TEID on the wire
+    // while the production allocation contract is the only route to a live
+    // mapping.
+    std::deque<uint32_t> teidQueue;
+    // The retirement record is bounded. A test lowers that bound to reach the
+    // eviction path on exactly the code a bearer runs, and the default is the
+    // production capacity so that no other case sees a shorter memory than the
+    // eNB does.
+    explicit Lab(size_t retiredCapacity = lte::enb::RetiredTeidLedger::DefaultCapacity)
+        : registry(8, [this] {
+              if (teidQueue.empty())
+                  throw lte::enb::TeidExhausted("the test TEID queue is empty");
+              const uint32_t value = teidQueue.front();
+              teidQueue.pop_front();
+              return value;
+          }, retiredCapacity)
+    {
+    }
+    UeRegistry registry;
     S1uEndpoint s1u{"127.0.0.1", 0, true, registry, ueLink};
 
     static constexpr std::array<uint8_t, 4> SgwAddress{127, 0, 0, 9};
@@ -97,10 +133,12 @@ struct Lab
 
     EnbUeEntry &attach(uint32_t radioUeId, const InetAddress &uePeer, uint32_t localTeid)
     {
+        teidQueue.push_back(localTeid);
         auto &entry = registry.registerPeer(radioUeId, uePeer);
-        entry.bearer.establish({5, 9, radioUeId, SgwAddress, 0xA1A2A3A4u, localTeid});
+        const uint32_t allocated = registry.allocateLocalTeid();
+        entry.bearer.establish({5, 9, radioUeId, SgwAddress, 0xA1A2A3A4u, allocated});
         entry.bearer.activateUe(radioUeId, 5, {10, 45, 0, static_cast<uint8_t>(radioUeId)});
-        registry.bindLocalTeid(entry, localTeid);
+        registry.bindLocalTeid(entry, entry.bearer.parameters().localTeid);
         // What the multiplexer does once the default bearer is confirmed ready.
         entry.s1 = lte::enb::UeS1State::BEARER_ACTIVE;
         return entry;
@@ -131,23 +169,80 @@ TEST_CASE("lte/gtpu/end-marker: the genuine captured End Marker decodes as a nam
     CHECK(decoded.messageType != gtpu::TPdu);
 }
 
+TEST_CASE("lte/gtpu/end-marker: an End Marker with a set S flag is refused under the strict LTE profile")
+{
+    // TS 29.281 V14.0.0 (Release 14) §5.1, Sequence number flag (S): "In an End
+    // marker message the S flag shall be set to '0'." V9.3.0 (Release 9) §5.1
+    // says nothing about the End Marker at all, so the requirement is a later
+    // release's and is adopted here deliberately as the receive profile: a
+    // conforming sender never sets it. There is no compatibility switch that
+    // keeps the older, laxer reading.
+    const std::vector<uint8_t> sequenced{0x32, gtpu::EndMarker, 0x00, 0x04, 0x00, 0x00, 0x10, 0x01,
+                                         0x12, 0x34, 0x00, 0x00};
+    CHECK_THROWS_AS(gtpu::Decode(sequenced.data(), sequenced.size()), gtpu::CodecError);
+
+    // The same refusal with no optional block at all behind the flag.
+    std::vector<uint8_t> bareFlag{0x32, gtpu::EndMarker, 0x00, 0x00, 0x00, 0x00, 0x10, 0x01};
+    CHECK_THROWS_AS(gtpu::Decode(bareFlag.data(), bareFlag.size()), gtpu::CodecError);
+
+    // S combined with E is refused too, and so is S combined with PN.
+    std::vector<uint8_t> withExtension{0x36, gtpu::EndMarker, 0x00, 0x08, 0x00, 0x00, 0x10, 0x01,
+                                       0x00, 0x00, 0x00, 0xC0, 0x01, 0x00, 0x00, 0x00};
+    CHECK_THROWS_AS(gtpu::Decode(withExtension.data(), withExtension.size()), gtpu::CodecError);
+    std::vector<uint8_t> withNPdu{0x33, gtpu::EndMarker, 0x00, 0x04, 0x00, 0x00, 0x10, 0x01,
+                                  0x00, 0x00, 0x7B, 0x00};
+    CHECK_THROWS_AS(gtpu::Decode(withNPdu.data(), withNPdu.size()), gtpu::CodecError);
+
+    // A malformed information-element area is still refused when the flag is
+    // set: the flag rule is a header rule and is applied before anything else
+    // is interpreted, so the outcome does not depend on which defect is found
+    // first.
+    std::vector<uint8_t> both{0x32, gtpu::EndMarker, 0x00, 0x02, 0x00, 0x00, 0x10, 0x01,
+                              0xFF, 0x02};
+    CHECK_THROWS_AS(gtpu::Decode(both.data(), both.size()), gtpu::CodecError);
+
+    // The endpoint refuses it as a malformed datagram and no bearer moves.
+    Lab lab;
+    auto &entry = lab.attach(1, lab.ueA.LocalAddress(), 0x00001001U);
+    lab.s1u.handleDatagram(sequenced.data(), sequenced.size(), Lab::SgwPeer());
+    CHECK(lab.s1u.counters().malformedDrops == 1);
+    CHECK(entry.bearer.counters().endMarkers == 0);
+    CHECK(entry.bearer.active());
+    CHECK_FALSE(lab.ueReceived(lab.ueA));
+
+    // The rule is specific to the End Marker. A G-PDU and an Echo may carry a
+    // sequence number, and their handling is unchanged.
+    const auto payload = Ipv4({10, 45, 0, 1}, {10, 45, 0, 1});
+    const auto plain = gtpu::EncodeTPdu(0x00001001U, payload.data(), payload.size());
+    std::vector<uint8_t> sequencedGpdu{0x32, gtpu::TPdu, 0x00, 0x04, 0x00, 0x00, 0x10, 0x01,
+                                       0x00, 0x01, 0x00, 0x00};
+    sequencedGpdu.insert(sequencedGpdu.end(), payload.begin(), payload.end());
+    sequencedGpdu[2] = static_cast<uint8_t>(((sequencedGpdu.size() - 8) >> 8U) & 0xFFU);
+    sequencedGpdu[3] = static_cast<uint8_t>((sequencedGpdu.size() - 8) & 0xFFU);
+    const auto decodedGpdu = gtpu::Decode(sequencedGpdu.data(), sequencedGpdu.size());
+    REQUIRE(decodedGpdu.sequenceNumber.has_value());
+    CHECK(*decodedGpdu.sequenceNumber == 0x0001);
+    CHECK(decodedGpdu.payload.size() == payload.size());
+    (void)plain;
+}
+
 TEST_CASE("lte/gtpu/end-marker: the optional-header forms decode and the malformed header is rejected")
 {
-    // S flag with a sequence number: valid, and the sequence is not a payload.
-    std::vector<uint8_t> sequenced{0x32, gtpu::EndMarker, 0x00, 0x04, 0x00, 0x00, 0x10, 0x01,
-                                   0x12, 0x34, 0x00, 0x00};
-    auto decoded = gtpu::Decode(sequenced.data(), sequenced.size());
-    REQUIRE(decoded.sequenceNumber.has_value());
-    CHECK(*decoded.sequenceNumber == 0x1234);
-    CHECK(decoded.teid == 0x00001001U);
-    CHECK(decoded.payload.empty());
-
     // E flag with one supported extension header, then no information elements.
     std::vector<uint8_t> extended{0x34, gtpu::EndMarker, 0x00, 0x08, 0x00, 0x00, 0x10, 0x02,
                                   0x00, 0x00, 0x00, 0xC0, 0x01, 0x00, 0x00, 0x00};
-    decoded = gtpu::Decode(extended.data(), extended.size());
+    auto decoded = gtpu::Decode(extended.data(), extended.size());
     CHECK(decoded.extensionTypes == std::vector<uint8_t>{0xC0});
     CHECK(decoded.teid == 0x00001002U);
+    CHECK(decoded.payload.empty());
+
+    // PN flag with an N-PDU number. No End Marker-specific rule restricts it,
+    // so the general §5.1 parsing stands.
+    std::vector<uint8_t> npdu{0x31, gtpu::EndMarker, 0x00, 0x04, 0x00, 0x00, 0x10, 0x03,
+                              0x00, 0x00, 0x7B, 0x00};
+    decoded = gtpu::Decode(npdu.data(), npdu.size());
+    REQUIRE(decoded.npduNumber.has_value());
+    CHECK(*decoded.npduNumber == 0x7B);
     CHECK(decoded.payload.empty());
 
     auto wire = EndMarkerWire(0x00001003U);
@@ -172,12 +267,14 @@ TEST_CASE("lte/gtpu/end-marker: the optional-header forms decode and the malform
     CHECK_THROWS_AS(gtpu::Decode(truncated.data(), truncated.size()), gtpu::CodecError);
 
     // The optional block is required exactly when one of E, S or PN is set.
+    // PN is used here rather than S, because a set S flag on an End Marker is
+    // already refused as a header rule of its own.
     bad = wire;
-    bad[0] = 0x32;
+    bad[0] = 0x31;
     CHECK_THROWS_AS(gtpu::Decode(bad.data(), bad.size()), gtpu::CodecError);
 
     // A declared optional block that is shorter than the four octets it needs.
-    std::vector<uint8_t> shortOptional{0x32, gtpu::EndMarker, 0x00, 0x02, 0x00, 0x00, 0x10, 0x04,
+    std::vector<uint8_t> shortOptional{0x31, gtpu::EndMarker, 0x00, 0x02, 0x00, 0x00, 0x10, 0x04,
                                        0x12, 0x34};
     CHECK_THROWS_AS(gtpu::Decode(shortOptional.data(), shortOptional.size()), gtpu::CodecError);
 
@@ -190,51 +287,225 @@ TEST_CASE("lte/gtpu/end-marker: the optional-header forms decode and the malform
     CHECK_THROWS_AS(gtpu::Decode(oversized.data(), oversized.size()), gtpu::CodecError);
 }
 
-TEST_CASE("lte/gtpu/end-marker: only the optional Private Extension information element is accepted")
+// Builds an End Marker whose information-element area is exactly `ies`. The
+// outer length is derived, so a test that wants a mismatch has to corrupt it on
+// purpose.
+std::vector<uint8_t> EndMarkerWith(std::vector<uint8_t> ies, uint32_t teid = 0x00001001U)
 {
-    CHECK_NOTHROW(gtpu::Decode(EndMarkerWire(7).data(), EndMarkerWire(7).size()));
-
-    auto withExtension = EndMarkerWire(7, PrivateExtension({0xAA, 0xBB}));
-    auto decoded = gtpu::Decode(withExtension.data(), withExtension.size());
-    CHECK(decoded.messageType == gtpu::EndMarker);
-    CHECK(decoded.teid == 7);
-    // The information-element area of a control message is not user-plane
-    // payload and is not published as one.
-    CHECK(decoded.payload.empty());
-
-    auto repeated = EndMarkerWire(7, [] {
-        std::vector<uint8_t> ies = PrivateExtension({0x01});
-        const auto more = PrivateExtension({0x02, 0x03});
-        ies.insert(ies.end(), more.begin(), more.end());
-        return ies;
-    }());
-    CHECK_NOTHROW(gtpu::Decode(repeated.data(), repeated.size()));
-
-    // An information element of any other type cannot be interpreted.
-    auto foreign = EndMarkerWire(7, {0x0E, 0x00});
-    CHECK_THROWS_AS(gtpu::Decode(foreign.data(), foreign.size()), gtpu::CodecError);
-    // A truncated type-length pair, and a value longer than what remains.
-    auto truncatedType = EndMarkerWire(7, {0xFF});
-    CHECK_THROWS_AS(gtpu::Decode(truncatedType.data(), truncatedType.size()), gtpu::CodecError);
-    auto overrun = EndMarkerWire(7, {0xFF, 0x08, 0x01});
-    CHECK_THROWS_AS(gtpu::Decode(overrun.data(), overrun.size()), gtpu::CodecError);
+    return EndMarkerWire(teid, std::move(ies));
 }
 
-TEST_CASE("lte/gtpu/end-marker: the boundary lengths decode and the neighbouring ones do not")
+TEST_CASE("lte/gtpu/private-extension: a well-formed Private Extension decodes and never becomes user data")
 {
-    // The smallest End Marker: the mandatory header alone.
-    CHECK_NOTHROW(gtpu::Decode(GenuineOpen5gsEndMarker.data(), GenuineOpen5gsEndMarker.size()));
+    // Independent hard-coded wire vectors. They are written octet by octet
+    // rather than produced by the fixture helper, so a defect in the helper
+    // cannot pass as correct behaviour. All of these are synthetic protocol
+    // vectors: none of them was observed in an Open5GS capture. The one vector
+    // that was is GenuineOpen5gsEndMarker, and it carries no information
+    // element at all.
 
-    // An information-element area that exactly fills the message.
-    const auto exact = EndMarkerWire(9, PrivateExtension({0x01, 0x02, 0x03}));
-    CHECK_NOTHROW(gtpu::Decode(exact.data(), exact.size()));
-    // The same message with the declared value length one longer than what
-    // remains does not. Index 9 is the Private Extension length octet.
-    std::vector<uint8_t> overrun = exact;
-    overrun[9] = 4;
-    CHECK_THROWS_AS(gtpu::Decode(overrun.data(), overrun.size()), gtpu::CodecError);
+    Lab lab;
+    auto &entry = lab.attach(1, lab.ueA.LocalAddress(), 0x00001001U);
 
-    // The largest payload a GTP-U length field can describe round-trips.
+    // A genuine eight-octet End Marker with no information element.
+    const std::vector<uint8_t> noIe{0x30, 0xFE, 0x00, 0x00, 0x00, 0x00, 0x10, 0x01};
+    // The minimal valid Private Extension: Type 0xFF, Length 2, Extension
+    // Identifier 0x1234, and an empty Extension Value. Octets 6-m of figure
+    // 8.6-1 are absent because Length stops at the identifier.
+    const std::vector<uint8_t> minimal{0x30, 0xFE, 0x00, 0x05, 0x00, 0x00, 0x10, 0x01,
+                                       0xFF, 0x00, 0x02, 0x12, 0x34};
+    // Length 4: the same identifier and a two-octet Extension Value. This is
+    // the worked example the specification layout implies.
+    const std::vector<uint8_t> withValue{0x30, 0xFE, 0x00, 0x07, 0x00, 0x00, 0x10, 0x01,
+                                         0xFF, 0x00, 0x04, 0x12, 0x34, 0xAA, 0xBB};
+    // Two complete Private Extensions concatenated, which 8.6 permits. The
+    // first occupies 3 + 2 and the second 3 + 3 octets, so the information
+    // element area is eleven octets long.
+    const std::vector<uint8_t> twice{0x30, 0xFE, 0x00, 0x0B, 0x00, 0x00, 0x10, 0x01,
+                                     0xFF, 0x00, 0x02, 0x00, 0x01, 0xFF, 0x00, 0x03, 0x00, 0x02, 0x07};
+
+    for (const auto &wire : {noIe, minimal, withValue, twice})
+    {
+        const auto decoded = gtpu::Decode(wire.data(), wire.size());
+        CHECK(decoded.messageType == gtpu::EndMarker);
+        CHECK(decoded.teid == 0x00001001U);
+        // The information-element area of a control message is not user-plane
+        // payload and is never published as one.
+        CHECK(decoded.payload.empty());
+
+        lab.s1u.handleDatagram(wire.data(), wire.size(), Lab::SgwPeer());
+        CHECK_FALSE(lab.ueReceived(lab.ueA));
+        // Not one byte of user-plane accounting moves for a control message.
+        CHECK(entry.counters.s1uDownlinkPackets == 0);
+        CHECK(entry.counters.s1uDownlinkBytes == 0);
+        CHECK(entry.bearer.counters().downlinkPackets == 0);
+        CHECK(entry.bearer.counters().endMarkers > 0);
+    }
+    CHECK(entry.bearer.active());
+    CHECK(lab.s1u.counters().malformedDrops == 0);
+
+    // The Extension Identifier is an IANA Private Enterprise Number in network
+    // byte order. It is validated structurally and never interpreted, so what
+    // is observable is that a well-formed network-order field is accepted and
+    // that one octet short of it is not. That is tested below.
+    const std::vector<uint8_t> enterprise{0x30, 0xFE, 0x00, 0x05, 0x00, 0x00, 0x10, 0x01,
+                                          0xFF, 0x00, 0x02, 0xAB, 0xCD};
+    CHECK_NOTHROW(gtpu::Decode(enterprise.data(), enterprise.size()));
+}
+
+TEST_CASE("lte/gtpu/private-extension: the 16-bit length is honoured at its octet boundary")
+{
+    // Length 255 (0x00FF): the Extension Identifier plus a 253-octet Extension
+    // Value. The whole element is 3 + 255 = 258 octets.
+    std::vector<uint8_t> at255{0x30, 0xFE, 0x01, 0x02, 0x00, 0x00, 0x10, 0x01,
+                               0xFF, 0x00, 0xFF, 0x12, 0x34};
+    at255.insert(at255.end(), 253, 0x5A);
+    // Length 256 (0x0100): one octet more, which needs both length octets.
+    std::vector<uint8_t> at256{0x30, 0xFE, 0x01, 0x03, 0x00, 0x00, 0x10, 0x01,
+                               0xFF, 0x01, 0x00, 0x12, 0x34};
+    at256.insert(at256.end(), 254, 0x5A);
+
+    REQUIRE(at255.size() == 8 + 3 + 255);
+    REQUIRE(at256.size() == 8 + 3 + 256);
+    // The declared outer length is the whole information-element area.
+    REQUIRE(at255[2] == 0x01);
+    REQUIRE(at255[3] == 0x02);
+    REQUIRE(at256[2] == 0x01);
+    REQUIRE(at256[3] == 0x03);
+
+    for (const auto &wire : {at255, at256})
+    {
+        const auto decoded = gtpu::Decode(wire.data(), wire.size());
+        CHECK(decoded.payload.empty());
+        CHECK(decoded.teid == 0x00001001U);
+    }
+
+    // The same two wires with the low length octet one smaller declare a value
+    // one octet longer than what remains, and are refused.
+    auto short255 = at255;
+    short255[10] = 0xFE;
+    CHECK_THROWS_AS(gtpu::Decode(short255.data(), short255.size()), gtpu::CodecError);
+    auto short256 = at256;
+    short256[10] = 0xFF;
+    CHECK_THROWS_AS(gtpu::Decode(short256.data(), short256.size()), gtpu::CodecError);
+
+    // The largest information-element area the 16-bit outer length can
+    // describe: 3 + 0xFFFC = 0xFFFF octets of Private Extension.
+    std::vector<uint8_t> largest{0x30, 0xFE, 0xFF, 0xFF, 0x00, 0x00, 0x10, 0x01,
+                                 0xFF, 0xFF, 0xFC, 0x12, 0x34};
+    largest.insert(largest.end(), 0xFFFCu - 2, 0x5A);
+    REQUIRE(largest.size() == 8 + 0xFFFF);
+    CHECK_NOTHROW(gtpu::Decode(largest.data(), largest.size()));
+    // One octet beyond what the field can describe is refused.
+    largest.push_back(0x00);
+    CHECK_THROWS_AS(gtpu::Decode(largest.data(), largest.size()), gtpu::CodecError);
+}
+
+TEST_CASE("lte/gtpu/private-extension: a malformed Private Extension is refused and disturbs no state")
+{
+    Lab lab;
+    auto &entry = lab.attach(1, lab.ueA.LocalAddress(), 0x00001001U);
+
+    // One live G-PDU first, so a later drop has something it must not disturb.
+    const auto downlink = Ipv4({10, 45, 0, 1}, {10, 45, 0, 1});
+    const auto live = GPduWire(0x00001001U, downlink);
+    lab.s1u.handleDatagram(live.data(), live.size(), Lab::SgwPeer());
+    REQUIRE(lab.ueReceived(lab.ueA));
+    REQUIRE(entry.counters.s1uDownlinkPackets == 1);
+    REQUIRE(entry.bearer.counters().downlinkPackets == 1);
+
+    // Octet by octet, independent of the fixture helper. Each is the
+    // information-element area of an otherwise well-formed End Marker.
+    const std::vector<std::vector<uint8_t>> malformed{
+        // The Phase 16 fixture's shape: a one-octet length and no Extension
+        // Identifier. Read against figure 8.6-1 its Length is 0x02AA, which
+        // claims 682 octets that are not there.
+        {0xFF, 0x02, 0xAA, 0xBB},
+        // Type present, both Length octets absent.
+        {0xFF},
+        // Type and one Length octet present, the second absent.
+        {0xFF, 0x00},
+        // Length present, the Extension Identifier entirely absent.
+        {0xFF, 0x00, 0x02},
+        // Extension Identifier one octet short.
+        {0xFF, 0x00, 0x02, 0x12},
+        // Length zero: shorter than the Extension Identifier it must carry.
+        {0xFF, 0x00, 0x00, 0x12, 0x34},
+        // Length one: still shorter than the Extension Identifier.
+        {0xFF, 0x00, 0x01, 0x12},
+        // Declared value longer than what remains.
+        {0xFF, 0x00, 0x04, 0x12, 0x34, 0xAA},
+        // Extension Value one octet short of its declared length.
+        {0xFF, 0x00, 0x05, 0x12, 0x34, 0xAA, 0xBB},
+        // A length that claims the whole of the 16-bit space.
+        {0xFF, 0xFF, 0xFF, 0x12, 0x34},
+        // Wrong Type: a Recovery TV IE is not a Private Extension.
+        {0x0E, 0x00, 0x02, 0x12, 0x34},
+        // A well-formed Private Extension followed by an unsupported IE.
+        {0xFF, 0x00, 0x02, 0x12, 0x34, 0x0E, 0x00, 0x02, 0x56, 0x78},
+        // A well-formed Private Extension followed by an incomplete one.
+        {0xFF, 0x00, 0x02, 0x12, 0x34, 0xFF},
+        // A well-formed Private Extension followed by a truncated second one.
+        {0xFF, 0x00, 0x02, 0x12, 0x34, 0xFF, 0x00, 0x02, 0x12},
+        // Two complete Private Extensions and then one trailing octet.
+        {0xFF, 0x00, 0x02, 0x12, 0x34, 0xFF, 0x00, 0x02, 0x56, 0x78, 0xAA},
+    };
+
+    for (const auto &ies : malformed)
+    {
+        const auto wire = EndMarkerWith(ies);
+        CHECK_THROWS_AS(gtpu::Decode(wire.data(), wire.size()), gtpu::CodecError);
+        // The endpoint refuses it as malformed and nothing else moves.
+        lab.s1u.handleDatagram(wire.data(), wire.size(), Lab::SgwPeer());
+        CHECK_FALSE(lab.ueReceived(lab.ueA));
+    }
+
+    // A well-formed Private Extension embedded in a header that is itself
+    // malformed. The header is refused first, and the valid-looking tail buys
+    // it nothing.
+    const std::vector<uint8_t> validIe{0xFF, 0x00, 0x02, 0x12, 0x34};
+    for (const uint8_t flags : {uint8_t{0x20}, uint8_t{0x50}, uint8_t{0x38}, uint8_t{0x00}})
+    {
+        auto wire = EndMarkerWith(validIe);
+        wire[0] = flags;
+        CHECK_THROWS_AS(gtpu::Decode(wire.data(), wire.size()), gtpu::CodecError);
+        lab.s1u.handleDatagram(wire.data(), wire.size(), Lab::SgwPeer());
+        CHECK_FALSE(lab.ueReceived(lab.ueA));
+    }
+
+    // The outer GTP-U length must describe the datagram exactly, information
+    // elements and all.
+    {
+        auto wire = EndMarkerWith(validIe);
+        wire[3] = static_cast<uint8_t>(wire[3] + 1);
+        CHECK_THROWS_AS(gtpu::Decode(wire.data(), wire.size()), gtpu::CodecError);
+        lab.s1u.handleDatagram(wire.data(), wire.size(), Lab::SgwPeer());
+        CHECK_FALSE(lab.ueReceived(lab.ueA));
+    }
+    {
+        auto wire = EndMarkerWith(validIe);
+        wire[3] = static_cast<uint8_t>(wire[3] - 1);
+        CHECK_THROWS_AS(gtpu::Decode(wire.data(), wire.size()), gtpu::CodecError);
+        lab.s1u.handleDatagram(wire.data(), wire.size(), Lab::SgwPeer());
+        CHECK_FALSE(lab.ueReceived(lab.ueA));
+    }
+
+    // Every malformed datagram was counted as one and left nothing behind: the
+    // bearer is still the bearer it was and the live G-PDU is still counted.
+    // Fifteen malformed information-element areas, four malformed flags and two
+    // outer-length mismatches.
+    CHECK(lab.s1u.counters().malformedDrops == malformed.size() + 6);
+    CHECK(entry.counters.s1uDownlinkPackets == 1);
+    CHECK(entry.counters.s1uDownlinkBytes == downlink.size());
+    CHECK(entry.bearer.counters().downlinkPackets == 1);
+    CHECK(entry.bearer.counters().endMarkers == 0);
+    CHECK(entry.bearer.active());
+    CHECK(entry.bearer.parameters().localTeid == 0x00001001U);
+    CHECK(lab.registry.findBearerByLocalTeid(0x00001001U).entry == &entry);
+}
+
+TEST_CASE("lte/gtpu/end-marker: the largest T-PDU a length field can describe round-trips")
+{
     std::vector<uint8_t> largest(0xFFFF, 0x41);
     largest[0] = 0x45;
     const auto encoded = gtpu::EncodeTPdu(0x00000101U, largest.data(), largest.size());
@@ -254,7 +525,7 @@ TEST_CASE("lte/gtpu/end-marker: unsupported message types are still refused"){
     }
 }
 
-TEST_CASE("lte/enb/retired-teid: the ledger records, repeats, revives and ages out deterministically")
+TEST_CASE("lte/enb/retired-teid: the ledger records and repeats and is never withdrawn")
 {
     RetiredTeidLedger ledger(3);
     CHECK(ledger.capacity() == 3);
@@ -271,22 +542,104 @@ TEST_CASE("lte/enb/retired-teid: the ledger records, repeats, revives and ages o
     CHECK(ledger.size() == 2);
     CHECK(ledger.evictions() == 0);
 
-    ledger.revive(11);
-    CHECK_FALSE(ledger.contains(11));
-    CHECK(ledger.size() == 1);
-    ledger.revive(11); // reviving an identifier with no record is not an error
-    CHECK(ledger.size() == 1);
+    // There is deliberately no way to withdraw a record. A retirement stays
+    // recorded for as long as the record lasts, so nothing can erase the
+    // evidence that a tunnel ended in order to reuse its identifier.
+    CHECK(ledger.contains(11));
+    CHECK_FALSE(ledger.retire(11));
+    CHECK(ledger.contains(11));
 
-    CHECK(ledger.retire(13));
-    CHECK(ledger.retire(14)); // the ledger is now full
+    CHECK(ledger.retire(13)); // the ledger is now full
     CHECK(ledger.size() == 3);
-    CHECK(ledger.retire(15)); // evicts the longest-retired record, which is 12
+    CHECK(ledger.evictions() == 0);
+    CHECK(ledger.retire(14)); // evicts the longest-retired record, which is 11
     CHECK(ledger.size() == 3);
     CHECK(ledger.evictions() == 1);
+    CHECK_FALSE(ledger.contains(11));
+    CHECK(ledger.contains(12));
+    CHECK(ledger.contains(13));
+    CHECK(ledger.contains(14));
+    // The oldest surviving record is the next to go, so the record is an
+    // ordered window over the tunnels that ended most recently.
+    CHECK(ledger.retire(15));
+    CHECK(ledger.size() == 3);
+    CHECK(ledger.evictions() == 2);
     CHECK_FALSE(ledger.contains(12));
     CHECK(ledger.contains(13));
     CHECK(ledger.contains(14));
     CHECK(ledger.contains(15));
+}
+
+TEST_CASE("lte/enb/retired-teid: a retired identifier is refused as a live binding")
+{
+    UeRegistry registry(8);
+    auto &entry = registry.registerPeer(1, InetAddress("127.0.0.1", 40001));
+    const uint32_t teid = registry.allocateLocalTeid();
+    entry.bearer.establish({5, 9, 1, {127, 0, 0, 9}, 0xA1A1A1A1u, teid});
+    registry.bindLocalTeid(entry, teid);
+    registry.releaseS1(entry);
+    REQUIRE(registry.isRetiredTeid(teid));
+
+    // Both binding overloads refuse it. The refusal is specifically the
+    // retirement, not merely an unreserved value, and the record is not
+    // withdrawn to make room.
+    entry.bearer.establish({5, 9, 1, {127, 0, 0, 9}, 0xA1A1A1A1u, teid}, true);
+    auto refusal = [](const std::function<void()> &call) {
+        try
+        {
+            call();
+        }
+        catch (const lte::enb::RegistryError &e)
+        {
+            return std::string(e.what());
+        }
+        return std::string();
+    };
+    CHECK(refusal([&] { registry.bindLocalTeid(entry, teid); }).find("retired") != std::string::npos);
+    CHECK(refusal([&] { registry.bindLocalTeid(entry, entry.bearer, teid); }).find("retired") != std::string::npos);
+
+    // Failure is atomic: the live index is unchanged and the retired identifier
+    // stays unbound.
+    CHECK(registry.isRetiredTeid(teid));
+    CHECK(registry.findBearerByLocalTeid(teid).entry == nullptr);
+    CHECK(registry.retiredTeids().size() == 1);
+    CHECK(registry.size() == 1);
+    CHECK(entry.s1 == lte::enb::UeS1State::IDLE_RETAINED);
+}
+
+TEST_CASE("lte/enb/retired-teid: an identifier this registry never allocated cannot be bound")
+{
+    UeRegistry registry(8);
+    auto &entry = registry.registerPeer(1, InetAddress("127.0.0.1", 40001));
+    const uint32_t teid = registry.allocateLocalTeid();
+    entry.bearer.establish({5, 9, 1, {127, 0, 0, 9}, 0xA1A1A1A1u, teid});
+    registry.bindLocalTeid(entry, teid);
+
+    // A value chosen by hand is not an identifier this registry ever issued, so
+    // it cannot become a live mapping. Without this the binder is an open
+    // setter and the allocator's no-reissue guarantee is bypassed by anyone who
+    // picks their own number.
+    auto &other = registry.registerPeer(2, InetAddress("127.0.0.1", 40002));
+    other.bearer.establish({5, 9, 2, {127, 0, 0, 9}, 0xA1A1A1A2u, 0x0000F002U});
+    auto refusal = [](const std::function<void()> &call) {
+        try
+        {
+            call();
+        }
+        catch (const lte::enb::RegistryError &e)
+        {
+            return std::string(e.what());
+        }
+        return std::string();
+    };
+    CHECK(refusal([&] { registry.bindLocalTeid(other, 0x0000F002U); }).find("reserved") != std::string::npos);
+    CHECK(refusal([&] { registry.bindLocalTeid(other, other.bearer, 0x0000F002U); }).find("reserved") !=
+          std::string::npos);
+    // Zero is refused outright, and so is an identifier already owned.
+    CHECK_THROWS_AS(registry.bindLocalTeid(other, 0), lte::enb::RegistryError);
+    CHECK_THROWS_AS(registry.bindLocalTeid(entry, entry.bearer, teid), lte::enb::RegistryError);
+    CHECK(registry.findBearerByLocalTeid(0x0000F002U).entry == nullptr);
+    CHECK(registry.findBearerByLocalTeid(teid).entry == &entry);
 }
 
 TEST_CASE("lte/enb/retired-teid: release retires every local TEID of the access")
@@ -321,10 +674,11 @@ TEST_CASE("lte/enb/retired-teid: release retires every local TEID of the access"
 
 TEST_CASE("lte/enb/retired-teid: the allocator never offers a live or a retired identifier")
 {
-    // A deterministic allocator that comes back round to values the registry
-    // must refuse: zero, one that is already retired and one that is still
-    // live. This is the wraparound of the 32-bit sequence, which the
-    // process-wide monotonic counter cannot reach on its own in a test.
+    // A deliberately pathological allocator that offers back values the
+    // registry must refuse: zero, one that is already retired and one that is
+    // still live. The production sequence can never do this — it is monotonic
+    // and spends every step at most once — so the case exists to hold the
+    // registry's own defence in place against an allocator that does.
     std::vector<uint32_t> offered{0, 7, 42, 0, 7, 42, 0, 100};
     size_t next = 0;
     UeRegistry registry(8, [&] {
@@ -362,23 +716,77 @@ TEST_CASE("lte/enb/retired-teid: the allocator never offers a live or a retired 
     CHECK(registry.findByLocalTeid(live) == &second);
 }
 
-TEST_CASE("lte/enb/retired-teid: a retirement record cannot shadow an active mapping")
+TEST_CASE("lte/enb/retired-teid: an evicted tombstone still leaves its identifier unreusable")
 {
-    UeRegistry registry(8);
-    auto &entry = registry.registerPeer(1, InetAddress("127.0.0.1", 40001));
-    entry.bearer.establish({5, 9, 1, {127, 0, 0, 9}, 0xA1A1A1A1u, 0x00000011u});
-    registry.bindLocalTeid(entry, 0x00000011u);
-    registry.releaseS1(entry);
-    REQUIRE(registry.isRetiredTeid(0x00000011u));
+    // A ledger that keeps a single record: retiring a second identifier evicts
+    // the first tombstone, so the first is no longer remembered as retired at
+    // all. That is the state a long-lived eNB reaches, and the point of this
+    // case is that eviction changes nothing about eligibility. The retirement
+    // record is an observation aid and the work order forbids leaning on
+    // `contains()` alone, so the two things that actually hold are checked
+    // instead: the reservation contract refuses the binding, and the allocator
+    // never offers the value again.
+    lte::enb::TeidSequence sequence{0x00001000U, 8};
+    UeRegistry registry(8, [&sequence] { return sequence.next(); }, 1);
 
-    // A later access binds an identifier chosen by hand. It becomes live again
-    // and the stale retirement record is dropped, so the live mapping is what
-    // resolves and what the allocator is allowed to avoid.
-    entry.bearer.establish({5, 9, 1, {127, 0, 0, 9}, 0xA1A1A1A1u, 0x00000011u}, true);
-    registry.bindLocalTeid(entry, 0x00000011u);
-    CHECK_FALSE(registry.isRetiredTeid(0x00000011u));
-    CHECK(registry.findBearerByLocalTeid(0x00000011u).entry == &entry);
-    CHECK(registry.retiredTeids().size() == 0);
+    auto &first = registry.registerPeer(1, InetAddress("127.0.0.1", 40001));
+    const uint32_t oldTeid = registry.allocateLocalTeid();
+    first.bearer.establish({5, 9, 1, {127, 0, 0, 9}, 0xA1A1A1A1u, oldTeid});
+    first.bearer.activateUe(1, 5, {10, 45, 0, 1});
+    registry.bindLocalTeid(first, oldTeid);
+    registry.releaseS1(first);
+    REQUIRE(registry.isRetiredTeid(oldTeid));
+
+    // The second retirement evicts the first record.
+    auto &second = registry.registerPeer(2, InetAddress("127.0.0.1", 40002));
+    const uint32_t newerTeid = registry.allocateLocalTeid();
+    second.bearer.establish({5, 9, 2, {127, 0, 0, 9}, 0xA1A1A1A2u, newerTeid});
+    second.bearer.activateUe(2, 5, {10, 45, 0, 2});
+    registry.bindLocalTeid(second, newerTeid);
+    registry.releaseS1(second);
+    REQUIRE(registry.isRetiredTeid(newerTeid));
+    REQUIRE_FALSE(registry.isRetiredTeid(oldTeid));
+    REQUIRE(registry.retiredTeids().size() == 1);
+    REQUIRE(registry.retiredTeids().evictions() == 1);
+
+    // The evicted identifier is still refused as a live binding. The refusal is
+    // deliberately no longer the retirement check — that record is gone — but
+    // the reservation contract: nothing ever reserves this value again.
+    auto refusal = [](const std::function<void()> &call) {
+        try
+        {
+            call();
+        }
+        catch (const lte::enb::RegistryError &e)
+        {
+            return std::string(e.what());
+        }
+        return std::string();
+    };
+    auto &third = registry.registerPeer(3, InetAddress("127.0.0.1", 40003));
+    third.bearer.establish({5, 9, 3, {127, 0, 0, 9}, 0xA1A1A1A3u, oldTeid}, true);
+    const std::string message = refusal([&] { registry.bindLocalTeid(third, oldTeid); });
+    CHECK(message.find("reserved") != std::string::npos);
+    CHECK(registry.findBearerByLocalTeid(oldTeid).entry == nullptr);
+
+    // And the allocator never offers it again whatever the ledger now says. The
+    // sequence is monotonic and has already spent that step, so the rest of its
+    // window is a set of distinct values none of which is the old one.
+    size_t remaining = 0;
+    for (;;)
+    {
+        try
+        {
+            const uint32_t value = registry.allocateLocalTeid();
+            CHECK(value != oldTeid);
+            ++remaining;
+        }
+        catch (const lte::enb::TeidExhausted &)
+        {
+            break;
+        }
+    }
+    CHECK(remaining == 6);
 }
 
 TEST_CASE("lte/enb/retired-teid: ageing a record out cannot disturb an unrelated live tunnel")
@@ -386,9 +794,10 @@ TEST_CASE("lte/enb/retired-teid: ageing a record out cannot disturb an unrelated
     RetiredTeidLedger ledger(2);
     UeRegistry registry(8);
     auto &entry = registry.registerPeer(1, InetAddress("127.0.0.1", 40001));
-    entry.bearer.establish({5, 9, 1, {127, 0, 0, 9}, 0xA1A1A1A1u, 0x00000021u});
+    const uint32_t teid = registry.allocateLocalTeid();
+    entry.bearer.establish({5, 9, 1, {127, 0, 0, 9}, 0xA1A1A1A1u, teid});
     entry.bearer.activateUe(1, 5, {10, 45, 0, 2});
-    registry.bindLocalTeid(entry, 0x00000021u);
+    registry.bindLocalTeid(entry, teid);
 
     ledger.retire(1);
     ledger.retire(2);
@@ -396,8 +805,226 @@ TEST_CASE("lte/enb/retired-teid: ageing a record out cannot disturb an unrelated
     CHECK(ledger.size() == 2);
     CHECK(ledger.evictions() == 1);
     // The live tunnel is untouched by any of it.
-    CHECK(registry.findBearerByLocalTeid(0x00000021u).entry == &entry);
-    CHECK(registry.findBearerByLocalTeid(0x00000021u).bearer->active());
+    CHECK(registry.findBearerByLocalTeid(teid).entry == &entry);
+    CHECK(registry.findBearerByLocalTeid(teid).bearer->active());
+}
+
+TEST_CASE("lte/enb/teid-sequence: the whole issuance window is usable and nothing is issued twice")
+{
+    // The window is the guarantee. Exactly `window` steps are reserved, each
+    // step names one 32-bit pattern, and no pattern is produced twice, so the
+    // last allocation in the window is as safe as the first. A window that runs
+    // into the reserved zero spends that step and does not return it, which is
+    // why the returned values are checked for distinctness and non-zero rather
+    // than counted blindly against the window.
+    constexpr uint64_t window = 32;
+    lte::enb::TeidSequence sequence{0x0000A000U, window};
+    std::unordered_set<uint32_t> seen;
+    for (uint64_t i = 0; i < window; ++i)
+    {
+        const uint32_t value = sequence.next();
+        CHECK(value != 0);
+        CHECK(seen.insert(value).second);
+    }
+    CHECK(seen.size() == window);
+    CHECK(sequence.issued() == window);
+    // Every value the window can name is inside its span and nothing outside it
+    // was ever offered.
+    for (const uint32_t value : seen)
+    {
+        const uint32_t offset = value - 0x0000A000U;
+        CHECK(offset >= 1U);
+        CHECK(offset <= window);
+    }
+}
+
+TEST_CASE("lte/enb/teid-sequence: exhaustion fails closed and the window never reopens")
+{
+    // The step that would have produced the reserved zero is spent rather than
+    // returned, so the sequence yields one value fewer than its window and then
+    // refuses. That refusal is sticky: the counter is never advanced past the
+    // end of the window, so the sequence cannot wrap open again and reissue an
+    // identifier a released tunnel used.
+    lte::enb::TeidSequence sequence{0xFFFFFFFEU, 4};
+    // The four candidates are 0xFFFFFFFF, 0x00000000, 0x00000001 and
+    // 0x00000002; the second is reserved and its step is spent.
+    CHECK(sequence.next() == 0xFFFFFFFFU);
+    CHECK(sequence.next() == 0x00000001U);
+    CHECK(sequence.next() == 0x00000002U);
+    CHECK(sequence.issued() == 4);
+
+    // Exhaustion is immediate and repeatable: no identifier comes out, no busy
+    // loop is entered, and the counter does not move while refusing.
+    auto exhausted = [](const std::function<uint32_t()> &call) {
+        try
+        {
+            (void)call();
+        }
+        catch (const lte::enb::TeidExhausted &)
+        {
+            return true;
+        }
+        return false;
+    };
+    CHECK(exhausted([&] { return sequence.next(); }));
+    CHECK(exhausted([&] { return sequence.next(); }));
+    CHECK(exhausted([&] { return sequence.next(); }));
+    CHECK(sequence.issued() == 4);
+
+    // A window of zero is a configuration error rather than a sequence that
+    // quietly issues nothing for ever.
+    CHECK_THROWS_AS(lte::enb::TeidSequence(1, 0), std::invalid_argument);
+}
+
+TEST_CASE("lte/enb/teid-sequence: concurrent callers never share or lose a step")
+{
+    // The sequence is the one part of the allocation path that is meant to be
+    // shared, and each step is reserved by exactly one caller. The registry
+    // around it is not a thread-safe container by design and is not exercised
+    // here. Observations are collected first and asserted after the join, so no
+    // assertion is made from a worker thread.
+    constexpr uint64_t window = 4096;
+    constexpr int threadCount = 8;
+    lte::enb::TeidSequence sequence{0x0000B000U, window};
+    std::vector<std::vector<uint32_t>> perThread(threadCount);
+    std::vector<std::thread> workers;
+    for (int i = 0; i < threadCount; ++i)
+    {
+        workers.emplace_back([&sequence, &perThread, i] {
+            for (;;)
+            {
+                try
+                {
+                    perThread[i].push_back(sequence.next());
+                }
+                catch (const lte::enb::TeidExhausted &)
+                {
+                    return;
+                }
+            }
+        });
+    }
+    for (auto &worker : workers)
+        worker.join();
+
+    std::unordered_set<uint32_t> seen;
+    size_t total = 0;
+    for (const auto &values : perThread)
+    {
+        for (const uint32_t value : values)
+        {
+            CHECK(value != 0);
+            CHECK(seen.insert(value).second);
+            ++total;
+        }
+    }
+    // Every step of the window went to exactly one caller.
+    CHECK(total == window);
+    CHECK(seen.size() == window);
+    CHECK(sequence.issued() == window);
+}
+
+TEST_CASE("lte/enb/retired-teid: a dedicated bearer is held to the same allocation contract as the default")
+{
+    UeRegistry registry(8);
+    auto &entry = registry.registerPeer(1, InetAddress("127.0.0.1", 40001));
+    const uint32_t defaultTeid = registry.allocateLocalTeid();
+    entry.bearer.establish({5, 9, 1, {127, 0, 0, 9}, 0xA1A1A1A1u, defaultTeid});
+    entry.bearer.activateUe(1, 5, {10, 45, 0, 1});
+    registry.bindLocalTeid(entry, defaultTeid);
+
+    // A dedicated bearer takes its identifier from the same allocator and binds
+    // it through the same validated registration. Neither kind of bearer has a
+    // route that skips either step.
+    auto &dedicated = registry.addDedicatedBearer(
+        entry, {6, 7, 1, {127, 0, 0, 9}, 0xA1A2A3A2u, registry.allocateLocalTeid(), 5, {9, 15, false, false, {}}});
+    const uint32_t dedicatedTeid = dedicated.parameters().localTeid;
+    REQUIRE(dedicatedTeid != defaultTeid);
+    registry.bindLocalTeid(entry, dedicated, dedicatedTeid);
+
+    auto refusal = [](const std::function<void()> &call) {
+        try
+        {
+            call();
+        }
+        catch (const lte::enb::RegistryError &e)
+        {
+            return std::string(e.what());
+        }
+        return std::string();
+    };
+
+    // A value chosen by hand is refused for a dedicated bearer exactly as it is
+    // for the default one.
+    CHECK(refusal([&] { registry.bindLocalTeid(entry, dedicated, 0x0000D001U); }).find("reserved") !=
+          std::string::npos);
+    // A reserved value that names some other bearer is refused rather than
+    // silently replacing the binding this one already holds.
+    const uint32_t stray = registry.allocateLocalTeid();
+    CHECK(refusal([&] { registry.bindLocalTeid(entry, dedicated, stray); }).find("different") != std::string::npos);
+    CHECK(registry.findBearerByLocalTeid(defaultTeid).bearer == &entry.bearer);
+    CHECK(registry.findBearerByLocalTeid(dedicatedTeid).bearer == &dedicated);
+    CHECK(registry.findBearerByLocalTeid(stray).entry == nullptr);
+
+    // Both kinds retire through the same path on an access release, and neither
+    // can be rebound afterwards.
+    registry.releaseS1(entry);
+    CHECK(registry.isRetiredTeid(defaultTeid));
+    CHECK(registry.isRetiredTeid(dedicatedTeid));
+    CHECK(refusal([&] { registry.bindLocalTeid(entry, defaultTeid); }).find("retired") != std::string::npos);
+    CHECK(refusal([&] { registry.bindLocalTeid(entry, dedicated, dedicatedTeid); }).find("retired") !=
+          std::string::npos);
+}
+
+TEST_CASE("lte/enb/retired-teid: a failed establishment leaves no reservation and no half-built bearer")
+{
+    UeRegistry registry(8);
+    auto &entry = registry.registerPeer(1, InetAddress("127.0.0.1", 40001));
+
+    // The establishment reserves an identifier and then fails before it is
+    // bound. The rollback drops the reservation without retiring anything: no
+    // tunnel of this registry ever existed, so there is nothing to remember as
+    // retired and nothing to leave half-built.
+    const uint32_t teid = registry.allocateLocalTeid();
+    entry.bearer.establish({5, 9, 1, {127, 0, 0, 9}, 0xA1A1A1A1u, teid});
+    registry.unbindLocalTeid(entry, teid);
+    CHECK_FALSE(registry.isRetiredTeid(teid));
+    CHECK(registry.findBearerByLocalTeid(teid).entry == nullptr);
+    CHECK(registry.retiredTeids().size() == 0);
+    CHECK(registry.retiredTeids().evictions() == 0);
+
+    // The identifier is unusable rather than silently reusable: nothing else
+    // ever reserved it, so it cannot be bound.
+    auto refusal = [](const std::function<void()> &call) {
+        try
+        {
+            call();
+        }
+        catch (const lte::enb::RegistryError &e)
+        {
+            return std::string(e.what());
+        }
+        return std::string();
+    };
+    CHECK(refusal([&] { registry.bindLocalTeid(entry, teid); }).find("reserved") != std::string::npos);
+
+    // A rollback naming an identifier that is some other entry's live tunnel
+    // must not disturb that tunnel at all.
+    auto &other = registry.registerPeer(2, InetAddress("127.0.0.1", 40002));
+    const uint32_t otherTeid = registry.allocateLocalTeid();
+    other.bearer.establish({5, 9, 2, {127, 0, 0, 9}, 0xA1A1A1A2u, otherTeid});
+    other.bearer.activateUe(2, 5, {10, 45, 0, 2});
+    registry.bindLocalTeid(other, otherTeid);
+    registry.unbindLocalTeid(entry, otherTeid);
+    CHECK(registry.findBearerByLocalTeid(otherTeid).entry == &other);
+    CHECK_FALSE(registry.isRetiredTeid(otherTeid));
+    CHECK(other.bearer.active());
+
+    // A rollback of this entry's own live mapping does retire it, because a
+    // tunnel existed and its identifier must stop resolving as a known end.
+    registry.unbindLocalTeid(other, otherTeid);
+    CHECK(registry.isRetiredTeid(otherTeid));
+    CHECK(registry.findBearerByLocalTeid(otherTeid).entry == nullptr);
 }
 
 TEST_CASE("lte/gtpu/dispatch: a G-PDU is delivered to the UE and an End Marker never is")
@@ -547,6 +1174,85 @@ TEST_CASE("lte/gtpu/dispatch: a delayed G-PDU cannot reach the tunnel a later ac
     CHECK(entryB.counters.s1uDownlinkPackets == 1);
 }
 
+TEST_CASE("lte/gtpu/dispatch: a delayed G-PDU for an evicted TEID still reaches no UE")
+{
+    // A ledger of one record, so the second retirement evicts the first
+    // tombstone. Nothing about that eviction may make the old identifier
+    // resolve again: the packet is dropped exactly as it was before the record
+    // aged out, and the new tunnel on the same radio endpoint is untouched.
+    //
+    // The drop is classified as `unknownTeidDrops` rather than
+    // `retiredTeidDrops` from here on, because the record that distinguished
+    // the two has aged out. That is the documented limit of a bounded
+    // observation aid and not a delivery failure.
+    Lab lab(1);
+    auto &entryA = lab.attach(1, lab.ueA.LocalAddress(), 0x0000B001U);
+    lab.registry.releaseS1(entryA);
+    REQUIRE(lab.registry.isRetiredTeid(0x0000B001U));
+    auto &entryB = lab.attach(2, lab.ueB.LocalAddress(), 0x0000B002U);
+    lab.registry.releaseS1(entryB);
+    REQUIRE(lab.registry.isRetiredTeid(0x0000B002U));
+    REQUIRE_FALSE(lab.registry.isRetiredTeid(0x0000B001U));
+    REQUIRE(lab.registry.retiredTeids().evictions() == 1);
+
+    // A new tunnel on the very endpoint the old one used.
+    lab.registry.remove(entryA);
+    auto &fresh = lab.attach(3, lab.ueA.LocalAddress(), 0x0000B003U);
+    REQUIRE(lab.registry.findBearerByLocalTeid(0x0000B003U).entry == &fresh);
+
+    const auto downlink = Ipv4({10, 45, 0, 1}, {10, 45, 0, 3});
+    const auto stale = GPduWire(0x0000B001U, downlink);
+    lab.s1u.handleDatagram(stale.data(), stale.size(), Lab::SgwPeer());
+
+    CHECK(lab.s1u.counters().unknownTeidDrops == 1);
+    CHECK(lab.s1u.counters().retiredTeidDrops == 0);
+    CHECK_FALSE(lab.ueReceived(lab.ueA));
+    CHECK(fresh.counters.s1uDownlinkPackets == 0);
+    CHECK(fresh.bearer.counters().downlinkPackets == 0);
+    CHECK(fresh.bearer.active());
+    CHECK(lab.registry.findBearerByLocalTeid(0x0000B001U).entry == nullptr);
+
+    // The new tunnel still carries traffic, so the drop cost it nothing.
+    const auto live = GPduWire(0x0000B003U, downlink);
+    lab.s1u.handleDatagram(live.data(), live.size(), Lab::SgwPeer());
+    CHECK(lab.ueReceived(lab.ueA));
+    CHECK(fresh.counters.s1uDownlinkPackets == 1);
+}
+
+TEST_CASE("lte/gtpu/dispatch: a delayed End Marker for an evicted TEID moves nothing")
+{
+    // The same eviction as above, and an End Marker naming the identifier whose
+    // record has aged out. An End Marker is an observation and never a state
+    // change, so this one must not release the new bearer, not advance an
+    // access generation and not start anything.
+    Lab lab(1);
+    auto &entryA = lab.attach(1, lab.ueA.LocalAddress(), 0x0000C001U);
+    lab.registry.releaseS1(entryA);
+    REQUIRE(lab.registry.isRetiredTeid(0x0000C001U));
+    auto &entryB = lab.attach(2, lab.ueB.LocalAddress(), 0x0000C002U);
+    lab.registry.releaseS1(entryB);
+    REQUIRE_FALSE(lab.registry.isRetiredTeid(0x0000C001U));
+    REQUIRE(lab.registry.retiredTeids().evictions() == 1);
+
+    lab.registry.remove(entryA);
+    auto &fresh = lab.attach(3, lab.ueA.LocalAddress(), 0x0000C003U);
+    const uint32_t generation = fresh.accessGeneration;
+    const auto marker = EndMarkerWire(0x0000C001U);
+    lab.s1u.handleDatagram(marker.data(), marker.size(), Lab::SgwPeer());
+
+    CHECK(lab.s1u.counters().endMarkers == 1);
+    CHECK(lab.s1u.counters().endMarkerUnknownTunnels == 1);
+    CHECK(lab.s1u.counters().endMarkerRetiredTunnels == 0);
+    CHECK(lab.s1u.counters().endMarkerActiveTunnels == 0);
+    CHECK_FALSE(lab.ueReceived(lab.ueA));
+    // Nothing about the new tunnel moved.
+    CHECK(fresh.accessGeneration == generation);
+    CHECK(fresh.s1 == lte::enb::UeS1State::BEARER_ACTIVE);
+    CHECK(fresh.bearer.active());
+    CHECK(fresh.bearer.counters().endMarkers == 0);
+    CHECK(lab.registry.findBearerByLocalTeid(0x0000C003U).entry == &fresh);
+}
+
 TEST_CASE("lte/gtpu/dispatch: an End Marker for a retired tunnel is idempotent and changes nothing")
 {
     Lab lab;
@@ -628,9 +1334,15 @@ TEST_CASE("lte/gtpu/isolation: a dedicated bearer's End Marker is scoped to that
 {
     Lab lab;
     auto &entry = lab.attach(1, lab.ueA.LocalAddress(), 0x0000A001U);
+    // The dedicated tunnel's identifier is named on the wire below, so it is
+    // queued for the allocator and then allocated: no route to a live mapping
+    // picks a value by hand.
+    lab.teidQueue.push_back(0x0000A002U);
     auto &dedicated = lab.registry.addDedicatedBearer(
-        entry, {6, 7, 1, Lab::SgwAddress, 0xA1A2A3A5u, 0x0000A002U, 5, {9, 15, false, false, {}}});
-    lab.registry.bindLocalTeid(entry, dedicated, 0x0000A002U);
+        entry, {6, 7, 1, Lab::SgwAddress, 0xA1A2A3A5u, lab.registry.allocateLocalTeid(), 5, {9, 15, false, false, {}}});
+    const uint32_t dedicatedTeid = dedicated.parameters().localTeid;
+    REQUIRE(dedicatedTeid == 0x0000A002U);
+    lab.registry.bindLocalTeid(entry, dedicated, dedicatedTeid);
     dedicated.activateUe(1, 6, entry.bearer.ueIpv4());
 
     const auto endMarker = EndMarkerWire(0x0000A002U);
@@ -656,7 +1368,9 @@ TEST_CASE("lte/gtpu/dispatch: control messages are never counted as user-plane p
 {
     Lab lab;
     auto &entry = lab.attach(1, lab.ueA.LocalAddress(), 0x0000B001U);
-    const auto endMarker = EndMarkerWire(0x0000B001U, PrivateExtension({0x11, 0x22, 0x33}));
+    // A well-formed Private Extension whose Extension Value is opaque vendor
+    // data. None of it is user-plane payload and none of it may be counted.
+    const auto endMarker = EndMarkerWire(0x0000B001U, PrivateExtension(0x1234, {0x11, 0x22, 0x33}));
     lab.s1u.handleDatagram(endMarker.data(), endMarker.size(), Lab::SgwPeer());
 
     CHECK(entry.counters.s1uDownlinkPackets == 0);
@@ -818,12 +1532,17 @@ TEST_CASE("lte/gtpu/dispatch: a G-PDU for a bearer that is not yet forwardable i
     Lab lab;
 
     // Established, and its TEID resolves, but the UE has not yet confirmed
-    // transport readiness, so the bearer is not forwardable.
+    // transport readiness, so the bearer is not forwardable. The identifier is
+    // named on the wire below, so it is queued for the allocator and then
+    // allocated rather than bound by hand.
+    lab.teidQueue.push_back(0x0000D001U);
     auto &entry = lab.registry.registerPeer(5, lab.ueA.LocalAddress());
-    entry.bearer.establish({5, 9, 5, Lab::SgwAddress, 0xA1A2A3A4u, 0x0000D001U});
-    lab.registry.bindLocalTeid(entry, 0x0000D001U);
+    const uint32_t teid = lab.registry.allocateLocalTeid();
+    REQUIRE(teid == 0x0000D001U);
+    entry.bearer.establish({5, 9, 5, Lab::SgwAddress, 0xA1A2A3A4u, teid});
+    lab.registry.bindLocalTeid(entry, teid);
     REQUIRE_FALSE(entry.bearer.active());
-    REQUIRE(lab.registry.findBearerByLocalTeid(0x0000D001U).bearer == &entry.bearer);
+    REQUIRE(lab.registry.findBearerByLocalTeid(teid).bearer == &entry.bearer);
 
     const auto downlink = Ipv4({10, 45, 0, 5}, {10, 45, 0, 5});
     const auto wire = GPduWire(0x0000D001U, downlink);
@@ -847,16 +1566,25 @@ TEST_CASE("lte/enb/retired-teid: an E-RAB release retires exactly the transport 
 {
     Lab lab;
     auto &entry = lab.attach(1, lab.ueA.LocalAddress(), 0x0000E001U);
+    // Both dedicated tunnels name their identifiers below, so each is queued
+    // for the allocator and then allocated: no route to a live mapping picks a
+    // value by hand.
+    lab.teidQueue.push_back(0x0000E002U);
     auto &first = lab.registry.addDedicatedBearer(
-        entry, {6, 7, 1, Lab::SgwAddress, 0xA1A2A3A5u, 0x0000E002U, 5, {9, 15, false, false, {}}});
-    lab.registry.bindLocalTeid(entry, first, 0x0000E002U);
+        entry, {6, 7, 1, Lab::SgwAddress, 0xA1A2A3A5u, lab.registry.allocateLocalTeid(), 5, {9, 15, false, false, {}}});
+    const uint32_t firstTeid = first.parameters().localTeid;
+    lab.registry.bindLocalTeid(entry, first, firstTeid);
+    lab.teidQueue.push_back(0x0000E003U);
     auto &second = lab.registry.addDedicatedBearer(
-        entry, {7, 7, 1, Lab::SgwAddress, 0xA1A2A3A6u, 0x0000E003U, 5, {9, 15, false, false, {}}});
-    lab.registry.bindLocalTeid(entry, second, 0x0000E003U);
+        entry, {7, 7, 1, Lab::SgwAddress, 0xA1A2A3A6u, lab.registry.allocateLocalTeid(), 5, {9, 15, false, false, {}}});
+    const uint32_t secondTeid = second.parameters().localTeid;
+    lab.registry.bindLocalTeid(entry, second, secondTeid);
+    REQUIRE(firstTeid == 0x0000E002U);
+    REQUIRE(secondTeid == 0x0000E003U);
     // The second addDedicatedBearer may have moved the vector, so the addresses
     // are read back through the index under test rather than held across it.
-    auto *firstBearer = lab.registry.findBearerByLocalTeid(0x0000E002U).bearer;
-    auto *secondBearer = lab.registry.findBearerByLocalTeid(0x0000E003U).bearer;
+    auto *firstBearer = lab.registry.findBearerByLocalTeid(firstTeid).bearer;
+    auto *secondBearer = lab.registry.findBearerByLocalTeid(secondTeid).bearer;
     REQUIRE(firstBearer != nullptr);
     REQUIRE(secondBearer != nullptr);
     REQUIRE(firstBearer != secondBearer);
@@ -864,11 +1592,11 @@ TEST_CASE("lte/enb/retired-teid: an E-RAB release retires exactly the transport 
     // Releasing one dedicated E-RAB retires that tunnel and nothing else. The
     // search for it steps over the dedicated bearers that are not it.
     lab.registry.releaseBearer(entry, 7);
-    CHECK(lab.registry.isRetiredTeid(0x0000E003U));
-    CHECK_FALSE(lab.registry.isRetiredTeid(0x0000E002U));
+    CHECK(lab.registry.isRetiredTeid(secondTeid));
+    CHECK_FALSE(lab.registry.isRetiredTeid(firstTeid));
     CHECK_FALSE(lab.registry.isRetiredTeid(0x0000E001U));
-    CHECK(lab.registry.findBearerByLocalTeid(0x0000E003U).bearer == nullptr);
-    CHECK(lab.registry.findBearerByLocalTeid(0x0000E002U).bearer == firstBearer);
+    CHECK(lab.registry.findBearerByLocalTeid(secondTeid).bearer == nullptr);
+    CHECK(lab.registry.findBearerByLocalTeid(firstTeid).bearer == firstBearer);
     CHECK(entry.dedicatedBearers.size() == 1);
 
     // Releasing the default E-RAB tears down the whole PDN connection: the
@@ -876,9 +1604,9 @@ TEST_CASE("lte/enb/retired-teid: an E-RAB release retires exactly the transport 
     // too. The logical session is not touched by an E-RAB release.
     lab.registry.releaseBearer(entry, 5);
     CHECK(lab.registry.isRetiredTeid(0x0000E001U));
-    CHECK(lab.registry.isRetiredTeid(0x0000E002U));
+    CHECK(lab.registry.isRetiredTeid(firstTeid));
     CHECK(lab.registry.findBearerByLocalTeid(0x0000E001U).bearer == nullptr);
-    CHECK(lab.registry.findBearerByLocalTeid(0x0000E002U).bearer == nullptr);
+    CHECK(lab.registry.findBearerByLocalTeid(firstTeid).bearer == nullptr);
     CHECK(entry.dedicatedBearers.empty());
     CHECK_FALSE(entry.bearer.signalingEstablished());
 

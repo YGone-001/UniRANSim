@@ -112,17 +112,19 @@ EnbUeEntry &Establish(EnbMultiplexer &mux, const FakeUe &ue, uint32_t &enbUeS1ap
     mux.registry().setMmeUeS1apId(entry, 200 + ue.ueId);
     entry.s1 = UeS1State::BEARER_ACTIVE;
     entry.accessGeneration = 3;
-    const uint32_t base = 400 + ue.ueId * 10;
-    entry.bearer.establish({5, 9, ue.ueId, {127, 0, 0, 2}, 30 + ue.ueId, base + 5});
+    // Every local TEID comes from the registry's own allocator and is bound
+    // through the validated registration. Nothing here picks a value by hand.
+    const uint32_t defaultTeid = mux.registry().allocateLocalTeid();
+    entry.bearer.establish({5, 9, ue.ueId, {127, 0, 0, 2}, 30 + ue.ueId, defaultTeid});
     entry.bearer.activateUe(ue.ueId, 5, {10, 45, 0, static_cast<uint8_t>(ue.ueId)});
-    mux.registry().bindLocalTeid(entry, base + 5);
-    defaultLocalTeid = base + 5;
+    mux.registry().bindLocalTeid(entry, defaultTeid);
+    defaultLocalTeid = defaultTeid;
     for (uint8_t ebi : {6, 7})
     {
         auto &dedicated = mux.registry().addDedicatedBearer(
-            entry, {ebi, 7, ue.ueId, {127, 0, 0, 2}, 30 + ue.ueId + ebi, base + ebi, 5});
+            entry, {ebi, 7, ue.ueId, {127, 0, 0, 2}, 30 + ue.ueId + ebi, mux.registry().allocateLocalTeid(), 5});
         dedicated.activateUe(ue.ueId, ebi, entry.bearer.ueIpv4());
-        mux.registry().bindLocalTeid(entry, dedicated, base + ebi);
+        mux.registry().bindLocalTeid(entry, dedicated, dedicated.parameters().localTeid);
     }
     enbUeS1apId = 100 + ue.ueId;
     return entry;

@@ -9,6 +9,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <lte/qos.hpp>
@@ -19,6 +20,54 @@
 namespace lte::enb
 {
 
+// Thrown when the local S1-U TEID issuance window is spent. It fails closed:
+// no identifier is returned, so no tunnel can be established on a reused, a
+// zero or an already-issued identifier.
+class TeidExhausted : public std::runtime_error
+{
+  public:
+    using std::runtime_error::runtime_error;
+};
+
+// The wire TEID is 32 bits and zero is not a tunnel identifier, so a process
+// can issue at most 2^32 - 1 distinct identifiers. That count is the issuance
+// window: within it no identifier is issued twice, and reaching it ends the
+// sequence instead of starting a second pass.
+constexpr uint64_t TeidIssuanceWindow = 0xFFFFFFFFull;
+
+// One monotonic sequence of local S1-U TEIDs, of exactly the form production
+// uses. `AllocateLocalTeid` is a process-wide instance of this with the full
+// window; tests construct their own with a small window to reach the last safe
+// identifier and exhaustion on the same code path a bearer establishment runs.
+class TeidSequence
+{
+  public:
+    // `window` is how many steps the sequence may take before it is spent. The
+    // values are `seed + step + 1` in 32-bit modular arithmetic, so the
+    // arithmetic is explicitly modulo 2^32 and cannot silently truncate a
+    // wider counter.
+    explicit TeidSequence(uint32_t seed, uint64_t window = TeidIssuanceWindow);
+
+    // Issues the next identifier of the sequence. Never returns zero and never
+    // returns a value twice. Throws TeidExhausted once the window is spent; the
+    // counter is never advanced past the window, so exhaustion is sticky and
+    // cannot wrap the sequence open again.
+    uint32_t next();
+
+    // How many identifiers have been issued. Steps spent skipping the reserved
+    // zero are counted too, so `issued()` is a step count, not an identifier
+    // count.
+    [[nodiscard]] uint64_t issued() const { return m_steps.load(std::memory_order_relaxed); }
+    [[nodiscard]] uint64_t window() const { return m_window; }
+
+  private:
+    uint32_t m_seed;
+    uint64_t m_window;
+    std::atomic<uint64_t> m_steps{0};
+};
+
+// Issues one local S1-U TEID from a process-wide sequence that never repeats a
+// value and never issues zero. See TeidSequence for the exact guarantee.
 uint32_t AllocateLocalTeid();
 
 // A bounded record of the local S1-U TEIDs whose tunnel has been retired.
@@ -35,12 +84,15 @@ uint32_t AllocateLocalTeid();
 // retired record can never disclose who the tunnel belonged to.
 //
 // The record is bounded. When it is full the longest-retired identifier is
-// dropped first. That is safe because the allocator never hands out an
-// identifier whose record still stands, and the allocator is monotonic across
-// the whole process, so an evicted identifier is not handed out again before
-// its own later turn in that sequence either. Eviction only ever ages the
-// classification of a very late packet back to "unknown TEID"; it can never
-// make an identifier valid twice over.
+// dropped first. That is safe, and it is not what stops an identifier being
+// used twice: this ledger is an observation aid, never an allocation
+// guarantee. Uniqueness is the allocator's, which never offers the same value
+// twice in a process, so an evicted identifier is not handed out again either.
+// Eviction only ever ages the classification of a very late packet back to
+// "unknown TEID"; it can never make an identifier valid twice over.
+//
+// There is deliberately no way to withdraw a record. A retired identifier
+// stays retired for as long as it is remembered, and binding is refused for it.
 class RetiredTeidLedger
 {
   public:
@@ -56,10 +108,6 @@ class RetiredTeidLedger
     bool retire(uint32_t teid);
 
     [[nodiscard]] bool contains(uint32_t teid) const;
-    // Forgets a record because its identifier is being bound to a live tunnel
-    // again. A live identifier is by definition not retired, and a record left
-    // behind would keep the allocator from ever offering that identifier again.
-    void revive(uint32_t teid);
 
     [[nodiscard]] size_t size() const { return m_byTeid.size(); }
     [[nodiscard]] size_t capacity() const { return m_capacity; }

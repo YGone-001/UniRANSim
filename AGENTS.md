@@ -88,21 +88,43 @@ a safety boundary. These rules are what a change must not weaken.
   authorisation: handling one must never release a bearer, advance an access
   generation, or start any procedure. It is recorded and nothing else moves.
   No code path generates or transmits an End Marker.
+- The S flag of an End Marker must be clear (TS 29.281 V14.0.0 §5.1). An End
+  Marker with the S flag set is refused at decode, and there is no runtime
+  switch that relaxes it.
 - TEID rules differ per message type and must stay that way. A G-PDU needs a
   non-zero TEID and a non-empty payload and may contain no information element.
   An End Marker needs a non-zero TEID and, beyond an empty information-element
-  area, only well-formed Private Extension TLVs (type `0xFF`). Echo carries a
+  area, only well-formed Private Extension information elements. Echo carries a
   zero TEID. Reject rather than guess at anything else.
+- A Private Extension is Type `0xFF`, a **16-bit** Length, a **16-bit**
+  Extension Identifier and the Extension Value (TS 29.281 figure 8.6-1).
+  Length excludes the Type and Length fields, so it counts the Extension
+  Identifier and the whole Extension Value: `Length >= 2` and the element
+  occupies `3 + Length` octets. The Extension Identifier is an IANA Private
+  Enterprise Number and is never interpreted. Do not let a one-octet-length
+  reading back into the parser: it accepts `FF 02 AA BB`, which the
+  specification rejects as truncated.
 - A local S1-U TEID is active (in `UeRegistry::m_byLocalTeid`), retired (in the
-  `RetiredTeidLedger`), or unknown. Every path that stops a tunnel from
-  resolving goes through `UeRegistry::retireLocalTeid`, so an identifier cannot
-  become unresolvable without also becoming identifiable as retired.
+  `RetiredTeidLedger`), or unknown. Every path that releases a live tunnel goes
+  through `UeRegistry::retireLocalTeid`, so an identifier cannot stop resolving
+  without also becoming identifiable as retired. The one exception is the
+  rollback of an establishment that never bound anything, where
+  `unbindLocalTeid` drops the reservation and retires nothing — no tunnel ever
+  existed to retire.
+- Uniqueness of a local S1-U TEID comes from the allocator alone, never from
+  the retirement record. `allocateLocalTeid` reserves a value and `bindLocalTeid`
+  accepts only a reserved one, so no caller can attach an identifier of its own
+  choosing. The allocator is monotonic over a bounded issuance window, never
+  reissues a value, and fails closed with `TeidExhausted` rather than rolling
+  over. The guarantee is process-lifetime only; nothing is persisted.
 - `UeRegistry::allocateLocalTeid` must keep refusing an identifier that is zero,
-  live, or still recorded as retired. That last rule is what stops a delayed
-  packet of an old tunnel from resolving against the new tunnel a re-used
-  identifier would name. The retired-TEID record is bounded and holds only the
-  identifier and its retirement order — no UE identity, peer address or
-  subscriber information.
+  live, or still recorded as retired, and `bindLocalTeid` must keep refusing one
+  that is not reserved, or is still retired. There is no revival: nothing
+  withdraws a retirement record. The retired-TEID record is bounded and holds
+  only the identifier and its retirement order — no UE identity, peer address
+  or subscriber information — and is an observation aid, not an allocation
+  guarantee. An identifier whose record has aged out is still unusable: it is
+  not reserved, and the allocator has already spent its step.
 - A G-PDU whose TEID does not resolve is dropped and classified: retired TEID
   is traffic that outlived its tunnel, unknown TEID is a packet that never had
   one. Neither may create or disturb any bearer or UE state.

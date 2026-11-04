@@ -21,6 +21,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <utils/network.hpp>
@@ -142,9 +143,13 @@ class UeRegistry
   public:
     // `teidAllocator` supplies raw local TEID candidates. It is the process-wide
     // monotonic allocator in production; a test passes a deterministic sequence
-    // to drive the boundary and wraparound cases that a randomised 32-bit
-    // counter cannot reach on its own.
-    explicit UeRegistry(size_t maxUes, std::function<uint32_t()> teidAllocator = &AllocateLocalTeid);
+    // to reach the exhaustion and boundary cases that a process-wide sequence
+    // cannot reach on its own. Whatever the source, a candidate is only usable
+    // once: `allocateLocalTeid` reserves it and `bindLocalTeid` accepts nothing
+    // else. `retiredCapacity` bounds the retirement record; only a test lowers
+    // it, to reach the eviction path on the same code a bearer runs.
+    explicit UeRegistry(size_t maxUes, std::function<uint32_t()> teidAllocator = &AllocateLocalTeid,
+                        size_t retiredCapacity = RetiredTeidLedger::DefaultCapacity);
 
     // Registers a simulated radio identity and its verified UDP peer. A
     // duplicate radio identity, an identity claimed from another endpoint, an
@@ -181,11 +186,27 @@ class UeRegistry
     void setMmeUeS1apId(EnbUeEntry &entry, uint32_t mmeUeS1apId);
     void clearMmeUeS1apId(EnbUeEntry &entry);
 
-    // Allocates a local S1-U TEID unique across concurrently active bearers,
-    // never zero, and never one that is still remembered as retired. The last
-    // rule is what keeps a delayed packet of an old tunnel from resolving
-    // against the new tunnel that a re-used identifier would otherwise name.
+    // Reserves a local S1-U TEID for one bearer and returns it. The value is
+    // unique across concurrently active bearers, never zero, and never one that
+    // is still remembered as retired. It is not yet bound: `bindLocalTeid` must
+    // be called with exactly this value, and only a value this function
+    // reserved can be bound at all. That contract is what stops a caller
+    // attaching an identifier chosen by hand and so bypassing the allocator's
+    // no-reissue guarantee.
+    //
+    // The search is bounded. With the production allocator, which never offers
+    // the same value twice, at most one candidate can be unusable; the bound
+    // only exists so that a pathological allocator fails deterministically
+    // instead of looping for ever. Exhaustion throws RegistryError, and
+    // TeidExhausted from a spent production allocator is propagated unchanged:
+    // both leave no reservation behind.
     uint32_t allocateLocalTeid();
+    // Binds a reserved identifier to a bearer of this entry. Both overloads
+    // refuse a zero identifier, an identifier already owned by another bearer,
+    // an identifier this registry never reserved, and one still recorded as
+    // retired. Refusing the last is absolute: a retired identifier is never
+    // rebound to a live tunnel, so a delayed packet of an old tunnel can never
+    // resolve against a new one. There is no revival.
     void bindLocalTeid(EnbUeEntry &entry, uint32_t teid);
     void bindLocalTeid(EnbUeEntry &entry, BearerContext &bearer, uint32_t teid);
 
@@ -200,6 +221,12 @@ class UeRegistry
     // is retained in IDLE_RETAINED state for a later Service Request or
     // re-Attach. Other entries are untouched.
     void releaseS1(EnbUeEntry &entry);
+    // Stops a local TEID resolving. A live mapping of this entry is retired
+    // through `retireLocalTeid`, so it becomes identifiable as retired rather
+    // than merely missing. A value that is not a live mapping of this entry is
+    // an outstanding reservation from an establishment that did not complete,
+    // and dropping the reservation is the rollback that keeps a failed
+    // establishment from leaking one.
     void unbindLocalTeid(EnbUeEntry &entry, uint32_t teid);
     void deleteBearerContexts(EnbUeEntry &entry);
 
@@ -228,6 +255,12 @@ class UeRegistry
     std::function<uint32_t()> m_allocTeid;
     uint32_t m_nextEnbUeS1apId{1};
     RetiredTeidLedger m_retiredTeids;
+    // Local TEIDs this registry's allocator has issued and that are not yet
+    // bound to a bearer. It holds only values in flight, so it stays small; it
+    // is what makes `bindLocalTeid` a validated registration rather than an
+    // open setter. A reservation is consumed by a bind, dropped by an
+    // `unbindLocalTeid` rollback, and dropped defensively by `retireLocalTeid`.
+    std::unordered_set<uint32_t> m_reservedTeids;
     std::unordered_map<uint32_t, std::unique_ptr<EnbUeEntry>> m_byRadioUeId;
     // InetAddress has no std::hash specialization; its string form is unique.
     std::unordered_map<std::string, EnbUeEntry *> m_byPeer;

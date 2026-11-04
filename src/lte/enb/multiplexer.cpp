@@ -601,9 +601,10 @@ void EnbMultiplexer::onInitialContextSetupRequest(const uint8_t *data, size_t si
             failedAt[index] = s1ap::ErabFailedItem{erab.erabId, "radioNetwork", 29};
             continue;
         }
+        uint32_t localTeid = 0;
         try
         {
-            const uint32_t localTeid = m_registry.allocateLocalTeid();
+            localTeid = m_registry.allocateLocalTeid();
             const uint8_t linkedDefault = static_cast<uint8_t>(erab.erabId == defaultEbi ? 0 : defaultEbi);
             if (bearer == nullptr)
                 // A dedicated E-RAB of a fresh-target mobility bootstrap: the UE
@@ -626,6 +627,11 @@ void EnbMultiplexer::onInitialContextSetupRequest(const uint8_t *data, size_t si
         catch (const std::exception &)
         {
             // Candidate is private; an unsuccessful item never becomes indexed.
+            // An identifier reserved here but never bound is released, so a
+            // failed item cannot leak a reservation and make later allocations
+            // impossible.
+            if (localTeid != 0)
+                m_registry.unbindLocalTeid(candidate, localTeid);
             failedAt[index] = s1ap::ErabFailedItem{erab.erabId, "radioNetwork", 25};
         }
     }
@@ -637,6 +643,13 @@ void EnbMultiplexer::onInitialContextSetupRequest(const uint8_t *data, size_t si
             failed.push_back(*slot);
     if (!defaultEstablished || !nonGbrEstablished)
     {
+        // Candidate is discarded whole and nothing is bound yet, so every
+        // identifier the loop reserved is released before returning. Without
+        // this a failed establishment would leak reservations until valid
+        // allocations became impossible.
+        for (const auto &slot : establishedAt)
+            if (slot.has_value())
+                m_registry.unbindLocalTeid(candidate, TeidFromBytes(slot->gtpTeid));
         fail("radioNetwork", 25);
         return;
     }
@@ -738,6 +751,7 @@ void EnbMultiplexer::onErabSetupRequest(const uint8_t *data, size_t size)
             failed.push_back({erab.erabId, "transport", 0});
             continue;
         }
+        uint32_t localTeid = 0;
         try
         {
             // A dedicated bearer this eNB retained is re-established, and so is
@@ -751,7 +765,7 @@ void EnbMultiplexer::onErabSetupRequest(const uint8_t *data, size_t size)
                                  (declared.has_value() &&
                                   std::find(declared->dedicatedEbis.begin(), declared->dedicatedEbis.end(),
                                             erab.erabId) != declared->dedicatedEbis.end());
-            const uint32_t localTeid = m_registry.allocateLocalTeid();
+            localTeid = m_registry.allocateLocalTeid();
             m_registry.addDedicatedBearer(candidate,
                 {erab.erabId, erab.qci, entry->radioUeId, erab.transportLayerAddress,
                  TeidFromBytes(erab.gtpTeid), localTeid, entry->bearer.parameters().erabId, qos}, restore);
@@ -761,6 +775,10 @@ void EnbMultiplexer::onErabSetupRequest(const uint8_t *data, size_t size)
         }
         catch (const std::exception &e)
         {
+            // An identifier reserved here but never bound is released, so a
+            // failed item cannot leak a reservation.
+            if (localTeid != 0)
+                m_registry.unbindLocalTeid(candidate, localTeid);
             failed.push_back({erab.erabId, "radioNetwork", 25});
             Log("WARN", "Failed dedicated E-RAB " + std::to_string(erab.erabId) + ": " + e.what());
         }

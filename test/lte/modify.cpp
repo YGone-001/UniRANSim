@@ -102,12 +102,15 @@ EnbUeEntry &AddUe(EnbMultiplexer &mux, uint32_t id)
     r.bindEnbUeS1apId(ue, id);
     r.setMmeUeS1apId(ue, 100 + id);
     ue.s1 = UeS1State::BEARER_ACTIVE;
-    ue.bearer.establish({5, 9, id, {127, 0, 0, 2}, 10 + id, 100 + id});
+    // Every local TEID comes from the registry's own allocator and is bound
+    // through the validated registration. Nothing here picks a value by hand.
+    const uint32_t defaultTeid = r.allocateLocalTeid();
+    ue.bearer.establish({5, 9, id, {127, 0, 0, 2}, 10 + id, defaultTeid});
     ue.bearer.activateUe(id, 5, {10, 45, 0, static_cast<uint8_t>(id)});
-    r.bindLocalTeid(ue, 100 + id);
-    auto &dedicated = r.addDedicatedBearer(ue, {6, 7, id, {127, 0, 0, 2}, 20 + id, 200 + id, 5});
+    r.bindLocalTeid(ue, defaultTeid);
+    auto &dedicated = r.addDedicatedBearer(ue, {6, 7, id, {127, 0, 0, 2}, 20 + id, r.allocateLocalTeid(), 5});
     dedicated.activateUe(id, 6, ue.bearer.ueIpv4());
-    r.bindLocalTeid(ue, dedicated, 200 + id);
+    r.bindLocalTeid(ue, dedicated, dedicated.parameters().localTeid);
     return ue;
 }
 
@@ -439,8 +442,13 @@ TEST_CASE("lte/modify: multiplexer applies independent items and preserves other
     CHECK(mux.registry().findBearer(b, 6)->parameters().qci == 7);
     CHECK(a.counters.s1uUplinkPackets == 42);
     CHECK(b.counters.s1uDownlinkPackets == 17);
-    CHECK(mux.registry().findBearerByLocalTeid(201).entry == &a);
-    CHECK(mux.registry().findBearerByLocalTeid(202).entry == &b);
+    // The receiving TEIDs are allocated, so the index is checked by looking up
+    // each UE's own dedicated identifier rather than a literal.
+    const uint32_t aTeid = a.dedicatedBearers[0].parameters().localTeid;
+    const uint32_t bTeid = b.dedicatedBearers[0].parameters().localTeid;
+    REQUIRE(aTeid != bTeid);
+    CHECK(mux.registry().findBearerByLocalTeid(aTeid).entry == &a);
+    CHECK(mux.registry().findBearerByLocalTeid(bTeid).entry == &b);
     CHECK(b.mmeUeS1apId == 102);
 }
 
@@ -466,6 +474,10 @@ TEST_CASE("lte/modify: transport ignores accompanying QoS NAS and preserves othe
     Sender sender;
     EnbMultiplexer mux(Config(), sender);
     auto &a = AddUe(mux, 1);
+    // The local receiving TEID is allocated, so a test asserts that the
+    // modification left it alone rather than pinning a literal value.
+    const uint32_t dedicatedLocalTeid = a.dedicatedBearers[0].parameters().localTeid;
+    const uint32_t defaultSgwTeid = a.bearer.parameters().sgwTeid;
     auto r = Request();
     r.erabs[0].qos.qci = 0;
     r.erabs[0].nasPdu.clear();
@@ -475,8 +487,8 @@ TEST_CASE("lte/modify: transport ignores accompanying QoS NAS and preserves othe
     REQUIRE(b);
     CHECK(b->parameters().qci == 7);
     CHECK(b->parameters().sgwTeid == 0x1234);
-    CHECK(b->parameters().localTeid == 201);
-    CHECK(a.bearer.parameters().sgwTeid == 11);
+    CHECK(b->parameters().localTeid == dedicatedLocalTeid);
+    CHECK(a.bearer.parameters().sgwTeid == defaultSgwTeid);
     CHECK(a.bearer.active());
     r.erabs[0].transport->teid = 0;
     Dispatch(mux, r);
@@ -580,7 +592,7 @@ TEST_CASE("lte/modify: transport replacement routes actual UDP only to the selec
     // Old peer must no longer be accepted on the unchanged receiving TEID.
     auto downlink = packet;
     std::swap_ranges(downlink.begin() + 12, downlink.begin() + 16, downlink.begin() + 16);
-    auto datagram = gtpu::EncodeTPdu(201, downlink.data(), downlink.size());
+    auto datagram = gtpu::EncodeTPdu(a.dedicatedBearers[0].parameters().localTeid, downlink.data(), downlink.size());
     oldSgw.Send(mux.s1uAddress(), datagram.data(), datagram.size());
     mux.poll(0, 16);
     CHECK(radio.Receive(buffer, sizeof(buffer), 0, peer) <= 0);
@@ -625,12 +637,15 @@ TEST_CASE("lte/modify: default bearer QoS modification and default TFT rejection
     Sender sender;
     EnbMultiplexer mux(Config(), sender);
     auto &a = AddUe(mux, 1);
+    // The local receiving TEID is allocated, so a test asserts that the QoS
+    // modification left it alone rather than pinning a literal value.
+    const uint32_t defaultLocalTeid = a.bearer.parameters().localTeid;
     auto r = Request();
     r.erabs[0].erabId = 5;
     r.erabs[0].qos.qci = 8;
     Dispatch(mux, r);
     CHECK(a.bearer.parameters().qci == 8);
-    CHECK(a.bearer.parameters().localTeid == 101);
+    CHECK(a.bearer.parameters().localTeid == defaultLocalTeid);
     CHECK(a.bearer.active());
     CHECK(mux.registry().findBearer(a, 6)->parameters().qci == 7);
     nas::EpsBearerConfiguration b;

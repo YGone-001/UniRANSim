@@ -64,8 +64,8 @@ uint32_t TeidFromBytes(const std::array<uint8_t, 4> &value)
            (static_cast<uint32_t>(value[2]) << 8U) | value[3];
 }
 
-UeRegistry::UeRegistry(size_t maxUes, std::function<uint32_t()> teidAllocator)
-    : m_maxUes(maxUes), m_allocTeid(std::move(teidAllocator))
+UeRegistry::UeRegistry(size_t maxUes, std::function<uint32_t()> teidAllocator, size_t retiredCapacity)
+    : m_maxUes(maxUes), m_allocTeid(std::move(teidAllocator)), m_retiredTeids(retiredCapacity)
 {
     if (!m_allocTeid)
         throw RegistryError("A local S1-U TEID allocator is required");
@@ -264,14 +264,22 @@ void UeRegistry::clearMmeUeS1apId(EnbUeEntry &entry)
 
 uint32_t UeRegistry::allocateLocalTeid()
 {
-    // The process-wide allocator never hands out zero and is monotonic across
-    // the whole process, so a value is not offered again before every later one
-    // has been used. Skipping the values that are still live or still
-    // remembered as retired closes the one case the monotonicity does not
-    // cover, the wraparound of the 32-bit sequence: an identifier that has been
-    // retired before must not be offered again while its record stands, or a
-    // delayed packet of the old tunnel would resolve against the new one.
-    for (;;)
+    // The production allocator is monotonic and never offers the same value
+    // twice within the process, so a candidate it produces is never one that is
+    // already live or already retired: the loop runs at most twice against it,
+    // once for the reserved zero. It is bounded rather than open only so that a
+    // pathological injected allocator, which can keep returning unusable
+    // values, fails deterministically instead of hanging.
+    //
+    // The bound is the registry's own capacity horizon: it cannot be forbidding
+    // more distinct identifiers at once than the live bearers it can hold plus
+    // the retirement records it keeps plus the reserved zero, and one more
+    // candidate is enough to find a free one among them. An allocator that
+    // cannot produce a usable value inside that many attempts is refused, and a
+    // refusal reserves nothing.
+    const size_t maxAttempts =
+        m_maxUes * (1 + EnbUeEntry::MaxDedicatedBearers) + m_retiredTeids.capacity() + 2;
+    for (size_t attempt = 0; attempt < maxAttempts; ++attempt)
     {
         const uint32_t candidate = m_allocTeid();
         if (candidate == 0)
@@ -280,8 +288,12 @@ uint32_t UeRegistry::allocateLocalTeid()
             continue;
         if (m_retiredTeids.contains(candidate))
             continue;
+        // Reserved before returning, so that only this registry's own
+        // allocations can ever be bound.
+        m_reservedTeids.insert(candidate);
         return candidate;
     }
+    throw RegistryError("No usable local S1-U TEID is available");
 }
 
 void UeRegistry::bindLocalTeid(EnbUeEntry &entry, uint32_t teid)
@@ -293,16 +305,25 @@ void UeRegistry::bindLocalTeid(EnbUeEntry &entry, BearerContext &bearer, uint32_
 {
     if (teid == 0)
         throw RegistryError("An active S1-U TEID must be non-zero");
+    // A retired identifier is refused absolutely. Rebinding one would erase the
+    // evidence that its tunnel ended, and a delayed packet of that tunnel would
+    // then resolve against the new bearer that happens to hold the identifier.
+    // Nothing withdraws a retirement record.
+    if (m_retiredTeids.contains(teid))
+        throw RegistryError("A retired S1-U TEID cannot be rebound to a live tunnel");
+    // Only an identifier this registry's allocator issued may become a live
+    // mapping. Without this, `bindLocalTeid` is an open setter and the
+    // allocator's no-reissue guarantee is bypassed by any caller that chooses
+    // its own value. The check also refuses an identifier whose retirement
+    // record has aged out, because such a value is not reserved either.
+    if (m_reservedTeids.count(teid) == 0)
+        throw RegistryError("The S1-U TEID was not reserved by this registry's allocator");
     if (m_byLocalTeid.count(teid) != 0)
         throw RegistryError("The S1-U TEID is already owned by another bearer");
     if (bearer.parameters().localTeid != teid)
         throw RegistryError("The bearer already owns a different local S1-U TEID");
+    m_reservedTeids.erase(teid);
     m_byLocalTeid.emplace(teid, &entry);
-    // A live identifier is by definition not retired. This only matters for an
-    // identifier assigned by hand that was retired earlier in the process, and
-    // leaving its record behind would keep the allocator from ever offering it
-    // while it is in fact in use.
-    m_retiredTeids.revive(teid);
 }
 
 bool UeRegistry::isRetiredTeid(uint32_t teid) const
@@ -315,6 +336,9 @@ void UeRegistry::retireLocalTeid(uint32_t teid)
     if (teid == 0)
         return;
     m_byLocalTeid.erase(teid);
+    // A reservation belonging to an establishment that never completed is
+    // dropped here too, so a reserved identifier cannot outlive the attempt.
+    m_reservedTeids.erase(teid);
     // The identifier stops resolving and is remembered as retired, so a delayed
     // G-PDU or a reordered End Marker naming it is reported as having outlived
     // its tunnel rather than as naming a tunnel that was never issued.
@@ -366,7 +390,15 @@ void UeRegistry::unbindLocalTeid(EnbUeEntry &entry, uint32_t teid)
 {
     const auto it = m_byLocalTeid.find(teid);
     if (it != m_byLocalTeid.end() && it->second == &entry)
+    {
         retireLocalTeid(teid);
+        return;
+    }
+    // Not a live mapping of this entry. This is the rollback of an
+    // establishment that never completed, and dropping its reservation is the
+    // rollback: the identifier is not retired, because no tunnel of this
+    // registry ever existed to retire.
+    m_reservedTeids.erase(teid);
 }
 
 void UeRegistry::deleteBearerContexts(EnbUeEntry &entry)
