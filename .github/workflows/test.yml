@@ -140,11 +140,73 @@ jobs:
             grep -q "Released S1 context of LTE UE" privileged-tun.log
             ! grep -q "control-plane-only" privileged-tun.log
           '
+      # The multi-round dedicated-bearer restoration is a second skipped case
+      # and is run as its own invocation, with its own log and its own
+      # sentinels, so one case's pass cannot be mistaken for the other's.
+      - name: Run the privileged dedicated-bearer multi-round integration
+        run: |
+          sudo unshare --net -- bash -euo pipefail -c '
+            ip link set lo up
+            test "$(id -u)" = "0"
+            test -c /dev/net/tun
+            export UNIRANSIM_RUN_PRIVILEGED_TUN_TESTS=1
+            ./cmake-build-privileged/nr-tests \
+              --no-skip \
+              --test-case="lte/ue_mobility_target: a dedicated bearer with a non-empty TFT survives three paging restorations on a real TUN" \
+              2>&1 | tee privileged-tun-p17.log
+
+            # A skipped case never reaches its own body, so it prints neither
+            # sentinel and the job must not be able to call that a pass.
+            grep -q "UNIRANSIM-PHASE17-PRIVILEGED-EXECUTED" privileged-tun-p17.log
+            grep -q "UNIRANSIM-PHASE17-PRIVILEGED-COMPLETE" privileged-tun-p17.log
+            grep -Eq "test cases: +1 \| +1 passed \| 0 failed" privileged-tun-p17.log
+
+            # Three complete Paging restorations of one registration: three
+            # matched pages, three Service Requests, three restorations and no
+            # second Attach.
+            grep -q "Paging statistics: indications=3 matched=3 ignored=0" privileged-tun-p17.log
+            grep -q "service-requests=3 restorations=3 restoration-failures=0" privileged-tun-p17.log
+            test "$(grep -c "State=ATTACH_REQUEST_SENT" privileged-tun-p17.log)" -eq 1
+            test "$(grep -c "State=ATTACH_COMPLETE_SENT" privileged-tun-p17.log)" -eq 1
+
+            # The radio answer form: one bearer-inventory declaration to the
+            # fresh cell and two compact Service Requests to the cell that had
+            # since confirmed the roles.
+            test "$(grep -c "bearer-inventory Service Request sent for the network-triggered restoration" privileged-tun-p17.log)" -eq 1
+            test "$(grep -c "compact EPS Service Request sent for the network-triggered restoration" privileged-tun-p17.log)" -eq 2
+            grep -q "bootstrap=DECLARE_REQUIRED" privileged-tun-p17.log
+            grep -q "bootstrap=ROLES_RETAINED" privileged-tun-p17.log
+
+            # Every round restored both bearers at its own access generation.
+            grep -q "confirm-gen=1" privileged-tun-p17.log
+            grep -q "confirm-gen=2" privileged-tun-p17.log
+            grep -q "confirm-gen=3" privileged-tun-p17.log
+
+            # Independent user plane on both bearers: the UE moved one packet
+            # per direction per bearer per round, and the eNB forwarded the
+            # same six each way. A control-plane-only run reports zeros here.
+            grep -q "dedicated-ul=3 dedicated-dl=3" privileged-tun-p17.log
+            grep -q "tun-ul=6/" privileged-tun-p17.log
+            grep -q "tun-dl=6/" privileged-tun-p17.log
+            grep -q "radio-ul=6/" privileged-tun-p17.log
+            grep -q "radio-dl=6/" privileged-tun-p17.log
+            grep -q "s1u-ul=6/" privileged-tun-p17.log
+            grep -q "s1u-dl=6/" privileged-tun-p17.log
+
+            # Previous-round transport stays dead and is classified, not
+            # delivered and not able to disturb the bearer that replaced it.
+            grep -q "Dropped S1-U T-PDU for retired TEID" privileged-tun-p17.log
+            grep -q "GTP-U End Marker for retired tunnel TEID" privileged-tun-p17.log
+            grep -q "drops(malformed/teid/peer/inactive)=0/0/0/0" privileged-tun-p17.log
+            ! grep -q "control-plane-only" privileged-tun-p17.log
+          '
       - name: Report
         if: always()
         run: |
-          if [ -f privileged-tun.log ]; then
-            { echo '```'; cat privileged-tun.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "The privileged TUN integration produced no log at all." >> "$GITHUB_STEP_SUMMARY"
-          fi
+          for log in privileged-tun.log privileged-tun-p17.log; do
+            if [ -f "$log" ]; then
+              { echo "### $log"; echo '```'; cat "$log"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "The privileged TUN integration produced no $log at all." >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done

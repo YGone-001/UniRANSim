@@ -177,6 +177,35 @@ constexpr uint8_t kDefaultEbi = 5;
 // two preamble bits and the MMEC of X.691 aligned PER, then the M-TMSI.
 const std::vector<uint8_t> kExpectedSTmsi{0x00, 0x40, 0xC0, 0x00, 0x01, 0x8E};
 
+// The Tracking Area Update Accept below assigns a fresh GUTI, so the pages that
+// follow it address the UE by its new M-TMSI rather than the Attach one.
+constexpr uint32_t kUpdatedMTmsi = 0xC000018Fu;
+
+// The TFT value field of a real Open5GS MME Activate Dedicated EPS Bearer
+// Context Request captured during Phase 7 and decoded in test/lte/tft.cpp. It
+// is a CREATE_NEW TFT carrying two directed UDP packet filters:
+//
+//   filter 0, precedence 0, uplink only   — local port 7000 -> remote port 5000
+//   filter 1, precedence 1, downlink only — remote port 7000 -> local port 5000
+//
+// so the dedicated bearer takes exactly the UDP 7000<->5000 flow and every
+// other datagram falls back to the default bearer. The dedicated application
+// socket below is bound and addressed to that flow for exactly this reason.
+const std::vector<uint8_t> kCapturedDedicatedTft{
+    0x22, 0x20, 0x00, 0x11, 0x30, 0x11, 0x10, 0x00, 0x00, 0x00, 0x00, 0xFF,
+    0xFF, 0xFF, 0xFF, 0x40, 0x1B, 0x58, 0x50, 0x13, 0x88, 0x11, 0x01, 0x08,
+    0x30, 0x11, 0x50, 0x1B, 0x58, 0x40, 0x13, 0x88};
+
+// A TFT whose only packet filter names an unknown component type. The codec
+// refuses it, which is what makes it the "invalid TFT" an activation must
+// reject rather than half-apply.
+const std::vector<uint8_t> kInvalidDedicatedTft{0x21, 0x20, 0x00, 0x01, 0x99};
+
+// The two UDP ports of the flow the captured TFT's filters name: 7000 = 0x1B58
+// and 5000 = 0x1388 on the wire.
+constexpr uint16_t kDedicatedLocalPort = 7000;
+constexpr uint16_t kDedicatedPeerPort = 5000;
+
 // ---------------------------------------------------------------------------
 // S1AP capture
 // ---------------------------------------------------------------------------
@@ -257,6 +286,29 @@ bool Contains(const std::vector<uint8_t> &haystack, const std::vector<uint8_t> &
 bool Contains(const std::string &haystack, const std::string &needle)
 {
     return haystack.find(needle) != std::string::npos;
+}
+
+size_t CountOccurrences(const std::string &haystack, const std::string &needle)
+{
+    size_t total = 0;
+    for (size_t at = haystack.find(needle); at != std::string::npos; at = haystack.find(needle, at + needle.size()))
+        ++total;
+    return total;
+}
+
+// A network-authored Activate Dedicated EPS Bearer Context Request: EBI, PTI,
+// linked default EBI, a one-octet EPS QoS and the TFT value field the network
+// chose. The TFT is a type-4 information element — one length octet then the
+// value field, not the two-octet LV-E form — so an empty network TFT is a
+// single zero octet. The UE accepts the message into its own bearer runtime
+// and from then on owns the identity.
+std::vector<uint8_t> ActivateDedicated(uint8_t ebi, const std::vector<uint8_t> &tft = {},
+                                       uint8_t linkedEbi = kDefaultEbi)
+{
+    std::vector<uint8_t> out{static_cast<uint8_t>((ebi << 4U) | 0x02U), 0x01, 0xC5, linkedEbi, 0x01, 0x09};
+    out.push_back(static_cast<uint8_t>(tft.size()));
+    out.insert(out.end(), tft.begin(), tft.end());
+    return out;
 }
 
 // A network-authored E-RAB item for an Initial Context Setup Request or an
@@ -621,7 +673,26 @@ class Lab
     {
     }
 
-    void scriptDedicated(std::vector<uint8_t> activate) { m_activate = std::move(activate); }
+    // The dedicated EPS bearers the serving cell activates after Attach
+    // Complete. Every one of them is created by the network's own protected
+    // Activate Dedicated EPS Bearer Context Request, carrying the TFT value
+    // field the network chose — empty by default, non-empty when a case is
+    // about what the UE does with the filters it was given.
+    void scriptDedicated(std::vector<uint8_t> activate, std::vector<uint8_t> tft = {})
+    {
+        m_activate = std::move(activate);
+        m_activateTft = std::move(tft);
+    }
+
+    // One more protected downlink NAS message from the same EPS peer that
+    // performed the Attach. It is how a case authors the network messages the
+    // scripted activation list does not cover — a second activation, a
+    // deliberately malformed one — and it consumes the very next downlink NAS
+    // COUNT exactly as any other network message would.
+    void injectSourceNas(std::vector<uint8_t> plain)
+    {
+        sendNasToUe(ProtectDownlink(plain, /*newContext=*/false));
+    }
 
     void startUe()
     {
@@ -654,6 +725,7 @@ class Lab
         if (m_ue.joinable())
             m_ue.join();
         closeApplicationSocket();
+        closeDedicatedSocket();
     }
 
     // Drives both simulated endpoints until `done()` holds or the budget runs
@@ -706,6 +778,20 @@ class Lab
     {
         return drive([this] { return m_targetWire.count(kInitialUeMessage) == 1; }, timeoutMs);
     }
+
+    // The network side of one access restoration. Whichever radio form the UE
+    // answered a page with, the target turns it into exactly one Initial UE
+    // Message on the live association, so `n` counts them from the very first
+    // and a case driving several rounds waits for each in turn.
+    bool driveUntilTargetUeMessage(size_t n, int timeoutMs = 12000)
+    {
+        return drive([&] { return m_targetWire.count(kInitialUeMessage) >= n; }, timeoutMs);
+    }
+
+    // How many Initial UE Messages the target has produced on the live
+    // association. Every paging answer becomes exactly one, whichever radio
+    // form it took, and so does the Tracking Area Update that opened the cell.
+    [[nodiscard]] size_t initialUeMessages() const { return m_targetWire.count(kInitialUeMessage); }
 
     bool driveUntilTargetRejects(int timeoutMs = 8000)
     {
@@ -796,55 +882,75 @@ class Lab
         m_target->handleS1ap(pdu.data(), pdu.size(), 1);
     }
 
+    // The same release, for a case that may find nothing left to release. An
+    // entry that is already retained-idle holds no S1 connection, so there is
+    // no context to release and no eNB-UE-S1AP-ID to name in the command.
+    bool releaseUeContextIfAny(uint32_t mmeUeS1apId = 500)
+    {
+        const auto *entry = m_target->registry().find(m_config.ueId);
+        if (entry == nullptr)
+        {
+            note("the target registry holds no entry for the UE");
+            return false;
+        }
+        if (entry->enbUeS1apId == 0)
+            return false;
+        deliverUeContextRelease(mmeUeS1apId);
+        return true;
+    }
+
+    // A network-authored S1AP Paging on the non-UE-associated SCTP stream,
+    // delivered through the real target eNB's own S1AP dispatcher. The page
+    // therefore takes the same path a live one does: APER decode, tracking-area
+    // filtering, the fan-out to retained idle radio endpoints, and finally each
+    // UE matching its own S-TMSI. Nothing here injects a PAGING_INDICATION at
+    // the UE.
+    void deliverPaging(uint32_t mTmsi, uint16_t tac)
+    {
+        s1ap::PagingMessage page{};
+        page.ueIdentityIndexValue = static_cast<uint16_t>(mTmsi & 0x3FFU);
+        page.identity = s1ap::PagingMessage::Identity::S_TMSI;
+        page.sTmsi = s1ap::STmsi{kMmeCode, mTmsi};
+        page.cnDomain = 0;
+        page.taiList = {s1ap::Tai{m_config.plmn, tac}};
+        const auto pdu = s1ap::EncodePaging(page);
+        m_target->handleS1ap(pdu.data(), pdu.size(), 0);
+    }
+
     // The test application is a real kernel UDP socket bound to the PDN
     // address the network assigned: a datagram it sends is routed by the kernel
     // into the UE's TUN, and a datagram the UE writes into that TUN is routed
     // back to it. It cannot be bound before the TUN exists, because until then
     // the address is not local to this host.
-    bool openApplicationSocket()
-    {
-        if (m_appFd >= 0)
-            return true;
-        m_appFd = socket(AF_INET, SOCK_DGRAM, 0);
-        if (m_appFd < 0)
-        {
-            note("the test application could not create a UDP socket");
-            return false;
-        }
-        sockaddr_in address{};
-        address.sin_family = AF_INET;
-        address.sin_port = htons(kApplicationPort);
-        address.sin_addr.s_addr = htonl(0x0A000001u); // 10.0.0.1, the assigned PDN address
-        if (bind(m_appFd, reinterpret_cast<const sockaddr *>(&address), sizeof(address)) != 0)
-        {
-            note("the test application could not bind the assigned PDN address");
-            close(m_appFd);
-            m_appFd = -1;
-            return false;
-        }
-        return true;
-    }
+    //
+    // There are two of them, on two ports, because that is what separates the
+    // two bearers at the application layer. The ordinary socket speaks a flow
+    // no packet filter of the captured TFT names, so it belongs to the default
+    // bearer; the dedicated socket is bound and addressed to exactly the UDP
+    // 7000<->5000 flow those filters select, so a datagram it sends is the one
+    // the dedicated bearer must carry.
+    bool openApplicationSocket() { return openBoundSocket(kApplicationPort, m_appFd); }
 
-    void closeApplicationSocket()
+    bool openDedicatedSocket() { return openBoundSocket(kDedicatedLocalPort, m_dedicatedFd); }
+
+    bool openDedicatedSinkSocket() { return openBoundSocket(kDedicatedPeerPort, m_dedicatedSinkFd); }
+
+    void closeApplicationSocket() { closeSocket(m_appFd); }
+
+    void closeDedicatedSocket()
     {
-        if (m_appFd >= 0)
-        {
-            close(m_appFd);
-            m_appFd = -1;
-        }
+        closeSocket(m_dedicatedFd);
+        closeSocket(m_dedicatedSinkFd);
     }
 
     bool sendApplicationDatagram(const std::vector<uint8_t> &payload)
     {
-        if (m_appFd < 0)
-            return false;
-        sockaddr_in destination{};
-        destination.sin_family = AF_INET;
-        destination.sin_port = htons(kPeerPort);
-        destination.sin_addr.s_addr = htonl(0xC6120002u); // 198.18.0.2, reachable only through the TUN
-        const ssize_t sent = sendto(m_appFd, payload.data(), payload.size(), 0,
-                                    reinterpret_cast<const sockaddr *>(&destination), sizeof(destination));
-        return sent == static_cast<ssize_t>(payload.size());
+        return sendDatagram(m_appFd, kPeerPort, payload);
+    }
+
+    bool sendDedicatedDatagram(const std::vector<uint8_t> &payload)
+    {
+        return sendDatagram(m_dedicatedFd, kDedicatedPeerPort, payload);
     }
 
     // The test SGW endpoint. It binds exactly the address and port every E-RAB
@@ -860,10 +966,36 @@ class Lab
         m_sgw->Send(m_target->s1uAddress(), datagram.data(), datagram.size());
     }
 
+    // A GTP-U datagram whose wire form this test authors rather than the
+    // production encoder. It is only ever used for the End Marker, which
+    // nothing in the production tree encodes or transmits: the byte pattern is
+    // the genuine Open5GS SGW-U capture vector with its TEID substituted.
+    void sendSgwRaw(const std::vector<uint8_t> &datagram)
+    {
+        if (!m_sgw)
+            return note("the test SGW endpoint was never enabled");
+        m_sgw->Send(m_target->s1uAddress(), datagram.data(), datagram.size());
+    }
+
+    // The End Marker of one tunnel: the mandatory eight-octet header and
+    // nothing else, TS 29.281 figure 5.2.1-1. Anchored on the Phase 15 capture
+    // 30 fe 00 00 c6 b5 5b 7a.
+    static std::vector<uint8_t> EndMarker(uint32_t teid)
+    {
+        return {0x30, 0xFE, 0x00, 0x00,
+                static_cast<uint8_t>(teid >> 24U), static_cast<uint8_t>(teid >> 16U),
+                static_cast<uint8_t>(teid >> 8U), static_cast<uint8_t>(teid)};
+    }
+
     [[nodiscard]] const std::vector<std::vector<uint8_t>> &radioUplink() const { return m_radioUplink; }
     [[nodiscard]] const std::vector<std::vector<uint8_t>> &heldUplink() const { return m_held; }
     [[nodiscard]] const std::vector<std::vector<uint8_t>> &sgwDatagrams() const { return m_sgwDatagrams; }
     [[nodiscard]] const std::vector<std::vector<uint8_t>> &applicationDatagrams() const { return m_appDatagrams; }
+    [[nodiscard]] const std::vector<std::vector<uint8_t>> &dedicatedDatagrams() const { return m_dedicatedDatagrams; }
+    [[nodiscard]] const std::vector<std::vector<uint8_t>> &dedicatedSinkDatagrams() const
+    {
+        return m_dedicatedSinkDatagrams;
+    }
     [[nodiscard]] bool readySeen() const { return m_readySeen; }
     [[nodiscard]] uint8_t readyEbi() const { return m_readyEbi; }
     [[nodiscard]] std::array<uint8_t, 4> readyIpv4() const { return m_readyIpv4; }
@@ -1049,16 +1181,69 @@ class Lab
 
     void pumpApplication()
     {
-        if (m_appFd < 0)
+        pumpApplication(m_appFd, m_appDatagrams);
+        pumpApplication(m_dedicatedFd, m_dedicatedDatagrams);
+        pumpApplication(m_dedicatedSinkFd, m_dedicatedSinkDatagrams);
+    }
+
+    void pumpApplication(int fd, std::vector<std::vector<uint8_t>> &sink)
+    {
+        if (fd < 0)
             return;
         uint8_t buffer[2048];
         for (int budget = 4; budget > 0; --budget)
         {
-            const ssize_t received = recv(m_appFd, buffer, sizeof(buffer), MSG_DONTWAIT);
+            const ssize_t received = recv(fd, buffer, sizeof(buffer), MSG_DONTWAIT);
             if (received <= 0)
                 return;
-            m_appDatagrams.emplace_back(buffer, buffer + received);
+            sink.emplace_back(buffer, buffer + received);
         }
+    }
+
+    bool openBoundSocket(uint16_t port, int &fd)
+    {
+        if (fd >= 0)
+            return true;
+        fd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (fd < 0)
+        {
+            note("the test application could not create a UDP socket");
+            return false;
+        }
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_port = htons(port);
+        address.sin_addr.s_addr = htonl(0x0A000001u); // 10.0.0.1, the assigned PDN address
+        if (bind(fd, reinterpret_cast<const sockaddr *>(&address), sizeof(address)) != 0)
+        {
+            note("the test application could not bind the assigned PDN address");
+            close(fd);
+            fd = -1;
+            return false;
+        }
+        return true;
+    }
+
+    static void closeSocket(int &fd)
+    {
+        if (fd >= 0)
+        {
+            close(fd);
+            fd = -1;
+        }
+    }
+
+    bool sendDatagram(int fd, uint16_t destinationPort, const std::vector<uint8_t> &payload)
+    {
+        if (fd < 0)
+            return false;
+        sockaddr_in destination{};
+        destination.sin_family = AF_INET;
+        destination.sin_port = htons(destinationPort);
+        destination.sin_addr.s_addr = htonl(0xC6120002u); // 198.18.0.2, reachable only through the TUN
+        const ssize_t sent = sendto(fd, payload.data(), payload.size(), 0,
+                                    reinterpret_cast<const sockaddr *>(&destination), sizeof(destination));
+        return sent == static_cast<ssize_t>(payload.size());
     }
 
     void sendToUe(link::MessageType type, std::vector<uint8_t> payload)
@@ -1155,7 +1340,7 @@ class Lab
         {
             m_attachComplete = true;
             for (const uint8_t ebi : m_activate)
-                sendNasToUe(ProtectDownlink(ActivateDedicated(ebi), /*newContext=*/false));
+                sendNasToUe(ProtectDownlink(ActivateDedicated(ebi, m_activateTft), /*newContext=*/false));
             return;
         }
         // Anything else is the Activate Dedicated EPS Bearer Context Accept, and
@@ -1228,14 +1413,6 @@ class Lab
         return out;
     }
 
-    // A network-authored Activate Dedicated EPS Bearer Context Request: EBI,
-    // PTI, linked default EBI, a one-octet EPS QoS and an empty TFT. The UE
-    // accepts it into its own bearer runtime and from then on owns the identity.
-    static std::vector<uint8_t> ActivateDedicated(uint8_t ebi)
-    {
-        return {static_cast<uint8_t>((ebi << 4U) | 0x02U), 0x01, 0xC5, kDefaultEbi, 0x01, 0x09, 0x00};
-    }
-
     // A Tracking Area Update Accept the network itself would author: the plain
     // EPS-only "TA updated" result this procedure performs, a periodic timer, a
     // tracking area list for the reselected cell's PLMN/TAC and a fresh GUTI.
@@ -1262,6 +1439,7 @@ class Lab
     SecurityContext m_security{};
     InetAddress m_uePeer;
     std::vector<uint8_t> m_activate;
+    std::vector<uint8_t> m_activateTft;
     std::set<uint8_t> m_activated;
     std::vector<std::string> m_problems;
     bool m_attachComplete{};
@@ -1281,7 +1459,11 @@ class Lab
     std::vector<std::vector<uint8_t>> m_held;
     std::vector<std::vector<uint8_t>> m_sgwDatagrams;
     std::vector<std::vector<uint8_t>> m_appDatagrams;
+    std::vector<std::vector<uint8_t>> m_dedicatedDatagrams;
+    std::vector<std::vector<uint8_t>> m_dedicatedSinkDatagrams;
     int m_appFd{-1};
+    int m_dedicatedFd{-1};
+    int m_dedicatedSinkFd{-1};
     bool m_readySeen{};
     uint8_t m_readyEbi{};
     std::array<uint8_t, 4> m_readyIpv4{};
@@ -1456,6 +1638,86 @@ TEST_CASE("lte/ue_mobility_target: a repeated mobility uplink is refused by the 
     CHECK(Contains(lab.log, "Retransmitted TAU_NORMAL_PENDING, retry=1"));
     CHECK(Contains(lab.log, "TAU_NORMAL_PENDING timed out after bounded retransmissions"));
     CHECK_FALSE(Contains(lab.log, "Tracking Area Update accepted"));
+}
+
+// ---------------------------------------------------------------------------
+// A dedicated bearer the network creates carries the TFT the network chose
+// ---------------------------------------------------------------------------
+
+TEST_CASE("lte/ue_mobility_target: a network-activated dedicated bearer keeps the non-empty TFT it was given")
+{
+    Lab lab(47347, 47348);
+    lab.scriptDedicated({6}, kCapturedDedicatedTft);
+    lab.startUe();
+
+    const bool attached = lab.driveUntilSourceAttachComplete();
+    const bool dedicated = lab.driveUntilDedicatedConfirmed({6});
+
+    // The production UE decoded the network's TFT value field through the real
+    // NAS Activate Dedicated EPS Bearer Context Request and applied it to the
+    // bearer runtime it just built. The filter count on that line is the
+    // runtime's own, so a two-filter capture vector has to arrive as two
+    // filters here: an empty, truncated or undecodable TFT would have been
+    // refused before any of this was logged.
+    lab.shutdownUe();
+    REQUIRE(lab.problems().empty());
+    REQUIRE(attached);
+    REQUIRE(dedicated);
+    CHECK(Contains(lab.log, "Dedicated EPS bearer 6 activated (QCI=9, linked-EBI=5, filters=2)"));
+    CHECK_FALSE(Contains(lab.log, "Rejected dedicated EPS bearer activation"));
+    CHECK(lab.exitCode() == 0);
+    CHECK(Contains(lab.log, "LTE UE shutdown complete"));
+}
+
+// ---------------------------------------------------------------------------
+// An unusable activation is refused and leaves the default bearer alone
+// ---------------------------------------------------------------------------
+
+TEST_CASE("lte/ue_mobility_target: an unusable dedicated bearer activation is refused and leaves the default bearer alone")
+{
+    Lab lab(47349, 47350);
+    lab.scriptDedicated({6}, kCapturedDedicatedTft);
+    lab.startUe();
+
+    const bool attached = lab.driveUntilSourceAttachComplete();
+    const bool dedicated = lab.driveUntilDedicatedConfirmed({6});
+
+    // Three activations the network must not be able to land. The first names
+    // an EPS bearer identity the UE already holds, the second claims to be
+    // linked to a default bearer this session does not have, and the third
+    // carries a TFT the codec refuses. Each is a real protected downlink NAS
+    // message from the same EPS peer that performed the Attach.
+    lab.injectSourceNas(ActivateDedicated(6, kCapturedDedicatedTft));
+    lab.injectSourceNas(ActivateDedicated(7, kCapturedDedicatedTft, /*linkedEbi=*/7));
+    lab.injectSourceNas(ActivateDedicated(8, kInvalidDedicatedTft));
+
+    // Nothing further should arrive from the UE, so the run is over once the
+    // three rejections have been logged. The default bearer is still the one
+    // the Attach confirmed and the one dedicated bearer that was accepted is
+    // still the UE's, which is what "a failed activation must not disturb the
+    // default bearer" means in this state machine.
+    const bool rejected = lab.drive(
+        [&] { return CountOccurrences(lab.captureText(), "Rejected dedicated EPS bearer activation") >= 3; }, 8000);
+    const bool stillDedicated = lab.driveUntilDedicatedConfirmed({6});
+
+    lab.shutdownUe();
+    const std::string transcript = lab.log;
+    REQUIRE(lab.problems().empty());
+    REQUIRE(attached);
+    REQUIRE(dedicated);
+    REQUIRE(rejected);
+    CHECK(stillDedicated);
+    CHECK(CountOccurrences(transcript, "Rejected dedicated EPS bearer activation") == 3);
+    CHECK(Contains(transcript, "Dedicated bearer identity is already active"));
+    CHECK(Contains(transcript, "Dedicated bearer references a different default bearer"));
+    CHECK(Contains(transcript, "Dedicated EPS bearer 6 activated (QCI=9, linked-EBI=5, filters=2)"));
+    // The three rejections carry ESM cause 26 and name the bearer they refuse;
+    // none of them deactivates anything the UE already holds.
+    CHECK_FALSE(Contains(transcript, "Dedicated EPS bearer 6 deactivated"));
+    CHECK_FALSE(Contains(transcript, "Dedicated EPS bearer 7 activated"));
+    CHECK_FALSE(Contains(transcript, "Dedicated EPS bearer 8 activated"));
+    CHECK(lab.exitCode() == 0);
+    CHECK(Contains(transcript, "LTE UE shutdown complete"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1854,4 +2116,652 @@ TEST_CASE("lte/ue_mobility_target: real TUN mobility restoration and user-plane 
     CHECK(nothingSwept);
 
     std::fprintf(stderr, "UNIRANSIM-PRIVILEGED-TUN-COMPLETE\n");
+}
+
+// ---------------------------------------------------------------------------
+// A real dedicated bearer with a real TFT across three Paging restorations
+// ---------------------------------------------------------------------------
+//
+// The case above proves one access restoration end to end. This one proves the
+// thing Phase 17 is about: a dedicated EPS bearer the network created, with the
+// non-empty TFT it was given, survives three consecutive ECM-IDLE -> network
+// Paging -> Service Request -> multi-E-RAB restoration cycles under one EPS
+// registration, with fresh local GTP-U TEIDs every time and independent user
+// plane on both bearers in every round.
+//
+// The three rounds are not three scripted outcomes. Each one is a real S1AP
+// Paging on the non-UE-associated stream, fanned out by the real target eNB to
+// the retained idle endpoint, matched by the running UE against its own
+// S-TMSI, answered on the radio form the UE's own bearer-role state selects,
+// and restored by a network-authored Initial Context Setup Request that lists
+// the dedicated E-RAB before the default one so the roles cannot be inferred
+// from the order of the list.
+TEST_CASE("lte/ue_mobility_target: a dedicated bearer with a non-empty TFT survives three paging restorations on a real TUN"
+ * doctest::skip())
+{
+    if (std::getenv("UNIRANSIM_RUN_PRIVILEGED_TUN_TESTS") == nullptr)
+        FAIL("the privileged TUN integration case requires UNIRANSIM_RUN_PRIVILEGED_TUN_TESTS=1");
+    if (geteuid() != 0)
+        FAIL("the privileged TUN integration case must run as root");
+    if (access("/dev/net/tun", R_OK | W_OK) != 0)
+        FAIL("the privileged TUN integration case needs a usable /dev/net/tun");
+    std::fprintf(stderr, "UNIRANSIM-PHASE17-PRIVILEGED-EXECUTED\n");
+
+    const auto defaultRoutesBefore = DefaultRouteLines();
+    const auto netnsBefore = ListNetworkNamespaces();
+
+    TunSweepGuard sweep;
+    if (!ListInterfaces(kTunPrefix).empty())
+        FAIL("the privileged TUN integration case needs an unused TUN name prefix");
+
+    LabOptions options;
+    options.procedureTimeoutMs = 30000;
+    options.maxRetries = 2;
+    options.tunBlock = kPrivilegedTun;
+    options.radioTap = true;
+    Lab lab(47353, 47354, options);
+    lab.enableTestSgw();
+    lab.scriptDedicated({6}, kCapturedDedicatedTft);
+    lab.startUe();
+
+    // ---- the source cell: one Attach, one network-created dedicated bearer
+    const bool attached = lab.driveUntilSourceAttachComplete();
+    const bool bearerReady = lab.driveUntilBearerReady();
+    const bool dedicatedActivated = lab.driveUntilDedicatedConfirmed({6});
+    const bool dedicatedNamed =
+        Contains(lab.captureText(), "Dedicated EPS bearer 6 activated (QCI=9, linked-EBI=5, filters=2)");
+
+    const auto interfacesAfterAttach = ListInterfaces(kTunPrefix);
+    const bool oneTunCreated = interfacesAfterAttach.size() == 1;
+    const std::string tunName = oneTunCreated ? interfacesAfterAttach.front() : std::string{};
+    const bool tunSurvivedToTheEnd = !tunName.empty();
+
+    // The three application flows of the two bearers. The ordinary socket
+    // speaks a UDP pair the captured TFT's filters do not name, so every
+    // datagram of it belongs to the default bearer. The dedicated source
+    // socket is bound to local port 7000 and addresses port 5000, which is
+    // exactly what filter 0 selects uplink; the dedicated sink is bound to
+    // local port 5000, which is where filter 1 says a downlink for this flow
+    // arrives. All three are real kernel sockets on the PDN address the
+    // network assigned, and they can only be bound once the TUN exists.
+    const bool applicationOpen = lab.openApplicationSocket();
+    const bool dedicatedOpen = lab.openDedicatedSocket();
+    const bool dedicatedSinkOpen = lab.openDedicatedSinkSocket();
+
+    // ---- the target cell: a Normal TAU that establishes no bearer there
+    const bool idle = lab.driveUntilIdleReleased();
+    const bool arrived = lab.driveUntilTargetInitialUeMessage();
+    auto *entry = lab.target().registry().find(lab.config().ueId);
+    const bool registered = entry != nullptr;
+    const bool inventoryDeclared = registered && entry->declaredBearers.has_value() &&
+                                   entry->declaredBearers->defaultEbi == kDefaultEbi &&
+                                   entry->declaredBearers->dedicatedEbis == std::vector<uint8_t>{6};
+    const bool freshTargetAccess =
+        registered && entry->mobilityBootstrap && entry->enbUeS1apId != 0 && entry->accessGeneration == 1;
+
+    // The Update is answered with an Accept and nothing else. No bearer
+    // context is fabricated for the target, which is what makes the first
+    // Paging answer below carry the bearer inventory: a cell whose TAU
+    // established nothing has never been told which E-RAB is which.
+    lab.deliverProtectedDownlink(lab.tauAccept());
+    const bool tauAccepted =
+        lab.drive([&] { return Contains(lab.captureText(), "Tracking Area Update accepted"); }, 8000);
+
+    // The MME then closes the S1 connection the Update opened. That connection
+    // never carried a bearer, so the target releases it without telling the UE
+    // anything and without advancing the access generation the two ends hold
+    // in common: the entry lands in the retained-idle state the Paging fan-out
+    // needs and both ends still agree on generation one.
+    const bool tauReleaseIssued = lab.releaseUeContextIfAny();
+    entry = lab.target().registry().find(lab.config().ueId);
+    const bool tauAccessSilentlyReleased =
+        entry != nullptr && entry->s1 == UeS1State::IDLE_RETAINED && entry->enbUeS1apId == 0 &&
+        entry->accessGeneration == 1 && !entry->mobilityBootstrap && !entry->declaredBearers.has_value() &&
+        entry->sessionRetained;
+
+    struct Round
+    {
+        bool pageDelivered{};
+        bool answered{};
+        bool oneInventoryAnswerSoFar{};
+        bool compactAnswersMatchRound{};
+        bool defaultRestored{};
+        bool dedicatedRestored{};
+        uint8_t defaultEbi{};
+        uint8_t dedicatedEbi{};
+        uint8_t dedicatedLinkedEbi{};
+        uint32_t defaultLocalTeid{};
+        uint32_t dedicatedLocalTeid{};
+        bool teidsFresh{};
+        bool releasedToIdleRetained{};
+        bool onePacketPerDirection{};
+        uint32_t defaultConfirmGeneration{};
+        uint32_t dedicatedConfirmGeneration{};
+        bool confirmationsBoundToTheAccess{};
+        bool uplinkDefaultOnItsOwnTeid{};
+        bool uplinkDedicatedOnItsOwnTeid{};
+        bool uplinkDedicatedNotOnTheDefaultTeid{};
+        bool downlinkDefaultDelivered{};
+        bool downlinkDedicatedDelivered{};
+        uint64_t defaultUplinkPackets{};
+        uint64_t defaultDownlinkPackets{};
+        uint64_t dedicatedUplinkPackets{};
+        uint64_t dedicatedDownlinkPackets{};
+    };
+    std::vector<Round> rounds;
+
+    for (int r = 0; r < 3; ++r)
+    {
+        Round round;
+        const uint32_t defaultSgwTeid = 30u + static_cast<uint32_t>(r);
+        const uint32_t dedicatedSgwTeid = 36u + static_cast<uint32_t>(r);
+
+        // A network-authored Paging on the non-UE-associated SCTP stream. It
+        // takes the real dispatcher's whole path: APER decode, tracking-area
+        // filtering, the fan-out to retained idle endpoints and the UE's own
+        // S-TMSI match. Nothing here injects a PAGING_INDICATION.
+        lab.deliverPaging(kUpdatedMTmsi, 2);
+        round.pageDelivered = lab.target().pagingCounters().notificationsDelivered >=
+                              static_cast<uint64_t>(r + 1);
+        // The target turns every paging answer into exactly one Initial UE
+        // Message, whichever radio form it took. The Tracking Area Update
+        // already took the first one, so this round's is the next.
+        round.answered = lab.driveUntilTargetUeMessage(static_cast<size_t>(r) + 2);
+
+        // The radio form is the UE's own choice, made from whether the cell it
+        // is answering has ever been confirmed to hold the bearer roles. The
+        // fresh target cell of round one has not, so it is given the
+        // declaration; the cell that has since confirmed them is given the
+        // compact Service Request. The cumulative counts are what make this
+        // per-round rather than "it happened at some point": after round one
+        // there is exactly one declaration and no compact answer, and each
+        // later round adds exactly one compact answer and no declaration.
+        const auto transcript = lab.captureText();
+        const size_t inventoryAnswers = CountOccurrences(
+            transcript, "bearer-inventory Service Request sent for the network-triggered restoration");
+        const size_t compactAnswers = CountOccurrences(
+            transcript, "compact EPS Service Request sent for the network-triggered restoration");
+        round.oneInventoryAnswerSoFar = inventoryAnswers == 1;
+        round.compactAnswersMatchRound = compactAnswers == static_cast<size_t>(r);
+
+        // Both bearers in one network-authored Initial Context Setup Request,
+        // deliberately listed dedicated-first. The default bearer is
+        // established first whatever order the MME lists its E-RABs in, and
+        // the roles come from the UE's declaration or from the retained
+        // contexts, never from QCI or from the order of this list.
+        const size_t uplinkBefore = lab.radioUplink().size();
+        lab.deliverIcsr({Erab(6, 7, dedicatedSgwTeid), Erab(kDefaultEbi, 9, defaultSgwTeid)});
+        const bool bothActive = lab.drive(
+            [&] {
+                auto *e = lab.target().registry().find(lab.config().ueId);
+                return e != nullptr && e->bearer.active() && !e->dedicatedBearers.empty() &&
+                       e->dedicatedBearers.front().active();
+            },
+            10000);
+
+        entry = lab.target().registry().find(lab.config().ueId);
+        round.defaultRestored = entry != nullptr && entry->bearer.active();
+        round.dedicatedRestored =
+            entry != nullptr && entry->dedicatedBearers.size() == 1 && entry->dedicatedBearers.front().active();
+        if (entry != nullptr)
+        {
+            round.defaultEbi = entry->bearer.parameters().erabId;
+            if (!entry->dedicatedBearers.empty())
+            {
+                round.dedicatedEbi = entry->dedicatedBearers.front().parameters().erabId;
+                round.dedicatedLinkedEbi = entry->dedicatedBearers.front().parameters().linkedDefaultEbi;
+            }
+            round.defaultLocalTeid = entry->bearer.parameters().localTeid;
+            round.dedicatedLocalTeid = entry->dedicatedBearers.empty()
+                                           ? 0
+                                           : entry->dedicatedBearers.front().parameters().localTeid;
+        }
+
+        // The generation the running UE confirmed each restoration with. It is
+        // read out of the UE's own BEARER_TRANSPORT_READY frames rather than
+        // predicted, because the number is the one thing that ties this
+        // access's confirmations to this access and makes a stale one refuse.
+        for (size_t i = uplinkBefore; i < lab.radioUplink().size(); ++i)
+        {
+            const auto frame = DecodeRadio(lab.radioUplink()[i]);
+            if (!frame || frame->type != link::MessageType::BEARER_TRANSPORT_READY)
+                continue;
+            try
+            {
+                const auto ready =
+                    link::DecodeBearerTransportReady(frame->payload.data(), frame->payload.size());
+                if (ready.ebi == round.defaultEbi)
+                    round.defaultConfirmGeneration = ready.generation;
+                if (ready.ebi == round.dedicatedEbi)
+                    round.dedicatedConfirmGeneration = ready.generation;
+            }
+            catch (const std::exception &)
+            {
+            }
+        }
+        round.confirmationsBoundToTheAccess = round.defaultConfirmGeneration != 0 &&
+                                              round.defaultConfirmGeneration == round.dedicatedConfirmGeneration;
+
+        // Independent user plane on both bearers. The default flow matches no
+        // filter of the captured TFT and must travel the default bearer; the
+        // dedicated flow is exactly the UDP pair filter 0 selects and must
+        // travel the dedicated bearer and never the default one. The proof is
+        // the SGW-side TEID each uplink G-PDU is sent under, which is the one
+        // the network's own E-RAB item named for that bearer.
+        const size_t sgwBefore = lab.sgwDatagrams().size();
+        const std::string defaultText = "round " + std::to_string(r + 1) + " default uplink";
+        const std::vector<uint8_t> defaultPayload(defaultText.begin(), defaultText.end());
+        const bool defaultSent = lab.sendApplicationDatagram(defaultPayload);
+        const bool defaultUplinkArrived =
+            defaultSent && lab.drive([&] { return lab.sgwDatagrams().size() > sgwBefore; }, 8000);
+        std::optional<gtpu::Packet> defaultGtp;
+        if (defaultUplinkArrived)
+        {
+            try
+            {
+                defaultGtp = gtpu::Decode(lab.sgwDatagrams()[sgwBefore].data(), lab.sgwDatagrams()[sgwBefore].size());
+            }
+            catch (const std::exception &)
+            {
+            }
+        }
+        round.uplinkDefaultOnItsOwnTeid =
+            defaultGtp.has_value() && defaultGtp->messageType == gtpu::TPdu && defaultGtp->teid == defaultSgwTeid;
+
+        const std::string dedicatedText = "round " + std::to_string(r + 1) + " dedicated uplink";
+        const std::vector<uint8_t> dedicatedPayload(dedicatedText.begin(), dedicatedText.end());
+        const bool dedicatedSent = lab.sendDedicatedDatagram(dedicatedPayload);
+        const bool dedicatedUplinkArrived =
+            dedicatedSent && lab.drive([&] { return lab.sgwDatagrams().size() > sgwBefore + 1; }, 8000);
+        std::optional<gtpu::Packet> dedicatedGtp;
+        if (dedicatedUplinkArrived)
+        {
+            try
+            {
+                dedicatedGtp =
+                    gtpu::Decode(lab.sgwDatagrams()[sgwBefore + 1].data(), lab.sgwDatagrams()[sgwBefore + 1].size());
+            }
+            catch (const std::exception &)
+            {
+            }
+        }
+        round.uplinkDedicatedOnItsOwnTeid = dedicatedGtp.has_value() && dedicatedGtp->messageType == gtpu::TPdu &&
+                                            dedicatedGtp->teid == dedicatedSgwTeid;
+        round.uplinkDedicatedNotOnTheDefaultTeid =
+            dedicatedGtp.has_value() && dedicatedGtp->teid != defaultSgwTeid;
+
+        // Downlink: one G-PDU under each local TEID the target just allocated,
+        // each delivered to the application flow its own bearer carries. The
+        // downlink bearer is the one the GTP-U TEID names, so the two are
+        // addressed to the two different UDP ports of the two flows.
+        const size_t appBefore = lab.applicationDatagrams().size();
+        const size_t sinkBefore = lab.dedicatedSinkDatagrams().size();
+        const std::string defaultDownText = "round " + std::to_string(r + 1) + " default downlink";
+        const std::vector<uint8_t> defaultDownPayload(defaultDownText.begin(), defaultDownText.end());
+        lab.sendSgwDownlink(round.defaultLocalTeid,
+                            BuildUdpIpv4(kPeerIpv4, kPdnIpv4, kPeerPort, kApplicationPort, defaultDownPayload));
+        const bool defaultDownArrived =
+            lab.drive([&] { return lab.applicationDatagrams().size() > appBefore; }, 8000);
+        round.downlinkDefaultDelivered = defaultDownArrived && !lab.applicationDatagrams().empty() &&
+                                         lab.applicationDatagrams().back() == defaultDownPayload;
+
+        const std::string dedicatedDownText = "round " + std::to_string(r + 1) + " dedicated downlink";
+        const std::vector<uint8_t> dedicatedDownPayload(dedicatedDownText.begin(), dedicatedDownText.end());
+        // Filter 1 of the captured TFT is downlink only, remote port 7000 and
+        // local port 5000, so the peer's source port is the dedicated flow's
+        // 7000 and the UE's destination is the sink socket's 5000.
+        lab.sendSgwDownlink(round.dedicatedLocalTeid,
+                            BuildUdpIpv4(kPeerIpv4, kPdnIpv4, kDedicatedLocalPort, kDedicatedPeerPort,
+                                         dedicatedDownPayload));
+        const bool dedicatedDownArrived =
+            lab.drive([&] { return lab.dedicatedSinkDatagrams().size() > sinkBefore; }, 8000);
+        round.downlinkDedicatedDelivered = dedicatedDownArrived && !lab.dedicatedSinkDatagrams().empty() &&
+                                           lab.dedicatedSinkDatagrams().back() == dedicatedDownPayload;
+
+        entry = lab.target().registry().find(lab.config().ueId);
+        if (entry != nullptr)
+        {
+            round.defaultUplinkPackets = entry->bearer.counters().uplinkPackets;
+            round.defaultDownlinkPackets = entry->bearer.counters().downlinkPackets;
+            if (!entry->dedicatedBearers.empty())
+            {
+                round.dedicatedUplinkPackets = entry->dedicatedBearers.front().counters().uplinkPackets;
+                round.dedicatedDownlinkPackets = entry->dedicatedBearers.front().counters().downlinkPackets;
+            }
+        }
+
+        // Fresh local GTP-U TEIDs for this access epoch, distinct from each
+        // other and from the SGW-side TEIDs the network's own E-RAB items
+        // named. Whether they are also distinct from every earlier epoch is
+        // checked once, across all three rounds, below.
+        round.teidsFresh = round.defaultLocalTeid != 0 && round.dedicatedLocalTeid != 0 &&
+                           round.defaultLocalTeid != round.dedicatedLocalTeid &&
+                           round.defaultLocalTeid != defaultSgwTeid &&
+                           round.dedicatedLocalTeid != dedicatedSgwTeid;
+
+        // The bearer packet counters belong to the logical EPS bearer and are
+        // deliberately not reset by an access release, so what a fresh TEID
+        // must not do is inherit traffic it never carried. Every round moves
+        // exactly one packet per direction per bearer, and the running totals
+        // say so: after round n each counter is exactly n.
+        round.onePacketPerDirection = round.defaultUplinkPackets == static_cast<uint64_t>(r + 1) &&
+                                      round.defaultDownlinkPackets == static_cast<uint64_t>(r + 1) &&
+                                      round.dedicatedUplinkPackets == static_cast<uint64_t>(r + 1) &&
+                                      round.dedicatedDownlinkPackets == static_cast<uint64_t>(r + 1);
+
+        // The first two rounds end with the network releasing the access. The
+        // third keeps its bearers up while the stale-transport probes below run
+        // against them, and is released once they are done.
+        if (r < 2)
+        {
+            lab.releaseUeContextIfAny();
+            lab.drive(
+                [&] {
+                    return CountOccurrences(lab.captureText(),
+ "EPS registration, security, GUTI, bearer and TUN retained") >=
+                           static_cast<size_t>(r + 2);
+                },
+                8000);
+            entry = lab.target().registry().find(lab.config().ueId);
+            round.releasedToIdleRetained = entry != nullptr && entry->s1 == UeS1State::IDLE_RETAINED;
+        }
+        (void)bothActive;
+        rounds.push_back(round);
+    }
+
+    // Every round must have used its own local TEIDs, and no round may reuse
+    // one an earlier access epoch already spent.
+    bool localTeidsPairwiseDistinct = true;
+    for (size_t i = 0; i < rounds.size(); ++i)
+        for (size_t j = i + 1; j < rounds.size(); ++j)
+            if (rounds[i].defaultLocalTeid == rounds[j].defaultLocalTeid ||
+                rounds[i].defaultLocalTeid == rounds[j].dedicatedLocalTeid ||
+                rounds[i].dedicatedLocalTeid == rounds[j].defaultLocalTeid ||
+                rounds[i].dedicatedLocalTeid == rounds[j].dedicatedLocalTeid)
+                localTeidsPairwiseDistinct = false;
+
+    // Previous-round transport stays dead. A delayed G-PDU naming a TEID the
+    // first access held resolves nowhere and reaches no application, and an
+    // End Marker naming one of those retired tunnels is recorded and moves
+    // nothing at all: the bearers this access restored are exactly as they
+    // were, with the same local TEIDs and the same forwardable state.
+    const uint32_t staleDefaultTeid = rounds.empty() ? 0 : rounds.front().defaultLocalTeid;
+    const uint32_t staleDedicatedTeid = rounds.empty() ? 0 : rounds.front().dedicatedLocalTeid;
+    const size_t appBeforeStale = lab.applicationDatagrams().size();
+    const size_t sinkBeforeStale = lab.dedicatedSinkDatagrams().size();
+    lab.sendSgwDownlink(staleDefaultTeid,
+                        BuildUdpIpv4(kPeerIpv4, kPdnIpv4, kPeerPort, kApplicationPort, {'s', 't'}));
+    lab.sendSgwDownlink(staleDedicatedTeid,
+                        BuildUdpIpv4(kPeerIpv4, kPdnIpv4, kDedicatedLocalPort, kDedicatedPeerPort, {'s', 't'}));
+    lab.sendSgwRaw(Lab::EndMarker(staleDefaultTeid));
+    lab.sendSgwRaw(Lab::EndMarker(staleDedicatedTeid));
+    lab.drive([] { return false; }, 500);
+    const bool staleTeidsDoNotResolve =
+        lab.target().registry().findBearerByLocalTeid(staleDefaultTeid).entry == nullptr &&
+        lab.target().registry().findBearerByLocalTeid(staleDedicatedTeid).entry == nullptr;
+    const bool stalePacketsDidNotArrive = lab.applicationDatagrams().size() == appBeforeStale &&
+                                          lab.dedicatedSinkDatagrams().size() == sinkBeforeStale;
+    entry = lab.target().registry().find(lab.config().ueId);
+    const bool endMarkerMovedNothing =
+        entry != nullptr && entry->bearer.active() && entry->dedicatedBearers.size() == 1 &&
+        entry->dedicatedBearers.front().active() && !rounds.empty() &&
+        entry->bearer.parameters().localTeid == rounds.back().defaultLocalTeid &&
+        entry->dedicatedBearers.front().parameters().localTeid == rounds.back().dedicatedLocalTeid;
+    // What the target actually did with them, from its own log: both delayed
+    // G-PDUs were classified as traffic that outlived its tunnel and both End
+    // Markers as announcements about a tunnel already retired.
+    const bool staleTrafficClassified =
+        Contains(lab.captureText(), "Dropped S1-U T-PDU for retired TEID") &&
+        Contains(lab.captureText(), "GTP-U End Marker for retired tunnel TEID");
+
+    // The third round's access is released now that the probes are done.
+    lab.releaseUeContextIfAny();
+    lab.drive(
+        [&] {
+            return CountOccurrences(lab.captureText(), "EPS registration, security, GUTI, bearer and TUN retained") >= 4;
+        },
+        8000);
+
+    lab.closeApplicationSocket();
+    lab.closeDedicatedSocket();
+    lab.shutdownUe();
+    const bool cleanShutdown = lab.exitCode() == 0 && Contains(lab.log, "LTE UE shutdown complete");
+
+    // Nothing the scenario built survives it. The third round already released
+    // the access, so there is normally no S1 connection left here; a run that
+    // stopped early is cleaned up either way.
+    const bool tunReleased = tunName.empty() || !InterfaceExists(tunName);
+    const bool routeReleased = !RouteExists(kPeerIpv4, tunName);
+    lab.releaseUeContextIfAny();
+    entry = lab.target().registry().find(lab.config().ueId);
+    const bool targetTransportGone =
+        entry != nullptr && !entry->bearer.signalingEstablished() && !entry->bearer.active() &&
+        entry->dedicatedBearers.size() == 1 && !entry->dedicatedBearers.front().signalingEstablished() &&
+        !entry->dedicatedBearers.front().active();
+    lab.target().shutdown();
+    const bool noOrphanTun = ListInterfaces(kTunPrefix).empty();
+    const bool defaultRouteUntouched = DefaultRouteLines() == defaultRoutesBefore;
+    const bool namespacesUntouched = ListNetworkNamespaces() == netnsBefore;
+    const bool nothingSwept = sweep.swept.empty();
+
+    // The complete production log and the per-round transport table, on stderr
+    // beside the sentinels.
+    std::fprintf(stderr, "=== production log ===\n%s=== end of production log ===\n", lab.log.c_str());
+    std::fprintf(stderr, "=== per-round transport ===\n");
+    for (size_t i = 0; i < rounds.size(); ++i)
+        std::fprintf(stderr,
+                     "round %zu: default ebi=%u local-teid=0x%08X sgw-teid=0x%08X confirm-gen=%u "
+                     "pkts(ul/dl)=%llu/%llu | dedicated ebi=%u linked=%u local-teid=0x%08X sgw-teid=0x%08X "
+                     "confirm-gen=%u pkts(ul/dl)=%llu/%llu\n",
+                     i + 1, rounds[i].defaultEbi, rounds[i].defaultLocalTeid, 30u + static_cast<uint32_t>(i),
+                     rounds[i].defaultConfirmGeneration,
+                     static_cast<unsigned long long>(rounds[i].defaultUplinkPackets),
+                     static_cast<unsigned long long>(rounds[i].defaultDownlinkPackets), rounds[i].dedicatedEbi,
+                     rounds[i].dedicatedLinkedEbi, rounds[i].dedicatedLocalTeid, 36u + static_cast<uint32_t>(i),
+                     rounds[i].dedicatedConfirmGeneration,
+                     static_cast<unsigned long long>(rounds[i].dedicatedUplinkPackets),
+                     static_cast<unsigned long long>(rounds[i].dedicatedDownlinkPackets));
+    std::fprintf(stderr, "=== end of per-round transport ===\n");
+
+    REQUIRE(lab.problems().empty());
+    REQUIRE(attached);
+    REQUIRE(bearerReady);
+    REQUIRE(dedicatedActivated);
+    CHECK(dedicatedNamed);
+    REQUIRE(oneTunCreated);
+    CHECK(tunSurvivedToTheEnd);
+    REQUIRE(applicationOpen);
+    REQUIRE(dedicatedOpen);
+    REQUIRE(dedicatedSinkOpen);
+    REQUIRE(idle);
+    REQUIRE(arrived);
+    REQUIRE(registered);
+    CHECK(inventoryDeclared);
+    CHECK(freshTargetAccess);
+    REQUIRE(tauAccepted);
+    REQUIRE(tauReleaseIssued);
+    CHECK(tauAccessSilentlyReleased);
+    REQUIRE(rounds.size() == 3);
+
+    for (size_t i = 0; i < rounds.size(); ++i)
+    {
+        const auto &round = rounds[i];
+        INFO("paging round " << (i + 1));
+        CHECK(round.pageDelivered);
+        CHECK(round.answered);
+        CHECK(round.oneInventoryAnswerSoFar);
+        CHECK(round.compactAnswersMatchRound);
+        CHECK(round.defaultRestored);
+        CHECK(round.dedicatedRestored);
+        CHECK(round.defaultEbi == kDefaultEbi);
+        CHECK(round.dedicatedEbi == 6);
+        CHECK(round.dedicatedLinkedEbi == kDefaultEbi);
+        CHECK(round.teidsFresh);
+        CHECK(round.onePacketPerDirection);
+        CHECK(round.confirmationsBoundToTheAccess);
+        CHECK(round.defaultConfirmGeneration == i + 1);
+        CHECK(round.dedicatedConfirmGeneration == i + 1);
+        CHECK(round.uplinkDefaultOnItsOwnTeid);
+        CHECK(round.uplinkDedicatedOnItsOwnTeid);
+        CHECK(round.uplinkDedicatedNotOnTheDefaultTeid);
+        CHECK(round.downlinkDefaultDelivered);
+        CHECK(round.downlinkDedicatedDelivered);
+        if (i < 2)
+            CHECK(round.releasedToIdleRetained);
+    }
+    // Exactly one bearer-inventory answer and two compact ones: round one
+    // declared the roles to a cell that had never held them, and rounds two and
+    // three answered a cell that had since confirmed them.
+    const bool exactlyOneInventoryAnswer =
+        CountOccurrences(lab.log, "bearer-inventory Service Request sent for the network-triggered restoration") == 1;
+    const bool exactlyTwoCompactAnswers =
+        CountOccurrences(lab.log, "compact EPS Service Request sent for the network-triggered restoration") == 2;
+    const bool bothBootstrapsSeen = Contains(lab.log, "bootstrap=DECLARE_REQUIRED") &&
+                                    Contains(lab.log, "bootstrap=ROLES_RETAINED");
+    // One EPS registration and one Attach: the three restorations are three
+    // access epochs of the same session, never three registrations.
+    const bool oneAttachOnly = CountOccurrences(lab.log, "State=ATTACH_REQUEST_SENT") == 1 &&
+                               CountOccurrences(lab.log, "State=ATTACH_COMPLETE_SENT") == 1;
+    CHECK(exactlyOneInventoryAnswer);
+    CHECK(exactlyTwoCompactAnswers);
+    CHECK(bothBootstrapsSeen);
+    CHECK(oneAttachOnly);
+    CHECK(localTeidsPairwiseDistinct);
+    CHECK(staleTeidsDoNotResolve);
+    CHECK(stalePacketsDidNotArrive);
+    CHECK(endMarkerMovedNothing);
+    CHECK(staleTrafficClassified);
+    REQUIRE(cleanShutdown);
+    REQUIRE(tunReleased);
+    REQUIRE(routeReleased);
+    REQUIRE(targetTransportGone);
+    REQUIRE(noOrphanTun);
+    CHECK(defaultRouteUntouched);
+    CHECK(namespacesUntouched);
+    CHECK(nothingSwept);
+
+    std::fprintf(stderr, "UNIRANSIM-PHASE17-PRIVILEGED-COMPLETE\n");
+}
+
+// ---------------------------------------------------------------------------
+// Paging the network must not turn into a Service Request
+// ---------------------------------------------------------------------------
+//
+// Every page here is a real S1AP Paging PDU delivered through the real target
+// eNB's own dispatcher on the non-UE-associated stream, so what is under test
+// is the whole chain a live page takes: APER decode, the target's tracking-area
+// filter, the fan-out to retained idle endpoints, and the running UE matching
+// the page against its own S-TMSI. Nothing injects a PAGING_INDICATION.
+//
+// The four refusals sit at two different boundaries and the case records which
+// one caught each: a page outside the served tracking area, and a page aimed at
+// a UE that is not idle-retained, never reach a radio endpoint at all; a page
+// that does reach the UE and names another identity is refused by the UE
+// itself. Both layers have to hold, because the fan-out is deliberately broad:
+// the eNB pages every retained idle UE serving the tracking area and lets each
+// one decide whether the identity is its own.
+TEST_CASE("lte/ue_mobility_target: a page that must not start a Service Request is refused at the right boundary")
+{
+    Lab lab(47355, 47356);
+    lab.startUe();
+
+    const bool attached = lab.driveUntilSourceAttachComplete();
+    const bool idle = lab.driveUntilIdleReleased();
+    const bool arrived = lab.driveUntilTargetInitialUeMessage();
+
+    // A genuine Tracking Area Update that establishes no bearer on the target,
+    // and the S1 connection it opened is then closed again. The UE is idle,
+    // registered under the fresh GUTI the Accept assigned, and the target holds
+    // it in the retained-idle state the fan-out pages.
+    lab.deliverProtectedDownlink(lab.tauAccept());
+    const bool tauAccepted =
+        lab.drive([&] { return Contains(lab.captureText(), "Tracking Area Update accepted"); }, 8000);
+    const bool tauReleaseIssued = lab.releaseUeContextIfAny();
+    auto *entry = lab.target().registry().find(lab.config().ueId);
+    const bool idleRetained = entry != nullptr && entry->s1 == UeS1State::IDLE_RETAINED;
+
+    const size_t messagesBeforeProbes = lab.initialUeMessages();
+
+    // A page for the identity the UE was given at Attach and has since been
+    // talked out of. The target fans it out, because the fan-out is by tracking
+    // area and not by identity, and the UE is the one that recognises the
+    // S-TMSI as not its own.
+    lab.deliverPaging(kMTmsi, 2);
+    const bool foreignPageDelivered = lab.target().pagingCounters().notificationsDelivered == 1;
+    const bool foreignPageIgnored =
+        lab.drive([&] { return Contains(lab.captureText(), "Paging indication ignored: IDENTITY_MISMATCH"); }, 8000);
+    const bool foreignPageStartedNothing = lab.initialUeMessages() == messagesBeforeProbes;
+
+    // A page for the right identity outside the tracking area this cell serves.
+    // The target's own filter drops it and no radio endpoint is disturbed.
+    lab.deliverPaging(kUpdatedMTmsi, 1);
+    lab.drive([] { return false; }, 300);
+    const bool foreignAreaFiltered = lab.target().pagingCounters().filteredByTac >= 1;
+    const bool foreignAreaNotDelivered = lab.target().pagingCounters().notificationsDelivered == 1;
+    const bool foreignAreaStartedNothing = lab.initialUeMessages() == messagesBeforeProbes;
+
+    // The one page that is for this UE in this area is answered, and the answer
+    // is the bearer-inventory form because the cell it is answering has never
+    // been confirmed to hold the bearer roles.
+    lab.deliverPaging(kUpdatedMTmsi, 2);
+    const bool goodPageDelivered = lab.target().pagingCounters().notificationsDelivered == 2;
+    const bool goodPageAnswered = lab.drive(
+        [&] {
+            return Contains(lab.captureText(),
+                            "bearer-inventory Service Request sent for the network-triggered restoration");
+        },
+        8000);
+    const bool goodPageOpenedOneContext = lab.initialUeMessages() == messagesBeforeProbes + 1;
+
+    // A repeat while that answer is still outstanding. The S1 connection it is
+    // opening is already pending, so the target has nothing left to page and
+    // the UE would refuse it as a second trigger even if one arrived.
+    lab.deliverPaging(kUpdatedMTmsi, 2);
+    lab.drive([] { return false; }, 300);
+    const bool repeatWhilePendingNotDelivered = lab.target().pagingCounters().notificationsDelivered == 2;
+    const bool repeatWhilePendingStartedNothing =
+        lab.initialUeMessages() == messagesBeforeProbes + 1;
+
+    // Once the restoration is done the UE is connected, and a page aimed at a
+    // connected UE is not a page this cell has anything to fan out.
+    lab.deliverIcsr({Erab(kDefaultEbi, 9, 30)});
+    const bool restored = lab.drive(
+        [&] {
+            return Contains(lab.captureText(), "State=ECM_CONNECTED; bearer signaling restored in control-plane-only mode");
+        },
+        8000);
+    lab.deliverPaging(kUpdatedMTmsi, 2);
+    lab.drive([] { return false; }, 300);
+    const bool repeatWhileConnectedNotDelivered = lab.target().pagingCounters().notificationsDelivered == 2;
+    const bool repeatWhileConnectedStartedNothing =
+        lab.initialUeMessages() == messagesBeforeProbes + 1;
+
+    lab.shutdownUe();
+    const bool cleanShutdown = lab.exitCode() == 0 && Contains(lab.log, "LTE UE shutdown complete");
+    const bool exactlyOneServiceRequest =
+        CountOccurrences(lab.log, "Service Request sent for the network-triggered restoration") == 1;
+
+    REQUIRE(lab.problems().empty());
+    REQUIRE(attached);
+    REQUIRE(idle);
+    REQUIRE(arrived);
+    REQUIRE(tauAccepted);
+    REQUIRE(tauReleaseIssued);
+    CHECK(idleRetained);
+    CHECK(foreignPageDelivered);
+    CHECK(foreignPageIgnored);
+    CHECK(foreignPageStartedNothing);
+    CHECK(foreignAreaFiltered);
+    CHECK(foreignAreaNotDelivered);
+    CHECK(foreignAreaStartedNothing);
+    CHECK(goodPageDelivered);
+    CHECK(goodPageAnswered);
+    CHECK(goodPageOpenedOneContext);
+    CHECK(repeatWhilePendingNotDelivered);
+    CHECK(repeatWhilePendingStartedNothing);
+    REQUIRE(restored);
+    CHECK(repeatWhileConnectedNotDelivered);
+    CHECK(repeatWhileConnectedStartedNothing);
+    CHECK(cleanShutdown);
+    CHECK(exactlyOneServiceRequest);
 }

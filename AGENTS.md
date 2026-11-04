@@ -51,13 +51,19 @@ pass on the exact pushed commit:
 
 The local equivalents are a Release build per compiler, a Debug build with
 `-DUERANSIM_SANITIZE=address,undefined`, a Debug build with
-`-DUERANSIM_COVERAGE=ON`, and the privileged case run under `unshare --net`
+`-DUERANSIM_COVERAGE=ON`, and the privileged cases run under `unshare --net`
 with `UNIRANSIM_RUN_PRIVILEGED_TUN_TESTS=1`. On a machine where the sanitizer
 build faults on `vm.mmap_rnd_bits`, that sysctl step can be skipped locally; CI
 sets it.
 
 A `doctest::skip()` case has no `ctest` entry at all, so the ordinary suite
 cannot run it. That is what makes a privileged case safe to keep in the tree.
+The privileged job runs **one invocation per skipped case**, each with its own
+log and its own execution and completion sentinels, so one case's pass cannot
+be mistaken for another's. A skipped case is never a pass: if its sentinels are
+absent the run failed, whatever the exit code says. Each privileged case is run
+as `nr-tests --no-skip --test-case="<exact title>"` inside a private network
+namespace that has a real `/dev/net/tun` and root capability.
 
 ## Testing rules
 
@@ -69,6 +75,19 @@ cannot run it. That is what makes a privileged case safe to keep in the tree.
   missing statistics line is not evidence of anything.
 - Tests may not close a requirement with a hand-built success state that skips
   the production transition under test.
+- A positive Paging test must build a valid S1AP Paging PDU and deliver it
+  through the eNB's actual S1AP dispatcher on the non-UE-associated SCTP
+  stream zero, so the real fan-out runs and each UE matches its own S-TMSI.
+  Do not close a positive Paging requirement by injecting a
+  `PAGING_INDICATION` straight into the UE.
+- A retransmission of an outstanding Service Request is not another Paging
+  round. Count restorations by the access epochs that actually completed, not
+  by the number of answers the UE produced.
+- A restoration is only proven by independent user-plane traffic on **every**
+  bearer it claims to restore. For a default and a dedicated bearer that is
+  two flows, and the dedicated flow must travel the dedicated bearer's TEID.
+  A control-plane-only pass is not a restoration pass, and a loopback packet
+  that never left a socket pair is not user-plane evidence.
 
 ## GTP-U message handling
 
@@ -142,6 +161,49 @@ endpoints:
 ./cmake-build-release/nr-tests --no-version --test-case="lte/gtpu/*,lte/enb/retired-teid*"
 ```
 
+## Dedicated bearer restoration
+
+A dedicated EPS bearer that the network created is logical state that outlives
+the access that carried it. The rules below are what a change must not weaken
+when that bearer is restored on a later access.
+
+- Bearer identities are decoded from the network's own signalling. Do not
+  assume EBI 5 or EBI 6 in production acceptance logic, and do not infer
+  default-versus-dedicated roles from QCI or from the order the E-RABs are
+  listed in. An E-RAB list that is deliberately reordered must still produce
+  the same roles.
+- A dedicated bearer keeps the network-assigned EBI, its linked default EBI,
+  its QoS, its EPS session identity and the **non-empty TFT** it was given
+  through protected NAS signalling, across every access release and every
+  later restoration. The uplink flow that reaches a dedicated bearer is
+  selected by matching the packet against the retained TFT, never by QCI and
+  never by bearer ordering.
+- Readiness is ordered. The default bearer is established first whatever order
+  the E-RABs arrive in, and a dedicated bearer's access is restored only after
+  the default it is linked to is ready. `BearerRuntime::restoreAccess` is
+  deliberately TUN-gated: without a real TUN the restoration is refused and
+  the message is dropped. Do not relax that gate in production to make a
+  control-plane test pass.
+- The radio answer form comes from `MobilityContext::accessBootstrap` — that
+  is, from **confirmed** bearer-role ownership — never from
+  `accessGeneration`. A cell that has never confirmed the roles needs the
+  bearer inventory; a cell that has does not, whatever its generation number
+  is. `onAttachComplete` deliberately does not mark the roles retained, and a
+  Tracking Area Update that establishes no bearer must leave the declaration
+  outstanding for the next restoration.
+- Local S1-U TEIDs are a fresh pair on every restoration. The previous pair
+  must stop resolving, a delayed G-PDU for an old TEID must not reach the new
+  tunnel, and an old End Marker must not release or modify the new bearer.
+  Bearer packet counters accumulate across access restorations by design, so
+  a fresh TEID must not be credited with traffic it never carried.
+- Multi-round restorations after one EPS registration must not re-Attach. The
+  first restoration at a cell that has not confirmed the roles declares the
+  retained inventory; the later ones at that same cell use the compact Service
+  Request.
+
+The detail, including the generation arithmetic and the measured per-round
+transport, is in `docs/lte-dedicated-bearer-paging-restoration.md`.
+
 ## What must never be committed
 
 - `config/*.local.yaml` — private laboratory configurations, including
@@ -173,8 +235,16 @@ The LTE path can be driven against a real Open5GS EPC. When it is:
 - Preserve pre-existing laboratory resources. An empty-looking resource is
   still not ours to delete; removing one needs ownership established first and
   separate authorization.
-- A policy change such as a PCC rule is separately authorization-gated. Do not
-  apply or reapply one just to reproduce an earlier result.
+- A policy change such as a PCC rule is separately authorization-gated, and the
+  authorization is per change and per subscriber. A past authorization is spent
+  once it has been used and is **not** standing authorization for a later phase
+  or a later reproduction. Without a fresh, explicit authorization that names
+  the subscriber, the APN/session, the rule scope, the backup procedure, the
+  rollback and the verification, do not apply or reapply a PCC rule, modify
+  PCRF policy, modify HSS or authentication data, provision another subscriber,
+  or touch any other subscriber's rules. Root privileges are not authorization.
+  When the authorization is absent, record the live gate as blocked and say so;
+  do not substitute a deterministic or local result for it.
 - Subscriber provisioning, `maxUes`, and throughput benchmarking are outside
   the scope of ordinary development work.
 
