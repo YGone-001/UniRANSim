@@ -173,6 +173,13 @@ constexpr uint8_t kMmeCode = 1;
 constexpr uint32_t kMTmsi = 0xC000018Eu;
 constexpr uint8_t kDefaultEbi = 5;
 
+// The QoS the fixtures give the default bearer. QCI 9 is the non-GBR "TCP
+// based" class of TS 23.203 table 6.1.7-1, which is what an ordinary Internet
+// APN default bearer carries, and it is the QCI the S1AP E-RAB for the default
+// bearer names throughout these cases. A non-GBR QCI gets no GBR QoS
+// Information, so the E-RABs built below carry none and none is invented.
+constexpr uint8_t kDefaultQci = 9;
+
 // The S-TMSI value the target eNB has to put in the Initial UE Message: the
 // two preamble bits and the MMEC of X.691 aligned PER, then the M-TMSI.
 const std::vector<uint8_t> kExpectedSTmsi{0x00, 0x40, 0xC0, 0x00, 0x01, 0x8E};
@@ -191,10 +198,38 @@ constexpr uint32_t kUpdatedMTmsi = 0xC000018Fu;
 // so the dedicated bearer takes exactly the UDP 7000<->5000 flow and every
 // other datagram falls back to the default bearer. The dedicated application
 // socket below is bound and addressed to that flow for exactly this reason.
+//
+// Evidence provenance. What is captured is this TFT value field and the bearer
+// identity metadata that came beside it: the activation carried EBI 6 linked to
+// default EBI 5 with QCI 7, and the S1AP E-RAB Setup Request that carried the
+// same E-RAB also named QCI 7. What is *not* captured is the enclosing NAS
+// message: ActivateDedicated() below builds that envelope in this file, and the
+// S1AP E-RAB items are built here too. The production UE then decodes the
+// constructed envelope through its own NAS decoder and stores what it decoded.
+// No packet capture is claimed to exist for the envelope and no byte-for-byte
+// equivalence with one is claimed; the capture-backed facts are the TFT octets
+// and the EBI 6 / linked EBI 5 / QCI 7 bearer identity.
 const std::vector<uint8_t> kCapturedDedicatedTft{
     0x22, 0x20, 0x00, 0x11, 0x30, 0x11, 0x10, 0x00, 0x00, 0x00, 0x00, 0xFF,
     0xFF, 0xFF, 0xFF, 0x40, 0x1B, 0x58, 0x50, 0x13, 0x88, 0x11, 0x01, 0x08,
     0x30, 0x11, 0x50, 0x1B, 0x58, 0x40, 0x13, 0x88};
+
+// The QCI that capture records for that dedicated E-RAB. It is the QCI the
+// network's own NAS Activate Dedicated EPS Bearer Context Request carried and
+// the same value the matching S1AP E-RAB Level QoS Parameters named, so every
+// fixture that plays this bearer uses it on both sides. QCI 7 is the non-GBR
+// "voice, video, interactive gaming" class of TS 23.203 table 6.1.7-1.
+constexpr uint8_t kCapturedDedicatedEbi = 6;
+constexpr uint8_t kCapturedDedicatedQci = 7;
+
+// The second dedicated bearer the reselection case plays alongside it: an
+// ordinary network-created dedicated bearer with no capture behind it, on the
+// standardized non-GBR QCI 8 of TS 23.203 table 6.1.7-1. It exists so a run
+// with two dedicated bearers carries two demonstrably different QCIs, and it
+// is never given an E-RAB in the cases that use it, so there is no S1AP QoS
+// beside it to disagree with.
+constexpr uint8_t kSecondDedicatedEbi = 9;
+constexpr uint8_t kSecondDedicatedQci = 8;
 
 // A TFT whose only packet filter names an unknown component type. The codec
 // refuses it, which is what makes it the "invalid TFT" an activation must
@@ -296,16 +331,28 @@ size_t CountOccurrences(const std::string &haystack, const std::string &needle)
     return total;
 }
 
-// A network-authored Activate Dedicated EPS Bearer Context Request: EBI, PTI,
-// linked default EBI, a one-octet EPS QoS and the TFT value field the network
-// chose. The TFT is a type-4 information element — one length octet then the
-// value field, not the two-octet LV-E form — so an empty network TFT is a
-// single zero octet. The UE accepts the message into its own bearer runtime
-// and from then on owns the identity.
-std::vector<uint8_t> ActivateDedicated(uint8_t ebi, const std::vector<uint8_t> &tft = {},
-                                       uint8_t linkedEbi = kDefaultEbi)
+// A network-authored Activate Dedicated EPS Bearer Context Request: EBI and
+// PTI, the message type, the linked default EBI, the EPS quality of service and
+// the TFT value field the network chose.
+//
+// The EPS QoS here is the plain one-octet form of TS 24.301 §9.9.4.3: a length
+// octet of 1 followed by the QCI alone, with no bitrate extension octets. That
+// is the whole of what the EPS QoS sent to the UE carries — QCI and bitrates —
+// and it deliberately carries no ARP, which belongs to the S1AP E-RAB Level QoS
+// Parameters (TS 36.413 §9.2.1.15) and is never part of this message. QCI and
+// linked EBI are inputs rather than defaults, so no call site can play a
+// dedicated bearer with a QoS it did not choose and no hidden QCI 9 can reach
+// a capture-backed activation.
+//
+// The TFT is a type-4 information element — one length octet then the value
+// field, not the two-octet LV-E form — so an empty network TFT is a single zero
+// octet. The UE accepts the message into its own bearer runtime and from then
+// on owns the identity.
+std::vector<uint8_t> ActivateDedicated(uint8_t ebi, const std::vector<uint8_t> &tft,
+                                       uint8_t linkedEbi, uint8_t qci)
 {
-    std::vector<uint8_t> out{static_cast<uint8_t>((ebi << 4U) | 0x02U), 0x01, 0xC5, linkedEbi, 0x01, 0x09};
+    std::vector<uint8_t> out{static_cast<uint8_t>((ebi << 4U) | 0x02U), 0x01, 0xC5,
+                             linkedEbi,       0x01,          qci};
     out.push_back(static_cast<uint8_t>(tft.size()));
     out.insert(out.end(), tft.begin(), tft.end());
     return out;
@@ -329,6 +376,18 @@ s1ap::ErabToBeSetupItem ErabWithNas(uint8_t ebi, uint8_t qci, uint32_t sgwTeid)
     item.nasPduPresent = true;
     item.nasPdu = {0x2E, 0x01};
     return item;
+}
+
+// The line the production UE logs when it accepts a dedicated activation,
+// built from the same fixture values the activation was built from. Deriving
+// it instead of writing the numbers again is what stops the assertion and the
+// input from drifting apart: change the fixture QCI and this line follows,
+// so a test can only pass when the runtime really reported the QoS it was
+// given.
+std::string ExpectedActivationLine(uint8_t ebi, uint8_t qci, uint8_t linkedEbi, size_t filters)
+{
+    return "Dedicated EPS bearer " + std::to_string(ebi) + " activated (QCI=" + std::to_string(qci) +
+           ", linked-EBI=" + std::to_string(linkedEbi) + ", filters=" + std::to_string(filters) + ")";
 }
 
 // ---------------------------------------------------------------------------
@@ -674,11 +733,16 @@ class Lab
     }
 
     // The dedicated EPS bearers the serving cell activates after Attach
-    // Complete. Every one of them is created by the network's own protected
-    // Activate Dedicated EPS Bearer Context Request, carrying the TFT value
+    // Complete: one (EBI, QCI) pair per bearer. Every one of them is created by
+    // the network's own protected Activate Dedicated EPS Bearer Context
+    // Request, carrying the QCI named here for that bearer and the TFT value
     // field the network chose — empty by default, non-empty when a case is
-    // about what the UE does with the filters it was given.
-    void scriptDedicated(std::vector<uint8_t> activate, std::vector<uint8_t> tft = {})
+    // about what the UE does with the filters it was given. The QCI travels
+    // per bearer rather than as one value for the whole list, so a case with
+    // more than one dedicated bearer plays a distinct QoS per bearer and the
+    // two cannot blur into one another.
+    void scriptDedicated(std::vector<std::pair<uint8_t, uint8_t>> activate,
+                         std::vector<uint8_t> tft = {})
     {
         m_activate = std::move(activate);
         m_activateTft = std::move(tft);
@@ -1065,7 +1129,8 @@ class Lab
     std::vector<uint8_t> expectedTauRequest() const
     {
         std::vector<uint8_t> identities{kDefaultEbi};
-        identities.insert(identities.end(), m_activate.begin(), m_activate.end());
+        for (const auto &bearer : m_activate)
+            identities.push_back(bearer.first);
         return nas::EncodeTauRequest(m_security.ksi, assignedGuti(), identities, false);
     }
 
@@ -1339,8 +1404,9 @@ class Lab
         if (plain.size() >= 2 && plain[0] == 0x07 && plain[1] == 0x43)
         {
             m_attachComplete = true;
-            for (const uint8_t ebi : m_activate)
-                sendNasToUe(ProtectDownlink(ActivateDedicated(ebi, m_activateTft), /*newContext=*/false));
+            for (const auto &[ebi, qci] : m_activate)
+                sendNasToUe(ProtectDownlink(
+                    ActivateDedicated(ebi, m_activateTft, kDefaultEbi, qci), /*newContext=*/false));
             return;
         }
         // Anything else is the Activate Dedicated EPS Bearer Context Accept, and
@@ -1438,7 +1504,7 @@ class Lab
     Config m_config;
     SecurityContext m_security{};
     InetAddress m_uePeer;
-    std::vector<uint8_t> m_activate;
+    std::vector<std::pair<uint8_t, uint8_t>> m_activate;
     std::vector<uint8_t> m_activateTft;
     std::set<uint8_t> m_activated;
     std::vector<std::string> m_problems;
@@ -1472,19 +1538,102 @@ class Lab
 } // namespace
 
 // ---------------------------------------------------------------------------
+// One dedicated bearer keeps one QoS identity on the NAS side and the S1AP side
+// ---------------------------------------------------------------------------
+
+TEST_CASE("lte/ue_mobility_target: a dedicated bearer fixture carries one QCI through the NAS and the S1AP encodings")
+{
+    // The fixture is the only place a QoS value is chosen, so this case reads
+    // the value back out of the production decoders rather than out of the
+    // fixture's own expectations. It is deterministic and needs no UE: the
+    // network-authored NAS envelope and the network-authored S1AP E-RAB are
+    // both built here and both decoded by the production code that will later
+    // consume them, which is what makes an agreement between the two sides an
+    // observed fact rather than a coincidence of two hardcoded strings.
+    const auto plain = ActivateDedicated(kCapturedDedicatedEbi, kCapturedDedicatedTft,
+                                         kDefaultEbi, kCapturedDedicatedQci);
+    const auto message = nas::DecodeDownlink(plain.data(), plain.size());
+
+    REQUIRE(message.type == nas::DownlinkEmm::ACTIVATE_DEDICATED_EPS_BEARER_CONTEXT);
+    const auto &request = message.dedicatedBearer;
+    CHECK(request.epsBearerIdentity == kCapturedDedicatedEbi);
+    CHECK(request.linkedEpsBearerIdentity == kDefaultEbi);
+    CHECK(request.qci == kCapturedDedicatedQci);
+    CHECK(request.tft == kCapturedDedicatedTft);
+
+    // The same bearer identity on the S1AP side, through the real codec.
+    s1ap::ErabSetupRequest setup;
+    setup.mmeUeS1apId = 500;
+    setup.enbUeS1apId = 2;
+    setup.erabs.push_back(Erab(kCapturedDedicatedEbi, kCapturedDedicatedQci, 36));
+    const auto encoded = s1ap::EncodeErabSetupRequest(setup);
+    const auto decoded = s1ap::DecodeErabSetupRequest(encoded.data(), encoded.size());
+
+    REQUIRE(decoded.erabs.size() == 1);
+    const auto &erab = decoded.erabs.front();
+    CHECK(erab.erabId == kCapturedDedicatedEbi);
+    CHECK(erab.qci == kCapturedDedicatedQci);
+
+    // The two sides name one QoS for one bearer identity. A fixture that
+    // drifted on either side breaks here, rather than being hidden behind a log
+    // line only one of the two messages produced.
+    CHECK(request.qci == erab.qci);
+
+    // ARP belongs to the S1AP E-RAB Level QoS Parameters and to nothing the UE
+    // is sent: the default values are encoded and decoded unchanged, and the
+    // NAS message above has no field that could carry them.
+    CHECK(erab.priorityLevel == 15);
+    CHECK_FALSE(erab.preemptionCapability);
+    CHECK_FALSE(erab.preemptionVulnerability);
+
+    // A non-GBR QCI carries no GBR QoS Information — TS 36.413 §9.2.1.15 has
+    // the GBR part present for GBR bearers only — so the fixture invents no
+    // bitrates and the codec round-trips their absence.
+    CHECK_FALSE(erab.gbr.has_value());
+}
+
+TEST_CASE("lte/ue_mobility_target: two dedicated bearers keep two distinct QCIs through the decoder")
+{
+    // Per-bearer QoS rather than one value for the whole activation list. These
+    // are the two dedicated bearers the reselection case plays, and each must
+    // come back out of the production decoder with its own value and its own
+    // identity.
+    const std::vector<std::pair<uint8_t, uint8_t>> scripted{
+        {kCapturedDedicatedEbi, kCapturedDedicatedQci}, {kSecondDedicatedEbi, kSecondDedicatedQci}};
+    CHECK(scripted[0].second != scripted[1].second);
+
+    for (const auto &[ebi, qci] : scripted)
+    {
+        const auto plain = ActivateDedicated(ebi, {}, kDefaultEbi, qci);
+        const auto message = nas::DecodeDownlink(plain.data(), plain.size());
+        REQUIRE(message.type == nas::DownlinkEmm::ACTIVATE_DEDICATED_EPS_BEARER_CONTEXT);
+        CHECK(message.dedicatedBearer.epsBearerIdentity == ebi);
+        CHECK(message.dedicatedBearer.linkedEpsBearerIdentity == kDefaultEbi);
+        CHECK(message.dedicatedBearer.qci == qci);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The real UE opens a real target eNB and completes a Tracking Area Update
 // ---------------------------------------------------------------------------
 
 TEST_CASE("lte/ue_mobility_target: a real UE reselection reaches a real target eNB and completes a TAU there")
 {
     Lab lab(47341, 47342);
-    lab.scriptDedicated({6, 9});
+    // Two dedicated bearers, each with its own QoS. EBI 6 is the capture-backed
+    // identity and plays the QCI the capture records for it; EBI 9 is a second,
+    // ordinary dedicated bearer on the standardized non-GBR QCI 8 of TS 23.203
+    // table 6.1.7-1. Neither is given an E-RAB in this case, so there is no
+    // S1AP QoS beside them here to agree or disagree with — the point of the
+    // pair is that two activations in one run keep two distinct QCIs.
+    lab.scriptDedicated({{kCapturedDedicatedEbi, kCapturedDedicatedQci},
+                         {kSecondDedicatedEbi, kSecondDedicatedQci}});
     lab.startUe();
 
     // The serving cell brings the EPS session up: real AKA, a real Attach, and
     // two dedicated bearers the network activates on top of the default one.
     const bool attached = lab.driveUntilSourceAttachComplete();
-    const bool dedicated = lab.driveUntilDedicatedConfirmed({6, 9});
+    const bool dedicated = lab.driveUntilDedicatedConfirmed({kCapturedDedicatedEbi, kSecondDedicatedEbi});
     const bool idle = lab.driveUntilIdleReleased();
 
     // The UE reselects the target cell and opens it with its own mobility
@@ -1514,14 +1663,14 @@ TEST_CASE("lte/ue_mobility_target: a real UE reselection reaches a real target e
     const bool declaredDefault = registered && entry->declaredBearers.has_value() &&
                                 entry->declaredBearers->defaultEbi == kDefaultEbi;
     const bool declaredDedicated = registered && entry->declaredBearers.has_value() &&
-                                   entry->declaredBearers->dedicatedEbis == std::vector<uint8_t>{6, 9};
+                                   entry->declaredBearers->dedicatedEbis == std::vector<uint8_t>{kCapturedDedicatedEbi, kSecondDedicatedEbi};
     const bool pending = registered && entry->s1 == UeS1State::CONTEXT_PENDING && entry->mobilityBootstrap &&
                          entry->enbUeS1apId != 0;
 
     // The network restores the default bearer first. The declared dedicated
     // bearers are named in the declaration and are restored when the network
     // later asks for them, never guessed from the E-RAB list.
-    lab.deliverIcsr({Erab(kDefaultEbi, 9, 30)});
+    lab.deliverIcsr({Erab(kDefaultEbi, kDefaultQci, 30)});
     const bool established = registered && entry->s1 == UeS1State::CONTEXT_ESTABLISHED &&
                              entry->bearer.signalingEstablished() && entry->bearer.restorationPending() &&
                              !entry->bearer.active() && entry->bearer.parameters().erabId == kDefaultEbi &&
@@ -1572,7 +1721,7 @@ TEST_CASE("lte/ue_mobility_target: a real UE reselection reaches a real target e
     // rather than as a brand-new one, and with target transport that is not the
     // source cell's. The UE-side confirmation of that transport needs the local
     // user plane and is covered at the target in test/lte/mobility_target.cpp.
-    lab.deliverErabSetup(ErabWithNas(6, 7, 36));
+    lab.deliverErabSetup(ErabWithNas(kCapturedDedicatedEbi, kCapturedDedicatedQci, 36));
     REQUIRE(lab.problems().empty());
     REQUIRE(entry->dedicatedBearers.size() == 1);
     const auto &dedicated6 = entry->dedicatedBearers.front();
@@ -1593,11 +1742,11 @@ TEST_CASE("lte/ue_mobility_target: a real UE reselection reaches a real target e
 TEST_CASE("lte/ue_mobility_target: a repeated mobility uplink is refused by the target without disturbing its context")
 {
     Lab lab(47343, 47344, /*procedureTimeoutMs=*/200, /*maxRetries=*/1);
-    lab.scriptDedicated({6});
+    lab.scriptDedicated({{kCapturedDedicatedEbi, kCapturedDedicatedQci}});
     lab.startUe();
 
     const bool attached = lab.driveUntilSourceAttachComplete();
-    const bool dedicated = lab.driveUntilDedicatedConfirmed({6});
+    const bool dedicated = lab.driveUntilDedicatedConfirmed({kCapturedDedicatedEbi});
     const bool idle = lab.driveUntilIdleReleased();
     const bool arrived = lab.driveUntilTargetInitialUeMessage();
 
@@ -1647,11 +1796,11 @@ TEST_CASE("lte/ue_mobility_target: a repeated mobility uplink is refused by the 
 TEST_CASE("lte/ue_mobility_target: a network-activated dedicated bearer keeps the non-empty TFT it was given")
 {
     Lab lab(47347, 47348);
-    lab.scriptDedicated({6}, kCapturedDedicatedTft);
+    lab.scriptDedicated({{kCapturedDedicatedEbi, kCapturedDedicatedQci}}, kCapturedDedicatedTft);
     lab.startUe();
 
     const bool attached = lab.driveUntilSourceAttachComplete();
-    const bool dedicated = lab.driveUntilDedicatedConfirmed({6});
+    const bool dedicated = lab.driveUntilDedicatedConfirmed({kCapturedDedicatedEbi});
 
     // The production UE decoded the network's TFT value field through the real
     // NAS Activate Dedicated EPS Bearer Context Request and applied it to the
@@ -1663,7 +1812,7 @@ TEST_CASE("lte/ue_mobility_target: a network-activated dedicated bearer keeps th
     REQUIRE(lab.problems().empty());
     REQUIRE(attached);
     REQUIRE(dedicated);
-    CHECK(Contains(lab.log, "Dedicated EPS bearer 6 activated (QCI=9, linked-EBI=5, filters=2)"));
+    CHECK(Contains(lab.log, ExpectedActivationLine(kCapturedDedicatedEbi, kCapturedDedicatedQci, kDefaultEbi, 2)));
     CHECK_FALSE(Contains(lab.log, "Rejected dedicated EPS bearer activation"));
     CHECK(lab.exitCode() == 0);
     CHECK(Contains(lab.log, "LTE UE shutdown complete"));
@@ -1676,20 +1825,23 @@ TEST_CASE("lte/ue_mobility_target: a network-activated dedicated bearer keeps th
 TEST_CASE("lte/ue_mobility_target: an unusable dedicated bearer activation is refused and leaves the default bearer alone")
 {
     Lab lab(47349, 47350);
-    lab.scriptDedicated({6}, kCapturedDedicatedTft);
+    lab.scriptDedicated({{kCapturedDedicatedEbi, kCapturedDedicatedQci}}, kCapturedDedicatedTft);
     lab.startUe();
 
     const bool attached = lab.driveUntilSourceAttachComplete();
-    const bool dedicated = lab.driveUntilDedicatedConfirmed({6});
+    const bool dedicated = lab.driveUntilDedicatedConfirmed({kCapturedDedicatedEbi});
 
     // Three activations the network must not be able to land. The first names
     // an EPS bearer identity the UE already holds, the second claims to be
     // linked to a default bearer this session does not have, and the third
     // carries a TFT the codec refuses. Each is a real protected downlink NAS
     // message from the same EPS peer that performed the Attach.
-    lab.injectSourceNas(ActivateDedicated(6, kCapturedDedicatedTft));
-    lab.injectSourceNas(ActivateDedicated(7, kCapturedDedicatedTft, /*linkedEbi=*/7));
-    lab.injectSourceNas(ActivateDedicated(8, kInvalidDedicatedTft));
+    lab.injectSourceNas(ActivateDedicated(kCapturedDedicatedEbi, kCapturedDedicatedTft,
+                                          /*linkedEbi=*/kDefaultEbi, kCapturedDedicatedQci));
+    lab.injectSourceNas(ActivateDedicated(7, kCapturedDedicatedTft,
+                                          /*linkedEbi=*/7, kCapturedDedicatedQci));
+    lab.injectSourceNas(ActivateDedicated(8, kInvalidDedicatedTft,
+                                          /*linkedEbi=*/kDefaultEbi, kCapturedDedicatedQci));
 
     // Nothing further should arrive from the UE, so the run is over once the
     // three rejections have been logged. The default bearer is still the one
@@ -1698,7 +1850,7 @@ TEST_CASE("lte/ue_mobility_target: an unusable dedicated bearer activation is re
     // default bearer" means in this state machine.
     const bool rejected = lab.drive(
         [&] { return CountOccurrences(lab.captureText(), "Rejected dedicated EPS bearer activation") >= 3; }, 8000);
-    const bool stillDedicated = lab.driveUntilDedicatedConfirmed({6});
+    const bool stillDedicated = lab.driveUntilDedicatedConfirmed({kCapturedDedicatedEbi});
 
     lab.shutdownUe();
     const std::string transcript = lab.log;
@@ -1710,7 +1862,7 @@ TEST_CASE("lte/ue_mobility_target: an unusable dedicated bearer activation is re
     CHECK(CountOccurrences(transcript, "Rejected dedicated EPS bearer activation") == 3);
     CHECK(Contains(transcript, "Dedicated bearer identity is already active"));
     CHECK(Contains(transcript, "Dedicated bearer references a different default bearer"));
-    CHECK(Contains(transcript, "Dedicated EPS bearer 6 activated (QCI=9, linked-EBI=5, filters=2)"));
+    CHECK(Contains(transcript, ExpectedActivationLine(kCapturedDedicatedEbi, kCapturedDedicatedQci, kDefaultEbi, 2)));
     // The three rejections carry ESM cause 26 and name the bearer they refuse;
     // none of them deactivates anything the UE already holds.
     CHECK_FALSE(Contains(transcript, "Dedicated EPS bearer 6 deactivated"));
@@ -1758,7 +1910,7 @@ TEST_CASE("lte/ue_mobility_target: real TUN mobility restoration and user-plane 
     options.radioTap = true;
     Lab lab(47345, 47346, options);
     lab.enableTestSgw();
-    lab.scriptDedicated({6});
+    lab.scriptDedicated({{kCapturedDedicatedEbi, kCapturedDedicatedQci}});
     lab.startUe();
 
     // A real EPS AKA, a real Attach, and a kernel TUN interface the production
@@ -1786,7 +1938,7 @@ TEST_CASE("lte/ue_mobility_target: real TUN mobility restoration and user-plane 
     // The network activates one dedicated bearer on top of the default one and
     // then releases the UE into ECM-IDLE, where it reselects into the target
     // cell and opens it with its own mobility uplink.
-    const bool dedicated = lab.driveUntilDedicatedConfirmed({6});
+    const bool dedicated = lab.driveUntilDedicatedConfirmed({kCapturedDedicatedEbi});
     const bool idle = lab.driveUntilIdleReleased();
     const bool arrived = lab.driveUntilTargetInitialUeMessage();
 
@@ -1810,7 +1962,7 @@ TEST_CASE("lte/ue_mobility_target: real TUN mobility restoration and user-plane 
     const bool registered = entry != nullptr;
     const bool inventoryDeclared = registered && entry->declaredBearers.has_value() &&
                                    entry->declaredBearers->defaultEbi == kDefaultEbi &&
-                                   entry->declaredBearers->dedicatedEbis == std::vector<uint8_t>{6};
+                                   entry->declaredBearers->dedicatedEbis == std::vector<uint8_t>{kCapturedDedicatedEbi};
     const bool freshTargetAccess =
         registered && entry->mobilityBootstrap && entry->enbUeS1apId != 0 && entry->accessGeneration == 1;
 
@@ -1823,7 +1975,7 @@ TEST_CASE("lte/ue_mobility_target: real TUN mobility restoration and user-plane 
     // of it can be inspected; they are the UE's own octets and are forwarded
     // unmodified when that window closes.
     lab.holdUplink(true);
-    lab.deliverIcsr({Erab(6, 7, 36), Erab(kDefaultEbi, 9, 30)});
+    lab.deliverIcsr({Erab(kCapturedDedicatedEbi, kCapturedDedicatedQci, 36), Erab(kDefaultEbi, kDefaultQci, 30)});
     const bool notificationsHeld = lab.driveUntilHeldUplink(2);
 
     // Both held frames are the running UE's own, and it produced the default
@@ -2161,15 +2313,21 @@ TEST_CASE("lte/ue_mobility_target: a dedicated bearer with a non-empty TFT survi
     options.radioTap = true;
     Lab lab(47353, 47354, options);
     lab.enableTestSgw();
-    lab.scriptDedicated({6}, kCapturedDedicatedTft);
+    lab.scriptDedicated({{kCapturedDedicatedEbi, kCapturedDedicatedQci}}, kCapturedDedicatedTft);
     lab.startUe();
 
     // ---- the source cell: one Attach, one network-created dedicated bearer
     const bool attached = lab.driveUntilSourceAttachComplete();
     const bool bearerReady = lab.driveUntilBearerReady();
-    const bool dedicatedActivated = lab.driveUntilDedicatedConfirmed({6});
+    const bool dedicatedActivated = lab.driveUntilDedicatedConfirmed({kCapturedDedicatedEbi});
+    // The NAS-side half of the QoS consistency claim. The production UE logged
+    // the QCI it decoded out of the network's own Activate Dedicated EPS Bearer
+    // Context Request, so this is the UE's observation of the EPS QoS it was
+    // given, not the fixture's opinion of it. The S1AP half is checked per
+    // round below out of the target's bearer registry.
     const bool dedicatedNamed =
-        Contains(lab.captureText(), "Dedicated EPS bearer 6 activated (QCI=9, linked-EBI=5, filters=2)");
+        Contains(lab.captureText(),
+                 ExpectedActivationLine(kCapturedDedicatedEbi, kCapturedDedicatedQci, kDefaultEbi, 2));
 
     const auto interfacesAfterAttach = ListInterfaces(kTunPrefix);
     const bool oneTunCreated = interfacesAfterAttach.size() == 1;
@@ -2195,7 +2353,7 @@ TEST_CASE("lte/ue_mobility_target: a dedicated bearer with a non-empty TFT survi
     const bool registered = entry != nullptr;
     const bool inventoryDeclared = registered && entry->declaredBearers.has_value() &&
                                    entry->declaredBearers->defaultEbi == kDefaultEbi &&
-                                   entry->declaredBearers->dedicatedEbis == std::vector<uint8_t>{6};
+                                   entry->declaredBearers->dedicatedEbis == std::vector<uint8_t>{kCapturedDedicatedEbi};
     const bool freshTargetAccess =
         registered && entry->mobilityBootstrap && entry->enbUeS1apId != 0 && entry->accessGeneration == 1;
 
@@ -2230,6 +2388,8 @@ TEST_CASE("lte/ue_mobility_target: a dedicated bearer with a non-empty TFT survi
         uint8_t defaultEbi{};
         uint8_t dedicatedEbi{};
         uint8_t dedicatedLinkedEbi{};
+        uint8_t defaultQci{};
+        uint8_t dedicatedQci{};
         uint32_t defaultLocalTeid{};
         uint32_t dedicatedLocalTeid{};
         bool teidsFresh{};
@@ -2290,7 +2450,8 @@ TEST_CASE("lte/ue_mobility_target: a dedicated bearer with a non-empty TFT survi
         // the roles come from the UE's declaration or from the retained
         // contexts, never from QCI or from the order of this list.
         const size_t uplinkBefore = lab.radioUplink().size();
-        lab.deliverIcsr({Erab(6, 7, dedicatedSgwTeid), Erab(kDefaultEbi, 9, defaultSgwTeid)});
+        lab.deliverIcsr({Erab(kCapturedDedicatedEbi, kCapturedDedicatedQci, dedicatedSgwTeid),
+                         Erab(kDefaultEbi, kDefaultQci, defaultSgwTeid)});
         const bool bothActive = lab.drive(
             [&] {
                 auto *e = lab.target().registry().find(lab.config().ueId);
@@ -2306,10 +2467,12 @@ TEST_CASE("lte/ue_mobility_target: a dedicated bearer with a non-empty TFT survi
         if (entry != nullptr)
         {
             round.defaultEbi = entry->bearer.parameters().erabId;
+            round.defaultQci = entry->bearer.parameters().qci;
             if (!entry->dedicatedBearers.empty())
             {
                 round.dedicatedEbi = entry->dedicatedBearers.front().parameters().erabId;
                 round.dedicatedLinkedEbi = entry->dedicatedBearers.front().parameters().linkedDefaultEbi;
+                round.dedicatedQci = entry->dedicatedBearers.front().parameters().qci;
             }
             round.defaultLocalTeid = entry->bearer.parameters().localTeid;
             round.dedicatedLocalTeid = entry->dedicatedBearers.empty()
@@ -2550,15 +2713,15 @@ TEST_CASE("lte/ue_mobility_target: a dedicated bearer with a non-empty TFT survi
     std::fprintf(stderr, "=== per-round transport ===\n");
     for (size_t i = 0; i < rounds.size(); ++i)
         std::fprintf(stderr,
-                     "round %zu: default ebi=%u local-teid=0x%08X sgw-teid=0x%08X confirm-gen=%u "
-                     "pkts(ul/dl)=%llu/%llu | dedicated ebi=%u linked=%u local-teid=0x%08X sgw-teid=0x%08X "
-                     "confirm-gen=%u pkts(ul/dl)=%llu/%llu\n",
-                     i + 1, rounds[i].defaultEbi, rounds[i].defaultLocalTeid, 30u + static_cast<uint32_t>(i),
-                     rounds[i].defaultConfirmGeneration,
+                     "round %zu: default ebi=%u qci=%u local-teid=0x%08X sgw-teid=0x%08X confirm-gen=%u "
+                     "pkts(ul/dl)=%llu/%llu | dedicated ebi=%u linked=%u qci=%u local-teid=0x%08X "
+                     "sgw-teid=0x%08X confirm-gen=%u pkts(ul/dl)=%llu/%llu\n",
+                     i + 1, rounds[i].defaultEbi, rounds[i].defaultQci, rounds[i].defaultLocalTeid,
+                     30u + static_cast<uint32_t>(i), rounds[i].defaultConfirmGeneration,
                      static_cast<unsigned long long>(rounds[i].defaultUplinkPackets),
                      static_cast<unsigned long long>(rounds[i].defaultDownlinkPackets), rounds[i].dedicatedEbi,
-                     rounds[i].dedicatedLinkedEbi, rounds[i].dedicatedLocalTeid, 36u + static_cast<uint32_t>(i),
-                     rounds[i].dedicatedConfirmGeneration,
+                     rounds[i].dedicatedLinkedEbi, rounds[i].dedicatedQci, rounds[i].dedicatedLocalTeid,
+                     36u + static_cast<uint32_t>(i), rounds[i].dedicatedConfirmGeneration,
                      static_cast<unsigned long long>(rounds[i].dedicatedUplinkPackets),
                      static_cast<unsigned long long>(rounds[i].dedicatedDownlinkPackets));
     std::fprintf(stderr, "=== end of per-round transport ===\n");
@@ -2594,8 +2757,16 @@ TEST_CASE("lte/ue_mobility_target: a dedicated bearer with a non-empty TFT survi
         CHECK(round.defaultRestored);
         CHECK(round.dedicatedRestored);
         CHECK(round.defaultEbi == kDefaultEbi);
-        CHECK(round.dedicatedEbi == 6);
+        CHECK(round.dedicatedEbi == kCapturedDedicatedEbi);
         CHECK(round.dedicatedLinkedEbi == kDefaultEbi);
+        // The QoS the network named for each bearer is read back out of the
+        // target's own bearer registry — the S1AP E-RAB Level QoS Parameters it
+        // decoded — rather than predicted from the fixture. The default bearer
+        // carries the QCI the fixture gives it on every round and the dedicated
+        // one carries the capture-backed QCI on every round, so a restoration
+        // cannot quietly change a bearer's QoS identity.
+        CHECK(round.defaultQci == kDefaultQci);
+        CHECK(round.dedicatedQci == kCapturedDedicatedQci);
         CHECK(round.teidsFresh);
         CHECK(round.onePacketPerDirection);
         CHECK(round.confirmationsBoundToTheAccess);
@@ -2724,7 +2895,7 @@ TEST_CASE("lte/ue_mobility_target: a page that must not start a Service Request 
 
     // Once the restoration is done the UE is connected, and a page aimed at a
     // connected UE is not a page this cell has anything to fan out.
-    lab.deliverIcsr({Erab(kDefaultEbi, 9, 30)});
+    lab.deliverIcsr({Erab(kDefaultEbi, kDefaultQci, 30)});
     const bool restored = lab.drive(
         [&] {
             return Contains(lab.captureText(), "State=ECM_CONNECTED; bearer signaling restored in control-plane-only mode");

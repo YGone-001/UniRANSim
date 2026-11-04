@@ -442,3 +442,89 @@ bearer is created. The live gate is therefore recorded as
   restarts.
 * **No live campaign, no live capture, no live TEID table.** Anything of that
   kind is absent, not pending measurement.
+
+## 14. Dedicated Bearer QoS Consistency and Evidence Provenance
+
+A dedicated bearer keeps its QoS across a restoration, so the network must state
+one QoS for one bearer identity wherever it states one at all. This section
+records what was found, what the rule is, and what the evidence behind the
+fixtures actually is.
+
+1. **What was wrong.** The capture-backed dedicated bearer — EBI 6, linked to
+   default EBI 5 — was played with **QCI 9** in the NAS Activate Dedicated EPS
+   Bearer Context Request and **QCI 7** in the S1AP E-RAB that established and
+   restored it. Same EBI, two QCI values, in the same test file. The source of
+   the capture records QCI 7 on both sides, so the NAS side of the fixture had
+   drifted away from the evidence it was named after.
+
+2. **What the two sides carry.** The NAS EPS quality of service (TS 24.301
+   §9.9.4.3) is what the UE is sent: QCI, and bitrate octets in the extended
+   form. The S1AP E-RAB Level QoS Parameters (TS 36.413 §9.2.1.15) carry the
+   QCI and the AllocationAndRetentionPriority. They are different messages with
+   different scopes, and the QCI is the field they share.
+
+3. **Per-bearer QoS identity.** The QoS is part of the identity that survives an
+   access release, along with the EBI, the linked default EBI and the TFT. The
+   fixture states it per bearer: `ActivateDedicated` takes the QCI as an
+   argument with no default, and a scripted activation list is a list of
+   (EBI, QCI) pairs rather than a list of EBIs. A case with two dedicated
+   bearers therefore plays two QCIs — EBI 6 on QCI 7 and EBI 9 on QCI 8 in the
+   reselection case — and they cannot blur together.
+
+4. **Explicit NAS QCI in the test fixtures.** No fixture may reach a dedicated
+   activation through a hidden QCI 9. The capture-backed bearer is played at
+   `kCapturedDedicatedQci`, the default bearer at `kDefaultQci`, and the second
+   dedicated bearer at `kSecondDedicatedQci`, all named constants beside the
+   capture they belong to.
+
+5. **Corresponding S1AP E-RAB QCI.** The E-RAB that establishes or restores a
+   dedicated bearer names the same QCI the NAS activation named. In the
+   three-round case the target's own bearer registry is read back after each
+   restoration: default EBI 5 at QCI 9 and dedicated EBI 6, linked EBI 5, at
+   QCI 7, on every round.
+
+6. **ARP is S1AP-side only.** AllocationAndRetentionPriority — priority level
+   15, pre-emption capability false, pre-emption vulnerability false in these
+   fixtures — is encoded and decoded in the S1AP E-RAB Level QoS Parameters and
+   is never part of the EPS QoS Profile sent to the UE. The NAS activation has
+   no field that could carry it. The values are left at the E-RAB helper
+   defaults and are not adjusted to look more realistic.
+
+7. **GBR and MBR follow the bearer type.** GBR QoS Information (TS 36.413
+   §9.2.1.18) is present for a GBR bearer only. QCI 7 ("voice, video,
+   interactive gaming") and QCI 9 ("TCP based") are both non-GBR in TS 23.203
+   table 6.1.7-1, so these E-RABs carry no GBR QoS Information and none is
+   invented. Full GBR bearer support is not implemented and is not claimed.
+
+8. **Legitimate QCI remapping needs evidence.** A different QCI on the two sides
+   is not universally impossible — roaming and inter-RAT handover can produce
+   one — but a remapping claim must be backed by explicit signalling or
+   configuration. For the same-PLMN scripted restoration these cases play, with
+   no such evidence, the network-authored NAS activation and the corresponding
+   S1AP E-RAB use the same dedicated-bearer QCI. No remapping is invented to
+   excuse a mismatch.
+
+9. **A captured TFT is not a captured NAS message.** The captured artefact is
+   the TFT value field and the bearer identity metadata beside it: EBI 6,
+   linked default EBI 5, QCI 7, and the same QCI in the S1AP E-RAB Setup
+   Request. The enclosing NAS Activate Dedicated EPS Bearer Context Request is
+   **constructed** by the test's `ActivateDedicated`, and the S1AP E-RAB items
+   are constructed too. The production UE then decodes that envelope with its
+   own NAS decoder. No packet capture is claimed for the envelope and no
+   byte-for-byte equivalence with one is claimed.
+
+10. **What the tests observe.** The consistency is read out of the production
+    decoders rather than out of the fixture's own expectations. A deterministic
+    case encodes the activation and the E-RAB, decodes them with
+    `nas::DecodeDownlink` and `s1ap::DecodeErabSetupRequest`, and requires the
+    two decoded QCIs to be equal. The live cases then observe the UE's own
+    report of the QoS it decoded, and the three-round case reads the target's
+    registry back after each restoration. Measured on the privileged run:
+    `Dedicated EPS bearer 6 activated (QCI=7, linked-EBI=5, filters=2)`, and
+    per round `default ebi=5 qci=9 … | dedicated ebi=6 linked=5 qci=7 …`.
+
+No production code was changed for this. The production NAS decoder already
+reads the QCI out of the EPS quality of service, the production S1AP codec
+already round-trips QCI and ARP and the presence or absence of GBR QoS
+Information, and the UE runtime already stores the decoded QCI on the bearer.
+The defect was in the test fixture's inputs and nowhere else.

@@ -201,8 +201,40 @@ when that bearer is restored on a later access.
   retained inventory; the later ones at that same cell use the compact Service
   Request.
 
-The detail, including the generation arithmetic and the measured per-round
-transport, is in `docs/lte-dedicated-bearer-paging-restoration.md`.
+### Dedicated bearer QoS identity
+
+A bearer's QoS is part of the identity that survives a restoration, and the two
+places the network states it must not disagree.
+
+- The NAS EPS quality of service (TS 24.301 §9.9.4.3) is what the UE is sent:
+  QCI and, for an extended form, bitrates. It carries **no ARP**. ARP priority
+  level and the pre-emption capability and vulnerability live in the S1AP E-RAB
+  Level QoS Parameters (TS 36.413 §9.2.1.15) and stay there. Do not add ARP to
+  the EPS QoS sent to the UE and do not drop it from the E-RAB to make the two
+  look alike.
+- GBR and MBR belong to GBR QoS Information (TS 36.413 §9.2.1.18) and are
+  present for a GBR bearer only. A non-GBR QCI must not be given fabricated GBR
+  values, and this project does not implement full GBR bearer support; do not
+  claim otherwise.
+- For the same EBI, the NAS activation and the S1AP E-RAB that establishes or
+  restores it name the **same QCI**. QCI remapping is not universally
+  impossible — roaming and inter-RAT handover can legitimately produce a
+  different value — but a remapping claim needs explicit signalling or
+  configuration evidence. Absent that, for a same-PLMN scripted restoration,
+  do not invent a remapping to excuse a mismatch.
+- Test fixtures state the QCI explicitly, per bearer, and never through a
+  hidden default. `ActivateDedicated` takes the QCI as an argument and a
+  scripted activation list carries one (EBI, QCI) pair per bearer, so a case
+  with two dedicated bearers plays two QCIs and they cannot blur together.
+- A fixture that is backed by a capture must say exactly what was captured. A
+  captured TFT value field is not a captured NAS message: the enclosing
+  activation is constructed in the test, and so is the S1AP E-RAB. Record which
+  is which, and never claim a packet capture or byte-for-byte capture
+  equivalence that does not exist.
+
+The detail, including the generation arithmetic, the measured per-round
+transport and the QoS consistency evidence, is in
+`docs/lte-dedicated-bearer-paging-restoration.md`.
 
 ## What must never be committed
 
