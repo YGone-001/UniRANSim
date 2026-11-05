@@ -6,6 +6,8 @@
 // See README, LICENSE, and CONTRIBUTING files for licensing details.
 //
 
+#include "log_capture.hpp"
+
 #include <ext/doctest/doctest.h>
 
 #include <lte/enb/codec.hpp>
@@ -191,6 +193,17 @@ std::optional<gtpu::Packet> ReceiveS1u(udp::UdpServer &socket)
     if (received <= 0)
         return std::nullopt;
     return gtpu::Decode(buffer, static_cast<size_t>(received));
+}
+
+// Occurrences of `needle` in a captured production log, so a shutdown
+// reporting case can prove the field it wants is present exactly as often as
+// it should be rather than assuming it.
+size_t CountOccurrences(const std::string &text, const std::string &needle)
+{
+    size_t count = 0;
+    for (size_t at = text.find(needle); at != std::string::npos; at = text.find(needle, at + needle.size()))
+        ++count;
+    return count;
 }
 
 } // namespace
@@ -1047,5 +1060,86 @@ TEST_CASE("multi-ue/codec: Downlink NAS Transport test encoder round-trips")
     CHECK(decoded.nasPdu == std::vector<uint8_t>{0x77, 0x55});
     CHECK_THROWS(s1ap::EncodeDownlinkNasTransport(0, 9, {0x77}));
     CHECK_THROWS(s1ap::EncodeDownlinkNasTransport(1, 0, {0x77}));
+}
+
+// ---------------------------------------------------------------------------
+// Shared S1-U shutdown statistics.
+//
+// The retired-TEID drop counter had no reporting surface at all: the shared
+// statistics line named echo, malformed and unknown-teid and stopped there, so
+// a live run could not read back what it had dropped without a debugger. These
+// cases drive the real multiplexer shutdown and assert on what it logged.
+//
+// Each case records its observations into a local and closes the capture
+// before the first assertion runs.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("multi-ue/shutdown: an ordinary shutdown reports the retired-TEID field as zero")
+{
+    std::string log;
+    {
+        lte::test::LogCapture capture;
+        CaptureSender sender;
+        EnbMultiplexer mux(TestEnbConfig(), sender);
+        FakeUe ue(1);
+        AttachUe(mux, ue, 0x111, {127, 0, 0, 9}, 0xA1A1A1A1, {10, 45, 0, 2});
+        mux.shutdown();
+        log = capture.text();
+    }
+
+    // The line kept its prefix and both original fields exactly as they were,
+    // and the new field is present and zero. An ordinary shutdown gains a field
+    // to parse, not a reinterpretation of what it already reported.
+    CHECK(CountOccurrences(log, "Shared S1-U endpoint statistics: echo=0 drops(malformed/unknown-teid)=0/0 "
+                                "drops(retired-teid)=0") == 1);
+    CHECK(CountOccurrences(log, "Shared S1-U endpoint statistics:") == 1);
+    // Nothing was dropped at all here, so no cumulative value is reported.
+    CHECK(CountOccurrences(log, "retired-total") == 0);
+}
+
+TEST_CASE("multi-ue/shutdown: the retired-TEID aggregate agrees with the cumulative warnings")
+{
+    std::string log;
+    bool retired = false;
+    std::vector<lte::ue::link::Message> strayRadio;
+    {
+        lte::test::LogCapture capture;
+        CaptureSender sender;
+        EnbMultiplexer mux(TestEnbConfig(), sender);
+        FakeUe ue(1);
+        FakeSgw sgw("127.0.0.9");
+        AttachUe(mux, ue, 0x111, {127, 0, 0, 9}, 0xA1A1A1A1, {10, 45, 0, 2});
+
+        auto *entry = mux.registry().find(1);
+        const uint32_t staleTeid = entry->bearer.parameters().localTeid;
+        // The access is released through the real registry lifecycle, so the
+        // identifier it carried is genuinely retired rather than merely unused.
+        mux.registry().releaseS1(*entry);
+        retired = staleTeid != 0 && mux.registry().isRetiredTeid(staleTeid);
+
+        // Two delayed G-PDUs for the tunnel this access just retired, over the
+        // real shared socket rather than a shortcut into the handler.
+        SendDownlink(mux, sgw, staleTeid, Ipv4({10, 45, 0, 1}, {10, 45, 0, 2}));
+        SendDownlink(mux, sgw, staleTeid, Ipv4({10, 45, 0, 1}, {10, 45, 0, 2}));
+
+        strayRadio = DrainRadio(ue.radio);
+        mux.shutdown();
+        log = capture.text();
+    }
+
+    REQUIRE(retired);
+    // Nothing reached the UE: these drops are reported, not delivered.
+    CHECK(strayRadio.empty());
+    // The two running warnings carried the count as it stood at each event, and
+    // the shutdown aggregate is the same number they add up to. Both surfaces
+    // read one field, so a live probe can take its delta from either of them.
+    CHECK(CountOccurrences(log, "retired-total=1") == 1);
+    CHECK(CountOccurrences(log, "retired-total=2") == 1);
+    CHECK(CountOccurrences(log, "drops(retired-teid)=2") == 1);
+    // The original fields are byte-preserved, and the unknown counter is still
+    // reported separately rather than folded into the retired one.
+    CHECK(CountOccurrences(log, "Shared S1-U endpoint statistics: echo=0 drops(malformed/unknown-teid)=0/0 "
+                                "drops(retired-teid)=2") == 1);
+    CHECK(CountOccurrences(log, "drops(malformed/unknown-teid)=0/0") == 1);
 }
 

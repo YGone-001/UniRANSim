@@ -259,8 +259,24 @@ A G-PDU whose TEID does not resolve is classified before it is dropped:
   counter of any UE is touched.
 * unknown TEID → `unknownTeidDrops`: a packet that never had a tunnel.
 
+The classification runs **before** the peer check, because there is no active
+bearer whose configured SGW peer could be compared. That order is deliberate
+and is what makes the retired branch reachable from a test-owned injector — and
+it is exactly why such an observation must be labelled
+`LIVE_ENB_RECEIVE_PATH_WITH_TEST_OWNED_INJECTOR` and never presented as proof of
+SGW peer authenticity (§14).
+
 Neither is forwarded, and neither can reach the tunnel a later access opened,
 because that tunnel has a different identifier (§7).
+
+**An evicted tombstone reclassifies.** Once the bounded ledger has aged a record
+out (§7), the identifier is no longer recognisable as retired. A packet naming
+it is still dropped and still reaches no UE, but it is counted as
+`unknownTeidDrops` and is reported as a packet that never had a tunnel. That is
+the documented limit of a bounded observation aid, and the reporting must say
+so rather than claim a retired event that cannot be shown. The counter surfaces
+below reflect exactly that: an evicted identifier produces no `retired-total`
+value at all.
 
 ## 9. End Marker handling
 
@@ -312,6 +328,50 @@ and no state is created on any UE either way.
 | `BearerPacketCounters::endMarkers` | End Markers recognised on this tunnel |
 | `BearerPacketCounters::duplicateEndMarkers` | repeats of one already recognised on this tunnel |
 
+### Runtime reporting surfaces
+
+`retiredTeidDrops` is a **process-lifetime, endpoint-level** counter of the
+shared S1-U endpoint. It is not a per-UE forwarding counter, not a count of
+retired-TEID allocations, not a count of UE Context Releases, not a count of
+End Markers, and not a count of any other drop family. It starts at zero when
+the endpoint is constructed and is never persisted, so it says nothing about a
+previous run. It is incremented exactly once per valid G-PDU whose TEID names a
+still-recorded retired identifier, and it is read from one place: there is no
+second counter.
+
+It is reported on **two surfaces that read that same field**:
+
+| Surface | Form | Emitted |
+|---|---|---|
+| Event level | `Dropped S1-U T-PDU for retired TEID 0xNNNNNNNN retired-total=N` | once per dropped packet, at `WARN` |
+| Aggregate | `Shared S1-U endpoint statistics: echo=… drops(malformed/unknown-teid)=…/… drops(retired-teid)=N` | once, at `INFO`, in `EnbMultiplexer::shutdown()` |
+
+The event-level `N` is the cumulative count **after** that packet's increment,
+so the first retired packet in a process reports `retired-total=1`. The two
+surfaces cannot disagree: both read one field, and no packet is processed
+between the last event and the shutdown line. A discrepancy would be a defect
+in one of the two, not a legitimate state.
+
+**Reconstructing a delta.** A bounded live probe does not need to shut the
+endpoint down to read the counter. Take the cumulative value immediately before
+the window from the last preceding event, or from a known zero if the process
+has emitted none, and the cumulative value immediately after it from the last
+event inside the window; the delta is their difference. Where other retired
+traffic may have occurred earlier in the same lifetime, use the measured prior
+cumulative value rather than assuming zero.
+
+**Event-to-counter matching.** The warning names the TEID in the same
+zero-padded uppercase hexadecimal form the counters use, so an event can be
+matched to a specific arrival by TEID, timestamp, capture and controlled test
+interval. A cumulative value printed in a log is not, by itself, proof that the
+packet reached the real S1-U socket (§14).
+
+**Compatibility surface.** The warning prefix `Dropped S1-U T-PDU for retired
+TEID ` and the pre-existing shutdown fields
+`Shared S1-U endpoint statistics: echo=… drops(malformed/unknown-teid)=…/…` are
+matched by CI assertions and by historical diagnostics. Append to them; never
+rewrite or reorder them.
+
 ## 12. Source files
 
 | File | Role |
@@ -342,10 +402,23 @@ code a bearer runs: `TeidSequence` is the sequence `AllocateLocalTeid()`
 itself instantiates, and the ledger capacity is a constructor parameter that
 only a test lowers.
 
-Line coverage of these four source files is 93.7% (612 of 653 lines). What is
+Line coverage of these four source files is 93.9% (614 of 654 lines). What is
 left uncovered is either pre-existing error handling outside this record, the
 `default:` dispatch branch that the message-type whitelist makes unreachable,
 or defensive early returns that no public call can reach.
+
+The runtime reporting surfaces (§11) are covered by six deterministic cases
+under `lte/gtpu/observability:` in `test/lte/gtpu_end_marker.cpp` and two under
+`multi-ue/shutdown:` in `test/lte/multi_ue.cpp`. The six endpoint cases drive
+`S1uEndpoint::handleDatagram` against loopback UDP endpoints and pin, one
+packet at a time: the cumulative form of the event-level value on a single
+drop; monotonic accumulation across repeated drops; the separation of an
+unknown TEID from a retired one; the fact that a malformed datagram advances
+neither count; the fact that an active bearer is undisturbed and reports
+nothing; and the reclassification of an evicted tombstone as unknown rather
+than retired. The two shutdown cases run the real `EnbMultiplexer` and pin both
+the exact aggregate line form and the agreement of `drops(retired-teid)=N` with
+the `retired-total=N` values of the same process lifetime.
 
 Existing suites (`test/lte/multi_ue.cpp`, `test/lte/restoration.cpp`,
 `test/lte/modify.cpp`, `test/lte/user_plane.cpp`) cover the bearer lifecycle
@@ -374,3 +447,18 @@ and the TEID-index invariants this record relies on.
 * **No live-lab End Marker claim.** Whether a genuine Open5GS End Marker is
   observed in a given live capture is recorded per capture and is not implied
   by this record.
+* **A cumulative log value is not live rejection evidence.** `retired-total=N`
+  and `drops(retired-teid)=N` report what this process counted; they do not
+  establish that any particular packet reached the real S1-U socket. The
+  deterministic cases in §13 inject through a test-owned injector and prove the
+  receive path's classification and accounting; a live run that produces the
+  same lines proves the same counting, and neither is a live rejection result.
+  Establishing that a packet arrived at the real receiver and was refused there
+  needs a separately authorized probe and matching capture evidence, which is
+  deliberately not part of this record and must not be claimed from a counter
+  or a log line.
+* **The counters are process-lifetime only.** Neither surface is persisted, so
+  neither says anything about a previous run. Delta reconstruction (§11) is
+  valid only within one lifetime: where other retired traffic may have occurred
+  earlier in that lifetime, the prior cumulative value must be read rather than
+  assumed to be zero.

@@ -163,7 +163,11 @@ void S1uEndpoint::handleGPdu(const gtpu::Packet &packet, const InetAddress &peer
         if (m_registry.isRetiredTeid(packet.teid))
         {
             ++m_counters.retiredTeidDrops;
-            Log("WARN", "Dropped S1-U T-PDU for retired TEID " + Hex(packet.teid, 8));
+            // The cumulative count is reported from the same field the
+            // deterministic tests read, so a live run can reconstruct the delta
+            // of a bounded probe without shutting the endpoint down to read it.
+            Log("WARN", "Dropped S1-U T-PDU for retired TEID " + Hex(packet.teid, 8) +
+                            " retired-total=" + std::to_string(m_counters.retiredTeidDrops));
             return;
         }
         ++m_counters.unknownTeidDrops;

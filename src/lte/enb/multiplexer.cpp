@@ -1305,7 +1305,13 @@ void EnbMultiplexer::shutdown()
     }
     Log("INFO", "Shared S1-U endpoint statistics: echo=" + std::to_string(m_s1u.counters().echoRequests) +
                     " drops(malformed/unknown-teid)=" + std::to_string(m_s1u.counters().malformedDrops) + "/" +
-                    std::to_string(m_s1u.counters().unknownTeidDrops));
+                    std::to_string(m_s1u.counters().unknownTeidDrops) +
+                    // Appended rather than merged into the pair above: an
+                    // unknown TEID and a retired one are different events and
+                    // the two counts must never be conflated or summed. This is
+                    // the same field the per-event warning reports, so the two
+                    // surfaces agree for one process lifetime.
+                    " drops(retired-teid)=" + std::to_string(m_s1u.counters().retiredTeidDrops));
     Log("INFO", "S1AP Paging statistics: received=" + std::to_string(m_paging.received) +
                     " valid=" + std::to_string(m_paging.valid) + " invalid=" + std::to_string(m_paging.invalid) +
                     " cs-domain=" + std::to_string(m_paging.csDomainIgnored) +

@@ -420,8 +420,14 @@ block per UE on shutdown:
 ```text
 User-plane statistics for LTE UE 1: radio-ul=… s1u-ul=… s1u-dl=… drops(…)=…
 User-plane statistics for LTE UE 2: radio-ul=… s1u-ul=… s1u-dl=… drops(…)=…
-Shared S1-U endpoint statistics: echo=… drops(malformed/unknown-teid)=…
+Shared S1-U endpoint statistics: echo=… drops(malformed/unknown-teid)=…/… drops(retired-teid)=…
 ```
+
+The shared line is endpoint-level and covers the whole process lifetime, not
+per-UE forwarding. The `malformed` and `unknown-teid` fields are a pair in that
+order and are never summed with the retired-TEID field: a retired TEID, an
+unknown TEID and a malformed datagram are three different events and each keeps
+its own count. See `docs/gtpu-end-marker-retired-tunnel-lifecycle.md` §11.
 
 Lifecycle isolation is verified the same way: detaching UE A (its Detach
 Request accepted, bearer released, TUN closed, TEID invalidated) must leave

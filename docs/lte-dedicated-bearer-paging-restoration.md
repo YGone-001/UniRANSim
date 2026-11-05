@@ -513,14 +513,23 @@ chain is unbroken across the session.
   the receive path. Any future probe sent from a test-owned socket must be
   labelled `LIVE_ENB_RECEIVE_PATH_WITH_TEST_OWNED_INJECTOR` and must not be
   described as proof of SGW peer authenticity.
-* **`S1uEndpointCounters::retiredTeidDrops` has no runtime reporting surface.**
-  It is declared in `s1u_endpoint.hpp`, incremented on the retired branch of
-  `handleGPdu`, and asserted in-process by the deterministic tests — but the
-  shared S1-U statistics line prints `malformed` and `unknown-teid` only. The
-  drop is logged with its own distinct message, so the classification is
-  observable live; the numeric counter delta required to prove the counter moved
-  is not. This is an observability gap in the reporting surface, not a
-  functional defect, and it does not affect the acceptance of Phase 16 or 17.
+* **`S1uEndpointCounters::retiredTeidDrops` has no runtime reporting surface**
+  — **this finding is historical and is now resolved.** At the time of the
+  Phase 17-C campaign the counter was declared in `s1u_endpoint.hpp`, incremented
+  on the retired branch of `handleGPdu`, and asserted in-process by the
+  deterministic tests — but the shared S1-U statistics line printed `malformed`
+  and `unknown-teid` only. The drop was logged with its own distinct message, so
+  the classification was observable live; the numeric counter delta required to
+  prove the counter moved was not. That was an observability gap in the
+  reporting surface, not a functional defect, and it did not affect the
+  acceptance of Phase 16 or 17. **Retired-TEID runtime observability
+  prerequisite resolved; live active rejection remains
+  `BLOCKED_AUTHORIZATION`.** The counter now has two surfaces reading one field —
+  `retired-total=N` appended to the retired-drop warning and
+  `drops(retired-teid)=N` appended to the shared shutdown line — as recorded in
+  `docs/gtpu-end-marker-retired-tunnel-lifecycle.md` §11. Resolving the
+  observability prerequisite does not itself close B-G17, which remains
+  `PARTIAL`, and it is not a live rejection result (§ "Limitations" below).
 * **Capture windows are not identical.** One control probe fell outside the
   GTP-U capture's window and is evidenced only at the UE TUN. Silence is not
   evidence: the absent frame is a capture-scope fact and proves nothing about
@@ -554,7 +563,11 @@ rather than substituting a deterministic result for it.
   restarts.
 * **Retired-tunnel isolation has no live positive probe.** The deterministic
   suite proves the drop-and-classify path; no live G-PDU has been sent against a
-  retired identifier, so no live rejection is claimed.
+  retired identifier, so no live rejection is claimed. The runtime
+  observability of `retiredTeidDrops` is now in place, so a later authorized
+  probe can measure the counter delta across a bounded window without shutting
+  the endpoint down — but the counter surface is a measurement instrument, not
+  the probe, and it is not evidence of a live rejection on its own.
 
 ## 14. Dedicated Bearer QoS Consistency and Evidence Provenance
 

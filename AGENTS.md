@@ -147,6 +147,20 @@ a safety boundary. These rules are what a change must not weaken.
 - A G-PDU whose TEID does not resolve is dropped and classified: retired TEID
   is traffic that outlived its tunnel, unknown TEID is a packet that never had
   one. Neither may create or disturb any bearer or UE state.
+- That classification is observable at runtime. `retiredTeidDrops` is a
+  **process-lifetime endpoint-level** counter of the shared S1-U endpoint, not
+  a per-UE forwarding counter, and it is reported on two surfaces that read the
+  same field: the cumulative value is appended to the retired-drop warning as
+  `retired-total=N`, and the aggregate is appended to the shared shutdown line
+  as `drops(retired-teid)=N`. Unknown, malformed, evicted-tombstone and
+  unexpected-peer cases must stay distinguishable from it and from each other,
+  and none may borrow another's count. The warning prefix and the pre-existing
+  shutdown fields are fixed compatibility surface: append to them, never
+  rewrite them, because CI and historical diagnostics match on them.
+  A cumulative log value alone is **not** proof that a specific packet reached
+  the real S1-U receiver. Establishing that needs a separately authorized probe
+  and matching capture evidence; deterministic or logged evidence is not a live
+  rejection result.
 - Peer identity is validated per bearer against `sgwAddress:2152` before
   anything else happens, for control messages as well as for G-PDUs. Do not
   move that check after a state change.

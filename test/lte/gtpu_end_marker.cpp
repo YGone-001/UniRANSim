@@ -6,6 +6,8 @@
 // See README, LICENSE, and CONTRIBUTING files for licensing details.
 //
 
+#include "log_capture.hpp"
+
 #include <ext/doctest/doctest.h>
 
 #include <lte/enb/gtpu.hpp>
@@ -153,6 +155,30 @@ struct Lab
         return ue.Receive(buffer.data(), buffer.size(), 0, peer) > 0;
     }
 };
+
+// Occurrences of `needle` in a captured production log. The observability cases
+// use it to prove that exactly one warning was emitted per dropped packet
+// rather than assuming it.
+size_t Occurrences(const std::string &text, const std::string &needle)
+{
+    size_t count = 0;
+    for (size_t at = text.find(needle); at != std::string::npos; at = text.find(needle, at + needle.size()))
+        ++count;
+    return count;
+}
+
+// Every cumulative value the production retired-TEID warning reported, in the
+// order it reported them. The value is parsed out of what the real code logged;
+// it is never read back from the counter it was printed from, so a case can
+// show that the two agree instead of assuming they must.
+std::vector<uint64_t> ReportedRetiredTotals(const std::string &text)
+{
+    const std::string key = "retired-total=";
+    std::vector<uint64_t> totals;
+    for (size_t at = text.find(key); at != std::string::npos; at = text.find(key, at + key.size()))
+        totals.push_back(std::stoull(text.substr(at + key.size())));
+    return totals;
+}
 
 } // namespace
 
@@ -1631,4 +1657,270 @@ TEST_CASE("lte/enb/retired-teid: the registry refuses an unusable allocator and 
     CHECK_THROWS_AS(lab.registry.bindLocalTeid(entry, 0x0000F002U), lte::enb::RegistryError);
     CHECK(lab.registry.findBearerByLocalTeid(0x0000F001U).bearer == &entry.bearer);
     CHECK(lab.registry.findBearerByLocalTeid(0x0000F002U).bearer == nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// Runtime observability of the retired-TEID drop counter.
+//
+// The counter was always correct and was always asserted in process. What was
+// missing was any runtime surface for it: an operator, and therefore a bounded
+// live acceptance campaign, could not read it without shutting the endpoint
+// down. These cases drive the real datagram path and assert on what the
+// production code actually logged, so the reporting format is proven by
+// generation rather than by assembling an expected string and comparing it.
+//
+// Each case records its observations into locals and closes the capture before
+// the first assertion runs, so a failed check can never print into the captured
+// buffer and become invisible.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("lte/gtpu/observability: one retired-TEID drop reports a cumulative total of one")
+{
+    std::string log;
+    lte::enb::S1uEndpointCounters counters{};
+    bool retired = false;
+    bool ueGotPacket = true;
+    {
+        lte::test::LogCapture capture;
+        Lab lab;
+        auto &entry = lab.attach(1, lab.ueA.LocalAddress(), 0x00009001U);
+        lab.registry.releaseS1(entry);
+        retired = lab.registry.isRetiredTeid(0x00009001U);
+
+        const auto downlink = Ipv4({10, 45, 0, 1}, {10, 45, 0, 1});
+        const auto wire = GPduWire(0x00009001U, downlink);
+        lab.s1u.handleDatagram(wire.data(), wire.size(), Lab::SgwPeer());
+
+        counters = lab.s1u.counters();
+        ueGotPacket = lab.ueReceived(lab.ueA);
+        log = capture.text();
+    }
+
+    // The access was released through the real registry lifecycle and the
+    // identifier is retired, so the packet above is the event under test.
+    REQUIRE(retired);
+    // One retired event moves the counter from 0 to 1 and leaves the other two
+    // drop families where they were.
+    CHECK(counters.retiredTeidDrops == 1);
+    CHECK(counters.unknownTeidDrops == 0);
+    CHECK(counters.malformedDrops == 0);
+    CHECK_FALSE(ueGotPacket);
+    // The warning kept its prefix and its hexadecimal TEID and now carries the
+    // cumulative count read from the very field the counter is.
+    CHECK(Occurrences(log, "Dropped S1-U T-PDU for retired TEID 0x00009001 retired-total=1") == 1);
+    CHECK(Occurrences(log, "Dropped S1-U T-PDU for retired TEID") == 1);
+    const auto totals = ReportedRetiredTotals(log);
+    REQUIRE(totals.size() == 1);
+    CHECK(totals[0] == 1);
+}
+
+TEST_CASE("lte/gtpu/observability: repeated retired-TEID drops accumulate monotonically")
+{
+    std::string log;
+    lte::enb::S1uEndpointCounters counters{};
+    bool retired = false;
+    bool ueAGotPacket = true;
+    bool ueBGotPacket = true;
+    {
+        lte::test::LogCapture capture;
+        Lab lab;
+        auto &entry = lab.attach(1, lab.ueA.LocalAddress(), 0x0000A001U);
+        lab.registry.releaseS1(entry);
+        retired = lab.registry.isRetiredTeid(0x0000A001U);
+        // A second UE stays live throughout, so a misrouted drop would show up
+        // as traffic on a tunnel the packet never named.
+        lab.attach(2, lab.ueB.LocalAddress(), 0x0000A002U);
+
+        const auto downlink = Ipv4({10, 45, 0, 1}, {10, 45, 0, 2});
+        const auto wire = GPduWire(0x0000A001U, downlink);
+        lab.s1u.handleDatagram(wire.data(), wire.size(), Lab::SgwPeer());
+        lab.s1u.handleDatagram(wire.data(), wire.size(), Lab::SgwPeer());
+
+        counters = lab.s1u.counters();
+        ueAGotPacket = lab.ueReceived(lab.ueA);
+        ueBGotPacket = lab.ueReceived(lab.ueB);
+        log = capture.text();
+    }
+
+    REQUIRE(retired);
+    CHECK(counters.retiredTeidDrops == 2);
+    CHECK(counters.unknownTeidDrops == 0);
+    CHECK(counters.malformedDrops == 0);
+    CHECK_FALSE(ueAGotPacket);
+    CHECK_FALSE(ueBGotPacket);
+    // Exactly one warning per dropped packet, and the totals they carry are the
+    // running count in order rather than a constant repeated twice.
+    CHECK(Occurrences(log, "Dropped S1-U T-PDU for retired TEID 0x0000A001 retired-total=1") == 1);
+    CHECK(Occurrences(log, "Dropped S1-U T-PDU for retired TEID 0x0000A001 retired-total=2") == 1);
+    const auto totals = ReportedRetiredTotals(log);
+    REQUIRE(totals.size() == 2);
+    CHECK(totals[0] == 1);
+    CHECK(totals[1] == 2);
+}
+
+TEST_CASE("lte/gtpu/observability: an unknown TEID is reported apart from a retired one")
+{
+    std::string log;
+    lte::enb::S1uEndpointCounters counters{};
+    bool retired = false;
+    bool neverIssued = true;
+    {
+        lte::test::LogCapture capture;
+        Lab lab;
+        auto &entry = lab.attach(1, lab.ueA.LocalAddress(), 0x00009101U);
+        lab.registry.releaseS1(entry);
+        retired = lab.registry.isRetiredTeid(0x00009101U);
+        neverIssued = !lab.registry.isRetiredTeid(0x00009102U) &&
+                      lab.registry.findBearerByLocalTeid(0x00009102U).entry == nullptr;
+
+        const auto downlink = Ipv4({10, 45, 0, 1}, {10, 45, 0, 1});
+        // A retired drop first, so a contamination would show against a
+        // non-zero retired count instead of hiding behind a zero that cannot
+        // move either way.
+        const auto stale = GPduWire(0x00009101U, downlink);
+        lab.s1u.handleDatagram(stale.data(), stale.size(), Lab::SgwPeer());
+        // A TEID this process never issued and never retired.
+        const auto stranger = GPduWire(0x00009102U, downlink);
+        lab.s1u.handleDatagram(stranger.data(), stranger.size(), Lab::SgwPeer());
+
+        counters = lab.s1u.counters();
+        log = capture.text();
+    }
+
+    REQUIRE(retired);
+    REQUIRE(neverIssued);
+    CHECK(counters.unknownTeidDrops == 1);
+    CHECK(counters.retiredTeidDrops == 1);
+    CHECK(counters.malformedDrops == 0);
+    // Each family produced its own message and neither borrowed the other's
+    // count: the unknown drop is not reported as a retired event at all.
+    CHECK(Occurrences(log, "Dropped S1-U T-PDU with unknown/stale TEID 0x00009102") == 1);
+    CHECK(Occurrences(log, "Dropped S1-U T-PDU for retired TEID") == 1);
+    const auto totals = ReportedRetiredTotals(log);
+    REQUIRE(totals.size() == 1);
+    CHECK(totals[0] == 1);
+}
+
+TEST_CASE("lte/gtpu/observability: a malformed datagram advances no retired or unknown count")
+{
+    std::string log;
+    lte::enb::S1uEndpointCounters counters{};
+    bool retired = false;
+    bool ueGotPacket = true;
+    {
+        lte::test::LogCapture capture;
+        Lab lab;
+        auto &entry = lab.attach(1, lab.ueA.LocalAddress(), 0x00009201U);
+        lab.registry.releaseS1(entry);
+        retired = lab.registry.isRetiredTeid(0x00009201U);
+
+        // Truncated below the eight-octet mandatory header, so the codec
+        // refuses it before any TEID can be read and no drop family above can
+        // be chosen.
+        const std::vector<uint8_t> truncated{0x30, 0xFF, 0x00, 0x01};
+        lab.s1u.handleDatagram(truncated.data(), truncated.size(), Lab::SgwPeer());
+
+        counters = lab.s1u.counters();
+        ueGotPacket = lab.ueReceived(lab.ueA);
+        log = capture.text();
+    }
+
+    REQUIRE(retired);
+    CHECK(counters.malformedDrops == 1);
+    CHECK(counters.retiredTeidDrops == 0);
+    CHECK(counters.unknownTeidDrops == 0);
+    CHECK_FALSE(ueGotPacket);
+    CHECK(Occurrences(log, "Dropped malformed S1-U datagram") == 1);
+    // No retired event, so no cumulative value is reported at all.
+    CHECK(Occurrences(log, "retired-total") == 0);
+}
+
+TEST_CASE("lte/gtpu/observability: an active bearer is undisturbed and counts nothing retired")
+{
+    std::string log;
+    lte::enb::S1uEndpointCounters counters{};
+    long downlinkAfterBoth = 0;
+    bool ueGotFirst = true;
+    bool ueGotSecond = true;
+    bool bearerStillActive = false;
+    {
+        lte::test::LogCapture capture;
+        Lab lab;
+        auto &entry = lab.attach(1, lab.ueA.LocalAddress(), 0x00009301U);
+
+        const auto downlink = Ipv4({10, 45, 0, 1}, {10, 45, 0, 1});
+        // The positive control: a valid downlink from the bearer's own
+        // configured SGW peer really is delivered.
+        const auto good = GPduWire(0x00009301U, downlink);
+        lab.s1u.handleDatagram(good.data(), good.size(), Lab::SgwPeer());
+        ueGotFirst = lab.ueReceived(lab.ueA);
+
+        // The same live TEID from a peer that is not its SGW. That is the
+        // unexpected-peer branch, which is about the source and not about the
+        // identifier, so it must not be reported as a retired-TEID drop.
+        const InetAddress stranger{"127.0.0.8", 2152};
+        const auto bad = GPduWire(0x00009301U, downlink);
+        lab.s1u.handleDatagram(bad.data(), bad.size(), stranger);
+
+        counters = lab.s1u.counters();
+        ueGotSecond = lab.ueReceived(lab.ueA);
+        downlinkAfterBoth = static_cast<long>(entry.counters.s1uDownlinkPackets);
+        bearerStillActive = entry.bearer.active();
+        log = capture.text();
+    }
+
+    CHECK(ueGotFirst);
+    CHECK(downlinkAfterBoth == 1);
+    CHECK(bearerStillActive);
+    // The wrong-peer packet is refused by the peer check and reaches no UE, and
+    // neither drop is credited to the retired counter.
+    CHECK_FALSE(ueGotSecond);
+    CHECK(counters.retiredTeidDrops == 0);
+    CHECK(counters.unknownTeidDrops == 0);
+    CHECK(counters.malformedDrops == 0);
+    CHECK(Occurrences(log, "Dropped S1-U datagram from unexpected peer") == 1);
+    CHECK(Occurrences(log, "retired-total") == 0);
+}
+
+TEST_CASE("lte/gtpu/observability: an evicted tombstone is reported as unknown and never as retired")
+{
+    std::string log;
+    lte::enb::S1uEndpointCounters counters{};
+    bool evicted = false;
+    bool ueGotPacket = true;
+    {
+        lte::test::LogCapture capture;
+        // A ledger of one record, so the second retirement evicts the first
+        // tombstone exactly as the production bound does.
+        Lab lab(1);
+        auto &entryA = lab.attach(1, lab.ueA.LocalAddress(), 0x0000B101U);
+        lab.registry.releaseS1(entryA);
+        auto &entryB = lab.attach(2, lab.ueB.LocalAddress(), 0x0000B102U);
+        lab.registry.releaseS1(entryB);
+        evicted = !lab.registry.isRetiredTeid(0x0000B101U) && lab.registry.retiredTeids().evictions() == 1;
+
+        // A new tunnel on the same radio endpoint, so a leak would have
+        // somewhere to go.
+        lab.registry.remove(entryA);
+        lab.attach(3, lab.ueA.LocalAddress(), 0x0000B103U);
+
+        const auto downlink = Ipv4({10, 45, 0, 1}, {10, 45, 0, 3});
+        const auto stale = GPduWire(0x0000B101U, downlink);
+        lab.s1u.handleDatagram(stale.data(), stale.size(), Lab::SgwPeer());
+
+        counters = lab.s1u.counters();
+        ueGotPacket = lab.ueReceived(lab.ueA);
+        log = capture.text();
+    }
+
+    REQUIRE(evicted);
+    // The record that distinguished this identifier from a never-issued one has
+    // aged out, so the packet is reported as one that never had a tunnel. That
+    // is the documented limit of a bounded observation aid, and the reporting
+    // must say so rather than claim a retired event that cannot be shown.
+    CHECK(counters.unknownTeidDrops == 1);
+    CHECK(counters.retiredTeidDrops == 0);
+    CHECK_FALSE(ueGotPacket);
+    CHECK(Occurrences(log, "Dropped S1-U T-PDU with unknown/stale TEID 0x0000B101") == 1);
+    CHECK(Occurrences(log, "retired-total") == 0);
 }
