@@ -243,17 +243,35 @@ moves exactly one packet per direction per bearer, and the running totals read
 1/1, 2/2, 3/3. A fresh TEID is not credited with traffic it never carried, and
 the bearer's lifetime total is not reset by an access release.
 
-### SGW-side TEIDs are not measured here
+### SGW-side TEIDs are constant across access restorations
 
 The three-round privileged case delivers a different SGW-side TEID on every
 round (`0x1E`/`0x1F`/`0x20` for the default and `0x24`/`0x25`/`0x26` for the
 dedicated), but those values are **authored by the test** in the E-RAB items.
-That is not a measurement of a real SGW.
+They are not a measurement of a real SGW and say nothing about what one does.
 
 Phase 15's live campaign observed a **constant** SGW-TEID `0x0000AF88` across
-three restorations. Whether a real SGW changes its downlink TEID when only the
-access transport is restored is therefore **not determined by this phase** and
-must not be read off either result as a property of the EPC.
+three restorations of a default bearer.
+
+Phase 17-B then measured it directly against live Open5GS, with a dedicated
+bearer present, across three Paging-triggered restorations after a single
+registration. The SGW-side S1-U TEID was **constant** for the whole session:
+
+| | establishment | round 1 | round 2 | round 3 |
+|---|---|---|---|---|
+| default bearer SGW-TEID | `0x0000DA40` | `0x0000DA40` | `0x0000DA40` | `0x0000DA40` |
+| dedicated bearer SGW-TEID | `0x000037F6` | `0x000037F6` | `0x000037F6` | `0x000037F6` |
+| default bearer eNB-TEID | `0x4D40293D` | `0x4D40293F` | `0x4D402941` | `0x4D402943` |
+| dedicated bearer eNB-TEID | `0x4D40293E` | `0x4D402940` | `0x4D402942` | `0x4D402944` |
+
+So the two ends do not move together. The eNB-side pair is fresh on every
+restoration, exactly as the allocator contract above requires. The SGW-side
+identifier is the bearer's, not the access's, and survives every access release
+for the life of the bearer. That is what the S5/S8-U side shows too: its TEIDs
+are stable for the same reason.
+
+This is a property of the measured implementation, not a claim about every EPC.
+A phase that needs a different behaviour has to measure it again.
 
 ## 9. Generation-bound readiness
 
@@ -398,39 +416,59 @@ skipped run cannot be mistaken for a pass.
 
 ## 13. Live Open5GS evidence and its limitations
 
-**No live Open5GS dedicated multi-round campaign was run in this phase.**
-
-The three-round behaviour described above is proven by a privileged TUN
+The three-round behaviour described above was first proven by a privileged TUN
 integration against a scripted network peer and a test SGW endpoint. That peer
 builds the S1AP messages the production code consumes and terminates the GTP-U
-tunnels; it is not the Open5GS MME, SGW or PCRF. Nothing here is a live EPC
-result, and the deterministic and privileged evidence must not be reported as
-one.
+tunnels; it is not the Open5GS MME, SGW or PCRF. That deterministic and
+privileged evidence is what the code is written against and is still the
+regression bar. It was never a live EPC result.
 
-The one live result this record leans on is from an earlier phase and is
-narrower than this scenario: a real Open5GS Paging-driven restoration of a
-default bearer across three access epochs, which is where the constant SGW-TEID
-`0x0000AF88` observation comes from (§8). It did not involve a dedicated bearer
-and is not evidence for one.
+A live Open5GS dedicated multi-round campaign has since been run under
+separate, explicit PCC authorization, and produced the following. Each line is
+what the live trace showed, not what the test suite asserts:
+
+* One EPS registration and **three** genuine S1AP UE Context Release
+  procedures (`user-inactivity` Request, Command, Complete), each opening an
+  ECM-IDLE epoch. No round re-Attached and there was no reauthentication.
+* One real network-created dedicated EPS bearer: EBI 6, linked to EBI 5, QCI 7
+  on **both** the NAS and the S1AP side, with the two-filter UDP TFT, activated
+  once and retained across all three releases.
+* Three MME-initiated Pagings addressed to this UE's own S-TMSI, each answered
+  by exactly one protected EPS Service Request bearing the security context
+  from the original Attach (same KSI, distinct short MACs).
+* Three restorations, each restoring **both** E-RABs, and each carrying
+  independent bidirectional user-plane traffic on both bearers.
+* The SGW-side TEID measurement in §8.
+
+Two things the live campaign did **not** establish, and which must not be
+filled in from the deterministic results:
+
+* **The answer form was the compact Service Request in all three rounds**, not
+  the bearer-inventory form in round 1. That is the correct form here: the cell
+  had already confirmed the bearer roles during the initial Attach, so
+  `MobilityContext::accessBootstrap` was `ROLES_RETAINED` before the first
+  page. A cell that has never confirmed the roles still needs the inventory.
+  The form is a property of confirmed role ownership, never of a round number.
+* **Retired-tunnel isolation was not probed live.** No G-PDU was injected, so
+  no rejection of a retired identifier is claimed from this campaign.
 
 Creating a live dedicated bearer requires a PCC rule on the subscriber, and
-that is separately authorization-gated. The authorization used by an earlier
-phase was spent and rolled back; it is not standing authorization. Without a
-fresh, explicit authorization naming the subscriber, the APN/session, the rule
-scope, the backup procedure, the rollback and the verification, no PCC rule is
-applied or reapplied, no PCRF or HSS data is touched, and no live dedicated
-bearer is created. The live gate is therefore recorded as
-**`BLOCKED_AUTHORIZATION`** rather than as a pass.
+that is separately authorization-gated. An authorization is spent once used and
+is not standing authorization. Without a fresh, explicit authorization naming
+the subscriber, the APN/session, the rule scope, the backup procedure, the
+rollback and the verification, no PCC rule is applied or reapplied, no PCRF or
+HSS data is touched, and no live dedicated bearer is created. Any campaign that
+finds itself in that position records the live gate as **`BLOCKED_AUTHORIZATION`**
+rather than substituting a deterministic result for it.
 
 ### Limitations
 
 * **The network peer is a test peer.** Message timing, retransmission policy,
   MME state machine quirks and SGW behaviour are not exercised beyond what the
-  peer scripts.
-* **SGW-side TEID behaviour across restorations is not measured** (§8).
+  peer scripts, and the live campaign covers one EPC build, not all of them.
 * **Only one dedicated bearer per round.** A session with several dedicated
-  bearers is supported by the same code paths but is not what the three-round
-  case exercises.
+  bearers is supported by the same code paths but is not what either the
+  three-round case or the live campaign exercises.
 * **The TFT is one real vector.** Other filter shapes, precedence conflicts and
   operation codes are covered by the TFT decode suite, not by the three-round
   case.
@@ -440,8 +478,9 @@ bearer is created. The live gate is therefore recorded as
   design.
 * **TEID uniqueness is process-lifetime only.** Nothing is persisted across
   restarts.
-* **No live campaign, no live capture, no live TEID table.** Anything of that
-  kind is absent, not pending measurement.
+* **Retired-tunnel isolation has no live positive probe.** The deterministic
+  suite proves the drop-and-classify path; no live G-PDU has been sent against a
+  retired identifier, so no live rejection is claimed.
 
 ## 14. Dedicated Bearer QoS Consistency and Evidence Provenance
 
@@ -528,3 +567,49 @@ reads the QCI out of the EPS quality of service, the production S1AP codec
 already round-trips QCI and ARP and the presence or absence of GBR QoS
 Information, and the UE runtime already stores the decoded QCI on the bearer.
 The defect was in the test fixture's inputs and nowhere else.
+
+11. **What live Open5GS does to a non-GBR rule that names a rate.** A real PCC
+    rule for a non-GBR QCI must carry **no `mbr` and no `gbr` at all**. Naming
+    one without the other makes the real MME advertise a QoS combination this
+    eNB has to refuse.
+
+    The mechanism, in Open5GS's own code: `mme-s11-handler.c` runs its bitrate
+    clamp whenever **any** of the four bitrate components is non-zero, and
+    raises every zero component to `OGS_MAX_BITRATE_S1AP` (10 Gbps).
+    `s1ap-build.c` then emits `gbrQosInformation` whenever **all four** are
+    non-zero. A rule carrying `mbr` 200 kbps and no `gbr` therefore leaves the
+    MME advertising `e-RAB-GuaranteedBitrateDL/UL` = 10 Gbps against
+    `e-RAB-MaximumBitrateDL/UL` = 200 kbps.
+
+    Measured on the live EPC, and this is the whole failure, in two messages:
+
+    ```
+    E-RABSetupRequest  (e-RAB-ID 6)
+        e-RABlevelQoSParameters
+            qCI: 7
+            allocationRetentionPriority  priorityLevel 8, shall-not-trigger-
+                pre-emption, not-pre-emptable
+            gbrQosInformation
+                e-RAB-MaximumBitrateDL/UL     200000 bits/s
+                e-RAB-GuaranteedBitrateDL/UL  10000000000 bits/s
+    E-RABSetupResponse
+        Cause: radioNetwork/invalid-qos-combination
+    ```
+
+    The NAS EPS quality of service in the same request disagreed with that
+    anyway — an extended-2 form giving 200 kbps MBR against 8 640 kbps /
+    256 Mbps / 10 000 Mbps GBR — so the two places the network states one
+    bearer's QoS were not even the same fabrication.
+
+    The refusal is correct and was kept. `ErabQos::valid()` requires
+    `guaranteedDl <= maximumDl` and `guaranteedUl <= maximumUl`, and
+    AGENTS.md requires that a non-GBR QCI be given no fabricated GBR values.
+    Nothing was relaxed to make the bearer come up.
+
+    With **both** bitrate fields absent the clamp is skipped, the
+    `gbrQosInformation` IE is not emitted at all, and the NAS EPS quality of
+    service takes its basic one-octet QCI-only form. That is the shape this
+    record already calls correct for QCI 7, and it is what a live campaign must
+    request of its policy rule. This is a rule of the *laboratory policy*, not
+    a change to production code; the production QoS validation is what caught
+    it.

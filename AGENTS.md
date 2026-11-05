@@ -277,6 +277,15 @@ The LTE path can be driven against a real Open5GS EPC. When it is:
   or touch any other subscriber's rules. Root privileges are not authorization.
   When the authorization is absent, record the live gate as blocked and say so;
   do not substitute a deterministic or local result for it.
+- A temporary PCC rule for a non-GBR QCI must carry **neither `mbr` nor
+  `gbr`**. Naming one without the other makes Open5GS raise the absent one to
+  `OGS_MAX_BITRATE_S1AP` (10 Gbps) while leaving the named one alone, so the
+  E-RAB Level QoS Parameters advertise a guaranteed bitrate above the maximum
+  bitrate and the eNB must refuse them as `invalid-qos-combination`. Both
+  fields absent is the conformant shape for a non-GBR QCI: no GBR QoS
+  Information and a basic QCI-only NAS EPS quality of service. This is a rule
+  about the laboratory policy document; do not relax production QoS validation
+  to accommodate a rule that breaks it.
 - Subscriber provisioning, `maxUes`, and throughput benchmarking are outside
   the scope of ordinary development work.
 
