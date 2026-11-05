@@ -452,6 +452,80 @@ filled in from the deterministic results:
 * **Retired-tunnel isolation was not probed live.** No G-PDU was injected, so
   no rejection of a retired identifier is claimed from this campaign.
 
+### The three rounds at frame level
+
+A later read-only reconciliation decoded the campaign's own captures and
+established each round against specific frames. The methodology matters more
+than the numbers, because it is what makes the numbers checkable.
+
+**Separate the establishment from the restorations.** The establishment is one
+Attach, one Initial Context Setup carrying the **default** bearer, and then a
+**separate E-RAB Setup** carrying the dedicated bearer. Each restoration is
+different: it re-establishes **both** E-RABs inside a **single** Initial Context
+Setup, and never re-Attaches. So an E-RAB Setup for EBI 6 appears exactly once
+in the session, at establishment, and the three restorations carry EBI 5 and
+EBI 6 together.
+
+**Establish the association first.** The capture was taken at the MME, so it
+contains every eNB's association. Ours is `10.10.0.139:34533 ↔ 10.10.0.139:36412`;
+the pre-existing cell at `10.10.0.138:36412` shares the TAI and contributes its
+own attaches and restorations on a disjoint TEID series and with different
+QCIs. Every claim must be scoped to one association before any frame number
+means anything. Paging makes this sharp: **each Paging is transmitted twice**,
+one copy per eNB serving the TAI, so a paging event appears as an adjacent frame
+pair and only the copy addressed to our association is ours.
+
+**Two bridges join the S1AP and GTP-U captures, and they must agree.** Relative
+times cannot be joined — the captures do not share a zero point. First, both
+record `frame.time_epoch` on one host clock, so every frame can be placed on an
+absolute axis. Second, each user-plane probe log records its own send wallclock
+and its source UDP port, and those two values select exactly one GTP-U frame.
+The two bridges agreed to within ±30 ms on every frame, a constant
+print-before-capture offset.
+
+**Distinguish probes from triggers.** A downlink datagram is sent to the PDN
+interface to make the SGW buffer traffic for an idle UE and the MME page it.
+That *trigger* is later delivered on the new default eNB TEID, immediately after
+the restoration, which is genuine evidence that a buffered downlink arrived on
+the restored tunnel — but it is the same datagram as the stimulus and is **not**
+an independent restoration probe. Counting it as one inflates the per-round
+evidence. Per round the independent probes are four: default uplink, default
+downlink, dedicated uplink, dedicated downlink, and the dedicated pair must
+travel the dedicated bearer's own TEIDs.
+
+The measured frame map for the campaign of record is:
+
+| Event | s1ap.pcap frames | eNB-UE-S1AP-ID | MME-UE-S1AP-ID |
+|---|---|---|---|
+| UE A Attach, default E-RAB 5 | 5, 17, 19 | 2 | 466 |
+| dedicated E-RAB 6 setup | 23, 25 | 2 | 466 |
+| round 1: release / Paging / Service Request / ICSR | 98-100 / 102 / 103 / 104-105 | 2→3 | 466→471 |
+| round 2: release / Paging / Service Request / ICSR | 203-205 / 208 / 209 / 210-211 | 3→4 | 471→478 |
+| round 3: release / Paging / Service Request / ICSR | 271-273 / 276 / 277 / 278-279 | 4→5 | 478→481 |
+
+Each round releases the context the **previous** round created, so the identity
+chain is unbroken across the session.
+
+### Residual limitations of the live evidence
+
+* **A constructed G-PDU is not a genuine SGW-generated G-PDU.** Nothing in the
+  campaign originated from the authenticated SGW path for the purpose of testing
+  the receive path. Any future probe sent from a test-owned socket must be
+  labelled `LIVE_ENB_RECEIVE_PATH_WITH_TEST_OWNED_INJECTOR` and must not be
+  described as proof of SGW peer authenticity.
+* **`S1uEndpointCounters::retiredTeidDrops` has no runtime reporting surface.**
+  It is declared in `s1u_endpoint.hpp`, incremented on the retired branch of
+  `handleGPdu`, and asserted in-process by the deterministic tests — but the
+  shared S1-U statistics line prints `malformed` and `unknown-teid` only. The
+  drop is logged with its own distinct message, so the classification is
+  observable live; the numeric counter delta required to prove the counter moved
+  is not. This is an observability gap in the reporting surface, not a
+  functional defect, and it does not affect the acceptance of Phase 16 or 17.
+* **Capture windows are not identical.** One control probe fell outside the
+  GTP-U capture's window and is evidenced only at the UE TUN. Silence is not
+  evidence: the absent frame is a capture-scope fact and proves nothing about
+  the network.
+
 Creating a live dedicated bearer requires a PCC rule on the subscriber, and
 that is separately authorization-gated. An authorization is spent once used and
 is not standing authorization. Without a fresh, explicit authorization naming
