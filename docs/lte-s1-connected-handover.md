@@ -350,28 +350,53 @@ credited with traffic it never carried.
 
 ### Connected-mode lifecycle
 
-The lifecycle a completed S1-based handover would drive is stated here so that
-the boundaries are explicit. **It is documented, not implemented.** No code
-asserts any of these transitions, and the repository contains no state machine
-that could make them.
+The lifecycle a completed S1-based handover would drive, and the event that
+authoritatively enters each state. **It is documented, not implemented.** No
+code asserts any of these transitions, and the repository contains no state
+machine that could make them.
 
 ```
-  ECM-CONNECTED (source)         TARGET_ADMITTED        TARGET_CONNECTED
-            |                          |                       |
-            |  Handover Request        |                       |
-            |  accepted by target ---->|                       |
-            |                          |  UE reached the target|
-            |                          |---------------------->|
-            |                          |                       |
-            |  source released         |  bearer path updated  |
-            |<-------------------------+-----------------------|
+SOURCE_CONNECTED
+      |  Handover Required sent by the source, with a named target
+      v
+HANDOVER_PREPARATION
+      |  Handover Request Accept received: the target admitted every E-RAB
+      v
+TARGET_RESOURCES_PREPARED
+      |  Handover Command received by the source, carrying the target container
+      v
+HANDOVER_COMMAND_RECEIVED
+      |  the source has sent the UE its handover command
+      v
+UE_TARGET_ACCESS_PENDING
+      |  Handover Notify sent by the target, naming the reached CGI and TAI
+      v
+TARGET_ACCESS_CONFIRMED
+      |  the MME has updated the bearer path to the target's transport
+      v
+CORE_BEARER_PATH_UPDATED
+      |  UE Context Release Command received by the source
+      v
+SOURCE_CONTEXT_RELEASED
+      |  the source context is gone and the target holds the UE alone
+      v
+TARGET_CONNECTED
 ```
 
-`TARGET_CONNECTED` is the state in which the UE is connected to the target eNB,
-the target has admitted every E-RAB it was asked for, and the MME has been told
-via Handover Notify. It is only reached after a Handover Notify, never after a
-Handover Request Acknowledge. A decoded-but-unadmitted Handover Request leaves
-every UE in its existing state.
+Each arrow's event is the *only* authority for that transition. The two that
+matter most for this phase:
+
+* `TARGET_RESOURCES_PREPARED` is entered on a Handover Request Acknowledge and
+  means the target has planned and committed resources. It does **not** mean
+  the UE has arrived.
+* `TARGET_CONNECTED` is entered only after a Handover Notify, never after a
+  Handover Request Acknowledge, and only after the MME has performed the bearer
+  path update. A decoded-but-unadmitted Handover Request leaves every UE in its
+  existing state; nothing in Phase 18-A can enter any of these states.
+
+Phase 18-A implements the *messages* on three of these arrows — Handover
+Required, Handover Request, Handover Request Acknowledge, Handover Command,
+Handover Notify — and none of the transitions.
 
 ### Failure and rollback behaviours
 
@@ -382,7 +407,7 @@ Each of the ten below is a named behaviour a future implementation must have.
 |---|---|---|
 | 1 | Target admission rejection | Handover Failure with a standard cause. No bearer, no TEID, no session created on the target. |
 | 2 | Missing Handover Request Acknowledge | The source keeps the UE context; no Handover Command is issued; the source times out and reports the failure to the MME. |
-| 3 | Handover Preparation Failure | The source keeps the UE context and stays in `ECM-CONNECTED`. Nothing about the bearer changes. |
+| 3 | Handover Preparation Failure | The source keeps the UE context and stays in `SOURCE_CONNECTED`. Nothing about the bearer changes. |
 | 4 | Handover Command rejection | The source does not reconfigure the UE; the source reports the failure; the bearer path is untouched. |
 | 5 | Target access failure | The target does not send Handover Notify; the target releases any transport it committed; the source context survives. |
 | 6 | Duplicate Handover Notify | Idempotent. The second notify changes nothing and is not a second handover. |
