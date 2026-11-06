@@ -316,14 +316,86 @@ not weaken.
 
 The detail, including the normative references, the S1-based versus X2-based
 distinction, the documented (not implemented) connected-mode lifecycle with
-`TARGET_CONNECTED` and the ten failure and rollback behaviours, the transparent
-container and security boundaries and the evidence categories, is in
+`TARGET_CONNECTED`, the ten failure and rollback behaviours and which of them
+the preparation slice now implements, the transparent container and security
+boundaries and the evidence categories, is in
 `docs/lte-s1-connected-handover.md`. The cases live in
 `test/lte/handover_s1.cpp` and drive the codecs and the admission evaluator
 against offline fixtures:
 
 ```bash
 ./cmake-build-release/nr-tests --no-version --test-case="lte/handover/*"
+```
+
+## Handover preparation and target resource commitment
+
+The target-side preparation slice is
+`src/lte/enb/handover_preparation.{hpp,cpp}` together with the provisional
+target contexts in `src/lte/enb/ue_registry.{hpp,cpp}`. It is the bridge
+between `EvaluateHandoverAdmission` and `BuildHandoverRequestAcknowledge`.
+These rules are what a change must not weaken.
+
+- Admission allocates nothing. `EvaluateHandoverAdmission` still reserves no
+  TEID, creates no registry entry and binds no S1AP identifier, and a plan that
+  cannot be committed whole is refused before anything is allocated: the commit
+  validates the complete bearer set first and only then reserves the first
+  identifier.
+- Commitment owns actual target resources. `CommitHandoverResources` takes its
+  local S1-U TEIDs from `UeRegistry::allocateLocalTeid`, binds them with
+  `bindLocalTeid`, and builds real bearer contexts through `establish` and
+  `addDedicatedBearer`. A committed result is never a list of fabricated
+  identifiers, and a partial multi-bearer commitment is never reported as a
+  success: either every admitted E-RAB is reserved, prepared and bound, or the
+  whole attempt is rolled back and the refusal names the cause.
+- Target preparation is not UE arrival. A prepared context is provisional: it
+  comes from `UeRegistry::allocateProvisional`, it has `radioUeId == 0` — a
+  value `registerPeer` refuses — and it is absent from the radio-identity and
+  peer indexes. Do not invent a radio peer, a UE session or a TUN attachment to
+  make a commit look like an arrival.
+- A prepared bearer cannot forward prematurely. A bearer established for a
+  prepared context is not made UE-ready, so `active()` is false. A G-PDU whose
+  TEID resolves to such a bearer is dropped as `bearerInactiveDrops` at that
+  entry: not as an unknown TEID, not as a retired TEID, not as a malformed
+  packet, and never to the UE link or the user-plane packet counters.
+- Rollback never leaves a live mapping. A TEID that was actually bound is
+  released through `unbindLocalTeid`, so it becomes identifiable as retired
+  through the normal lifecycle. A TEID that was only reserved has its
+  reservation dropped and is not retired, because no tunnel ever existed to
+  retire. Nothing withdraws a retirement record, and nothing rewinds the
+  allocator to simulate a rollback.
+- Allocator advancement is not automatically a leak. A rollback that cannot
+  complete is surfaced as `CLEANUP_FAILED` with `outstandingTeids` — the whole
+  reserved set, the bound identifiers and the reserved-only one — and the
+  record keeps that set so a later cancellation can try again. Those
+  identifiers stay spent; a retry must never reissue one, and a retry that
+  cannot see one would leak it.
+- Source state remains intact during a failed preparation. Preparing at a
+  target touches the target's registry alone. The source's contexts, its local
+  TEIDs, its bearer identities, its access generation and its session state do
+  not move, and no source TEID is retired.
+- Source eNB identity cannot be inferred from the target's MME-facing SCTP
+  association, from the UE's TAC, from a matching EBI or TEID, or by parsing
+  the opaque RRC container. A preparation that needs a source identity it
+  cannot establish from a documented contract is refused, not guessed.
+- Duplicate and stale transaction handling is mandatory. A repeat of the same
+  request under the same identity is one transaction and allocates nothing a
+  second time, whatever state the record has reached. A repeat that disagrees
+  with a live preparation is a conflicting duplicate and is refused. A request
+  under a stale association epoch is refused before it can touch anything.
+- A committed preparation is not a handover. `TARGET_PREPARED` means the target
+  owns prepared transport for a UE that has not arrived. Nothing in this slice
+  sends a Handover Notify, updates a bearer path, forwards user-plane data,
+  releases a source context or drives an RRC reconfiguration. Do not report a
+  prepared target as a completed handover.
+
+The detail, including the commit algorithm, the transaction identity and the
+prepared-state forwarding restriction, is in
+`docs/lte-s1-connected-handover.md`. The cases live in
+`test/lte/handover_preparation.cpp` and drive the commit and the preparation
+owner against real registry resources:
+
+```bash
+./cmake-build-release/nr-tests --no-version --test-case="lte/handover/preparation:*"
 ```
 
 ## What must never be committed

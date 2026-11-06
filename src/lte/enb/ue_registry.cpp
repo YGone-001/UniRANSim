@@ -79,7 +79,10 @@ EnbUeEntry &UeRegistry::registerPeer(uint32_t radioUeId, const InetAddress &peer
         throw RegistryError("A UE with this radio identity is already registered");
     if (m_byPeer.count(peer.toString()) != 0)
         throw RegistryError("This radio endpoint already carries another active UE identity");
-    if (m_byRadioUeId.size() >= m_maxUes)
+    // A provisional target context consumes a per-UE slot too, so the bound is
+    // over both kinds of entry. With no preparation outstanding the two are the
+    // same number and an ordinary eNB sees no change.
+    if (m_byRadioUeId.size() + m_provisional.size() >= m_maxUes)
         throw RegistryError("The eNB UE registry is full");
 
     auto entry = std::make_unique<EnbUeEntry>();
@@ -89,6 +92,53 @@ EnbUeEntry &UeRegistry::registerPeer(uint32_t radioUeId, const InetAddress &peer
     m_byPeer.emplace(peer.toString(), pointer);
     m_byRadioUeId.emplace(radioUeId, std::move(entry));
     return *pointer;
+}
+
+EnbUeEntry &UeRegistry::allocateProvisional()
+{
+    // The same per-UE bound as a reached UE. A provisional context holds real
+    // transport identifiers and real bearer contexts, so it costs exactly what
+    // a reached UE costs and must not be exempt from the capacity refusal that
+    // makes exhaustion a testable, deterministic failure.
+    if (m_byRadioUeId.size() + m_provisional.size() >= m_maxUes)
+        throw RegistryError("The eNB UE registry is full");
+
+    // `radioUeId` is left at zero on purpose. `registerPeer` refuses zero, so a
+    // reached UE can never hold it, and `isProvisional` is therefore an exact
+    // test rather than a flag that a caller could set.
+    auto entry = std::make_unique<EnbUeEntry>();
+    EnbUeEntry *pointer = entry.get();
+    const uint32_t key = m_nextProvisionalId++;
+    if (m_nextProvisionalId == 0)
+        m_nextProvisionalId = 1;
+    m_provisional.emplace(key, std::move(entry));
+    return *pointer;
+}
+
+void UeRegistry::removeProvisional(EnbUeEntry &entry)
+{
+    if (!isProvisional(entry))
+        throw RegistryError("The UE entry is not a provisional target context");
+    // Every prepared bearer is released through the same rollback a failed
+    // establishment uses: a TEID that was actually bound is retired through
+    // `retireLocalTeid` and becomes identifiable as retired, while one that was
+    // only reserved is dropped without ever having been a tunnel. Neither is
+    // left behind, and nothing here can reach an identifier this entry does not
+    // own, so a repeated call is idempotent.
+    deleteBearerContexts(entry);
+    if (entry.enbUeS1apId != 0)
+        m_byEnbUeS1apId.erase(entry.enbUeS1apId);
+    if (entry.mmeUeS1apId != 0)
+        m_byMmeUeS1apId.erase(entry.mmeUeS1apId);
+    for (auto it = m_provisional.begin(); it != m_provisional.end(); ++it)
+    {
+        if (it->second.get() == &entry)
+        {
+            m_provisional.erase(it);
+            return;
+        }
+    }
+    throw RegistryError("The provisional UE entry is not registered");
 }
 
 EnbUeEntry *UeRegistry::find(uint32_t radioUeId)

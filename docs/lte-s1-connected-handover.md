@@ -41,26 +41,33 @@ What the repository can do today, in production code, and prove with a test:
 | Keep default and dedicated bearer identity independent of E-RAB order | `src/lte/enb/handover_admission.cpp` | `lte/handover/bearer:*` |
 | Build a Handover Request Acknowledge only from transport a commit step bound | `src/lte/enb/handover_admission.cpp` | `lte/handover/resource: an acknowledge names only transport a commit step bound` |
 | Turn a refused admission into a Handover Failure with a standard cause | `src/lte/enb/handover_admission.cpp` | `lte/handover/resource: a refused admission reports a failure and acknowledges nothing` |
+| Commit an admitted plan into real, owned target transport, atomically across the bearer set | `src/lte/enb/handover_preparation.cpp` | `lte/handover/preparation: a commit binds real allocator teids and owns a provisional context` |
+| Hold a prepared bearer established and not forwardable | `src/lte/enb/handover_preparation.cpp` | `lte/handover/preparation: a g-pdu for a prepared teid is dropped as inactive, not as unknown or retired` |
+| Roll a failed commit back without leaving a live mapping | `src/lte/enb/handover_preparation.cpp` | `lte/handover/preparation: a failure on the second bearer leaves nothing of the first` |
+| Recognise a duplicate, a conflicting duplicate and a stale association epoch | `src/lte/enb/handover_preparation.cpp` | `lte/handover/preparation: a repeated request is one transaction and allocates nothing twice` |
 
 What the repository cannot do today: move a UE between two eNBs. There is no
-handover procedure state machine, no target-side bearer establishment, no
-source-side release after Handover Notify, no data forwarding path and no
-user-plane switchover. §2 and §14 say exactly where the boundary is.
+handover procedure state machine, no recognition of a UE arriving at a target,
+no source-side release after Handover Notify, no data forwarding path and no
+user-plane switchover. A target that has committed resources owns real
+transport for a UE that has not arrived and nothing more. §2, §27 and §14 say
+exactly where the boundary is.
 
 ## 2. Missing implementation areas
 
 The following are deliberately absent. Each is a real gap, not an implicit
 behaviour.
 
-* **No procedure driver.** The codecs and the admission evaluator are pure
-  functions and a pure evaluation. Nothing orders a Handover Required, waits
-  for a Handover Command, or starts a Handover Request on a target. There is no
-  state machine, and Phase 18-A deliberately did not add one.
-* **No target-side bearer establishment.** `EvaluateHandoverAdmission` plans.
-  It allocates no S1-U transport, binds no TEID, opens no session and touches no
-  `UeRegistry`. The only path to a `HandoverRequestAcknowledge` is
-  `BuildHandoverRequestAcknowledge`, which requires a separate
-  `CommittedTransport` set that no code in this phase produces.
+* **No procedure driver.** The codecs, the admission evaluator and the
+  preparation owner are pure functions, a pure evaluation and a deterministic
+  transaction record. Nothing orders a Handover Required, waits for a Handover
+  Command, or starts a Handover Request on a target. There is no state machine
+  that could drive a handover to completion.
+* **No target-side establishment for a UE that arrived.** What exists is the
+  preparation slice: a provisional context, real local S1-U transport, and
+  bearers that are established and not UE-ready. What does not exist is the
+  promotion of such a context into a reached UE session. Nothing calls
+  `activateUe` on a prepared bearer and nothing recognises an arrival.
 * **No source-side release.** Handover Notify is decoded and nothing follows.
   No bearer is released, no TEID is retired, no access generation advances.
 * **No data forwarding.** A Handover Command may *carry* forwarding endpoints
@@ -328,16 +335,25 @@ to hold unchanged:
 * Uniqueness comes from the allocator alone, never from the retirement record.
 * An End Marker is recorded and nothing else moves.
 
-What the handover foundation adds is only a *plan* for transport:
+What the admission evaluation adds is only a *plan* for transport:
 
 * `AdmittedBearer::targetTransport.address` is the target's own S1-U address.
 * `AdmittedBearer::targetTransport.teid` is zero and `bound` is false until a
-  commit step this phase does not implement says otherwise.
+  commit step says otherwise. Phase 18-A left that step unimplemented; the
+  preparation slice of Phase 18-B implements it, in
+  `src/lte/enb/handover_preparation.{hpp,cpp}`, and it is the only thing that
+  turns a plan into a binding.
 * `BuildHandoverRequestAcknowledge` takes that commit output as an explicit
   `std::vector<CommittedTransport>` and refuses to invent an address or a TEID.
   It refuses when the committed set does not cover the admitted bearers, when a
   committed TEID is zero, and when a committed endpoint is not on the target's
   own S1-U address.
+
+A TEID that the commit actually binds is bound through
+`UeRegistry::allocateLocalTeid` and `bindLocalTeid`, on a provisional target
+context, and it stops resolving only through `unbindLocalTeid` — retirement for
+a bound identifier, reservation-drop for one that never became a tunnel. The
+allocation, ownership and rollback rules are in sections 17, 19 and 21 below.
 
 Local S1-U TEIDs remain a fresh pair on every access restoration, and remain so
 for any future connected handover: the previous pair must stop resolving, a
@@ -401,7 +417,10 @@ Handover Notify — and none of the transitions.
 ### Failure and rollback behaviours
 
 Each of the ten below is a named behaviour a future implementation must have.
-**None is implemented, and none is claimed operational.**
+Phase 18-A implemented none of them. The preparation slice of Phase 18-B
+implements the *target-side resource* part of four of them, as marked below;
+the rest, and every part of a behaviour that needs a message to be sent or a UE
+to arrive, is still unimplemented and nothing here claims it operational.
 
 | # | Behaviour | Required outcome |
 |---|---|---|
@@ -416,10 +435,28 @@ Each of the ten below is a named behaviour a future implementation must have.
 | 9 | Source release before successful target completion | The UE context is not destroyed; the handover is reported failed; the retired-TEID ledger records only what was genuinely released. |
 | 10 | Partial admission of multiple E-RABs | Not permitted. Admission is all-or-nothing across the bearer set; a target that cannot admit every E-RAB admits none and reports Handover Failure. |
 
-Behaviour 10 is the one this phase *does* implement, in the narrow sense that
-`EvaluateHandoverAdmission` is all-or-nothing: a single unclassifiable,
-mismatched or unlinked E-RAB refuses the whole set and the `HandoverAdmission`
-holds no bearers at all.
+What the two phases implement of that table, and what they do not:
+
+* **1 — target admission rejection.** The target side is implemented. A refused
+  admission or a refused commit creates no bearer, no TEID and no session, and
+  `RefusalAsHandoverFailure` / `CommitRefusalAsHandoverFailure` produce a
+  Handover Failure that names a standard cause and no eNB-UE-S1AP-ID.
+  Transmitting it is still the caller's job.
+* **5 — target access failure.** Only the release half is implemented:
+  `HandoverPreparationOwner::cancel` and `expireDue` release everything the
+  preparation committed, through `unbindLocalTeid`, and the source context is
+  untouched. There is no Handover Notify to withhold, because no arrival is
+  ever recognised.
+* **7 — stale source association.** Implemented at the preparation boundary: a
+  request or a commit under an association epoch the owner no longer holds is
+  refused as `STALE_ASSOCIATION` before it can touch a resource.
+* **10 — partial admission of multiple E-RABs.** Implemented twice over:
+  `EvaluateHandoverAdmission` is all-or-nothing, and the commit validates the
+  complete admitted set before allocating anything and rolls back the whole
+  attempt if any one bearer fails.
+* **2, 3, 4, 6, 8, 9.** Not implemented. All of them need either a message to
+  be sent, a message to be received, or a UE to arrive, and none of those
+  happens in this repository.
 
 ### Refusal representation
 
@@ -494,8 +531,13 @@ encoder and the decoder agreeing on the same mistake.
 | All-or-nothing admission across a bearer set | **Implemented** |
 | Handover Request Acknowledge from committed transport | **Implemented** |
 | Handover Failure from a refused admission | **Implemented** |
+| Target-side resource commit, atomic across the bearer set | **Implemented** |
+| Provisional target context ownership | **Implemented** |
+| Prepared-but-not-forwardable bearer state | **Implemented** |
+| Preparation transaction lifecycle: duplicate, stale, expiry, cancel | **Implemented** |
+| Deterministic rollback of a failed commit | **Implemented** |
 | Handover procedure state machine | **Deferred** |
-| Target-side bearer establishment | **Deferred** |
+| Target-side bearer establishment for a UE that arrived | **Deferred** |
 | Source-side release after Handover Notify | **Deferred** |
 | MME-controlled bearer path update | **Deferred** |
 | Data forwarding path and user-plane switchover | **Deferred** |
@@ -509,17 +551,21 @@ encoder and the decoder agreeing on the same mistake.
 
 ## 15. Next-stage integration plan
 
-The next stage is the one this phase deliberately did not start: a target-side
-establishment that turns an admitted plan into committed transport.
+The plan this section recorded has its first step done: Phase 18-B implemented
+the commit step, in `src/lte/enb/handover_preparation.{hpp,cpp}`, and sections
+16 to 28 below are what it does. The remaining steps are unchanged and are
+still the work of a later phase.
 
-1. **Commit step.** A `CommitHandoverResources` that takes a
+1. **Commit step.** *(Done.)* A `CommitHandoverResources` that takes a
    `HandoverAdmission` and produces the `std::vector<CommittedTransport>`
    `BuildHandoverRequestAcknowledge` already consumes — allocating local S1-U
    TEIDs from `UeRegistry::allocateLocalTeid`, binding them, and refusing
    partial commitment. Admission and commitment stay separate.
 2. **Target session creation.** Create the target-side UE entry only once the
    commit succeeded, and only for the UEs that arrived, not for the UEs that
-   were merely planned.
+   were merely planned. Phase 18-B creates the *provisional* half of that: the
+   resources a plan owns before an arrival, kept apart from reached UEs. The
+   promotion of a provisional context into a reached one is not implemented.
 3. **Handover Notify handling.** On Handover Notify, verify the named CGI and
    TAI against the target's own identity before anything else moves.
 4. **Source release.** Release the source context and retire its local S1-U
@@ -531,6 +577,358 @@ establishment that turns an admitted plan into committed transport.
    forwarding model. No GTP-U End Marker behaviour is to be introduced before
    that model exists.
 
-Until step 1 exists, no test and no report may describe a handover as having
-happened. A codec that can represent Handover Notify is not a handover, and an
-admission that binds nothing is not a target.
+A test and a report may still not describe a handover as having happened. A
+codec that can represent Handover Notify is not a handover, an admission that
+binds nothing is not a target, and a target that owns prepared transport for a
+UE that has not arrived is not a connected UE.
+
+## 16. Target preparation architecture
+
+The preparation slice is two production pieces and no third:
+
+* `src/lte/enb/handover_preparation.{hpp,cpp}` — commitment and the
+  transaction lifecycle, namespace `lte::enb::s1ap`;
+* the provisional target contexts of `UeRegistry` — `allocateProvisional`,
+  `isProvisional`, `removeProvisional` — the only new registry surface.
+
+It owns no registry, no allocator and no bearer class of its own. It drives the
+existing `UeRegistry` allocator and the existing `DefaultBearerContext` /
+`BearerContext` classes, so every TEID rule of
+`docs/gtpu-end-marker-retired-tunnel-lifecycle.md` applies to a prepared tunnel
+exactly as it does to a reached UE's.
+
+A provisional context is what a target owns while the UE is still at the
+source. `registerPeer` demands a simulated radio identity and a verified UDP
+peer precisely so that no caller can manufacture an arrival, and a prepared
+handover has neither. `allocateProvisional` therefore creates an entry with
+`radioUeId == 0`, a value `registerPeer` refuses and no reached UE can hold:
+
+* it is absent from the radio-identity and the peer indexes, so `find` and
+  `findByPeer` never return it;
+* its S1AP identifiers and its local TEIDs are indexed exactly like a reached
+  UE's, which is what lets the shared S1-U endpoint recognise its transport and
+  refuse to forward to a bearer that has not been made UE-ready;
+* it is counted against the same `maxUes` bound, so a full registry refuses it
+  and allocates nothing;
+* it is held apart from the reached UEs, keyed by a local ordinal that is not
+  an S1AP identifier, not a TEID and not a UE identity.
+
+`UeRegistry::size()` counts reached UEs only. A provisional context is real
+against capacity and invisible against the UE count, and `isProvisional` is
+what tells the two kinds apart.
+
+## 17. The actual resource-commit algorithm
+
+`CommitHandoverResources(admission, target, registry, transaction, faults)` is
+all-or-nothing in five steps.
+
+1. **Validate the whole set, allocate nothing.** Every bearer must be
+   classifiable — an E-RAB identity one may hold, a non-zero QCI, a non-zero
+   SGW TEID — the target identity must name the receiving eNB, the target must
+   have an S1-U address, each admitted transport endpoint must be that address,
+   no two bearers may share an E-RAB, a default bearer may not name a linked
+   default, and each dedicated bearer must name a default of this same set and
+   not itself. There must be exactly one default bearer: none is
+   `LINKED_DEFAULT_MISSING`, more than one is `MULTIPLE_DEFAULT_BEARERS`, and
+   the set is refused whole rather than having one silently dropped. A decoded
+   but unadmitted admission, an empty bearer set, an absent transaction
+   identity, and an admission that already holds transport are refused here.
+2. **Capacity.** Registry capacity is checked before a context is made, and the
+   `CAPACITY_EXHAUSTED`, `CONFLICTING_TRANSACTION` and `STALE_ASSOCIATION`
+   fault points fire here, before any identifier is reserved.
+3. **Readiness plan.** Default bearers first, then dedicated bearers, each
+   group in the order the admission planned them. The order is a readiness
+   order and never the wire order, and a deliberately reordered E-RAB list
+   still produces it.
+4. **Prepare, in that order.** `allocateProvisional()` for the context; then
+   per bearer `allocateLocalTeid()` → the preparation fault point →
+   `BearerParameters` carrying the network's own EBI, QoS, SGW address and SGW
+   TEID → `establish` for a default or `addDedicatedBearer` for a dedicated one
+   → `bindLocalTeid`. Nothing calls `activateUe`, so nothing becomes
+   forwardable.
+5. **Publish.** An eNB-UE-S1AP-ID is allocated and bound, the MME identity is
+   recorded, and only then is the commit marked successful and the prepared set
+   filled in. A result is either the complete set or nothing;
+   `TargetResourceCommit` never carries a partial success.
+
+The readiness order exists because `addDedicatedBearer` requires the linked
+default to be established first. A set that lists a dedicated bearer before its
+default is still prepared correctly, and the roles come from the network's own
+statement — never from QCI and never from the order the E-RABs were listed in.
+
+## 18. Transaction identity
+
+`HandoverTransactionId` is `{mmeUeS1apId, associationEpoch, sequence}`. What
+names the transaction is the pair `(mmeUeS1apId, associationEpoch)`; the
+sequence is the owner's own tag and has no protocol meaning. `find` resolves on
+the pair and ignores the sequence, so a caller that presents the right identity
+with a stale or absent sequence is still talking about the same transaction and
+cannot start a second one. `operator==` compares the whole triple so a recorded
+transaction can be checked exactly.
+
+Deliberately none of: EBI, TEID, a timestamp, the UE's address, a TAC. Each is
+either shared with another UE, reused over time, or not the target's to decide.
+
+Duplicate handling is part of the identity, not an extra rule beside it:
+
+* a repeat of a request already known with the same plan returns the existing
+  record and allocates nothing, whatever state that record has reached;
+* a repeat that disagrees with a live preparation is a conflicting duplicate,
+  refused as `CONFLICTING_TRANSACTION` and starting nothing;
+* a different request after an earlier preparation reached a terminal state is
+  a genuinely new preparation, and is recorded as one.
+
+`find` scans newest-first, so where an identity has more than one record — an
+earlier one that finished and a later one — the current transaction is the one
+returned.
+
+## 19. Temporary resource ownership
+
+A record owns exactly two things: the provisional entry
+(`PreparationRecord::entry`) and the identifiers bound or reserved on its
+behalf (`ownedTeids`). Everything else in the record is a description of them.
+
+`releaseOwned` is the only release path. It walks `ownedTeids` through
+`unbindLocalTeid` — a live mapping is retired, a reservation is dropped — then
+calls `removeProvisional`, which erases the entry and every index it owns. It
+is idempotent and never reaches an identifier the record does not own.
+
+A commit that cannot clean up after itself does not pretend it did. The record
+keeps the entry and the whole outstanding set — bound and reserved-only alike —
+and the caller is told `CLEANUP_FAILED`, so a later `cancel` can try again. A
+retry that cannot see one of those identifiers would leak it; a retry must
+never reissue one. Those identifiers stay spent: no code rewinds the allocator,
+and no code withdraws a retirement record.
+
+`~HandoverPreparationOwner` releases what is left and never throws, because a
+destructor cannot report a cleanup failure. A caller that cares cancels
+explicitly and reads the result.
+
+## 20. Prepared-state forwarding restriction
+
+The restriction is the existing bearer readiness gate, reused rather than
+reimplemented. `establish` sets the bearer established and leaves it not
+UE-ready, so `active()` is false; nothing in this slice calls `activateUe`.
+
+A G-PDU whose TEID resolves to a prepared bearer is dropped at
+`S1uEndpoint::handleGPdu` with `bearerInactiveDrops` counted on that entry. It
+is not an unknown TEID, not a retired TEID and not a malformed packet: the
+endpoint's `unknownTeidDrops`, `retiredTeidDrops` and `malformedDrops` stay at
+zero. It never reaches the UE link, the frame encoders or the user-plane packet
+counters, and it never becomes a user-plane credit.
+
+`PreparedBearersNonForwardable` reads the real `BearerContext::active()` of the
+real contexts through the registry entry rather than any flag this module kept,
+so it cannot be made true by a description of a bearer that was never
+established: a bearer that was never prepared answers false there.
+
+## 21. TEID allocation and rollback semantics
+
+There is no new TEID lifecycle. A prepared tunnel's identifier comes from
+`UeRegistry::allocateLocalTeid` like any other, and:
+
+* `allocateLocalTeid` reserves a value and `bindLocalTeid` accepts only a
+  reserved one, so no caller can attach an identifier of its own choosing;
+* a zero, a live or a retired identifier is refused, and nothing revives a
+  retired one;
+* the allocator is monotonic over a bounded issuance window, never reissues a
+  value, and fails closed with `TeidExhausted`.
+
+Rollback distinguishes the two kinds of thing an attempt may hold. A TEID that
+was bound is a live mapping and is released through `unbindLocalTeid`, which
+retires it so it becomes identifiable as retired rather than merely missing. A
+TEID that was only reserved has never been a tunnel: `unbindLocalTeid` drops
+the reservation and retires nothing, because there is nothing to retire.
+Neither case erases history, and neither rewinds the allocator. A failed
+attempt has spent its identifiers, and that is not a leak.
+
+## 22. Admission-to-commit data flow
+
+```
+HandoverRequest + SourceContext + TargetContext + BearerRoleBinding[]
+        |
+        v  EvaluateHandoverAdmission          pure, allocates nothing
+HandoverAdmission  (holdsTransportResources() == false)
+        |
+        v  HandoverPreparationOwner::admit    records ADMITTED / ADMISSION_REFUSED
+PreparationRecord
+        |
+        v  HandoverPreparationOwner::commit   -> CommitHandoverResources
+TargetResourceCommit { prepared, ownedEntry, outstandingTeids }
+        |
+        v  HandoverPreparationOwner::acknowledge
+HandoverRequestAcknowledge                    via BuildHandoverRequestAcknowledge
+```
+
+The two things this flow must not conflate are the ones the module header
+states: admission is not commitment, and prepared is not arrived. The admission
+never holds transport; the commit owns it; the acknowledge reports it.
+
+The record's resource ladder — `ADMISSION_EVALUATED`, `RESOURCES_RESERVED`,
+`RESOURCES_COMMITTED_PREPARED`, `AWAITING_UE_TARGET_ACCESS` — is target-local
+bookkeeping and is not the eight-state connected-mode lifecycle of section 12.
+`awaitUeAccess` is the last step this slice defines, and it is a declaration
+that the target is waiting, not a statement that a UE arrived. No code in this
+repository recognises an arrival.
+
+## 23. Handover Request Acknowledge integration
+
+`HandoverPreparationOwner::acknowledge` builds the message from what the commit
+actually bound:
+
+* the MME-UE-S1AP-ID of the transaction, and the eNB-UE-S1AP-ID the commit
+  allocated and bound — a caller cannot send an identifier this target never
+  allocated;
+* the committed transport set, one entry per admitted bearer, each naming the
+  target's own S1-U address and the local TEID bound for that bearer;
+* the failed list and the container behaviour of Phase 18-A, unchanged.
+  `BuildHandoverRequestAcknowledge` still echoes the admission's
+  `sourceToTarget` into `targetToSource`; that is accepted Phase 18-A
+  behaviour pinned by the wire vectors, and producing a real Target-ToSource
+  container is a later phase's work.
+
+A transaction that is not prepared throws `HandoverRefused`: no record, or no
+bound eNB-UE-S1AP-ID, is `INVALID_CONTEXT_IDENTITY`, and a transaction that has
+not reached `TARGET_PREPARED` is `MISSING_MANDATORY_IE`. Repeating the call
+produces the same message and gains no resource. The failure form is
+`CommitRefusalAsHandoverFailure`, which carries the MME identity and names no
+eNB-UE-S1AP-ID, because a failed commit bound none that survives.
+
+## 24. Failure and cancellation behaviour
+
+Every refusal is a typed `CommitRefusalRecord` carrying a detail and the
+standard Cause it would be reported under, not a log line.
+
+| `CommitRefusal` | Cause | Meaning |
+|---|---|---|
+| `ADMISSION_NOT_ADMITTED` | — | the admission handed in was not a successful one |
+| `EMPTY_BEARER_SET` | — | no admitted bearer at all |
+| `TARGET_IDENTITY_MISMATCH` | — | the target does not name the receiving eNB |
+| `TARGET_TRANSPORT_ADDRESS_ABSENT` | — | the target has no S1-U address |
+| `DUPLICATE_ERAB_ID` | — | two admitted bearers name the same E-RAB |
+| `LINKED_DEFAULT_MISSING` | `radioNetwork` | a dedicated bearer names no default of this set, or there is no default |
+| `BEARER_PARAMETERS_INVALID` | — | an E-RAB identity out of range, a zero QCI, or a zero SGW TEID |
+| `MULTIPLE_DEFAULT_BEARERS` | — | a set that would need two default bearers |
+| `TRANSACTION_IDENTITY_ABSENT` | — | the transaction names no UE |
+| `CAPACITY_EXHAUSTED` | `radioNetwork`/20 | per-UE or registry capacity would be exceeded |
+| `TEID_ALLOCATION_FAILED` | `transport`/13 | the local allocator could not produce a usable identifier |
+| `DEFAULT_BEARER_PREPARATION_FAILED` | — | the default bearer could not be prepared |
+| `DEDICATED_BEARER_PREPARATION_FAILED` | — | a dedicated bearer could not be prepared |
+| `CONFLICTING_TRANSACTION` | — | another live preparation owns these resources |
+| `STALE_ASSOCIATION` | — | the caller works under an association epoch no longer bound |
+| `ALREADY_COMMITTED` | — | this transaction has already been committed |
+| `WRONG_STATE` | — | the operation does not accept this state |
+| `EXPIRED` | — | the preparation's deadline has passed |
+| `CLEANUP_FAILED` | — | rollback did not complete, and is reported as such |
+
+Failure injection is a `CommitFaultInjector` argument and never a global: an
+ordinary call cannot be made to fail by anything outside its own preconditions.
+The fault points are `CAPACITY_EXHAUSTED`, `DEFAULT_BEARER_PREPARATION`,
+`DEDICATED_BEARER_PREPARATION`, `CONFLICTING_TRANSACTION`, `STALE_ASSOCIATION`
+and `CLEANUP_FAILURE`. Two can be passed at once, because a rollback cannot
+fail unless something makes one be attempted: `CLEANUP_FAILURE` alone is a
+no-op on a commit that would otherwise succeed. TEID-allocation failure is
+deliberately not a fault point; it is injected through the `UeRegistry`
+allocator seam, where the existing exhaustion and boundary cases already live.
+
+Cancellation is explicit and idempotent. `cancel` releases whatever the record
+still owns and names it `PREPARATION_CANCELLED` unless it already had a
+terminal name of its own, so a commit failure is never rewritten into a
+cancellation. `expireDue(now)` is a deterministic call with an explicit clock,
+not a timer: every record past its deadline and not already terminal is expired
+and released. A completion after cancellation fails closed.
+
+## 25. Verified source/target isolation
+
+Preparing at a target touches the target's registry alone.
+
+The source-continuity case builds a real source UE through the production
+bearer path — `registerPeer`, `establish`, `activateUe`, `bindLocalTeid` on a
+default and a dedicated bearer — and then prepares a handover at a second,
+independent registry. After it, the source's local TEIDs still resolve, its
+bearers are still `active()`, its `accessGeneration`, its `s1` state and its
+`sessionRetained` are unchanged, and no source TEID has been retired. The
+target's identifiers are all distinct from the source's.
+
+Multi-UE isolation is the same shape with two transactions: four distinct local
+TEIDs, each resolving to its own entry, and cancelling one preparation leaves
+the other's TEIDs resolving and its acknowledge buildable. A preparation also
+leaves an unrelated reached UE in the same registry untouched.
+
+Source eNB identity is not derived anywhere in this slice: not from the
+MME-facing SCTP association the target holds, not from the UE's TAC, not from a
+matching EBI or TEID, and never by parsing the opaque RRC container. A
+preparation that needs an identity it cannot establish from a documented
+contract is refused.
+
+## 26. Actual tests and evidence
+
+`test/lte/handover_preparation.cpp`, **24 cases and 515 assertions**, driving
+the commit and the preparation owner against real registry resources and the
+isolated S1-U receive path.
+
+| Category | Cases | What it proves |
+|---|---|---|
+| A. Real target commit | 1 | the identifiers are the allocator's own, and the commit owns a provisional context |
+| B. Acknowledge from committed transport | 1 | the acknowledge names exactly the transport the commit bound |
+| C. Multi-bearer ordering | 2 | a reversed E-RAB list still commits default first; three bearers in a scrambled order commit in readiness order |
+| D. Atomic failure | 5 | a failure on the second bearer leaves nothing of the first; a failure on the first reserves one identifier and drops it; a rollback that cannot complete is surfaced and never reported as success; capacity exhaustion is a refusal and not a half-built context; a plan that cannot be committed whole is refused before anything is allocated |
+| E. Non-forwardable preparation | 3 | a prepared bearer is established and not ready for the UE; a G-PDU for a prepared TEID is dropped as inactive, not as unknown or retired; an old TEID stops resolving when the preparation is cancelled |
+| F. Source continuity | 1 | preparing at a target leaves the source eNB untouched |
+| G. Duplicate and stale operations | 7 | a repeated request is one transaction and allocates nothing twice; a conflicting duplicate is refused and starts nothing; a new request after a finished preparation is a new transaction; work begun under a stale association epoch is refused; an expired preparation releases what it owned; a commit after the deadline expires the transaction instead; a completion after cancellation fails closed |
+| H. Multi-UE isolation | 2 | two UEs prepared together stay independent; a preparation leaves a reached UE in the same registry alone |
+| I. Regression preservation | 1 | the accepted Phase 18-A contracts are unchanged |
+| Refusal surface | 1 | a refused commit reports a failure that names no surviving identifier |
+
+The whole suite after the slice: **693 cases, 131493 assertions, 0 failed, 2
+skipped**, up from 669 cases and 130978 assertions. The two skipped cases are
+the two privileged TUN cases of the CI matrix, which have no ordinary `ctest`
+entry and run only under the privileged job. The Phase 18-A handover slice is
+unchanged at 40 cases and 376 assertions.
+
+The evidence kinds are kept apart on purpose. The commit cases read an
+identifier's fate from the production structures — the allocator's issued
+sequence and the registry's own retirement record — rather than from a flag
+this module set. The forwarding case drives `S1uEndpoint::handleDatagram`
+against a loopback UDP endpoint and reads the endpoint and entry counters. No
+case claims a packet capture, a live rejection result or a UE arrival.
+
+## 27. Unsupported runtime behaviour
+
+Nothing in this slice runs in a live or a simulated eNB procedure. Specifically
+not implemented, and not claimed:
+
+* no S1AP dispatcher integration: no Handover Request is received by a running
+  eNB, and no acknowledge or failure is transmitted;
+* no Handover Notify, and no recognition of a UE arriving at the target —
+  `TARGET_PREPARED` and `AWAITING_UE_TARGET_ACCESS` are the end of this slice;
+* no promotion of a provisional context into a reached UE session;
+* no source context release, no source TEID retirement, no bearer path update;
+* no data forwarding, direct or indirect, and no GTP-U End Marker behaviour;
+* no RRC handover command, no Target-ToSource container of the target's own,
+  and no security key derivation;
+* no X2 handover, no Path Switch Request, no inter-RAT or inter-MME handover;
+* no live Open5GS handover and no PCC policy change.
+
+Prepared target transport is not completed handover. Do not claim otherwise.
+
+## 28. Phase 18-C prerequisites
+
+The remaining steps of section 15 are the prerequisites of a later phase, and
+this slice deliberately leaves each of them open:
+
+1. **Arrival.** A documented contract for recognising a UE at the target, and
+   the promotion of a provisional context into a reached one through
+   `registerPeer` and `activateUe` on a real verified peer. Until then nothing
+   may call `activateUe` on a prepared bearer.
+2. **Handover Notify.** Verify the named CGI and TAI against the target's own
+   identity before anything else moves.
+3. **Source release.** Release the source context and retire its local S1-U
+   TEIDs only after a Handover Notify for that UE.
+4. **Bearer path update.** The MME-controlled update, which is the point of the
+   S1 family and must not be replaced by a Path Switch Request.
+5. **Data forwarding.** Only after the above, and with a defined forwarding
+   model.
+
+A handover is still not an Attach and not an idle-mode Service Request, and
+none of these prerequisites may be reached by substituting one.

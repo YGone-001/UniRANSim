@@ -157,6 +157,46 @@ class UeRegistry
     // rejected.
     EnbUeEntry &registerPeer(uint32_t radioUeId, const InetAddress &peer);
 
+    // Creates a provisional target-side UE context for a handover preparation.
+    //
+    // A target eNB that has admitted a handover owns local S1-U transport for
+    // bearers whose UE has not arrived yet. That ownership has to be real — the
+    // identifiers come from this registry's allocator and are bound through
+    // `bindLocalTeid` — but it is not a UE session. `registerPeer` demands a
+    // simulated radio identity and a verified UDP peer precisely so that no
+    // caller can manufacture an arrival, and a prepared handover has neither:
+    // the UE is still at the source eNB. Inventing a peer to reuse that API
+    // would be inventing the arrival this context is waiting for.
+    //
+    // So a provisional entry has `radioUeId == 0`, a value `registerPeer`
+    // refuses and therefore one no reached UE can ever hold. The two kinds of
+    // entry are structurally distinguishable and cannot be confused. It is
+    // absent from the radio-identity and peer indexes, so `find` and
+    // `findByPeer` never return it, while its S1AP identifiers and its local
+    // TEIDs are indexed exactly like a reached UE's, which is what lets the
+    // shared S1-U endpoint recognise its transport and refuse to forward to a
+    // bearer that has not been made UE-ready.
+    //
+    // It is counted against the same `maxUes` bound as a reached UE, because
+    // every provisional context consumes per-UE resources and per-UE TEIDs. A
+    // full registry refuses it and allocates nothing.
+    EnbUeEntry &allocateProvisional();
+
+    // Whether this entry was created by `allocateProvisional`, that is, whether
+    // it owns prepared resources for a UE that has not arrived.
+    [[nodiscard]] static bool isProvisional(const EnbUeEntry &entry)
+    {
+        return entry.radioUeId == 0;
+    }
+
+    // Erases a provisional entry and everything it owns. Every prepared bearer
+    // is released through `unbindLocalTeid`, so a TEID that was actually bound
+    // is retired through the normal lifecycle while one that was only reserved
+    // is dropped without ever having been a tunnel. Calling it twice is
+    // idempotent for the resources in question: the second call finds nothing
+    // owned by this entry and cannot touch another transaction's identifiers.
+    void removeProvisional(EnbUeEntry &entry);
+
     EnbUeEntry *find(uint32_t radioUeId);
     EnbUeEntry *findByPeer(const InetAddress &peer);
     EnbUeEntry *findByEnbUeS1apId(uint32_t enbUeS1apId);
@@ -267,6 +307,12 @@ class UeRegistry
     std::unordered_map<uint32_t, EnbUeEntry *> m_byEnbUeS1apId;
     std::unordered_map<uint32_t, EnbUeEntry *> m_byMmeUeS1apId;
     std::unordered_map<uint32_t, EnbUeEntry *> m_byLocalTeid;
+    // Provisional target-side contexts, kept apart from the radio-identity index
+    // because they have no radio identity and no peer. The key is a local
+    // ordinal with no protocol meaning: it is not an S1AP identifier, not a
+    // TEID and not a UE identity.
+    std::unordered_map<uint32_t, std::unique_ptr<EnbUeEntry>> m_provisional;
+    uint32_t m_nextProvisionalId{1};
 };
 
 std::array<uint8_t, 4> ParseIpv4(const std::string &address);
