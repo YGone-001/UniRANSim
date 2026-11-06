@@ -96,7 +96,26 @@ enum class MessageType : uint8_t
     // did not put in its E-RAB list establishes nothing at all. It therefore
     // cannot make a network bearer true on its own, and it carries no
     // subscriber key and no authentication material.
-    NAS_UPLINK_MOBILITY_CONTEXT = 20
+    NAS_UPLINK_MOBILITY_CONTEXT = 20,
+    // Phase 18-C: the two halves of the simulator's handover access exchange.
+    // They are INTERNAL simulator abstractions and nothing else.
+    //
+    // They are NOT 3GPP RRC messages. They are not an RRC Connection
+    // Reconfiguration, not an RRC Connection Reconfiguration Complete, not a
+    // Random Access Preamble and not a Handover Command: no such procedure is
+    // executed here, and no RRC container of any kind travels in either of
+    // them. Their whole purpose is to carry one correlation binding from a
+    // source eNB that authorised a handover to the target eNB the UE must
+    // access, so that the target can recognise a handover-specific arrival as
+    // something other than an Attach, a Tracking Area Update or a Service
+    // Request. The types are named after what the simulation does with them,
+    // and never after a message the standard defines.
+    //
+    // SIMULATED_HANDOVER_COMMAND is downlink only: source eNB to the UE it
+    // already serves. SIMULATED_HANDOVER_ACCESS is uplink only: the UE to the
+    // target eNB it has just reached.
+    SIMULATED_HANDOVER_COMMAND = 21,
+    SIMULATED_HANDOVER_ACCESS = 22
 };
 
 struct Message
@@ -194,5 +213,85 @@ struct PagingNotification
 // violation or zero M-TMSI.
 std::vector<uint8_t> EncodePagingNotification(const PagingNotification &notification);
 PagingNotification DecodePagingNotification(const uint8_t *data, size_t size);
+
+// --- Simulated handover access -------------------------------------------
+//
+// The two messages above are the whole simulator-specific control exchange for
+// a target arrival. They carry a correlation binding, two cell identities, the
+// S1AP identity of the UE being handed over and the PDN address the arriving UE
+// restates, and nothing else: no NAS, no RRC container, no security material, no
+// subscriber identity and no key. The PLMN fields are three opaque octets,
+// exactly as the S1AP layer encodes them; this layer never interprets them, so
+// a link that carries them cannot be made to mean a different network than the
+// caller stated.
+//
+// The binding is a correlation token, not an authentication credential. Its
+// value is not secret and it proves nothing on its own. What makes it usable is
+// state at the target: one token per committed preparation, issued once,
+// consumed once, and bound to the transaction identity and the association
+// epoch it was issued under. Do not treat it as a key. It also has no S1AP
+// representation: nothing in this repository puts one into a transparent
+// container or any other information element, and nothing reads one out of one.
+//
+// The MME-UE-S1AP-ID is the identity the MME gave this UE, which is the one
+// the source eNB serves it under and the one the target's preparation was
+// committed for. It travels here because it is the second half of the
+// correlation: a binding alone says which preparation this could be, and the
+// identity says which UE it claims to be, so an arrival under a different MME
+// UE identity is a detectable disagreement rather than a silent acceptance. It
+// is an S1AP identifier and nothing more; no key and no subscriber identity is
+// derivable from it.
+//
+// The PDN address is the one the UE's own NAS assigned it, restated here for
+// the same reason `BearerTransportReady` restates it: a cell that never saw
+// this session's Attach cannot learn it without decrypting NAS, and it is never
+// invented on the way. The source eNB states it in the command from the bearer
+// it has been serving, and the arriving UE must present the same one, so a
+// target is not asked to take an uncorroborated address from a stranger.
+
+// SIMULATED_HANDOVER_COMMAND, downlink, source eNB to the UE it serves. It
+// names the cell the UE must access, the binding the UE must present there, the
+// S1AP identity of the UE being handed over and the PDN address of the bearers
+// being handed over.
+struct SimulatedHandoverCommand
+{
+    std::array<uint8_t, 3> targetPlmn{};
+    uint32_t targetEnbId{};
+    uint16_t targetTac{};
+    uint32_t arrivalToken{};
+    uint32_t mmeUeS1apId{};
+    std::array<uint8_t, 4> ueIpv4{};
+};
+
+// SIMULATED_HANDOVER_ACCESS, uplink, the UE to the target eNB it reached. It
+// repeats the binding, the identity and the PDN address, and names both the
+// cell whose command it is executing and the cell it is announcing itself to,
+// so a target can refuse an arrival that names the wrong source, the wrong
+// target, a different UE or a different address from the one the source
+// authorised.
+struct SimulatedHandoverAccess
+{
+    uint32_t arrivalToken{};
+    std::array<uint8_t, 3> sourcePlmn{};
+    uint32_t sourceEnbId{};
+    uint16_t sourceTac{};
+    std::array<uint8_t, 3> targetPlmn{};
+    uint32_t targetEnbId{};
+    uint16_t targetTac{};
+    uint32_t mmeUeS1apId{};
+    std::array<uint8_t, 4> ueIpv4{};
+};
+
+constexpr size_t SimulatedHandoverCommandSize = 21;
+constexpr size_t SimulatedHandoverAccessSize = 30;
+
+// Twenty-one and thirty octets respectively, with no variable part. Throws
+// DecodeError for a zero binding, a zero eNB identifier, a zero MME-UE-S1AP-ID
+// or a zero PDN address: none of the four names anything a target could
+// correlate against or forward to.
+std::vector<uint8_t> EncodeSimulatedHandoverCommand(const SimulatedHandoverCommand &command);
+SimulatedHandoverCommand DecodeSimulatedHandoverCommand(const uint8_t *data, size_t size);
+std::vector<uint8_t> EncodeSimulatedHandoverAccess(const SimulatedHandoverAccess &access);
+SimulatedHandoverAccess DecodeSimulatedHandoverAccess(const uint8_t *data, size_t size);
 
 } // namespace lte::ue::link

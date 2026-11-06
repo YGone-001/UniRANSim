@@ -895,40 +895,397 @@ case claims a packet capture, a live rejection result or a UE arrival.
 
 ## 27. Unsupported runtime behaviour
 
-Nothing in this slice runs in a live or a simulated eNB procedure. Specifically
-not implemented, and not claimed:
+Nothing in this family runs a complete handover against a live or a simulated
+MME. Specifically not implemented, and not claimed:
 
-* no S1AP dispatcher integration: no Handover Request is received by a running
-  eNB, and no acknowledge or failure is transmitted;
-* no Handover Notify, and no recognition of a UE arriving at the target —
-  `TARGET_PREPARED` and `AWAITING_UE_TARGET_ACCESS` are the end of this slice;
-* no promotion of a provisional context into a reached UE session;
+* no S1AP dispatcher integration for preparation: no Handover Request received
+  by a running eNB starts a preparation, because the source identity cannot be
+  established there and the path fails closed;
 * no source context release, no source TEID retirement, no bearer path update;
-* no data forwarding, direct or indirect, and no GTP-U End Marker behaviour;
+* no data forwarding, direct or indirect;
 * no RRC handover command, no Target-ToSource container of the target's own,
   and no security key derivation;
 * no X2 handover, no Path Switch Request, no inter-RAT or inter-MME handover;
 * no live Open5GS handover and no PCC policy change.
 
-Prepared target transport is not completed handover. Do not claim otherwise.
+What *is* implemented now, and only against isolated deterministic tests and
+the existing permitted privileged CI environments, is the target side of the
+arrival: a handover-specific simulated radio frame is decoded by the production
+radio handler, correlated to a committed preparation, and the prepared context
+is promoted to a reached UE whose bearers are activated and whose Handover
+Notify is gated on that arrival.
+
+Prepared target transport is not completed handover, and a sent Handover Notify
+is not one either. Do not claim otherwise.
 
 ## 28. Phase 18-C prerequisites
 
-The remaining steps of section 15 are the prerequisites of a later phase, and
-this slice deliberately leaves each of them open:
+The remaining steps of section 15 were the prerequisites of the arrival phase.
+This phase took up the first two; the last three are still open.
 
-1. **Arrival.** A documented contract for recognising a UE at the target, and
-   the promotion of a provisional context into a reached one through
-   `registerPeer` and `activateUe` on a real verified peer. Until then nothing
-   may call `activateUe` on a prepared bearer.
-2. **Handover Notify.** Verify the named CGI and TAI against the target's own
-   identity before anything else moves.
-3. **Source release.** Release the source context and retire its local S1-U
-   TEIDs only after a Handover Notify for that UE.
-4. **Bearer path update.** The MME-controlled update, which is the point of the
-   S1 family and must not be replaced by a Path Switch Request.
-5. **Data forwarding.** Only after the above, and with a defined forwarding
-   model.
+1. **Arrival.** *Taken up.* See section 29 onward. A documented contract
+   recognises a UE at the target and promotes a provisional context into a
+   reached one, re-binding its prepared bearers and activating them for a real
+   verified peer.
+2. **Handover Notify.** *Taken up.* See section 35. The named CGI and TAI are
+   verified against the target's own identity before anything else moves, and
+   the send is gated on the arrival.
+3. **Source release.** *Still open.* Release the source context and retire its
+   local S1-U TEIDs only after a Handover Notify for that UE.
+4. **Bearer path update.** *Still open.* The MME-controlled update, which is
+   the point of the S1 family and must not be replaced by a Path Switch
+   Request.
+5. **Data forwarding.** *Still open.* Only after the above, and with a defined
+   forwarding model.
 
 A handover is still not an Attach and not an idle-mode Service Request, and
 none of these prerequisites may be reached by substituting one.
+
+## 29. Target-arrival trust model
+
+A provisional context becomes a reached UE through
+`HandoverPreparationOwner::acceptArrival` and nothing else. The evidence it
+requires is built from two halves that are deliberately separate: what the UE
+said, and what this eNB is.
+
+What the UE said arrives as one `SIMULATED_HANDOVER_ACCESS` frame: the arrival
+binding, the source cell whose command it is executing, the target cell it is
+announcing itself to, the MME-UE-S1AP-ID it claims and the PDN address it
+restates.
+
+What this eNB is, the target reads from its own `EnbConfig`: its cell identity,
+its E-UTRAN CGI and the association epoch it is currently bound to. None of
+that comes from the frame. The frame names the cell so a disagreement is
+detectable rather than silently adopted.
+
+The binding is a correlation value and not a credential. It is issued once per
+committed preparation by `AllocateArrivalToken` — process-lifetime monotonic,
+never zero, never repeated — and it has no S1AP representation: nothing puts one
+into a transparent container or any other information element, and nothing
+reads one out of one. In this phase it is handed from the target's preparation
+to the source eNB's simulated handover command by a test harness that has
+verified both ends. That hand-off is explicitly test-harness-verified
+provenance and is not a production trust path; it becomes a Phase 18-D
+prerequisite.
+
+The optional `TargetArrivalEvidence::sourceCommand` is the corroboration a
+two-eNB harness can supply: the source's own statement of what it authorised,
+checked field by field against the arrival. It is absent on the ordinary radio
+receive path, because a target does not see the command its source sent and
+there is no information element in this repository that carries one. When it is
+absent the target falls back to the agreement it can establish on its own and
+does not pretend to a corroboration it does not have.
+
+Twelve things must hold together: an existing committed transaction; its
+current association epoch; its exact MME-UE-S1AP-ID; its committed target
+eNB-UE-S1AP-ID; the target's own cell identity; the source-authorized command
+or an equivalent verified transition; a handover-specific arrival through the
+real radio path; a unique radio UE identity; an unowned radio peer; a binding
+protected against stale and cross-transaction reuse; the original prepared
+bearer set; and the absence of a conflicting reached-UE context. Each has its
+own refusal, so a rejected arrival names what disagreed.
+
+## 30. Simulated radio message and transport contract
+
+Two message types were added to the existing simulated radio link, using its
+envelope, its length discipline and its `DecodeError` refusals unchanged.
+
+`SIMULATED_HANDOVER_COMMAND = 21`, downlink only, source eNB to the UE it
+already serves. Twenty-one octets with no variable part:
+
+```text
+targetPlmn(3) || targetEnbId(4) || targetTac(2) || arrivalToken(4)
+              || mmeUeS1apId(4) || ueIpv4(4)
+```
+
+`SIMULATED_HANDOVER_ACCESS = 22`, uplink only, the UE to the target eNB it
+reached. Thirty octets with no variable part:
+
+```text
+arrivalToken(4) || sourcePlmn(3) || sourceEnbId(4) || sourceTac(2)
+                || targetPlmn(3) || targetEnbId(4) || targetTac(2)
+                || mmeUeS1apId(4) || ueIpv4(4)
+```
+
+Both refuse a zero binding, a zero eNB identifier, a zero MME-UE-S1AP-ID and a
+zero PDN address at encode and at decode: none of the four names anything a
+target could correlate against or forward to. The PLMN fields are three opaque
+octets produced by `EncodePlmn`, never a string.
+
+The MME-UE-S1AP-ID is the second half of the correlation. The target holds one
+from the admission, and an arrival under a different one is a detectable
+disagreement rather than a silent acceptance. The PDN address is a UE
+restatement, at the same trust level as the existing `BEARER_READY` payload and
+`BearerTransportReady`: a cell that never saw the session's Attach cannot learn
+it without decrypting NAS, and it is never invented on the way.
+
+These are simulator control frames and not 3GPP RRC. They are never placed in a
+transparent container, never sent to an MME, and the exchange they form does
+not implement full LTE RRC.
+
+## 31. Provisional promotion algorithm
+
+`UeRegistry::promoteProvisional` moves one provisional entry into the reached-UE
+indexes. It is a move of the same `EnbUeEntry`, not a re-establishment.
+
+Before anything is published it validates: the entry is still provisional, the
+radio identity is non-zero and unused, the peer is unowned, and every
+established bearer is not `active()` and is bound to the identity the move is
+about to change. It refuses the whole promotion if the entry's `mmeUeS1apId` is
+zero while any bearer is established, because there would be nothing to re-bind
+them back to.
+
+The move then re-binds every prepared bearer to the arrived radio identity
+through `DefaultBearerContext::rebindAccessIdentity`, which refuses a bearer
+that is not established, one that is already UE-ready, a zero destination and a
+`from` that does not name the identity the bearer is currently bound to. This
+is necessary because `CommitHandoverResources` binds a prepared bearer to the
+MME-UE-S1AP-ID — the only identity the target has before a UE arrives — and
+`S1uEndpoint::forwardUplink` validates against `entry.radioUeId`. The two are
+not interchangeable.
+
+Publication claims the peer index and then the radio-identity index. Any
+failure unwinds the re-bindings in reverse, recovers the `unique_ptr` and
+restores the provisional map, so no half-published index survives.
+
+`UeRegistry::demoteToProvisional` is the exact inverse, for an arrival whose
+later step did not complete. It validates the same preconditions from the other
+side, erases both indexes, clears the radio identity and the peer, re-binds the
+bearers back to the `mmeUeS1apId`, and re-inserts under a fresh provisional key.
+Its own rollback restores the reached indexes if the re-binding fails.
+
+No TEID, no S1AP identifier and no capacity slot moves in either direction.
+
+## 32. Registry indexing and capacity ownership
+
+A provisional context lives in `m_provisional` alone. It has `radioUeId == 0`,
+which `registerPeer` refuses, and it is absent from the radio-identity index
+and the peer index. `UeRegistry::all()` deliberately returns reached entries
+only, which is why `holdsProvisional` exists: an arrival has to be able to prove
+the prepared context is still held as provisional before promoting it.
+
+A provisional context consumes per-UE resources and per-TEID capacity against
+the same `maxUes` bound as a reached UE. Promotion consumes no second slot: it
+moves the entry from the provisional map into `m_byRadioUeId`, and the test
+evidence for that is a registry at capacity minus one admitting an arrival that
+leaves `size()` exactly one larger than before and the provisional map one
+smaller.
+
+## 33. Preparation-owner handoff
+
+`HandoverPreparationOwner` is owned by `EnbMultiplexer` as `m_preparations`, is
+created in `bindAssociation` with the epoch that association allocated, and is
+destroyed in `unbindAssociation`. A preparation therefore cannot outlive the
+association it was made under, and a caller presenting an older epoch is refused
+as stale rather than served.
+
+On a successful arrival the record sets `ownershipTransferred`, clears `entry`
+and `ownedTeids`, and keeps only immutable audit scalars: `reachedRadioUeId`,
+`reachedEnbUeS1apId` and `reachedUeIpv4`. Those values never resolve to
+anything; they are what was reached, not a handle to it.
+
+From that moment the preparation layer can release nothing.
+`releaseOwned` early-returns with `WRONG_STATE`, `expireDue` skips the record,
+and the owner's destructor — which is what a failed association teardown runs —
+therefore cannot destroy a reached UE or retire its current TEIDs. This is the
+mandatory rule of the phase: a successful promotion transfers ownership away
+from preparation cleanup exactly once.
+
+## 34. Bearer activation
+
+`acceptArrival` validates the whole prepared set before the first `activateUe`:
+the default bearer and every dedicated one must be signalling-established, not
+already UE-ready, bound to the arrived radio identity, and non-zero in its E-RAB
+identity. Because `activateUe` re-checks exactly those conditions plus a
+non-zero address, the activation loop cannot stop half way. That is what makes
+`demoteToProvisional`'s refusal to touch an active bearer safe.
+
+The default is activated first whatever order the E-RABs arrived in, and a
+dedicated bearer only after the default it is linked to. The readiness is read
+from the real `BearerContext` objects, so a record that described readiness it
+does not have cannot pass.
+
+Nothing is re-established and no TEID is allocated at arrival. The prepared
+pair is carried into the reached UE untouched. `BearerRuntime::restoreAccess`
+is not involved and stays TUN-gated.
+
+## 35. Handover Notify gate
+
+`HandoverPreparationOwner::notify` is the only route to a transmitted Handover
+Notify, and `EnbMultiplexer::notifyHandover` is the only route to that. The
+gate, in order:
+
+1. the transaction exists;
+2. it belongs to the association the caller is working under;
+12. it has not already been notified — checked early so a duplicate is refused
+    as a duplicate rather than as something else that also happens to hold;
+3. its resources were committed;
+4. the UE's arrival was verified;
+5. the promotion succeeded and the reached registry, not the record, owns the
+   context;
+11. the source and the target name two distinct cells;
+7, 8, 6. the identities the message would carry are cross-checked against the
+    live reached context, and every prepared bearer is read as ready from the
+    real contexts;
+9, 10. the cell the caller names is the one the transaction was admitted for,
+    so the CGI and the TAI are this cell's and not a caller's assertion.
+
+Then the real codec builds the message and the real sender transmits it. An
+encode failure and a send failure are both reported as failures; a failed send
+leaves `notifySent` false so a later attempt is still possible and a duplicate
+arrival still cannot produce a second successful one.
+
+The message itself is Handover Notification, procedure 2, an initiating
+message, carrying the MME-UE-S1AP-ID and the eNB-UE-S1AP-ID the transaction
+bound and the target's own CGI and TAI. It carries no CriticalityDiagnostics.
+
+## 36. Security limitations
+
+The arrival binding is not a cryptographic authentication key and proves nothing
+on its own. No NAS or AS security key is derived or fabricated anywhere in this
+slice: `nextHopParameter` and `nextHopChainingCount` are carried from
+signalling, never generated, defaulted, derived or logged.
+
+The source-to-target command is a simulator control exchange. It is not
+authenticated, it is not confidential, and its binding is only as good as the
+state the target holds about the transaction that issued it.
+
+The `SourceContext` is test-harness-verified provenance and must not silently
+become trusted production information in a live S1AP dispatcher. The dispatcher
+does not start a preparation for that reason.
+
+## 37. Transparent-container limitations
+
+`SimulatedHandoverCommand` and `SimulatedHandoverAccess` are not RRC and are
+never put in a transparent container. The opaque handover container continues
+to be preserved byte for byte and never parsed for RRC or security content; an
+opaque container is not authority to invent fields.
+
+`BuildHandoverRequestAcknowledge` echoes the admission's `sourceToTarget` into
+`targetToSource`. That is accepted Phase 18-A behaviour pinned by the wire
+vectors and is deliberately unchanged: the acknowledge still carries no
+container of the target's own. Producing a real Target-ToSource container is
+later work.
+
+## 38. Replay and stale transaction protection
+
+A binding is issued once and spent once. A repeat of a frame whose binding has
+already been consumed is `ARRIVAL_TOKEN_CONSUMED`, not a second promotion. A
+binding nothing ever issued is `ARRIVAL_TOKEN_UNKNOWN`, and the allocator never
+reissues a value, so a token from a cleaned-up transaction cannot be reissued to
+another one.
+
+An arrival naming a different MME-UE-S1AP-ID, a different source cell, a
+different target cell or — where the caller has seen the command — a different
+PDN address is refused with its own name and disturbs nothing. An arrival under
+a radio identity a live UE already holds is `RADIO_IDENTITY_CONFLICT`; one from
+a peer that already owns a UE is `RADIO_PEER_CONFLICT`. An arrival presented
+under an association epoch that is not the bound one is `STALE_ASSOCIATION`.
+
+Every refusal is classified and counted through the production radio handler's
+existing rejection path. None of them creates, disturbs or releases any bearer
+or UE state, and none of them touches an unrelated transaction.
+
+## 39. Failure and rollback evidence
+
+Two deterministic fault seams, both arguments and never production switches.
+
+`PromotionFaultInjector` sits inside the registry: `PEER_INDEX_PUBLICATION`
+fails after the peer index has been claimed, and `RADIO_INDEX_PUBLICATION`
+after both have. Both roll the move back completely.
+
+`ArrivalFaultInjector` sits in the preparation layer: `REGISTRY_PUBLICATION`
+maps onto the registry's reached-index publication, and `BEARER_READINESS`
+fires after the complete bearer set has been validated and before the first
+`activateUe` — which is the only place it can, given that the activation loop
+cannot stop half way. On that failure the arrival demotes the context back to
+provisional and resets the resource state to awaiting access.
+
+In every injected case the evidence is the same: nothing in the reached
+indexes, the prepared context still provisional and still owning its transport,
+its TEIDs still resolving to it, its bearers still not `active()`, and a real
+G-PDU for the prepared TEID still dropped as `bearerInactiveDrops` rather than
+delivered.
+
+## 40. Source continuity
+
+Preparing at a target and arriving at one touch the target's registry alone.
+The source eNB's contexts, its local TEIDs, its bearer identities, its access
+generation and its session state do not move, and no source TEID is retired.
+
+The evidence for this is a two-eNB fixture: a reached UE on the source with a
+live TEID, a failed arrival at the target, and the source still holding the same
+entry, the same resolvable TEID and the same active bearer afterwards. The
+other UE's prepared resources at the target are equally untouched.
+
+The simulated handover command is the only thing that leaves the source, and it
+is not an S1AP message and not a bearer transition.
+
+## 41. Multi-UE isolation
+
+Two preparations at one target are two transactions with two bindings, and a
+failed arrival for one of them leaves the other exactly as it was: still
+provisional, still owning its transport, its TEID still resolving to it and its
+bearer still not forwardable. A second UE arriving under a radio identity a
+reached UE already holds is refused rather than merged into that UE's context,
+because the arrival is handled before any entry lookup and can therefore never
+fall into `registerPeer`.
+
+A reached UE's ownership transfer does not make another record's cleanup touch
+it: the preparation owner's destructor runs against records, and a transferred
+record is a no-op.
+
+## 42. Test results
+
+`test/lte/handover_target_arrival.cpp`, twelve cases under
+`lte/handover/arrival:*`, covering the required set:
+
+| Required | Case |
+|---|---|
+| A | a prepared context is not a reached ue and cannot forward a g-pdu |
+| B | an access frame through the production receive path correlates to the prepared transaction |
+| C | promotion moves the same entry and preserves every prepared identifier |
+| D | default and dedicated bearers activate with their prepared identity |
+| E | the same prepared teid refuses forwarding before arrival and delivers after it |
+| F | a handover notify is built from a proven arrival and sent through the real association |
+| G | a notify attempted before the arrival gate is refused without sending |
+| H | replayed, conflicting and wrong-target arrivals disturb nothing |
+| I | a promotion that cannot complete leaves no half-promoted context |
+| J | destroying the preparation owner leaves a reached ue alone |
+| K | a failed arrival leaves the source and another ue untouched |
+| L | the accepted gtpu and teid contracts are unchanged |
+
+Every arrival in these cases is a real encoded radio frame delivered to
+`EnbMultiplexer::handleRadioFrame`. There is no `arrived=true` flag in the
+tests or in the production code.
+
+## 43. Remaining Phase 18-D prerequisites
+
+What this phase established, and what a later phase still needs.
+
+Established: the arrival evidence contract, the atomic promotion with its
+rollback, the ownership transfer away from preparation cleanup, the activation
+of the prepared bearers and the Handover Notify gate wired to the real
+association-aware send.
+
+Still open:
+
+* **Source release.** Nothing releases a source context or retires a source
+  TEID. A source eNB that has sent a handover command still serves the UE.
+* **MME-controlled bearer path update.** The point of the S1 family. A Handover
+  Notify is the trigger and is now gated; the update it triggers is not
+  implemented, and must not be replaced by a Path Switch Request.
+* **Data forwarding.** Neither direct nor indirect, and no defined model yet.
+* **A production path for the arrival binding.** In this phase the binding is
+  handed target to source by a test harness that has verified both ends. That
+  is explicitly test-harness-verified provenance. A live two-eNB run needs a
+  real mechanism, and until one exists the runtime path must fail closed rather
+  than treat a guessed source as verified.
+* **A production path for the source context.** Same finding as Phase 18-B,
+  unchanged: the MME-facing SCTP association does not prove the source eNB
+  identity.
+
+A handover is not an Attach and not an idle-mode Service Request, and none of
+these may be reached by substituting one. A sent Handover Notify is not
+end-to-end S1 handover completion.
+

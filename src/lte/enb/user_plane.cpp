@@ -149,6 +149,19 @@ void DefaultBearerContext::activateUe(uint32_t ueId, uint8_t epsBearerIdentity,
     m_restoringAccess = false;
 }
 
+void DefaultBearerContext::rebindAccessIdentity(uint32_t from, uint32_t to)
+{
+    if (!m_established)
+        throw BearerError("EPS bearer signaling is not established");
+    if (m_ueReady)
+        throw BearerError("An active EPS bearer cannot be re-bound to another UE");
+    if (to == 0)
+        throw BearerError("A prepared EPS bearer cannot be bound to no UE identity");
+    if (from != m_parameters.ueId)
+        throw BearerError("Access identity re-binding does not name the identity the bearer is bound to");
+    m_parameters.ueId = to;
+}
+
 void DefaultBearerContext::validateUplink(uint32_t ueId, const uint8_t *packet, size_t size) const
 {
     if (!active())

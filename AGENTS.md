@@ -398,6 +398,81 @@ owner against real registry resources:
 ./cmake-build-release/nr-tests --no-version --test-case="lte/handover/preparation:*"
 ```
 
+## Verified target arrival and the Handover Notify gate
+
+A prepared target is a UE that has not arrived. The rules below are what a
+change must not weaken when one does.
+
+- Verified arrival is required before promotion. A provisional context becomes
+  a reached UE only through `HandoverPreparationOwner::acceptArrival`, driven by
+  a handover-specific simulated radio frame that reached
+  `EnbMultiplexer::handleRadioFrame`. A decoded Handover Request, a successful
+  admission, a committed resource set, a built acknowledge, a datagram on the
+  target's UDP socket or a numeric identity a caller supplied are each
+  insufficient on their own. Do not substitute a test-only `arrived=true` flag
+  for arrival evidence.
+- Prepared resources alone do not prove arrival. `TARGET_PREPARED` and
+  `RESOURCES_COMMITTED_PREPARED` say the target owns transport for a UE that has
+  not arrived. A prepared bearer is established and not `active()`, and the
+  shared S1-U endpoint drops its G-PDUs as `bearerInactiveDrops` — not as an
+  unknown TEID, not as a retired one and never to the UE link.
+- Provisional promotion preserves TEIDs and S1AP identities. It is a move of
+  one registry entry, not a re-establishment: the same local S1-U TEIDs, the
+  same eNB-UE-S1AP-ID and the same MME-UE-S1AP-ID. No TEID is allocated at
+  arrival and no bearer is re-established. The move also re-binds every prepared
+  bearer to the arrived radio identity, because a prepared bearer is bound to
+  the MME-UE-S1AP-ID until a UE identity exists and the two are not
+  interchangeable.
+- Promotion transfers ownership exactly once. On success the preparation record
+  sets `ownershipTransferred`, clears `entry` and `ownedTeids`, and keeps only
+  immutable audit scalars. Nothing in the preparation layer holds a pointer that
+  can release a reached UE's resources after that.
+- Preparation cleanup must not destroy a reached UE. `releaseOwned`, `expireDue`
+  and `~HandoverPreparationOwner` are no-ops on a transferred record. Cancellation,
+  repeated cancellation, expiry and destroying the owner are all equally
+  forbidden from touching a reached UE or retiring its current TEIDs.
+- Bearer activation requires verified readiness. The whole prepared set is
+  validated before the first `activateUe`, so the activation loop cannot stop
+  half way; the default is activated first whatever order the E-RABs arrived
+  in, and a dedicated bearer only after the default it is linked to. The
+  readiness is read from the real `BearerContext` objects, not from the record's
+  description of them. `BearerRuntime::restoreAccess` stays TUN-gated and is not
+  involved here.
+- Handover Notify requires confirmed target access. `notify()` refuses a
+  transaction that is absent, stale, uncommitted, unreached, incompletely
+  promoted, ambiguous, mismatched in identity or cell, or whose bearers are not
+  all ready — and an already-notified transaction is a duplicate rather than a
+  second notification. An unsuccessful send is reported as unsuccessful and
+  leaves `notifySent` false. A caller cannot bypass the gate by calling
+  `EncodeHandoverNotify` directly: that produces bytes, not an accepted runtime
+  handover.
+- Source eNB identity is not inferred from the MME SCTP association. The
+  `SourceContext` is supplied by the caller of `EnbMultiplexer::prepareHandover`
+  and is explicitly test-harness-verified provenance. It is never derived from
+  the SCTP peer, from TAC or PLMN equality, from a matching EBI or TEID, or by
+  parsing an opaque container. The live S1AP dispatcher does not start a
+  preparation: it cannot establish that provenance, so it fails closed.
+- Simulator-specific arrival control is not real RRC.
+  `SIMULATED_HANDOVER_COMMAND` and `SIMULATED_HANDOVER_ACCESS` are internal
+  simulator frames. The arrival binding is a correlation value and not a
+  credential, it has no S1AP representation, and nothing here derives or
+  fabricates a NAS or AS security key. Never place these frames in a transparent
+  container, send one to an MME, or describe the exchange as 3GPP RRC.
+- Source context release and the MME-controlled bearer path update remain
+  deferred. Nothing here sends a UE Context Release, retires a source TEID or
+  redirects real EPC downlink traffic. Do not claim end-to-end S1 handover
+  completion from a Handover Notify.
+
+The detail, including the arrival evidence contract, the promotion and rollback
+algorithm, the ownership transfer and the Notify gate, is in
+`docs/lte-s1-connected-handover.md`. The cases live in
+`test/lte/handover_target_arrival.cpp` and drive the production radio receive
+path against real registry resources:
+
+```bash
+./cmake-build-release/nr-tests --no-version --test-case="lte/handover/arrival:*"
+```
+
 ## What must never be committed
 
 - `config/*.local.yaml` — private laboratory configurations, including

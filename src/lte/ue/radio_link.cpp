@@ -32,7 +32,8 @@ bool IsKnown(MessageType type)
            type == MessageType::DATA_DOWNLINK_BEARER || type == MessageType::BEARER_ACTIVATED ||
            type == MessageType::DEDICATED_BEARER_RESTORED || type == MessageType::BEARER_TRANSPORT_READY ||
            type == MessageType::EPS_SESSION_DELETED || type == MessageType::S1_ACCESS_LOST ||
-           type == MessageType::NAS_UPLINK_MOBILITY || type == MessageType::NAS_UPLINK_MOBILITY_CONTEXT;
+           type == MessageType::NAS_UPLINK_MOBILITY || type == MessageType::NAS_UPLINK_MOBILITY_CONTEXT ||
+           type == MessageType::SIMULATED_HANDOVER_COMMAND || type == MessageType::SIMULATED_HANDOVER_ACCESS;
 }
 
 size_t MaximumPayload(MessageType type)
@@ -66,6 +67,13 @@ size_t MaximumPayload(MessageType type)
         return 9;
     if (type == MessageType::PAGING_INDICATION)
         return 7;
+    // The two simulated handover-control payloads are fixed-width and carry
+    // nothing variable: a command names one cell and one binding, an access
+    // repeats the binding and names both cells.
+    if (type == MessageType::SIMULATED_HANDOVER_COMMAND)
+        return SimulatedHandoverCommandSize;
+    if (type == MessageType::SIMULATED_HANDOVER_ACCESS)
+        return SimulatedHandoverAccessSize;
     return 1;
 }
 }
@@ -81,7 +89,11 @@ std::vector<uint8_t> Encode(const Message &message)
         (message.type == MessageType::NAS_UPLINK_MOBILITY_CONTEXT && message.payload.size() <= 7) ||
         ((message.type == MessageType::BEARER_RELEASED ||
           message.type == MessageType::S1_CONTEXT_RELEASE_REQUEST ||
-          message.type == MessageType::BEARER_ACTIVATED) && message.payload.size() != 1))
+          message.type == MessageType::BEARER_ACTIVATED) && message.payload.size() != 1) ||
+        (message.type == MessageType::SIMULATED_HANDOVER_COMMAND &&
+         message.payload.size() != SimulatedHandoverCommandSize) ||
+        (message.type == MessageType::SIMULATED_HANDOVER_ACCESS &&
+         message.payload.size() != SimulatedHandoverAccessSize))
         throw DecodeError("Invalid LTE radio-link message");
     if ((message.type == MessageType::S1_CONTEXT_RELEASED || message.type == MessageType::S1_CONTEXT_RESTORED) &&
         message.payload.size() != 1 && message.payload.size() != 5)
@@ -98,6 +110,10 @@ std::vector<uint8_t> Encode(const Message &message)
         if (consumed + 1 > message.payload.size() - 5)
             throw DecodeError("A mobility uplink context carries no protected NAS");
     }
+    if (message.type == MessageType::SIMULATED_HANDOVER_COMMAND)
+        DecodeSimulatedHandoverCommand(message.payload.data(), message.payload.size());
+    if (message.type == MessageType::SIMULATED_HANDOVER_ACCESS)
+        DecodeSimulatedHandoverAccess(message.payload.data(), message.payload.size());
     std::vector<uint8_t> out(HeaderSize + message.payload.size());
     out[0] = Version;
     out[1] = static_cast<uint8_t>(message.type);
@@ -126,7 +142,9 @@ Message Decode(const uint8_t *data, size_t size)
         (type == MessageType::NAS_UPLINK_MOBILITY && length <= 5) ||
         (type == MessageType::NAS_UPLINK_MOBILITY_CONTEXT && length <= 7) ||
         ((type == MessageType::BEARER_RELEASED || type == MessageType::S1_CONTEXT_RELEASE_REQUEST ||
-          type == MessageType::BEARER_ACTIVATED) && length != 1))
+          type == MessageType::BEARER_ACTIVATED) && length != 1) ||
+        (type == MessageType::SIMULATED_HANDOVER_COMMAND && length != SimulatedHandoverCommandSize) ||
+        (type == MessageType::SIMULATED_HANDOVER_ACCESS && length != SimulatedHandoverAccessSize))
         throw DecodeError("Malformed LTE radio-link payload length");
     if ((type == MessageType::S1_CONTEXT_RELEASED || type == MessageType::S1_CONTEXT_RESTORED) &&
         length != 1 && length != 5)
@@ -143,6 +161,10 @@ Message Decode(const uint8_t *data, size_t size)
         if (consumed + 1 > length - 5)
             throw DecodeError("A mobility uplink context carries no protected NAS");
     }
+    if (type == MessageType::SIMULATED_HANDOVER_COMMAND)
+        DecodeSimulatedHandoverCommand(data + HeaderSize, length);
+    if (type == MessageType::SIMULATED_HANDOVER_ACCESS)
+        DecodeSimulatedHandoverAccess(data + HeaderSize, length);
     uint32_t ueId = (static_cast<uint32_t>(data[2]) << 24U) | (static_cast<uint32_t>(data[3]) << 16U) |
                     (static_cast<uint32_t>(data[4]) << 8U) | data[5];
     if (ueId == 0)
@@ -258,13 +280,135 @@ Message BuildMobilityContext(uint32_t ueId, const std::array<uint8_t, 11> &guti,
     return {MessageType::NAS_UPLINK_MOBILITY_CONTEXT, ueId, std::move(payload)};
 }
 
+std::vector<uint8_t> EncodeSimulatedHandoverCommand(const SimulatedHandoverCommand &command)
+{
+    if (command.arrivalToken == 0)
+        throw DecodeError("A simulated handover command carries no arrival binding");
+    if (command.targetEnbId == 0)
+        throw DecodeError("A simulated handover command names no target eNB");
+    if (command.mmeUeS1apId == 0)
+        throw DecodeError("A simulated handover command names no UE");
+    if (command.ueIpv4 == std::array<uint8_t, 4>{})
+        throw DecodeError("A simulated handover command names no UE address");
+    std::vector<uint8_t> payload(SimulatedHandoverCommandSize);
+    std::copy(command.targetPlmn.begin(), command.targetPlmn.end(), payload.begin());
+    payload[3] = static_cast<uint8_t>(command.targetEnbId >> 24U);
+    payload[4] = static_cast<uint8_t>(command.targetEnbId >> 16U);
+    payload[5] = static_cast<uint8_t>(command.targetEnbId >> 8U);
+    payload[6] = static_cast<uint8_t>(command.targetEnbId);
+    payload[7] = static_cast<uint8_t>(command.targetTac >> 8U);
+    payload[8] = static_cast<uint8_t>(command.targetTac);
+    payload[9] = static_cast<uint8_t>(command.arrivalToken >> 24U);
+    payload[10] = static_cast<uint8_t>(command.arrivalToken >> 16U);
+    payload[11] = static_cast<uint8_t>(command.arrivalToken >> 8U);
+    payload[12] = static_cast<uint8_t>(command.arrivalToken);
+    payload[13] = static_cast<uint8_t>(command.mmeUeS1apId >> 24U);
+    payload[14] = static_cast<uint8_t>(command.mmeUeS1apId >> 16U);
+    payload[15] = static_cast<uint8_t>(command.mmeUeS1apId >> 8U);
+    payload[16] = static_cast<uint8_t>(command.mmeUeS1apId);
+    std::copy(command.ueIpv4.begin(), command.ueIpv4.end(), payload.begin() + 17);
+    return payload;
+}
+
+SimulatedHandoverCommand DecodeSimulatedHandoverCommand(const uint8_t *data, size_t size)
+{
+    if (data == nullptr || size != SimulatedHandoverCommandSize)
+        throw DecodeError("A simulated handover command is exactly twenty-one octets");
+    SimulatedHandoverCommand command{};
+    std::copy(data, data + 3, command.targetPlmn.begin());
+    command.targetEnbId = (static_cast<uint32_t>(data[3]) << 24U) | (static_cast<uint32_t>(data[4]) << 16U) |
+                          (static_cast<uint32_t>(data[5]) << 8U) | data[6];
+    command.targetTac = Read16(data + 7);
+    command.arrivalToken = (static_cast<uint32_t>(data[9]) << 24U) | (static_cast<uint32_t>(data[10]) << 16U) |
+                           (static_cast<uint32_t>(data[11]) << 8U) | data[12];
+    command.mmeUeS1apId = (static_cast<uint32_t>(data[13]) << 24U) | (static_cast<uint32_t>(data[14]) << 16U) |
+                          (static_cast<uint32_t>(data[15]) << 8U) | data[16];
+    std::copy(data + 17, data + 21, command.ueIpv4.begin());
+    if (command.arrivalToken == 0)
+        throw DecodeError("A simulated handover command carries no arrival binding");
+    if (command.targetEnbId == 0)
+        throw DecodeError("A simulated handover command names no target eNB");
+    if (command.mmeUeS1apId == 0)
+        throw DecodeError("A simulated handover command names no UE");
+    if (command.ueIpv4 == std::array<uint8_t, 4>{})
+        throw DecodeError("A simulated handover command names no UE address");
+    return command;
+}
+
+std::vector<uint8_t> EncodeSimulatedHandoverAccess(const SimulatedHandoverAccess &access)
+{
+    if (access.arrivalToken == 0)
+        throw DecodeError("A simulated handover access carries no arrival binding");
+    if (access.sourceEnbId == 0 || access.targetEnbId == 0)
+        throw DecodeError("A simulated handover access names no eNB");
+    if (access.mmeUeS1apId == 0)
+        throw DecodeError("A simulated handover access names no UE");
+    if (access.ueIpv4 == std::array<uint8_t, 4>{})
+        throw DecodeError("A simulated handover access names no UE address");
+    std::vector<uint8_t> payload(SimulatedHandoverAccessSize);
+    payload[0] = static_cast<uint8_t>(access.arrivalToken >> 24U);
+    payload[1] = static_cast<uint8_t>(access.arrivalToken >> 16U);
+    payload[2] = static_cast<uint8_t>(access.arrivalToken >> 8U);
+    payload[3] = static_cast<uint8_t>(access.arrivalToken);
+    std::copy(access.sourcePlmn.begin(), access.sourcePlmn.end(), payload.begin() + 4);
+    payload[7] = static_cast<uint8_t>(access.sourceEnbId >> 24U);
+    payload[8] = static_cast<uint8_t>(access.sourceEnbId >> 16U);
+    payload[9] = static_cast<uint8_t>(access.sourceEnbId >> 8U);
+    payload[10] = static_cast<uint8_t>(access.sourceEnbId);
+    payload[11] = static_cast<uint8_t>(access.sourceTac >> 8U);
+    payload[12] = static_cast<uint8_t>(access.sourceTac);
+    std::copy(access.targetPlmn.begin(), access.targetPlmn.end(), payload.begin() + 13);
+    payload[16] = static_cast<uint8_t>(access.targetEnbId >> 24U);
+    payload[17] = static_cast<uint8_t>(access.targetEnbId >> 16U);
+    payload[18] = static_cast<uint8_t>(access.targetEnbId >> 8U);
+    payload[19] = static_cast<uint8_t>(access.targetEnbId);
+    payload[20] = static_cast<uint8_t>(access.targetTac >> 8U);
+    payload[21] = static_cast<uint8_t>(access.targetTac);
+    payload[22] = static_cast<uint8_t>(access.mmeUeS1apId >> 24U);
+    payload[23] = static_cast<uint8_t>(access.mmeUeS1apId >> 16U);
+    payload[24] = static_cast<uint8_t>(access.mmeUeS1apId >> 8U);
+    payload[25] = static_cast<uint8_t>(access.mmeUeS1apId);
+    std::copy(access.ueIpv4.begin(), access.ueIpv4.end(), payload.begin() + 26);
+    return payload;
+}
+
+SimulatedHandoverAccess DecodeSimulatedHandoverAccess(const uint8_t *data, size_t size)
+{
+    if (data == nullptr || size != SimulatedHandoverAccessSize)
+        throw DecodeError("A simulated handover access is exactly thirty octets");
+    SimulatedHandoverAccess access{};
+    access.arrivalToken = (static_cast<uint32_t>(data[0]) << 24U) | (static_cast<uint32_t>(data[1]) << 16U) |
+                          (static_cast<uint32_t>(data[2]) << 8U) | data[3];
+    std::copy(data + 4, data + 7, access.sourcePlmn.begin());
+    access.sourceEnbId = (static_cast<uint32_t>(data[7]) << 24U) | (static_cast<uint32_t>(data[8]) << 16U) |
+                         (static_cast<uint32_t>(data[9]) << 8U) | data[10];
+    access.sourceTac = Read16(data + 11);
+    std::copy(data + 13, data + 16, access.targetPlmn.begin());
+    access.targetEnbId = (static_cast<uint32_t>(data[16]) << 24U) | (static_cast<uint32_t>(data[17]) << 16U) |
+                         (static_cast<uint32_t>(data[18]) << 8U) | data[19];
+    access.targetTac = Read16(data + 20);
+    access.mmeUeS1apId = (static_cast<uint32_t>(data[22]) << 24U) | (static_cast<uint32_t>(data[23]) << 16U) |
+                         (static_cast<uint32_t>(data[24]) << 8U) | data[25];
+    std::copy(data + 26, data + 30, access.ueIpv4.begin());
+    if (access.arrivalToken == 0)
+        throw DecodeError("A simulated handover access carries no arrival binding");
+    if (access.sourceEnbId == 0 || access.targetEnbId == 0)
+        throw DecodeError("A simulated handover access names no eNB");
+    if (access.mmeUeS1apId == 0)
+        throw DecodeError("A simulated handover access names no UE");
+    if (access.ueIpv4 == std::array<uint8_t, 4>{})
+        throw DecodeError("A simulated handover access names no UE address");
+    return access;
+}
+
 bool IsUplink(MessageType type)
 {
     return type == MessageType::NAS_UPLINK || type == MessageType::DATA_UPLINK || type == MessageType::BEARER_READY ||
            type == MessageType::DATA_UPLINK_BEARER || type == MessageType::BEARER_ACTIVATED ||
            type == MessageType::BEARER_TRANSPORT_READY || type == MessageType::EPS_SESSION_DELETED ||
            type == MessageType::S1_CONTEXT_RELEASE_REQUEST || type == MessageType::SERVICE_REQUEST ||
-           type == MessageType::NAS_UPLINK_MOBILITY || type == MessageType::NAS_UPLINK_MOBILITY_CONTEXT;
+           type == MessageType::NAS_UPLINK_MOBILITY || type == MessageType::NAS_UPLINK_MOBILITY_CONTEXT ||
+           type == MessageType::SIMULATED_HANDOVER_ACCESS;
 }
 
 bool IsDownlink(MessageType type)
@@ -273,7 +417,7 @@ bool IsDownlink(MessageType type)
            type == MessageType::DATA_DOWNLINK_BEARER || type == MessageType::BEARER_RELEASED ||
            type == MessageType::S1_CONTEXT_RELEASED || type == MessageType::S1_CONTEXT_RESTORED ||
            type == MessageType::PAGING_INDICATION || type == MessageType::DEDICATED_BEARER_RESTORED ||
-           type == MessageType::S1_ACCESS_LOST;
+           type == MessageType::S1_ACCESS_LOST || type == MessageType::SIMULATED_HANDOVER_COMMAND;
 }
 
 std::vector<uint8_t> EncodePagingNotification(const PagingNotification &notification)

@@ -5,7 +5,10 @@
 
 #include "handover_preparation.hpp"
 
+#include "multiplexer.hpp"
+
 #include <algorithm>
+#include <atomic>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -101,6 +104,10 @@ const char *ToString(PreparationState state)
         return "COMMITTING";
     case PreparationState::TARGET_PREPARED:
         return "TARGET_PREPARED";
+    case PreparationState::TARGET_REACHED:
+        return "TARGET_REACHED";
+    case PreparationState::NOTIFY_SENT:
+        return "NOTIFY_SENT";
     case PreparationState::ADMISSION_REFUSED:
         return "ADMISSION_REFUSED";
     case PreparationState::COMMIT_FAILED:
@@ -126,9 +133,16 @@ bool IsTerminal(PreparationState state)
     case PreparationState::ADMITTED:
     case PreparationState::COMMITTING:
     case PreparationState::TARGET_PREPARED:
+    case PreparationState::TARGET_REACHED:
+    case PreparationState::NOTIFY_SENT:
         return false;
     }
     return true;
+}
+
+bool IsReached(PreparationState state)
+{
+    return state == PreparationState::TARGET_REACHED || state == PreparationState::NOTIFY_SENT;
 }
 
 const char *ToString(ResourceState state)
@@ -143,6 +157,90 @@ const char *ToString(ResourceState state)
         return "RESOURCES_COMMITTED_PREPARED";
     case ResourceState::AWAITING_UE_TARGET_ACCESS:
         return "AWAITING_UE_TARGET_ACCESS";
+    case ResourceState::UE_ARRIVED:
+        return "UE_ARRIVED";
+    case ResourceState::BEARERS_READY:
+        return "BEARERS_READY";
+    case ResourceState::NOTIFY_ELIGIBLE:
+        return "NOTIFY_ELIGIBLE";
+    case ResourceState::NOTIFY_SENT:
+        return "NOTIFY_SENT";
+    }
+    return "UNKNOWN";
+}
+
+const char *ToString(ArrivalRefusal refusal)
+{
+    switch (refusal)
+    {
+    case ArrivalRefusal::TRANSACTION_IDENTITY_ABSENT:
+        return "TRANSACTION_IDENTITY_ABSENT";
+    case ArrivalRefusal::STALE_ASSOCIATION:
+        return "STALE_ASSOCIATION";
+    case ArrivalRefusal::ARRIVAL_TOKEN_UNKNOWN:
+        return "ARRIVAL_TOKEN_UNKNOWN";
+    case ArrivalRefusal::ARRIVAL_TOKEN_CONSUMED:
+        return "ARRIVAL_TOKEN_CONSUMED";
+    case ArrivalRefusal::TRANSACTION_IDENTITY_MISMATCH:
+        return "TRANSACTION_IDENTITY_MISMATCH";
+    case ArrivalRefusal::SOURCE_IDENTITY_MISMATCH:
+        return "SOURCE_IDENTITY_MISMATCH";
+    case ArrivalRefusal::TARGET_IDENTITY_MISMATCH:
+        return "TARGET_IDENTITY_MISMATCH";
+    case ArrivalRefusal::TARGET_CGI_MISMATCH:
+        return "TARGET_CGI_MISMATCH";
+    case ArrivalRefusal::TARGET_TAI_MISMATCH:
+        return "TARGET_TAI_MISMATCH";
+    case ArrivalRefusal::SOURCE_COMMAND_MISMATCH:
+        return "SOURCE_COMMAND_MISMATCH";
+    case ArrivalRefusal::NOT_AWAITING_ACCESS:
+        return "NOT_AWAITING_ACCESS";
+    case ArrivalRefusal::NOT_A_PREPARED_TARGET:
+        return "NOT_A_PREPARED_TARGET";
+    case ArrivalRefusal::RADIO_IDENTITY_CONFLICT:
+        return "RADIO_IDENTITY_CONFLICT";
+    case ArrivalRefusal::RADIO_PEER_CONFLICT:
+        return "RADIO_PEER_CONFLICT";
+    case ArrivalRefusal::BEARER_SET_INCOMPLETE:
+        return "BEARER_SET_INCOMPLETE";
+    case ArrivalRefusal::ARRIVAL_EVIDENCE_INCOMPLETE:
+        return "ARRIVAL_EVIDENCE_INCOMPLETE";
+    case ArrivalRefusal::PROMOTION_FAILED:
+        return "PROMOTION_FAILED";
+    case ArrivalRefusal::BEARER_READINESS_FAILED:
+        return "BEARER_READINESS_FAILED";
+    }
+    return "UNKNOWN";
+}
+
+const char *ToString(NotifyRefusal refusal)
+{
+    switch (refusal)
+    {
+    case NotifyRefusal::NO_PREPARATION:
+        return "NO_PREPARATION";
+    case NotifyRefusal::STALE_ASSOCIATION:
+        return "STALE_ASSOCIATION";
+    case NotifyRefusal::NOT_COMMITTED:
+        return "NOT_COMMITTED";
+    case NotifyRefusal::NOT_REACHED:
+        return "NOT_REACHED";
+    case NotifyRefusal::PROMOTION_INCOMPLETE:
+        return "PROMOTION_INCOMPLETE";
+    case NotifyRefusal::BEARERS_NOT_READY:
+        return "BEARERS_NOT_READY";
+    case NotifyRefusal::IDENTITY_MISMATCH:
+        return "IDENTITY_MISMATCH";
+    case NotifyRefusal::TARGET_CELL_MISMATCH:
+        return "TARGET_CELL_MISMATCH";
+    case NotifyRefusal::AMBIGUOUS_CONTEXT:
+        return "AMBIGUOUS_CONTEXT";
+    case NotifyRefusal::ALREADY_NOTIFIED:
+        return "ALREADY_NOTIFIED";
+    case NotifyRefusal::ENCODE_FAILED:
+        return "ENCODE_FAILED";
+    case NotifyRefusal::SEND_FAILED:
+        return "SEND_FAILED";
     }
     return "UNKNOWN";
 }
@@ -196,6 +294,21 @@ const char *ToString(CommitRefusal refusal)
 bool operator==(const HandoverTransactionId &a, const HandoverTransactionId &b)
 {
     return a.mmeUeS1apId == b.mmeUeS1apId && a.associationEpoch == b.associationEpoch && a.sequence == b.sequence;
+}
+
+// The process-wide issue order of arrival bindings. It never offers a value
+// twice and never offers zero, so a binding from a preparation that has been
+// cleaned up cannot be reissued to another one. The guarantee is process
+// lifetime only and nothing is persisted, exactly like the local S1-U TEID
+// allocator: the protection against reuse is the state that consumes a binding
+// once, not the secrecy or the permanence of the number.
+uint32_t AllocateArrivalToken()
+{
+    static std::atomic<uint32_t> next{1};
+    uint32_t value = next.fetch_add(1, std::memory_order_relaxed);
+    if (value == 0)
+        value = next.fetch_add(1, std::memory_order_relaxed);
+    return value;
 }
 
 bool operator!=(const HandoverTransactionId &a, const HandoverTransactionId &b)
@@ -592,6 +705,12 @@ HandoverPreparationOwner::~HandoverPreparationOwner()
 {
     // A destructor cannot report a cleanup that did not complete, so it tries
     // and then stops. A caller that needs to know must cancel explicitly.
+    //
+    // A record whose ownership has been transferred releases nothing here
+    // either. Destroying the preparation owner is not authority to destroy a
+    // reached UE, retire its current TEIDs or unbind the peer and radio
+    // identity it arrived under: those belong to the registry and outlive this
+    // object.
     for (auto &record : m_records)
     {
         try
@@ -754,6 +873,13 @@ TargetResourceCommit HandoverPreparationOwner::commit(const HandoverTransactionI
         record->ownedTeids.clear();
         for (const auto &bearer : outcome.prepared.bearers)
             record->ownedTeids.push_back(bearer.localTeid);
+        // The binding is issued exactly here, once, and only to a preparation
+        // that actually owns target resources. A commit that failed issues
+        // nothing, so no token can ever name resources that do not exist. It is
+        // never reissued afterwards: `releaseOwned` deliberately keeps it, so a
+        // replayed arrival is refused as spent rather than as unknown.
+        if (record->arrivalToken == 0)
+            record->arrivalToken = AllocateArrivalToken();
         record->refusal.reset();
         return outcome;
     }
@@ -795,6 +921,19 @@ HandoverRequestAcknowledge HandoverPreparationOwner::acknowledge(const HandoverT
 bool HandoverPreparationOwner::releaseOwned(PreparationRecord &record, PreparationState terminal,
                                             CommitRefusalRecord *failure)
 {
+    // A record whose ownership has gone to the reached-UE registry owns
+    // nothing, and a reached UE is not preparation state. Cancellation, expiry,
+    // a repeated cancellation and this owner's own destruction all land here,
+    // and none of them may destroy a reached UE, retire its current TEIDs or
+    // rewrite its name into a terminal failure. The record is left exactly as
+    // it is and the call reports that there was nothing to do.
+    if (record.ownershipTransferred)
+    {
+        if (failure != nullptr)
+            *failure = Refuse(CommitRefusal::WRONG_STATE,
+                              "the preparation's resources belong to the reached UE and are not preparation-owned");
+        return false;
+    }
     if (record.entry != nullptr)
     {
         // Bound identifiers are retired through the normal lifecycle and
@@ -851,7 +990,12 @@ size_t HandoverPreparationOwner::expireDue(std::chrono::steady_clock::time_point
     size_t expired = 0;
     for (auto &record : m_records)
     {
-        if (IsTerminal(record.state) || now <= record.deadline)
+        // A preparation whose resources a reached UE now owns is not expired.
+        // Its deadline is a bound on how long the target waits for an arrival,
+        // and once one has been accepted there is nothing left for the clock to
+        // take away. Expiring it would be a way to destroy a reached UE by
+        // waiting, and there is deliberately no such way.
+        if (record.ownershipTransferred || IsTerminal(record.state) || now <= record.deadline)
             continue;
         CommitRefusalRecord cleanup{};
         if (!releaseOwned(record, PreparationState::PREPARATION_EXPIRED, &cleanup))
@@ -888,6 +1032,387 @@ bool HandoverPreparationOwner::awaitUeAccess(const HandoverTransactionId &id, Co
     }
     record->resources.resourceState = ResourceState::AWAITING_UE_TARGET_ACCESS;
     return true;
+}
+
+// --- Verified target arrival ---------------------------------------------
+
+namespace
+{
+
+// The E-UTRAN CGI a cell with this identity broadcasts: the 20-bit macro eNB
+// identifier followed by an 8-bit local cell identifier of zero, which is what
+// this one-cell simulator has. It is the same arithmetic the encoder performs,
+// so the CGI a Handover Notify carries is the one this cell actually is.
+EutranCgi CgiOf(const EnbIdentity &cell)
+{
+    return EutranCgi{cell.plmn, (cell.enbId & 0xFFFFFU) << 8U};
+}
+
+bool SamePlmn(const Plmn &a, const Plmn &b)
+{
+    return EncodePlmn(a) == EncodePlmn(b);
+}
+
+} // namespace
+
+const PreparationRecord *HandoverPreparationOwner::findByArrivalToken(uint32_t arrivalToken) const
+{
+    if (arrivalToken == 0)
+        return nullptr;
+    for (auto it = m_records.rbegin(); it != m_records.rend(); ++it)
+        if (it->arrivalToken == arrivalToken)
+            return &*it;
+    return nullptr;
+}
+
+bool HandoverPreparationOwner::acceptArrival(const TargetArrivalEvidence &evidence, VerifiedTargetArrival *verified,
+                                             ArrivalRefusalRecord *failure, const ArrivalFaultInjector &faults)
+{
+    auto refuse = [failure](ArrivalRefusal refusal, std::string detail) {
+        if (failure != nullptr)
+            *failure = ArrivalRefusalRecord{refusal, std::move(detail)};
+        return false;
+    };
+
+    const lte::ue::link::SimulatedHandoverAccess &access = evidence.access;
+
+    // --- Evidence completeness. The frame's own decoder refuses a zero
+    // --- binding, a zero eNB identifier, a zero MME-UE-S1AP-ID and a zero PDN
+    // --- address, but the evidence is a plain carrier and a caller that filled
+    // --- one by hand is checked here too rather than trusted.
+    if (evidence.radioUeId == 0)
+        return refuse(ArrivalRefusal::ARRIVAL_EVIDENCE_INCOMPLETE, "the arrival names no simulated radio identity");
+    if (access.arrivalToken == 0)
+        return refuse(ArrivalRefusal::ARRIVAL_EVIDENCE_INCOMPLETE, "the arrival carries no transaction binding");
+    if (access.mmeUeS1apId == 0 || access.ueIpv4 == std::array<uint8_t, 4>{})
+        return refuse(ArrivalRefusal::ARRIVAL_EVIDENCE_INCOMPLETE, "the arrival names no UE or no address");
+
+    // --- Association epoch. An arrival under an association this target has
+    // --- since replaced is work belonging to an association that no longer
+    // --- exists, and it must not be able to move anything this one owns.
+    if (evidence.associationEpoch != m_epoch)
+        return refuse(ArrivalRefusal::STALE_ASSOCIATION,
+                      "the arrival is not for the association this target is bound to");
+
+    // --- Binding resolution. Exactly one committed preparation issued this
+    // --- binding, and a binding that has already been spent is recognisable as
+    // --- spent rather than as unknown, so a replay cannot look like a first
+    // --- arrival.
+    const PreparationRecord *bound = findByArrivalToken(access.arrivalToken);
+    if (bound == nullptr)
+        return refuse(ArrivalRefusal::ARRIVAL_TOKEN_UNKNOWN, "no committed preparation issued this arrival binding");
+    if (bound->ownershipTransferred || IsReached(bound->state))
+        return refuse(ArrivalRefusal::ARRIVAL_TOKEN_CONSUMED, "this arrival binding has already been spent");
+    if (bound->state != PreparationState::TARGET_PREPARED)
+        return refuse(ArrivalRefusal::NOT_A_PREPARED_TARGET,
+                      std::string("the preparation is ") + ToString(bound->state) + " and owns no target to arrive to");
+    if (bound->resources.resourceState != ResourceState::AWAITING_UE_TARGET_ACCESS)
+        return refuse(ArrivalRefusal::NOT_AWAITING_ACCESS,
+                      "the preparation is not awaiting its UE's access");
+
+    // --- Transaction identity. The binding names the transaction and the
+    // --- frame names the UE; the two are separate statements and must agree.
+    if (access.mmeUeS1apId != bound->id.mmeUeS1apId)
+        return refuse(ArrivalRefusal::TRANSACTION_IDENTITY_MISMATCH,
+                      "the arrival names an MME-UE-S1AP-ID this binding was not issued for");
+
+    // --- Cell identities. The frame names both cells so a target can refuse an
+    // --- arrival that names the wrong source or the wrong target, and the
+    // --- target's own identity and CGI come from its configuration rather than
+    // --- from anything the UE claimed.
+    const EnbIdentity &source = bound->admission.source;
+    if (EncodePlmn(source.plmn) != access.sourcePlmn || source.enbId != access.sourceEnbId ||
+        source.tac != access.sourceTac)
+        return refuse(ArrivalRefusal::SOURCE_IDENTITY_MISMATCH,
+                      "the arrival names a source cell this preparation was not admitted from");
+    if (EncodePlmn(evidence.target.plmn) != access.targetPlmn || evidence.target.enbId != access.targetEnbId ||
+        evidence.target.tac != access.targetTac)
+        return refuse(ArrivalRefusal::TARGET_IDENTITY_MISMATCH,
+                      "the arrival names a target cell that is not the one receiving it");
+    if (!SamePlmn(evidence.targetCgi.plmn, evidence.target.plmn) ||
+        evidence.targetCgi.cellId != CgiOf(evidence.target).cellId)
+        return refuse(ArrivalRefusal::TARGET_CGI_MISMATCH,
+                      "the E-UTRAN CGI of the receiving cell is not the one its identity broadcasts");
+    if (source.enbId == bound->admission.target.enbId && SamePlmn(source.plmn, bound->admission.target.plmn) &&
+        source.tac == bound->admission.target.tac && source.enbId != 0)
+        return refuse(ArrivalRefusal::TARGET_IDENTITY_MISMATCH,
+                      "the preparation names the same cell as its source and its target");
+    if (!SamePlmn(bound->admission.target.plmn, evidence.target.plmn) ||
+        bound->admission.target.enbId != evidence.target.enbId)
+        return refuse(ArrivalRefusal::TARGET_IDENTITY_MISMATCH,
+                      "the preparation was admitted for another target eNB");
+    if (bound->admission.target.tac != evidence.target.tac)
+        return refuse(ArrivalRefusal::TARGET_TAI_MISMATCH,
+                      "the preparation was admitted for another tracking area");
+
+    // --- Source command corroboration. Only when the caller has seen the
+    // --- command the source eNB sent; the ordinary radio receive path has not,
+    // --- and there it is simply not claimed.
+    if (evidence.sourceCommand.has_value())
+    {
+        const lte::ue::link::SimulatedHandoverCommand &command = *evidence.sourceCommand;
+        if (command.arrivalToken != access.arrivalToken || command.mmeUeS1apId != access.mmeUeS1apId ||
+            command.ueIpv4 != access.ueIpv4 || command.targetEnbId != access.targetEnbId ||
+            command.targetTac != access.targetTac || command.targetPlmn != access.targetPlmn)
+            return refuse(ArrivalRefusal::SOURCE_COMMAND_MISMATCH,
+                          "the arrival disagrees with the handover command the source eNB sent");
+    }
+
+    // --- Prepared bearer set. The context must still hold exactly what the
+    // --- admission planned, in the readiness order it planned it, or there is
+    // --- nothing here that the arrival could make ready. The registry, not the
+    // --- record, is asked whether the context is still its own.
+    EnbUeEntry *prepared = bound->entry;
+    if (prepared == nullptr || !m_registry.holdsProvisional(*prepared) || !UeRegistry::isProvisional(*prepared) ||
+        prepared->mmeUeS1apId != bound->id.mmeUeS1apId)
+        return refuse(ArrivalRefusal::BEARER_SET_INCOMPLETE,
+                      "the preparation no longer owns the provisional context it prepared");
+    if (bound->resources.bearers.empty() ||
+        prepared->bearer.parameters().erabId != bound->resources.bearers.front().erabId ||
+        prepared->dedicatedBearers.size() + 1 != bound->resources.bearers.size())
+        return refuse(ArrivalRefusal::BEARER_SET_INCOMPLETE,
+                      "the prepared bearer set is not the one the admission planned");
+    for (const PreparedBearer &planned : bound->resources.bearers)
+    {
+        const BearerContext *context = m_registry.findBearer(*prepared, planned.erabId);
+        if (context == nullptr || !context->signalingEstablished() || context->active())
+            return refuse(ArrivalRefusal::BEARER_SET_INCOMPLETE,
+                          "a prepared bearer is missing, not established or already forwardable");
+    }
+
+    // --- Radio identity and endpoint. Both must be free; the registry re-checks
+    // --- this and refuses rather than re-pointing, but a caller that already
+    // --- knows should not be told a promotion failed when the evidence itself
+    // --- is contradictory.
+    if (m_registry.find(evidence.radioUeId) != nullptr)
+        return refuse(ArrivalRefusal::RADIO_IDENTITY_CONFLICT, "another UE already holds this simulated radio identity");
+    if (m_registry.findByPeer(evidence.peer) != nullptr)
+        return refuse(ArrivalRefusal::RADIO_PEER_CONFLICT, "this radio endpoint already carries another UE");
+
+    // --- Promotion. Everything above is pure; only now does anything move.
+    EnbUeEntry *reached = nullptr;
+    try
+    {
+        reached = &m_registry.promoteProvisional(
+            *prepared, evidence.radioUeId, evidence.peer,
+            PromotionFaultInjector(faults.firesAt(ArrivalFaultInjector::Fault::REGISTRY_PUBLICATION)
+                                       ? PromotionFaultInjector::Fault::RADIO_INDEX_PUBLICATION
+                                       : PromotionFaultInjector::Fault::NONE));
+    }
+    catch (const std::exception &e)
+    {
+        return refuse(ArrivalRefusal::PROMOTION_FAILED,
+                      std::string("the provisional context could not become a reached UE: ") + e.what());
+    }
+
+    PreparationRecord *mutableRecord = findMutable(bound->id);
+    if (mutableRecord == nullptr)
+    {
+        m_registry.demoteToProvisional(*reached);
+        return refuse(ArrivalRefusal::PROMOTION_FAILED, "the preparation vanished during its own promotion");
+    }
+    mutableRecord->resources.resourceState = ResourceState::UE_ARRIVED;
+
+    // --- Bearer readiness. The complete set is validated before the first
+    // --- bearer is moved, and every `activateUe` call is then a re-check of
+    // --- conditions already established, so the sequence cannot stop half way
+    // --- through and leave one bearer forwardable and another not. The seam
+    // --- sits between that validation and the first activation on purpose.
+    auto ready = [](BearerContext &bearer, uint32_t radioUeId) {
+        return bearer.signalingEstablished() && !bearer.active() && bearer.parameters().ueId == radioUeId &&
+               bearer.parameters().erabId != 0;
+    };
+    const bool complete = ready(reached->bearer, evidence.radioUeId) &&
+                          std::all_of(reached->dedicatedBearers.begin(), reached->dedicatedBearers.end(),
+                                      [&ready, &evidence](BearerContext &bearer) {
+                                          return ready(bearer, evidence.radioUeId);
+                                      });
+    if (!complete || faults.firesAt(ArrivalFaultInjector::Fault::BEARER_READINESS))
+    {
+        m_registry.demoteToProvisional(*reached);
+        mutableRecord->resources.resourceState = ResourceState::AWAITING_UE_TARGET_ACCESS;
+        return refuse(ArrivalRefusal::BEARER_READINESS_FAILED,
+                      "the prepared bearers were not all ready to be made forwardable; the context is provisional again");
+    }
+
+    try
+    {
+        reached->bearer.activateUe(evidence.radioUeId, reached->bearer.parameters().erabId, access.ueIpv4);
+        for (auto &bearer : reached->dedicatedBearers)
+            bearer.activateUe(evidence.radioUeId, bearer.parameters().erabId, access.ueIpv4);
+    }
+    catch (const std::exception &e)
+    {
+        // Unreachable while the validation above holds, because every call
+        // re-checks exactly what it established. If a future change breaks that,
+        // this must fail closed rather than leave a half-activated reached UE:
+        // the demotion refuses an active bearer and the refusal is surfaced.
+        return refuse(ArrivalRefusal::BEARER_READINESS_FAILED,
+                      std::string("the prepared bearers could not be made forwardable: ") + e.what());
+    }
+
+    // The reached UE is now a real UE on this cell: its first access epoch here,
+    // with an S1 context and forwardable bearers.
+    reached->s1 = UeS1State::BEARER_ACTIVE;
+    reached->accessGeneration = 1;
+    mutableRecord->resources.resourceState = ResourceState::NOTIFY_ELIGIBLE;
+    mutableRecord->resources.state = PreparationState::TARGET_REACHED;
+    mutableRecord->state = PreparationState::TARGET_REACHED;
+
+    // --- Ownership transfer. Exactly once, and it is what makes every cleanup
+    // --- path above this point a no-op: the record keeps no pointer that could
+    // --- release the reached UE, only the immutable facts of what was reached.
+    mutableRecord->reachedRadioUeId = reached->radioUeId;
+    mutableRecord->reachedEnbUeS1apId = reached->enbUeS1apId;
+    mutableRecord->reachedUeIpv4 = access.ueIpv4;
+    mutableRecord->entry = nullptr;
+    mutableRecord->ownedTeids.clear();
+    mutableRecord->ownershipTransferred = true;
+    mutableRecord->refusal.reset();
+
+    if (verified != nullptr)
+    {
+        verified->transaction = bound->id;
+        verified->arrivalToken = access.arrivalToken;
+        verified->radioUeId = evidence.radioUeId;
+        verified->peer = evidence.peer;
+        verified->source = source;
+        verified->target = evidence.target;
+        verified->ueIpv4 = access.ueIpv4;
+    }
+    return true;
+}
+
+HandoverNotifyOutcome HandoverPreparationOwner::notify(const HandoverTransactionId &id,
+                                                       const EnbIdentity &actualTargetCell, IS1apSender &sender,
+                                                       uint16_t stream)
+{
+    HandoverNotifyOutcome outcome;
+    auto refuse = [&outcome](NotifyRefusal refusal, std::string detail) {
+        outcome.sent = false;
+        outcome.message.reset();
+        outcome.refusal = NotifyRefusalRecord{refusal, std::move(detail)};
+        return outcome;
+    };
+
+    // 1. The transaction exists.
+    PreparationRecord *record = findMutable(id);
+    if (record == nullptr)
+        return refuse(NotifyRefusal::NO_PREPARATION, "no preparation with this identity exists");
+
+    // 2. It belongs to the association the caller is working under. A Notify
+    //    through a newer association would be a statement about a transaction
+    //    that association never saw.
+    if (id.associationEpoch != m_epoch)
+        return refuse(NotifyRefusal::STALE_ASSOCIATION, "the association epoch is no longer bound");
+
+    // 12. Checked first among the state conditions so a duplicate is refused as
+    //     a duplicate rather than as something else that happens also to hold.
+    if (record->notifySent)
+        return refuse(NotifyRefusal::ALREADY_NOTIFIED,
+                      "a Handover Notify has already been sent for this transaction");
+
+    // 3. The target resources were committed.
+    if (IsTerminal(record->state) || record->state == PreparationState::NEW ||
+        record->state == PreparationState::ADMITTED || record->state == PreparationState::COMMITTING)
+        return refuse(NotifyRefusal::NOT_COMMITTED,
+                      std::string("the preparation is ") + ToString(record->state) + " and committed nothing");
+    if (record->resources.enbUeS1apId == 0)
+        return refuse(NotifyRefusal::NOT_COMMITTED, "the preparation owns no eNB-UE-S1AP-ID");
+
+    // 4. The UE's arrival was verified.
+    if (!IsReached(record->state))
+        return refuse(NotifyRefusal::NOT_REACHED,
+                      std::string("the preparation is ") + ToString(record->state) + " and no arrival is verified");
+
+    // 5. The promotion succeeded and the reached registry — not this record —
+    //    owns the context now.
+    if (!record->ownershipTransferred || record->entry != nullptr)
+        return refuse(NotifyRefusal::PROMOTION_INCOMPLETE,
+                      "the prepared context has not been transferred to a reached UE");
+
+    // 11. The source and the target name two different cells, and both are
+    //     named. A preparation that names one cell twice is not a handover.
+    const EnbIdentity &source = record->admission.source;
+    if (source.enbId == 0 || SameEnbIdentity(source, record->admission.target))
+        return refuse(NotifyRefusal::AMBIGUOUS_CONTEXT, "the source and the target of this handover are not distinct");
+
+    // 7, 8 and 6. The identities the Notify would carry come from what the
+    //    transaction actually bound, and are cross-checked against the live
+    //    reached context rather than against the record alone. The bearers are
+    //    read from the real contexts too, so a record that described readiness
+    //    it does not have cannot pass.
+    EnbUeEntry *reached = m_registry.findByMmeUeS1apId(record->resources.mmeUeS1apId);
+    if (reached == nullptr)
+        return refuse(NotifyRefusal::PROMOTION_INCOMPLETE, "no reached UE holds this MME-UE-S1AP-ID");
+    if (reached->enbUeS1apId != record->resources.enbUeS1apId ||
+        reached->mmeUeS1apId != record->resources.mmeUeS1apId)
+        return refuse(NotifyRefusal::IDENTITY_MISMATCH,
+                      "the reached UE does not hold the S1AP identities this transaction bound");
+    if (reached->radioUeId != record->reachedRadioUeId)
+        return refuse(NotifyRefusal::AMBIGUOUS_CONTEXT,
+                      "the reached UE is not the one this transaction's arrival established");
+
+    // 6. Every prepared bearer is ready. Read from the real contexts, so a
+    //    record that described readiness it does not have cannot pass.
+    bool allReady = reached->bearer.active();
+    for (const BearerContext &bearer : reached->dedicatedBearers)
+        allReady = allReady && bearer.active();
+    if (!allReady)
+        return refuse(NotifyRefusal::BEARERS_NOT_READY,
+                      "not every prepared bearer of the reached UE is ready to forward");
+
+    // 9 and 10. The cell the caller names must be the one this transaction was
+    //    admitted for, so the CGI and the TAI the Notify carries are this
+    //    cell's and not a caller's assertion.
+    if (!SamePlmn(record->admission.target.plmn, actualTargetCell.plmn) ||
+        record->admission.target.enbId != actualTargetCell.enbId)
+        return refuse(NotifyRefusal::TARGET_CELL_MISMATCH,
+                      "the cell named is not the target eNB this transaction was admitted for");
+    if (record->admission.target.tac != actualTargetCell.tac)
+        return refuse(NotifyRefusal::TARGET_CELL_MISMATCH,
+                      "the tracking area named is not the one this transaction was admitted for");
+
+    HandoverNotify message;
+    message.mmeUeS1apId = record->resources.mmeUeS1apId;
+    message.enbUeS1apId = record->resources.enbUeS1apId;
+    message.cgi = CgiOf(actualTargetCell);
+    message.tai = Tai{actualTargetCell.plmn, actualTargetCell.tac};
+
+    std::vector<uint8_t> pdu;
+    try
+    {
+        pdu = EncodeHandoverNotify(message);
+    }
+    catch (const std::exception &e)
+    {
+        return refuse(NotifyRefusal::ENCODE_FAILED,
+                      std::string("the real codec refused to build this Handover Notify: ") + e.what());
+    }
+
+    // The send is the last thing that can fail, and a failure leaves the
+    // transaction un-notified: an unsuccessful send is reported as unsuccessful
+    // and is not recorded as a notification, so a later attempt is still
+    // possible and a duplicate arrival still cannot produce a second successful
+    // one.
+    try
+    {
+        sender.sendS1ap(stream, pdu);
+    }
+    catch (const std::exception &e)
+    {
+        return refuse(NotifyRefusal::SEND_FAILED,
+                      std::string("the S1AP sender refused this Handover Notify: ") + e.what());
+    }
+
+    record->notifySent = true;
+    record->notifyRefusal.reset();
+    record->state = PreparationState::NOTIFY_SENT;
+    record->resources.state = PreparationState::NOTIFY_SENT;
+    record->resources.resourceState = ResourceState::NOTIFY_SENT;
+    outcome.sent = true;
+    outcome.message = message;
+    return outcome;
 }
 
 } // namespace lte::enb::s1ap

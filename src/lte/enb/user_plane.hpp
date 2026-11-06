@@ -176,6 +176,24 @@ class DefaultBearerContext
     void establish(const BearerParameters &parameters, bool restoringAccess);
     void establish(const BearerParameters &parameters) { establish(parameters, logicalExists()); }
     void activateUe(uint32_t ueId, uint8_t epsBearerIdentity, const std::array<uint8_t, 4> &ipv4Address);
+    // Re-binds the identity this bearer validates user-plane traffic against.
+    //
+    // It exists because a bearer prepared for a handover is established before
+    // the UE has arrived, so the only identity the target can bind it to is the
+    // MME-UE-S1AP-ID of the transaction. `forwardUplink` then validates against
+    // the arriving UE's simulated radio identity, and the two are not
+    // interchangeable: a prepared bearer that was never re-bound refuses every
+    // uplink of the UE it was prepared for. Re-binding is therefore part of
+    // making a prepared bearer the reached UE's bearer, and it is the only place
+    // that identity ever changes.
+    //
+    // It is not an open setter. It refuses a bearer that is not established,
+    // one that is already UE-ready, a zero destination, and a re-binding whose
+    // `from` does not name the identity the bearer is currently bound to. That
+    // last check is what makes the rollback a real inverse: a demotion that
+    // would undo a re-binding something else has already replaced is refused
+    // instead of silently re-pointing a live bearer at another UE.
+    void rebindAccessIdentity(uint32_t from, uint32_t to);
     void validateUplink(uint32_t ueId, const uint8_t *packet, size_t size) const;
     void validateDownlink(uint32_t incomingTeid, const uint8_t *packet, size_t size) const;
     void release();

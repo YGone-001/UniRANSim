@@ -115,6 +115,14 @@ EnbUeEntry &UeRegistry::allocateProvisional()
     return *pointer;
 }
 
+bool UeRegistry::holdsProvisional(const EnbUeEntry &entry) const
+{
+    for (const auto &item : m_provisional)
+        if (item.second.get() == &entry)
+            return true;
+    return false;
+}
+
 void UeRegistry::removeProvisional(EnbUeEntry &entry)
 {
     if (!isProvisional(entry))
@@ -139,6 +147,205 @@ void UeRegistry::removeProvisional(EnbUeEntry &entry)
         }
     }
     throw RegistryError("The provisional UE entry is not registered");
+}
+
+EnbUeEntry &UeRegistry::promoteProvisional(EnbUeEntry &entry, uint32_t radioUeId, const InetAddress &peer,
+                                          const PromotionFaultInjector &faults)
+{
+    // --- Validation. Nothing is published before every one of these holds,
+    // --- so a refusal cannot leave a half-published index behind.
+    if (!isProvisional(entry))
+        throw RegistryError("The UE entry is not a provisional target context");
+    if (radioUeId == 0)
+        throw RegistryError("The simulated radio UE identity must be non-zero");
+    auto provisional = m_provisional.end();
+    for (auto it = m_provisional.begin(); it != m_provisional.end(); ++it)
+    {
+        if (it->second.get() == &entry)
+        {
+            provisional = it;
+            break;
+        }
+    }
+    if (provisional == m_provisional.end())
+        throw RegistryError("The provisional UE entry is not registered");
+    if (m_byRadioUeId.count(radioUeId) != 0)
+        throw RegistryError("A UE with this radio identity is already registered");
+    if (m_byPeer.count(peer.toString()) != 0)
+        throw RegistryError("This radio endpoint already carries another active UE identity");
+    // The S1AP identities are already indexed as a provisional context's are.
+    // A different entry holding either one is a conflicting context that this
+    // arrival cannot be reconciled with, and it is refused rather than
+    // re-pointed.
+    if (entry.enbUeS1apId != 0)
+    {
+        EnbUeEntry *other = findByEnbUeS1apId(entry.enbUeS1apId);
+        if (other != nullptr && other != &entry)
+            throw RegistryError("Another UE context already holds this eNB-UE-S1AP-ID");
+    }
+    if (entry.mmeUeS1apId != 0)
+    {
+        EnbUeEntry *other = findByMmeUeS1apId(entry.mmeUeS1apId);
+        if (other != nullptr && other != &entry)
+            throw RegistryError("Another UE context already holds this MME-UE-S1AP-ID");
+    }
+
+    // --- Access-identity binding. Every prepared bearer is still bound to the
+    // --- only identity this target held before the UE arrived, and a bearer
+    // --- bound to that identity refuses the uplink of the UE that has just
+    // --- arrived under `radioUeId`. The whole set is checked before the first
+    // --- one is moved, so the sequence cannot stop half way through and the
+    // --- rollback only ever has a complete set to put back.
+    std::vector<BearerContext *> rebound;
+    if (entry.bearer.signalingEstablished() || !entry.dedicatedBearers.empty())
+    {
+        if (entry.mmeUeS1apId == 0)
+            throw RegistryError("A prepared context with bearers names no identity to bind them back to");
+        auto check = [](BearerContext &bearer, uint32_t expected) {
+            if (!bearer.signalingEstablished())
+                return;
+            if (bearer.active())
+                throw RegistryError("An active EPS bearer cannot be moved to another UE by a promotion");
+            if (bearer.parameters().ueId != expected)
+                throw RegistryError("A prepared EPS bearer is not bound to the identity of its own context");
+        };
+        check(entry.bearer, entry.mmeUeS1apId);
+        for (auto &bearer : entry.dedicatedBearers)
+            check(bearer, entry.mmeUeS1apId);
+    }
+
+    // --- Publication. The ownership moves out of the provisional map first,
+    // --- so the object stays alive for the whole attempt and the rollback can
+    // --- always take it back.
+    //
+    // Both indexes are given room for one more element before anything is
+    // touched, so the two insertions below cannot fail from a rehash and the
+    // rollback cannot be asked to recover from one.
+    m_byPeer.reserve(m_byPeer.size() + 1);
+    m_byRadioUeId.reserve(m_byRadioUeId.size() + 1);
+    const uint32_t previousRadioUeId = entry.radioUeId;
+    const InetAddress previousPeer = entry.peer;
+    std::unique_ptr<EnbUeEntry> owned = std::move(provisional->second);
+    m_provisional.erase(provisional);
+    entry.radioUeId = radioUeId;
+    entry.peer = peer;
+
+    bool peerIndexed = false;
+    bool radioIndexed = false;
+    try
+    {
+        auto rebind = [&rebound](BearerContext &bearer, uint32_t to) {
+            if (!bearer.signalingEstablished())
+                return;
+            bearer.rebindAccessIdentity(bearer.parameters().ueId, to);
+            rebound.push_back(&bearer);
+        };
+        rebind(entry.bearer, radioUeId);
+        for (auto &bearer : entry.dedicatedBearers)
+            rebind(bearer, radioUeId);
+
+        m_byPeer.emplace(peer.toString(), &entry);
+        peerIndexed = true;
+        if (faults.firesAt(PromotionFaultInjector::Fault::PEER_INDEX_PUBLICATION))
+            throw RegistryError("injected: the radio peer index refused publication");
+        m_byRadioUeId.emplace(radioUeId, std::move(owned));
+        radioIndexed = true;
+        if (faults.firesAt(PromotionFaultInjector::Fault::RADIO_INDEX_PUBLICATION))
+            throw RegistryError("injected: the radio identity index refused publication");
+    }
+    catch (...)
+    {
+        // Roll back to exactly the provisional state. The moved ownership is
+        // recovered before the index entry that holds it is erased, so the
+        // context itself is never destroyed by its own rollback, and every
+        // bearer this attempt moved is put back to the identity of the context
+        // it is still owned by.
+        for (auto it = rebound.rbegin(); it != rebound.rend(); ++it)
+            (*it)->rebindAccessIdentity(radioUeId, entry.mmeUeS1apId);
+        if (radioIndexed)
+        {
+            auto it = m_byRadioUeId.find(radioUeId);
+            if (it != m_byRadioUeId.end())
+            {
+                owned = std::move(it->second);
+                m_byRadioUeId.erase(it);
+            }
+        }
+        if (peerIndexed)
+            m_byPeer.erase(peer.toString());
+        entry.radioUeId = previousRadioUeId;
+        entry.peer = previousPeer;
+        const uint32_t key = m_nextProvisionalId++;
+        if (m_nextProvisionalId == 0)
+            m_nextProvisionalId = 1;
+        m_provisional.emplace(key, std::move(owned));
+        throw;
+    }
+    return entry;
+}
+
+void UeRegistry::demoteToProvisional(EnbUeEntry &entry)
+{
+    if (isProvisional(entry))
+        throw RegistryError("The UE entry is not a reached UE context");
+    const uint32_t radioUeId = entry.radioUeId;
+    if (radioUeId == 0)
+        throw RegistryError("A reached UE context names no radio identity");
+    if (m_byRadioUeId.count(radioUeId) == 0 || m_byRadioUeId.find(radioUeId)->second.get() != &entry)
+        throw RegistryError("The reached UE entry is not registered under its own radio identity");
+    if (m_byPeer.count(entry.peer.toString()) == 0 || m_byPeer.find(entry.peer.toString())->second != &entry)
+        throw RegistryError("The reached UE entry is not registered under its own radio endpoint");
+
+    // The whole set is checked before the first one is moved, for the same
+    // reason the promotion checks it: a rollback that stops half way through
+    // leaves bearers of one context bound to two different UEs.
+    if (entry.mmeUeS1apId == 0)
+        throw RegistryError("A prepared context with bearers names no identity to bind them back to");
+    auto check = [radioUeId](BearerContext &bearer) {
+        if (!bearer.signalingEstablished())
+            return;
+        if (bearer.active())
+            throw RegistryError("An active EPS bearer cannot be moved back by a demotion");
+        if (bearer.parameters().ueId != radioUeId)
+            throw RegistryError("A promoted EPS bearer is not bound to the identity of its own context");
+    };
+    check(entry.bearer);
+    for (auto &bearer : entry.dedicatedBearers)
+        check(bearer);
+
+    std::unique_ptr<EnbUeEntry> owned = std::move(m_byRadioUeId.find(radioUeId)->second);
+    m_byRadioUeId.erase(radioUeId);
+    const std::string peerKey = entry.peer.toString();
+    m_byPeer.erase(peerKey);
+    entry.radioUeId = 0;
+    entry.peer = InetAddress{};
+
+    try
+    {
+        auto rebind = [radioUeId, &entry](BearerContext &bearer) {
+            if (!bearer.signalingEstablished())
+                return;
+            bearer.rebindAccessIdentity(radioUeId, entry.mmeUeS1apId);
+        };
+        rebind(entry.bearer);
+        for (auto &bearer : entry.dedicatedBearers)
+            rebind(bearer);
+    }
+    catch (...)
+    {
+        // Put the reached indexes back exactly as they were. The context is
+        // left reached rather than half-reverted, which is the state the caller
+        // is told about by the throw.
+        entry.radioUeId = radioUeId;
+        m_byPeer.emplace(peerKey, &entry);
+        m_byRadioUeId.emplace(radioUeId, std::move(owned));
+        throw;
+    }
+
+    const uint32_t key = m_nextProvisionalId++;
+    if (m_nextProvisionalId == 0)
+        m_nextProvisionalId = 1;
+    m_provisional.emplace(key, std::move(owned));
 }
 
 EnbUeEntry *UeRegistry::find(uint32_t radioUeId)

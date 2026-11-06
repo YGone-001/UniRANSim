@@ -9,12 +9,14 @@
 #pragma once
 
 #include "codec.hpp"
+#include "handover_preparation.hpp"
 #include "s1u_endpoint.hpp"
 #include "types.hpp"
 #include "ue_registry.hpp"
 
 #include <chrono>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <vector>
 
@@ -152,6 +154,68 @@ class EnbMultiplexer
     // Consumes one simulated radio-link datagram received from a UE peer.
     void handleRadioFrame(const uint8_t *data, size_t size, const InetAddress &peer);
 
+    // --- Handover preparation, verified target arrival and Handover Notify ---
+    //
+    // The preparation owner of the currently bound association, or null while
+    // no association is bound. It is created under the epoch that association
+    // allocated and destroyed when that association is unbound, so a
+    // preparation cannot outlive the association it was made under and a caller
+    // presenting an older epoch is refused as stale rather than served.
+    [[nodiscard]] s1ap::HandoverPreparationOwner *preparations();
+    [[nodiscard]] const s1ap::HandoverPreparationOwner *preparations() const;
+
+    // What establishing a prepared handover transaction at this target reports.
+    struct PreparedHandover
+    {
+        s1ap::HandoverTransactionId transaction;
+        // The binding an arriving UE must present. It is handed to the source
+        // by the caller of `prepareHandover`, and that hand-off is explicitly
+        // test-harness-verified provenance: nothing in this repository carries
+        // one over the air between two eNBs or through an S1AP information
+        // element. It is a correlation value and not a key.
+        uint32_t arrivalToken{};
+        // The Handover Request Acknowledge the real codec built from what the
+        // commit bound. It is not evidence that a UE arrived.
+        s1ap::HandoverRequestAcknowledge acknowledge;
+    };
+
+    // Establishes a prepared handover transaction at this target: admits it,
+    // commits real target resources and marks the preparation awaiting the
+    // UE's access, in that order, stopping at the first refusal. Nothing is
+    // allocated for an admission that refuses, and a commit that cannot be
+    // made whole is rolled back before this reports anything.
+    //
+    // The `SourceContext` is supplied by the caller and is explicitly
+    // test-harness-verified provenance: a two-eNB harness that has driven both
+    // ends can state it, and nothing else in this repository can. It is never
+    // derived from the MME-facing SCTP association, from a TAC or PLMN
+    // equality, from a matching EBI or TEID, or by parsing an opaque handover
+    // container. That is why the live S1AP dispatcher does not call this: it
+    // has no way to establish that provenance and Phase 18-C does not give it
+    // one, so a Handover Request arriving over S1AP fails closed here rather
+    // than starting a preparation on a guessed source.
+    //
+    // On success `prepared` receives what was bound and the transaction is
+    // awaiting the UE's access. Returns false and states why in `failure`
+    // otherwise.
+    bool prepareHandover(const s1ap::HandoverTransactionId &requested, const s1ap::HandoverRequest &request,
+                         const s1ap::SourceContext &source, const s1ap::TargetContext &target,
+                         const std::vector<s1ap::BearerRoleBinding> &roles, PreparedHandover *prepared = nullptr,
+                         s1ap::CommitRefusalRecord *failure = nullptr, const s1ap::CommitFaultInjector &faults = {});
+
+    // Source side: hands the simulated handover command to the UE this entry
+    // already serves, over the real simulated radio link. It is a simulator
+    // control exchange and not 3GPP RRC: the bytes it carries never become a
+    // transparent container and are never sent to an MME.
+    void sendHandoverCommand(EnbUeEntry &entry, const lte::ue::link::SimulatedHandoverCommand &command);
+
+    // Target side: builds a Handover Notify behind the arrival gate and
+    // transmits it over the real S1AP association. The gate refuses every
+    // attempt that is not a proven arrival with ready bearers, and a send that
+    // does not reach the association is reported as a send failure rather than
+    // recorded as a notification.
+    s1ap::HandoverNotifyOutcome notifyHandover(const s1ap::HandoverTransactionId &id);
+
     [[nodiscard]] UeRegistry &registry();
     [[nodiscard]] const UeRegistry &registry() const;
     [[nodiscard]] InetAddress ueLinkAddress() const;
@@ -188,6 +252,16 @@ class EnbMultiplexer
     // Association-aware send. Returns false when the PDU was not transmitted
     // because no current association exists or an injection was armed.
     bool sendS1ap(uint16_t stream, const std::vector<uint8_t> &pdu);
+    // The same send under an explicit association epoch, so a handover
+    // transaction begun under one epoch cannot transmit through a later
+    // association that never saw it.
+    bool sendS1ap(uint32_t epoch, uint16_t stream, const std::vector<uint8_t> &pdu);
+    // A handover-specific arrival. It is handled before any UE entry lookup on
+    // purpose: the arriving UE is not one this registry already serves and
+    // must not be registered as a peer by this frame. The target learns of the
+    // UE through the committed preparation, and the arrival is what promotes
+    // it.
+    void onHandoverAccess(const lte::ue::link::Message &radio, const InetAddress &peer);
 
     EnbConfig m_config;
     S1apSenderBinding m_sender;
@@ -205,6 +279,12 @@ class EnbMultiplexer
     udp::UdpServer m_ueLink;
     UeRegistry m_registry;
     S1uEndpoint m_s1u;
+    // The handover preparations of the currently bound association. Declared
+    // after the registry on purpose: it is destroyed first, so its cleanup
+    // still finds the registry it holds provisional contexts in. A record
+    // whose ownership has already been transferred to a reached UE is not
+    // touched by that cleanup at all.
+    std::unique_ptr<s1ap::HandoverPreparationOwner> m_preparations;
     PagingCounters m_paging;
     RecoveryCounters m_recovery;
 };

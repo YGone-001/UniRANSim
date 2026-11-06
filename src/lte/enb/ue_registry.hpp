@@ -135,6 +135,44 @@ struct BearerLocation
 // negotiated outbound streams, with sharing when fewer streams than UEs exist.
 uint16_t SctpStreamForUe(int outboundStreams, uint32_t enbUeS1apId);
 
+// Opt-in fault points for the provisional-to-reached promotion. It is an
+// argument, never a global: production calls `promoteProvisional` without one
+// and cannot be made to fail by anything outside its own preconditions. A test
+// passes one to reach the rollback that a working promotion cannot reach on its
+// own, which is the only way to show that a half-published index never
+// survives.
+class PromotionFaultInjector
+{
+  public:
+    enum class Fault : uint8_t
+    {
+        NONE,
+        // Fail after the radio-peer index has been claimed, so the rollback has
+        // one published index to undo.
+        PEER_INDEX_PUBLICATION,
+        // Fail after both indexes have been claimed, so the rollback has to
+        // take the moved ownership back before it can undo them.
+        RADIO_INDEX_PUBLICATION
+    };
+
+    constexpr PromotionFaultInjector() = default;
+    constexpr explicit PromotionFaultInjector(Fault fault) : m_fault(fault)
+    {
+    }
+
+    [[nodiscard]] constexpr Fault fault() const
+    {
+        return m_fault;
+    }
+    [[nodiscard]] constexpr bool firesAt(Fault point) const
+    {
+        return m_fault != Fault::NONE && m_fault == point;
+    }
+
+  private:
+    Fault m_fault{Fault::NONE};
+};
+
 // Bounded registry of concurrently served radio UEs with the identity indexes
 // the S1AP dispatcher and the shared S1-U endpoint demultiplex by: radio UE
 // ID, verified UDP peer, eNB-UE-S1AP-ID, MME-UE-S1AP-ID and local GTP-U TEID.
@@ -189,6 +227,12 @@ class UeRegistry
         return entry.radioUeId == 0;
     }
 
+    // Whether this registry currently holds the entry as one of its provisional
+    // contexts. It is how a caller that holds a pointer to a prepared context
+    // checks that the registry still owns it before touching it, rather than
+    // trusting a pointer that a cleanup may already have released.
+    [[nodiscard]] bool holdsProvisional(const EnbUeEntry &entry) const;
+
     // Erases a provisional entry and everything it owns. Every prepared bearer
     // is released through `unbindLocalTeid`, so a TEID that was actually bound
     // is retired through the normal lifecycle while one that was only reserved
@@ -196,6 +240,54 @@ class UeRegistry
     // idempotent for the resources in question: the second call finds nothing
     // owned by this entry and cannot touch another transaction's identifiers.
     void removeProvisional(EnbUeEntry &entry);
+
+    // Moves a provisional target context into the reached-UE indexes and gives
+    // it the radio identity and peer it arrived under. This is the only way a
+    // provisional context becomes a reached UE, and it is a move: the same
+    // `EnbUeEntry` object keeps its bearers, its S1AP identifiers and its local
+    // S1-U TEIDs, and no second entry is created to copy them into.
+    //
+    // Validation happens before anything is published. It refuses a context
+    // that is not provisional, a zero radio identity, an entry this registry
+    // does not hold, a radio identity another UE already owns, a radio endpoint
+    // that already carries a UE, and a context whose S1AP identifiers are
+    // already held by another entry. A refusal leaves the context provisional
+    // and every index exactly as it was. There is no capacity check: the
+    // provisional entry already occupies its slot, so promotion moves it rather
+    // than consuming another one.
+    //
+    // Publication is rolled back if it does not complete, so no partially
+    // published radio or peer index can survive: the context goes back to being
+    // the provisional one it was and still owns everything it owned.
+    //
+    // The move also re-binds every prepared bearer to the arrived radio
+    // identity. A prepared bearer is established against the only identity the
+    // target held before the UE arrived — the MME-UE-S1AP-ID of its transaction
+    // — while `forwardUplink` validates against the arriving UE's radio
+    // identity, so a bearer that is not re-bound refuses every uplink of the UE
+    // it was prepared for. That re-binding is part of the move and is undone by
+    // the same rollback, so a promotion never leaves a published context whose
+    // bearers are still bound to a UE that is not the one that arrived.
+    EnbUeEntry &promoteProvisional(EnbUeEntry &entry, uint32_t radioUeId, const InetAddress &peer,
+                                  const PromotionFaultInjector &faults = {});
+
+    // The exact inverse of `promoteProvisional`, for a promotion that must not
+    // stand because a later step of the same arrival did not complete.
+    //
+    // It unpublishes the radio and peer indexes, re-binds every prepared bearer
+    // back to the MME-UE-S1AP-ID the preparation was committed under, clears the
+    // radio identity and the peer, and returns the entry to the provisional map.
+    // No TEID, no S1AP identifier and no capacity slot moves: the context keeps
+    // the transport it owns and stays counted where it was.
+    //
+    // It refuses rather than guesses. A bearer that is already UE-ready is not
+    // one this rollback may touch, a bearer bound to an identity other than the
+    // arrived radio identity has moved since the promotion and is not re-pointed
+    // here, and a context whose `mmeUeS1apId` is zero cannot have its prepared
+    // bearers bound back to anything. Each of those leaves the context exactly
+    // as it is and throws, because a half-reverted context is worse than the
+    // reached one it started from.
+    void demoteToProvisional(EnbUeEntry &entry);
 
     EnbUeEntry *find(uint32_t radioUeId);
     EnbUeEntry *findByPeer(const InetAddress &peer);

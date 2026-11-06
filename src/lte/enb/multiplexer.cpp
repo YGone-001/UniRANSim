@@ -13,6 +13,7 @@
 #include <iomanip>
 #include <set>
 #include <algorithm>
+#include <functional>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
@@ -43,6 +44,29 @@ std::string Describe(const EnbUeEntry &entry)
            << ", MME-UE-S1AP-ID=" << entry.mmeUeS1apId << ", " << ToString(entry.s1) << ")";
     return stream.str();
 }
+
+// Routes one Handover Notify through the association-aware send, so a PDU that
+// cannot reach the live association is reported as a send failure instead of
+// being recorded as a notification that never left the eNB. The send is given
+// as a callable so this stays a free class and needs no access to the
+// multiplexer's private transport.
+class NotifyingS1apSender final : public IS1apSender
+{
+  public:
+    explicit NotifyingS1apSender(std::function<bool(uint16_t, const std::vector<uint8_t> &)> send)
+        : m_send(std::move(send))
+    {
+    }
+
+    void sendS1ap(uint16_t stream, const std::vector<uint8_t> &pdu) override
+    {
+        if (!m_send(stream, pdu))
+            throw std::runtime_error("no live association carried this Handover Notify");
+    }
+
+  private:
+    std::function<bool(uint16_t, const std::vector<uint8_t> &)> m_send;
+};
 
 } // namespace
 
@@ -102,6 +126,12 @@ uint32_t EnbMultiplexer::bindAssociation(IS1apSender &sender, int outboundStream
         ++m_nextAssociationEpoch;
     m_associationEpoch = m_nextAssociationEpoch;
     m_sender.bind(sender, m_associationEpoch);
+    // Preparations belong to the association they were made under, so the
+    // owner is created with that association's epoch and is gone when the
+    // association is. Its cleanup releases anything a caller left prepared;
+    // it never touches a context whose ownership has already been transferred
+    // to a reached UE.
+    m_preparations = std::make_unique<s1ap::HandoverPreparationOwner>(m_registry, m_associationEpoch);
     setOutboundStreams(outboundStreams);
     m_injectionTriggered = false;
     ++m_recovery.associationsEstablished;
@@ -110,6 +140,9 @@ uint32_t EnbMultiplexer::bindAssociation(IS1apSender &sender, int outboundStream
 
 void EnbMultiplexer::unbindAssociation()
 {
+    // Destroyed first, while the registry it holds provisional contexts in is
+    // still alive.
+    m_preparations.reset();
     if (m_associationEpoch != 0)
         m_sender.unbind(m_associationEpoch);
     m_associationEpoch = 0;
@@ -146,6 +179,26 @@ bool EnbMultiplexer::sendS1ap(uint16_t stream, const std::vector<uint8_t> &pdu)
         return false;
     }
     const bool sent = m_sender.send(m_associationEpoch, stream, pdu);
+    if (!sent)
+    {
+        if (m_sender.bound())
+            ++m_recovery.staleSenderRejects;
+        else
+            ++m_recovery.unboundSenderRejects;
+    }
+    return sent;
+}
+
+bool EnbMultiplexer::sendS1ap(uint32_t epoch, uint16_t stream, const std::vector<uint8_t> &pdu)
+{
+    if (m_injectionArmed)
+    {
+        m_injectionArmed = false;
+        m_injectionTriggered = true;
+        noteInjectedAssociationLoss();
+        return false;
+    }
+    const bool sent = m_sender.send(epoch, stream, pdu);
     if (!sent)
     {
         if (m_sender.bound())
@@ -1018,6 +1071,16 @@ void EnbMultiplexer::handleRadioFrame(const uint8_t *data, size_t size, const In
         if (!lte::ue::link::IsUplink(radio.type))
             throw lte::ue::link::DecodeError("Unexpected LTE radio-link direction");
 
+        // A handover arrival is not a UE this registry already serves. It is
+        // handled before any entry lookup so it cannot fall into `registerPeer`
+        // and so an arrival under a radio identity that belongs to a live UE is
+        // refused as a conflict rather than merged into that UE's context.
+        if (radio.type == lte::ue::link::MessageType::SIMULATED_HANDOVER_ACCESS)
+        {
+            onHandoverAccess(radio, peer);
+            return;
+        }
+
         auto *entry = m_registry.find(radio.ueId);
         if (entry != nullptr && entry->peer != peer)
             throw lte::ue::link::DecodeError("LTE radio-link datagram from an endpoint that does not own this UE identity");
@@ -1257,6 +1320,166 @@ void EnbMultiplexer::sendRadio(EnbUeEntry &entry, lte::ue::link::MessageType typ
 uint16_t EnbMultiplexer::streamFor(const EnbUeEntry &entry) const
 {
     return SctpStreamForUe(m_outboundStreams, entry.enbUeS1apId);
+}
+
+s1ap::HandoverPreparationOwner *EnbMultiplexer::preparations()
+{
+    return m_preparations.get();
+}
+
+const s1ap::HandoverPreparationOwner *EnbMultiplexer::preparations() const
+{
+    return m_preparations.get();
+}
+
+bool EnbMultiplexer::prepareHandover(const s1ap::HandoverTransactionId &requested, const s1ap::HandoverRequest &request,
+                                     const s1ap::SourceContext &source, const s1ap::TargetContext &target,
+                                     const std::vector<s1ap::BearerRoleBinding> &roles, PreparedHandover *prepared,
+                                     s1ap::CommitRefusalRecord *failure, const s1ap::CommitFaultInjector &faults)
+{
+    auto decline = [failure](s1ap::CommitRefusal refusal, std::string detail, std::string causeCategory = "radioNetwork",
+                             int causeValue = -1) {
+        if (failure != nullptr)
+            *failure = s1ap::CommitRefusalRecord{refusal, std::move(detail), std::move(causeCategory), causeValue};
+        return false;
+    };
+
+    // No association means no preparation owner, and a preparation that
+    // belongs to no association cannot be made.
+    if (m_preparations == nullptr)
+        return decline(s1ap::CommitRefusal::WRONG_STATE, "no S1 association is bound, so no preparation can be made");
+
+    s1ap::PreparationRecord *record = m_preparations->admit(requested, request, source, target, roles, failure);
+    if (record == nullptr)
+        return false;
+
+    // A refusal of the admission is not a refusal to record it: `admit`
+    // returned a record that owns nothing. This reports it as a refusal
+    // because nothing was prepared, and the record stays so a repeat of the
+    // same request cannot allocate anything either.
+    if (record->refusal.has_value())
+    {
+        if (failure != nullptr)
+            *failure = *record->refusal;
+        return false;
+    }
+
+    const s1ap::HandoverTransactionId id = record->id;
+
+    // Commitment allocates the real target resources. It is all-or-nothing:
+    // a plan that cannot be committed whole is rolled back inside `commit` and
+    // nothing here reports a partial success.
+    s1ap::TargetResourceCommit committed = m_preparations->commit(id, target, faults);
+    if (!committed.committed)
+    {
+        if (failure != nullptr && committed.refusal.has_value())
+            *failure = *committed.refusal;
+        return false;
+    }
+
+    // Issued by the commit and bound to this transaction. It is what an
+    // arriving UE must present and what the caller hands to the source.
+    const uint32_t arrivalToken = record->arrivalToken;
+
+    // The acknowledge is built from what the commit actually bound. A codec
+    // that refuses to build it leaves the resources committed and the
+    // preparation unacknowledged, so the caller can cancel rather than being
+    // told a message exists that does not.
+    s1ap::HandoverRequestAcknowledge built;
+    try
+    {
+        built = m_preparations->acknowledge(id);
+    }
+    catch (const std::exception &e)
+    {
+        return decline(s1ap::CommitRefusal::WRONG_STATE,
+                       std::string("the Handover Request Acknowledge could not be built: ") + e.what());
+    }
+
+    if (!m_preparations->awaitUeAccess(id, failure))
+        return false;
+
+    if (prepared != nullptr)
+    {
+        prepared->transaction = id;
+        prepared->arrivalToken = record->arrivalToken;
+        prepared->acknowledge = std::move(built);
+    }
+    return true;
+}
+
+void EnbMultiplexer::sendHandoverCommand(EnbUeEntry &entry, const lte::ue::link::SimulatedHandoverCommand &command)
+{
+    // A command goes to a UE this eNB is already serving. A provisional
+    // target context is not one, and neither is an entry with no radio
+    // identity, so neither can be handed a command.
+    if (entry.radioUeId == 0 || UeRegistry::isProvisional(entry))
+        throw std::logic_error("A simulated handover command is sent to a UE this eNB already serves");
+    sendRadio(entry, lte::ue::link::MessageType::SIMULATED_HANDOVER_COMMAND,
+              lte::ue::link::EncodeSimulatedHandoverCommand(command));
+}
+
+s1ap::HandoverNotifyOutcome EnbMultiplexer::notifyHandover(const s1ap::HandoverTransactionId &id)
+{
+    s1ap::HandoverNotifyOutcome outcome;
+    if (m_preparations == nullptr)
+    {
+        outcome.sent = false;
+        outcome.refusal = s1ap::NotifyRefusalRecord{s1ap::NotifyRefusal::NO_PREPARATION,
+                                                   "no S1 association is bound, so no preparation exists"};
+        return outcome;
+    }
+
+    // The stream is the UE-associated one of the reached UE, and the send goes
+    // through the association-aware path so it is bound to the epoch this
+    // preparation was made under. A later association never carries it.
+    uint16_t stream = SctpStreamForUe(m_outboundStreams, id.mmeUeS1apId);
+    if (EnbUeEntry *reached = m_registry.findByMmeUeS1apId(id.mmeUeS1apId); reached != nullptr)
+        stream = streamFor(*reached);
+
+    const uint32_t epoch = m_associationEpoch;
+    NotifyingS1apSender sender(
+        [this, epoch](uint16_t s, const std::vector<uint8_t> &pdu) { return sendS1ap(epoch, s, pdu); });
+
+    // What this cell is, from its own configuration. The gate refuses a
+    // transaction that was admitted for another one.
+    const s1ap::EnbIdentity cell{m_config.plmn, m_config.enbId, m_config.tac};
+    return m_preparations->notify(id, cell, sender, stream);
+}
+
+void EnbMultiplexer::onHandoverAccess(const lte::ue::link::Message &radio, const InetAddress &peer)
+{
+    if (m_preparations == nullptr)
+        throw lte::ue::link::DecodeError("A handover arrival cannot be accepted while no S1 association is bound");
+
+    const auto access = lte::ue::link::DecodeSimulatedHandoverAccess(radio.payload.data(), radio.payload.size());
+
+    s1ap::TargetArrivalEvidence evidence;
+    evidence.access = access;
+    evidence.radioUeId = radio.ueId;
+    evidence.peer = peer;
+    // What this eNB is, read from its own configuration and never from the
+    // frame. The frame names the cell so a disagreement with it is detectable
+    // rather than silently adopted.
+    evidence.target = s1ap::EnbIdentity{m_config.plmn, m_config.enbId, m_config.tac};
+    evidence.targetCgi = s1ap::EutranCgi{m_config.plmn, (m_config.enbId & 0xFFFFFU) << 8U};
+    evidence.associationEpoch = m_associationEpoch;
+    // `sourceCommand` is deliberately left absent. A target does not see the
+    // command its source sent this UE, and nothing here reads one out of an
+    // opaque container. A two-eNB harness that has driven both ends supplies
+    // it through `acceptArrival` directly, as test-harness-verified
+    // provenance.
+
+    s1ap::VerifiedTargetArrival verified;
+    s1ap::ArrivalRefusalRecord failure;
+    if (!m_preparations->acceptArrival(evidence, &verified, &failure))
+        throw lte::ue::link::DecodeError(std::string("Refused a handover arrival: ") +
+                                         s1ap::ToString(failure.refusal) + " (" + failure.detail + ")");
+
+    Log("INFO", "Verified handover arrival of LTE UE " + std::to_string(verified.radioUeId) +
+                    " to this cell from eNB " + std::to_string(verified.source.enbId) + "; MME-UE-S1AP-ID=" +
+                    std::to_string(verified.transaction.mmeUeS1apId) +
+                    " and its prepared bearers now belong to the reached UE");
 }
 
 UeRegistry &EnbMultiplexer::registry()
