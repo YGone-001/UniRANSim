@@ -250,6 +250,82 @@ The detail, including the generation arithmetic, the measured per-round
 transport and the QoS consistency evidence, is in
 `docs/lte-dedicated-bearer-paging-restoration.md`.
 
+## S1AP handover message handling
+
+The S1-based connected-mode handover foundation is the codecs in
+`src/lte/enb/codec.{hpp,cpp}` and the pure admission evaluation in
+`src/lte/enb/handover_admission.{hpp,cpp}`. These rules are what a change must
+not weaken.
+
+- The supported family is S1-based handover only: Handover Required, Handover
+  Request, Handover Request Acknowledge, Handover Command, Handover Notify, and
+  the two failure representations Handover Preparation Failure and Handover
+  Failure. A Path Switch Request is X2-based and must not stand in for
+  Handover Notify or for the MME-controlled bearer path update. There is no
+  Path Switch Request in this repository and none may be added as a shortcut.
+- Procedure codes and information-element identifiers come from TS 36.413.
+  Do not invent one. The S1AP PDU category, the procedure code and the
+  procedure criticality are read back from the raw envelope bytes in the tests;
+  a change that silently moves Handover Notification to *reject* or Handover
+  Preparation to *ignore* is a wire change and must show as one.
+- An opaque handover container is preserved byte for byte and is never parsed
+  for RRC or security content. An opaque container is not authority to invent
+  security or RRC fields. An empty container and one past
+  `MaxTransparentContainerSize` are refused whole; an oversized container is
+  never truncated to the bound and accepted.
+- The handover security material — `nextHopChainingCount` and the
+  `nextHopParameter` — is carried from signalling, never generated, defaulted,
+  derived or logged. A Handover Request with no `UESecurityCapabilities` is
+  refused rather than accepted with a guessed algorithm set. Never fabricate
+  UE security keys.
+- `HandoverType` is `intralte` and nothing else. An inter-RAT value is refused
+  at decode and at encode, and a secondary transparent container is refused in
+  an intra-LTE handover.
+- A Handover Request carries no TargetID: the target is the recipient. The only
+  message in this family that names a target is Handover Required, and the only
+  named-target check is `CheckNamedTarget`. Do not add a target field to
+  Handover Request and do not compare a request against a target identity it
+  does not carry.
+- A target eNB identity is coherent only when its Global-ENB-ID PLMN and its
+  selected-TAI PLMN agree. An identity naming two networks is refused as an
+  invalid context identity.
+- Bearer identity is decoded from the network's own statement of the EPS
+  session. Do not assign default-versus-dedicated roles from QCI, and do not
+  infer them from the order the E-RABs are listed in. An E-RAB list that is
+  deliberately reordered must still produce the same roles and the same
+  default-first readiness order.
+- Admission and commitment stay separate. `EvaluateHandoverAdmission` is a pure
+  evaluation that allocates nothing: a decoded but unadmitted Handover Request
+  must not allocate an S1-U tunnel, bind a TEID, open a session, forward a
+  G-PDU, retire a source TEID or release an existing bearer. The only path to a
+  Handover Request Acknowledge is `BuildHandoverRequestAcknowledge`, which takes
+  an explicit `CommittedTransport` set and refuses to invent an address or a
+  TEID.
+- Admission is all-or-nothing across the bearer set. A target that cannot admit
+  every E-RAB admits none and reports a Handover Failure with a standard cause.
+  Do not implement a partial admission.
+- Local S1-U TEIDs stay a fresh pair on every access, and any future handover
+  keeps that: a previous pair must stop resolving, a delayed G-PDU for an old
+  TEID must not reach a new tunnel, and an old End Marker must not release or
+  modify a new bearer. Bearer packet counters accumulate across access
+  restorations by design, so a fresh TEID must not be credited with traffic it
+  never carried.
+- A handover is not an Attach and not an idle-mode Service Request. Do not
+  replace one with the other to reach a target, and do not mutate an unrelated
+  UE's session.
+
+The detail, including the normative references, the S1-based versus X2-based
+distinction, the documented (not implemented) connected-mode lifecycle with
+`TARGET_CONNECTED` and the ten failure and rollback behaviours, the transparent
+container and security boundaries and the evidence categories, is in
+`docs/lte-s1-connected-handover.md`. The cases live in
+`test/lte/handover_s1.cpp` and drive the codecs and the admission evaluator
+against offline fixtures:
+
+```bash
+./cmake-build-release/nr-tests --no-version --test-case="lte/handover/*"
+```
+
 ## What must never be committed
 
 - `config/*.local.yaml` — private laboratory configurations, including

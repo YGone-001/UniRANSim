@@ -65,6 +65,33 @@ constexpr uint16_t IE_E_RAB_RELEASED_LIST = 110;
 constexpr uint16_t IE_EUTRAN_CGI = 100;
 constexpr uint16_t IE_RRC_ESTABLISHMENT_CAUSE = 134;
 constexpr uint16_t IE_S_TMSI = 96;
+// TS 36.413 §9.1.3.1 S1-based connected-mode handover elementary procedures.
+// id-PathSwitchRequest (3) is the X2-based bearer path update and is
+// deliberately absent: it is not an S1-based handover message.
+constexpr uint16_t PROCEDURE_HANDOVER_PREPARATION = 0;
+constexpr uint16_t PROCEDURE_HANDOVER_RESOURCE_ALLOCATION = 1;
+constexpr uint16_t PROCEDURE_HANDOVER_NOTIFICATION = 2;
+// TS 36.413 handover information element identifiers. Every value below was
+// read out of the reference ASN.1 module 36413-g40.asn (TS 36.413 V16.4.0).
+// id-SourceID (3) is declared there but referenced by no handover IE set, so it
+// is deliberately not defined here and never appears on the wire.
+constexpr uint16_t IE_HANDOVER_TYPE = 1;
+constexpr uint16_t IE_TARGET_ID = 4;
+constexpr uint16_t IE_E_RAB_SUBJECT_TO_DATA_FORWARDING_LIST = 12;
+constexpr uint16_t IE_E_RAB_TO_RELEASE_LIST_HO_CMD = 13;
+constexpr uint16_t IE_E_RAB_DATA_FORWARDING_ITEM = 14;
+constexpr uint16_t IE_E_RAB_ADMITTED_LIST = 18;
+constexpr uint16_t IE_E_RAB_FAILED_TO_SETUP_LIST_HO_REQ_ACK = 19;
+constexpr uint16_t IE_E_RAB_ADMITTED_ITEM = 20;
+constexpr uint16_t IE_E_RAB_FAILED_TO_SETUP_ITEM_HO_REQ_ACK = 21;
+constexpr uint16_t IE_E_RAB_TO_BE_SETUP_ITEM_HO_REQ = 27;
+constexpr uint16_t IE_SECURITY_CONTEXT = 40;
+constexpr uint16_t IE_E_RAB_TO_BE_SETUP_LIST_HO_REQ = 53;
+constexpr uint16_t IE_DIRECT_FORWARDING_PATH_AVAILABILITY = 79;
+constexpr uint16_t IE_SOURCE_TO_TARGET_TRANSPARENT_CONTAINER = 104;
+constexpr uint16_t IE_TARGET_TO_SOURCE_TRANSPARENT_CONTAINER = 123;
+constexpr uint16_t IE_SOURCE_TO_TARGET_TRANSPARENT_CONTAINER_SECONDARY = 138;
+constexpr uint16_t IE_TARGET_TO_SOURCE_TRANSPARENT_CONTAINER_SECONDARY = 139;
 // TS 36.413 Paging information elements. Paging is a non-UE-associated
 // procedure, so none of these carry an eNB-UE-S1AP-ID or an MME-UE-S1AP-ID.
 // The identifiers were verified against a live Open5GS 2.8 MME Paging PDU with
@@ -2423,6 +2450,1324 @@ std::vector<uint8_t> EncodeErabModifyResponse(uint32_t mmeId, uint32_t enbId, co
     append(true);
     append(false);
     return EncodePdu(1, 6, Criticality::REJECT, ies);
+}
+
+// --- Phase 18-A: S1-based connected-mode handover ---------------------------
+//
+// The encoders and decoders below cover the five S1-based handover message
+// families of TS 36.413 V16.4.0 §9.1.3.1 and the two wire failure messages.
+// Every procedure code, IE identifier, criticality and presence value is
+// transcribed from the reference ASN.1 module 36413-g40.asn; nothing here is
+// derived from a guess.
+//
+// id-PathSwitchRequest (procedure 3) is the X2-based bearer path update. It is
+// deliberately absent. A handover path update is the MME's, and Handover Notify
+// is what asks for it.
+
+namespace
+{
+
+// --- HandoverType -----------------------------------------------------------
+//
+// HandoverType ::= ENUMERATED { intralte, ltetoutran, ltetogeran, utrantolte,
+//                               gerantolte, ..., eps-to-5gs, fivegs-to-eps }.
+// Five root values, so three bits, behind an extension marker. Only the root
+// value intralte is implemented: the four other root values are inter-RAT
+// handovers and the two extension values are 5GS ones, and encoding any of
+// them without an inter-RAT or 5GS implementation behind it would put a
+// message on the wire that this eNB cannot honour.
+
+void WriteHandoverType(BitWriter &writer, HandoverType type)
+{
+    if (type != HandoverType::INTRA_LTE)
+        throw HandoverRefused(HandoverRefusal::UNSUPPORTED_HANDOVER_TYPE,
+                              "Only an intra-LTE HandoverType can be encoded");
+    writer.writeBit(false); // root enumeration
+    writer.writeBits(static_cast<uint64_t>(type), 3);
+}
+
+HandoverType ReadHandoverType(BitReader &reader)
+{
+    if (reader.readBit())
+        throw HandoverRefused(HandoverRefusal::UNSUPPORTED_HANDOVER_TYPE,
+                              "Extended HandoverType is not supported");
+    const auto index = reader.readBits(3);
+    if (index > 4)
+        throw HandoverRefused(HandoverRefusal::UNSUPPORTED_HANDOVER_TYPE,
+                              "Reserved HandoverType enumeration value");
+    const auto type = static_cast<HandoverType>(index);
+    if (type != HandoverType::INTRA_LTE)
+        throw HandoverRefused(HandoverRefusal::UNSUPPORTED_HANDOVER_TYPE,
+                              "Only intra-LTE handover is supported");
+    return type;
+}
+
+// --- Opaque transparent containers -----------------------------------------
+//
+// Source-ToTarget-TransparentContainer and Target-ToSource-TransparentContainer
+// are plain OCTET STRING "coded according to the specifications of the target
+// system". They are carried byte-for-byte. Nothing here parses, trims or
+// rewrites one, so no RRC or security field can be read out of a container and
+// no container can be used as authority to invent one.
+
+std::vector<uint8_t> EncodeOpaqueContainer(const TransparentContainer &container)
+{
+    if (container.empty())
+        throw HandoverRefused(HandoverRefusal::INVALID_TRANSPARENT_CONTAINER,
+                              "A handover transparent container must not be empty");
+    if (container.size() > MaxTransparentContainerSize)
+        throw HandoverRefused(HandoverRefusal::INVALID_TRANSPARENT_CONTAINER,
+                              "Handover transparent container exceeds the receiver bound");
+    BitWriter writer;
+    writer.writeLength(container.size());
+    writer.writeBytes(container);
+    return writer.take();
+}
+
+TransparentContainer DecodeOpaqueContainer(const std::vector<uint8_t> &value)
+{
+    BitReader reader(value);
+    auto container = reader.readBytes(reader.readLength());
+    reader.requireFinished();
+    if (container.empty())
+        throw HandoverRefused(HandoverRefusal::INVALID_TRANSPARENT_CONTAINER,
+                              "A handover transparent container must not be empty");
+    if (container.size() > MaxTransparentContainerSize)
+        throw HandoverRefused(HandoverRefusal::INVALID_TRANSPARENT_CONTAINER,
+                              "Handover transparent container exceeds the receiver bound");
+    return container;
+}
+
+// --- Target identity --------------------------------------------------------
+//
+// TargetID ::= CHOICE { targeteNB-ID TargeteNB-ID, targetRNC-ID TargetRNC-ID,
+//                       cGI CGI, ..., targetgNgRanNode-ID TargetNgRanNode-ID }
+// with TargeteNB-ID ::= SEQUENCE { global-ENB-ID Global-ENB-ID,
+//                                  selected-TAI TAI,
+//                                  iE-Extensions ... OPTIONAL, ... }.
+//
+// Only the targeteNB-ID choice is named. A targetRNC-ID or a CGI would be an
+// inter-RAT target and a targetgNgRanNode-ID a 5GS one; both are refused as an
+// invalid context identity rather than decoded by guesswork. The PLMN of the
+// Global-ENB-ID and the PLMN of the selected TAI are two separate fields on the
+// wire and must agree: a target that names two different networks is not a
+// coherent target.
+
+void WriteEnbIdentity(BitWriter &writer, const EnbIdentity &identity)
+{
+    writer.writeBit(false); // TargeteNB-ID extension marker
+    writer.writeBit(false); // TargeteNB-ID iE-Extensions absent
+    auto plmn = EncodePlmn(identity.plmn);
+    // Global-ENB-ID
+    writer.writeBit(false); // Global-ENB-ID extension marker
+    writer.writeBit(false); // Global-ENB-ID iE-Extensions absent
+    WriteFixedOctets(writer, plmn.data(), plmn.size());
+    writer.writeBit(false); // ENB-ID CHOICE extension marker
+    writer.writeBit(false); // macroENB-ID
+    writer.align();
+    writer.writeBits(identity.enbId & 0xFFFFFU, 20);
+    // selected-TAI
+    writer.writeBit(false); // TAI extension marker
+    writer.writeBit(false); // TAI iE-Extensions absent
+    WriteFixedOctets(writer, plmn.data(), plmn.size());
+    writer.writeBits(identity.tac, 16);
+}
+
+EnbIdentity ReadEnbIdentity(BitReader &reader)
+{
+    if (reader.readBit())
+        throw HandoverRefused(HandoverRefusal::INVALID_CONTEXT_IDENTITY,
+                              "Extended TargeteNB-ID is not supported");
+    if (reader.readBit())
+        throw HandoverRefused(HandoverRefusal::INVALID_CONTEXT_IDENTITY,
+                              "TargeteNB-ID extensions are not supported");
+    if (reader.readBit() || reader.readBit())
+        throw HandoverRefused(HandoverRefusal::INVALID_CONTEXT_IDENTITY,
+                              "Unsupported Global-ENB-ID extension in TargetID");
+    auto idPlmn = ReadFixedOctets(reader, 3);
+    if (reader.readBit() || reader.readBit())
+        throw HandoverRefused(HandoverRefusal::INVALID_CONTEXT_IDENTITY,
+                              "Only macroENB-ID is supported in TargetID");
+    reader.align();
+    const auto enbId = static_cast<uint32_t>(reader.readBits(20));
+    if (reader.readBit() || reader.readBit())
+        throw HandoverRefused(HandoverRefusal::INVALID_CONTEXT_IDENTITY,
+                              "Unsupported TAI extension in TargetID");
+    auto taiPlmn = ReadFixedOctets(reader, 3);
+    const auto tac = static_cast<uint16_t>(reader.readBits(16));
+    if (!std::equal(idPlmn.begin(), idPlmn.end(), taiPlmn.begin(), taiPlmn.end()))
+        throw HandoverRefused(HandoverRefusal::INVALID_CONTEXT_IDENTITY,
+                              "TargetID names two different PLMN identities");
+    EnbIdentity identity{};
+    identity.plmn = DecodePlmn(idPlmn.data(), idPlmn.size());
+    identity.enbId = enbId;
+    identity.tac = tac;
+    return identity;
+}
+
+std::vector<uint8_t> EncodeTargetId(const EnbIdentity &identity)
+{
+    BitWriter writer;
+    writer.writeBit(false); // TargetID CHOICE extension marker
+    writer.writeBits(0, 2); // targeteNB-ID
+    WriteEnbIdentity(writer, identity);
+    return writer.take();
+}
+
+EnbIdentity ReadTargetId(const std::vector<uint8_t> &value)
+{
+    BitReader reader(value);
+    if (reader.readBit())
+        throw HandoverRefused(HandoverRefusal::INVALID_CONTEXT_IDENTITY,
+                              "Extended TargetID choice is not supported");
+    const auto index = reader.readBits(2);
+    if (index != 0)
+        throw HandoverRefused(HandoverRefusal::INVALID_CONTEXT_IDENTITY,
+                              "Only the targeteNB-ID TargetID choice is supported");
+    auto identity = ReadEnbIdentity(reader);
+    reader.requireFinished();
+    return identity;
+}
+
+// --- Security context -------------------------------------------------------
+//
+// SecurityContext ::= SEQUENCE { nextHopChainingCount INTEGER (0..7),
+//                                nextHopParameter SecurityKey,
+//                                iE-Extensions ... OPTIONAL, ... }.
+// This is handover security material. It is taken from the MME's signalling and
+// is never generated here, never defaulted and never logged.
+
+void WriteSecurityContext(BitWriter &writer, const SecurityContext &context)
+{
+    writer.writeBit(false); // SEQUENCE extension marker
+    writer.writeBit(false); // iE-Extensions absent
+    WriteConstrained(writer, context.nextHopChainingCount, 0, 7, false);
+    WriteSecurityKey(writer, context.nextHopParameter);
+}
+
+SecurityContext ReadSecurityContext(BitReader &reader)
+{
+    if (reader.readBit())
+        throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                              "Extended SecurityContext is not supported");
+    if (reader.readBit())
+        throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                              "SecurityContext extensions are not supported");
+    SecurityContext context{};
+    context.nextHopChainingCount = static_cast<uint8_t>(ReadConstrained(reader, 0, 7, false));
+    context.nextHopParameter = ReadSecurityKey(reader);
+    return context;
+}
+
+// --- E-RAB item shapes ------------------------------------------------------
+//
+// There are three E-RABToBeSetup item shapes in S1AP and they do not share a
+// field order. CtxtSUReq is (id, QoS, transport, TEID, optional NAS);
+// BearerSUReq is (id, QoS, transport, TEID, mandatory NAS); HOReq is
+// (id, transport, TEID, QoS). Reading one with another's layout consumes the
+// wrong number of bits and shifts every following field, so this third shape
+// gets its own encoder and its own decoder.
+
+void WriteErabToBeSetupItemHoReq(BitWriter &writer, const ErabToBeSetupItemHoReq &item)
+{
+    if (!item.qos.valid())
+        throw HandoverRefused(HandoverRefusal::UNSUPPORTED_ERAB_LIST,
+                              "E-RABToBeSetupItemHOReq carries invalid QoS");
+    // A non-GBR QCI carries no GBR QoS Information. Fabricating one here would
+    // advertise a guaranteed bitrate that the bearer was never given.
+    if (item.qos.qci > 4 && item.qos.gbr.has_value())
+        throw HandoverRefused(HandoverRefusal::UNSUPPORTED_ERAB_LIST,
+                              "A non-GBR QCI must not carry GBR QoS Information");
+    writer.writeBit(false); // SEQUENCE extension marker
+    writer.writeBit(false); // iE-Extensions absent
+    WriteErabId(writer, item.erabId);
+    WriteTransportLayerAddress(writer, item.sgwAddress);
+    WriteFixedOctets(writer, item.sgwTeid.data(), item.sgwTeid.size());
+    WriteErabLevelQos(writer, item.qos.qci, item.qos.priorityLevel, item.qos.preemptionCapability,
+                      item.qos.preemptionVulnerability, item.qos.gbr);
+}
+
+// ReadErabLevelQos and ReadArp write into the CtxtSUReq item shape. Reusing
+// them for the handover item means collecting the negotiated QoS through that
+// shape and copying it out, rather than duplicating the ARP and GBR readers.
+ErabQos ReadErabLevelQosAsQos(BitReader &reader)
+{
+    ErabToBeSetupItem carrier{};
+    ReadErabLevelQos(reader, carrier);
+    ErabQos qos;
+    qos.qci = carrier.qci;
+    qos.priorityLevel = carrier.priorityLevel;
+    qos.preemptionCapability = carrier.preemptionCapability;
+    qos.preemptionVulnerability = carrier.preemptionVulnerability;
+    qos.gbr = carrier.gbr;
+    return qos;
+}
+
+ErabToBeSetupItemHoReq ReadErabToBeSetupItemHoReq(BitReader &reader)
+{
+    if (reader.readBit())
+        throw HandoverRefused(HandoverRefusal::UNSUPPORTED_ERAB_LIST,
+                              "Extended E-RABToBeSetupItemHOReq is not supported");
+    const bool extensionsPresent = reader.readBit();
+    ErabToBeSetupItemHoReq item{};
+    item.erabId = ReadErabId(reader);
+    item.sgwAddress = ReadTransportLayerAddress(reader);
+    auto teid = ReadFixedOctets(reader, 4);
+    std::copy(teid.begin(), teid.end(), item.sgwTeid.begin());
+    item.qos = ReadErabLevelQosAsQos(reader);
+    if (extensionsPresent)
+        throw HandoverRefused(HandoverRefusal::UNSUPPORTED_ERAB_LIST,
+                              "E-RABToBeSetupItemHOReq extensions are not supported");
+    if (!item.qos.valid())
+        throw HandoverRefused(HandoverRefusal::UNSUPPORTED_ERAB_LIST,
+                              "E-RABToBeSetupItemHOReq carries invalid QoS");
+    if (item.qos.qci > 4 && item.qos.gbr.has_value())
+        throw HandoverRefused(HandoverRefusal::UNSUPPORTED_ERAB_LIST,
+                              "A non-GBR QCI must not carry GBR QoS Information");
+    return item;
+}
+
+// E-RABAdmittedItem and E-RABDataForwardingItem both carry up to two optional
+// forwarding endpoints, each an address and a TEID. An address without its TEID
+// is not an endpoint, so the pair is admitted or refused together.
+//
+// In APER a SEQUENCE writes its extension marker, then one presence bit per
+// OPTIONAL field in declaration order, and only then the fields themselves.
+// The presence bitmap therefore comes before the mandatory e-RAB-ID, not after
+// it: writing it at the end shifts every field by its own width and the item
+// decodes as a different bearer.
+void WriteForwardingPresence(BitWriter &writer, bool dlPresent, bool ulPresent)
+{
+    writer.writeBit(dlPresent); // dL-transportLayerAddress
+    writer.writeBit(dlPresent); // dL-gTP-TEID
+    writer.writeBit(ulPresent); // uL-TransportLayerAddress
+    writer.writeBit(ulPresent); // uL-gTP-TEID
+    writer.writeBit(false);     // iE-Extensions
+}
+
+void WriteForwardingPairs(BitWriter &writer, bool dlPresent, const std::array<uint8_t, 4> &dlAddress,
+                          const std::array<uint8_t, 4> &dlTeid, bool ulPresent,
+                          const std::array<uint8_t, 4> &ulAddress, const std::array<uint8_t, 4> &ulTeid)
+{
+    if (dlPresent)
+    {
+        WriteTransportLayerAddress(writer, dlAddress);
+        WriteFixedOctets(writer, dlTeid.data(), dlTeid.size());
+    }
+    if (ulPresent)
+    {
+        WriteTransportLayerAddress(writer, ulAddress);
+        WriteFixedOctets(writer, ulTeid.data(), ulTeid.size());
+    }
+}
+
+struct ForwardingPairs
+{
+    bool dlPresent{false};
+    std::array<uint8_t, 4> dlAddress{};
+    std::array<uint8_t, 4> dlTeid{};
+    bool ulPresent{false};
+    std::array<uint8_t, 4> ulAddress{};
+    std::array<uint8_t, 4> ulTeid{};
+    bool extensionsPresent{false};
+};
+
+ForwardingPairs ReadForwardingPresence(BitReader &reader, const char *what)
+{
+    ForwardingPairs pairs{};
+    const bool dlAddress = reader.readBit();
+    const bool dlTeid = reader.readBit();
+    const bool ulAddress = reader.readBit();
+    const bool ulTeid = reader.readBit();
+    pairs.extensionsPresent = reader.readBit();
+    if (dlAddress != dlTeid || ulAddress != ulTeid)
+        throw HandoverRefused(HandoverRefusal::UNSUPPORTED_ERAB_LIST,
+                              std::string(what) + " names a half-specified forwarding endpoint");
+    pairs.dlPresent = dlAddress;
+    pairs.ulPresent = ulAddress;
+    return pairs;
+}
+
+void ReadForwardingPairs(BitReader &reader, ForwardingPairs &pairs, const char *what)
+{
+    if (pairs.dlPresent)
+    {
+        pairs.dlAddress = ReadTransportLayerAddress(reader);
+        auto value = ReadFixedOctets(reader, 4);
+        std::copy(value.begin(), value.end(), pairs.dlTeid.begin());
+    }
+    if (pairs.ulPresent)
+    {
+        pairs.ulAddress = ReadTransportLayerAddress(reader);
+        auto value = ReadFixedOctets(reader, 4);
+        std::copy(value.begin(), value.end(), pairs.ulTeid.begin());
+    }
+    if (pairs.extensionsPresent)
+        throw HandoverRefused(HandoverRefusal::UNSUPPORTED_ERAB_LIST,
+                              std::string(what) + " extensions are not supported");
+}
+
+void WriteErabAdmittedItem(BitWriter &writer, const ErabAdmittedItem &item)
+{
+    writer.writeBit(false); // SEQUENCE extension marker
+    WriteForwardingPresence(writer, item.dlForwardingPresent, item.ulForwardingPresent);
+    WriteErabId(writer, item.erabId);
+    WriteTransportLayerAddress(writer, item.transportLayerAddress);
+    WriteFixedOctets(writer, item.gtpTeid.data(), item.gtpTeid.size());
+    WriteForwardingPairs(writer, item.dlForwardingPresent, item.dlTransportLayerAddress, item.dlGtpTeid,
+                         item.ulForwardingPresent, item.ulTransportLayerAddress, item.ulGtpTeid);
+}
+
+ErabAdmittedItem ReadErabAdmittedItem(BitReader &reader)
+{
+    if (reader.readBit())
+        throw HandoverRefused(HandoverRefusal::UNSUPPORTED_ERAB_LIST,
+                              "Extended E-RABAdmittedItem is not supported");
+    auto pairs = ReadForwardingPresence(reader, "E-RABAdmittedItem");
+    ErabAdmittedItem item{};
+    item.erabId = ReadErabId(reader);
+    item.transportLayerAddress = ReadTransportLayerAddress(reader);
+    auto teid = ReadFixedOctets(reader, 4);
+    std::copy(teid.begin(), teid.end(), item.gtpTeid.begin());
+    ReadForwardingPairs(reader, pairs, "E-RABAdmittedItem");
+    item.dlForwardingPresent = pairs.dlPresent;
+    item.dlTransportLayerAddress = pairs.dlAddress;
+    item.dlGtpTeid = pairs.dlTeid;
+    item.ulForwardingPresent = pairs.ulPresent;
+    item.ulTransportLayerAddress = pairs.ulAddress;
+    item.ulGtpTeid = pairs.ulTeid;
+    return item;
+}
+
+void WriteErabDataForwardingItem(BitWriter &writer, const ErabDataForwardingItem &item)
+{
+    writer.writeBit(false); // SEQUENCE extension marker
+    WriteForwardingPresence(writer, item.dlForwardingPresent, item.ulForwardingPresent);
+    WriteErabId(writer, item.erabId);
+    WriteForwardingPairs(writer, item.dlForwardingPresent, item.dlTransportLayerAddress, item.dlGtpTeid,
+                         item.ulForwardingPresent, item.ulTransportLayerAddress, item.ulGtpTeid);
+}
+
+ErabDataForwardingItem ReadErabDataForwardingItem(BitReader &reader)
+{
+    if (reader.readBit())
+        throw HandoverRefused(HandoverRefusal::UNSUPPORTED_ERAB_LIST,
+                              "Extended E-RABDataForwardingItem is not supported");
+    auto pairs = ReadForwardingPresence(reader, "E-RABDataForwardingItem");
+    ErabDataForwardingItem item{};
+    item.erabId = ReadErabId(reader);
+    ReadForwardingPairs(reader, pairs, "E-RABDataForwardingItem");
+    item.dlForwardingPresent = pairs.dlPresent;
+    item.dlTransportLayerAddress = pairs.dlAddress;
+    item.dlGtpTeid = pairs.dlTeid;
+    item.ulForwardingPresent = pairs.ulPresent;
+    item.ulTransportLayerAddress = pairs.ulAddress;
+    item.ulGtpTeid = pairs.ulTeid;
+    return item;
+}
+
+void WriteErabFailedItemHoReqAck(BitWriter &writer, const ErabFailedItemHoReqAck &item)
+{
+    writer.writeBit(false); // SEQUENCE extension marker
+    writer.writeBit(false); // iE-Extensions absent
+    WriteErabId(writer, item.erabId);
+    WriteCause(writer, item.causeCategory, item.causeValue);
+}
+
+ErabFailedItemHoReqAck ReadErabFailedItemHoReqAck(BitReader &reader)
+{
+    if (reader.readBit() || reader.readBit())
+        throw HandoverRefused(HandoverRefusal::UNSUPPORTED_ERAB_LIST,
+                              "Unsupported E-RABFailedToSetupItemHOReqAck extension");
+    ErabFailedItemHoReqAck item{};
+    item.erabId = ReadErabId(reader);
+    ReadCause(reader, item.causeCategory, item.causeValue);
+    return item;
+}
+
+// --- E-RAB lists ------------------------------------------------------------
+//
+// E-RAB-IE-ContainerList is SEQUENCE (SIZE(1..maxnoofE-RABs)) OF
+// ProtocolIE-SingleContainer, so a list is a bounded run of ordinary IE fields
+// whose value is one item. An empty list is not a list this codec produces or
+// accepts: maxnoofE-RABs is 256 and the lower bound is one.
+
+constexpr size_t MaxHoErabs = 256;
+
+void AppendHoList(BitWriter &writer, uint16_t itemId, const std::vector<std::vector<uint8_t>> &items,
+                  const char *what)
+{
+    if (items.empty() || items.size() > MaxHoErabs)
+        throw HandoverRefused(HandoverRefusal::UNSUPPORTED_ERAB_LIST,
+                              std::string(what) + " must carry 1..256 items");
+    WriteConstrained(writer, items.size(), 1, MaxHoErabs, true);
+    for (const auto &item : items)
+        WriteIe(writer, itemId, Criticality::IGNORE, item);
+}
+
+// Decodes one E-RAB list into its raw item values, refusing an unexpected item
+// identity, an unexpected item criticality, a duplicate E-RAB identity and a
+// list outside the 1..256 bound. The caller decodes each item value with the
+// reader that matches its shape.
+template <typename Item, typename Reader>
+std::vector<Item> ReadHoList(const std::vector<uint8_t> &value, uint16_t itemId, Reader readItem, const char *what)
+{
+    BitReader reader(value);
+    const size_t count = ReadConstrained(reader, 1, MaxHoErabs, true);
+    std::vector<Item> result;
+    result.reserve(count);
+    std::set<uint8_t> seen;
+    for (size_t i = 0; i < count; ++i)
+    {
+        const auto id = static_cast<uint16_t>(ReadConstrained(reader, 0, 65535, true));
+        if (id != itemId)
+            throw HandoverRefused(HandoverRefusal::UNSUPPORTED_ERAB_LIST,
+                                  std::string("Unexpected item identity in ") + what);
+        if (reader.readBits(2) != static_cast<uint8_t>(Criticality::IGNORE))
+            throw HandoverRefused(HandoverRefusal::UNSUPPORTED_ERAB_LIST,
+                                  std::string("Invalid item criticality in ") + what);
+        reader.align();
+        auto itemValue = reader.readOpenType();
+        BitReader itemReader(itemValue);
+        Item item = readItem(itemReader);
+        itemReader.requireFinished();
+        if (!seen.insert(item.erabId).second)
+            throw HandoverRefused(HandoverRefusal::UNSUPPORTED_ERAB_LIST,
+                                  std::string("Duplicated E-RAB identity in ") + what);
+        result.push_back(std::move(item));
+    }
+    reader.requireFinished();
+    return result;
+}
+
+// --- Cause ------------------------------------------------------------------
+
+std::vector<uint8_t> EncodeCauseValue(const std::string &category, int value)
+{
+    BitWriter writer;
+    WriteCause(writer, category, value);
+    return writer.take();
+}
+
+void DecodeCauseValue(const std::vector<uint8_t> &value, std::string &category, int &causeValue)
+{
+    BitReader reader(value);
+    ReadCause(reader, category, causeValue);
+    reader.requireFinished();
+}
+
+// --- UE-associated identities ----------------------------------------------
+
+void RequireUeIdentities(uint32_t mmeUeS1apId, uint32_t enbUeS1apId, bool enbRequired, const char *what)
+{
+    if (mmeUeS1apId == 0)
+        throw HandoverRefused(HandoverRefusal::INVALID_CONTEXT_IDENTITY,
+                              std::string(what) + " has a zero MME-UE-S1AP-ID");
+    if (enbRequired && enbUeS1apId == 0)
+        throw HandoverRefused(HandoverRefusal::INVALID_CONTEXT_IDENTITY,
+                              std::string(what) + " has a zero eNB-UE-S1AP-ID");
+    if (enbRequired && enbUeS1apId > 0xFFFFFFU)
+        throw HandoverRefused(HandoverRefusal::INVALID_CONTEXT_IDENTITY,
+                              std::string(what) + " has an eNB-UE-S1AP-ID out of range");
+}
+
+} // namespace
+
+const char *ToString(HandoverType type)
+{
+    switch (type)
+    {
+    case HandoverType::INTRA_LTE:
+        return "intralte";
+    case HandoverType::LTE_TO_UTRAN:
+        return "ltetoutran";
+    case HandoverType::LTE_TO_GERAN:
+        return "ltetogeran";
+    case HandoverType::UTRAN_TO_LTE:
+        return "utrantolte";
+    case HandoverType::GERAN_TO_LTE:
+        return "gerantolte";
+    case HandoverType::EPS_TO_5GS:
+        return "eps-to-5gs";
+    case HandoverType::FIVEGS_TO_EPS:
+        return "fivegs-to-eps";
+    }
+    return "unknown";
+}
+
+const char *ToString(HandoverRefusal refusal)
+{
+    switch (refusal)
+    {
+    case HandoverRefusal::UNSUPPORTED_HANDOVER_TYPE:
+        return "unsupported-handover-type";
+    case HandoverRefusal::INVALID_TRANSPARENT_CONTAINER:
+        return "invalid-transparent-container";
+    case HandoverRefusal::MISSING_MANDATORY_IE:
+        return "missing-mandatory-ie";
+    case HandoverRefusal::UNSUPPORTED_ERAB_LIST:
+        return "unsupported-erab-list";
+    case HandoverRefusal::INVALID_CONTEXT_IDENTITY:
+        return "invalid-context-identity";
+    }
+    return "unknown";
+}
+
+// --- Handover Required (procedure 0, initiating) ----------------------------
+
+std::vector<uint8_t> EncodeHandoverRequired(const HandoverRequired &message)
+{
+    RequireUeIdentities(message.mmeUeS1apId, message.enbUeS1apId, true, "Handover Required");
+    std::vector<std::pair<std::pair<uint16_t, Criticality>, std::vector<uint8_t>>> ies;
+    ies.push_back({{IE_MME_UE_S1AP_ID, Criticality::REJECT}, EncodeUeId(message.mmeUeS1apId, 0xFFFFFFFFU)});
+    ies.push_back({{IE_ENB_UE_S1AP_ID, Criticality::REJECT}, EncodeUeId(message.enbUeS1apId, 0xFFFFFFU)});
+    {
+        BitWriter writer;
+        WriteHandoverType(writer, message.handoverType);
+        ies.push_back({{IE_HANDOVER_TYPE, Criticality::REJECT}, writer.take()});
+    }
+    ies.push_back({{IE_CAUSE, Criticality::IGNORE},
+                   EncodeCauseValue(message.causeCategory, message.causeValue)});
+    ies.push_back({{IE_TARGET_ID, Criticality::REJECT}, EncodeTargetId(message.target)});
+    // Direct-Forwarding-Path-Availability is ENUMERATED { directPathAvailable,
+    // ... }: one root value, so the enumeration carries no index at all and the
+    // information element's presence is the whole statement. It is emitted only
+    // when direct forwarding is available.
+    if (message.directForwardingPathAvailable)
+    {
+        BitWriter writer;
+        writer.writeBit(false); // root enumeration
+        ies.push_back({{IE_DIRECT_FORWARDING_PATH_AVAILABILITY, Criticality::IGNORE}, writer.take()});
+    }
+    ies.push_back({{IE_SOURCE_TO_TARGET_TRANSPARENT_CONTAINER, Criticality::REJECT},
+                   EncodeOpaqueContainer(message.sourceToTarget)});
+    return EncodePdu(0, PROCEDURE_HANDOVER_PREPARATION, Criticality::REJECT, ies);
+}
+
+HandoverRequired DecodeHandoverRequired(const uint8_t *data, size_t length)
+{
+    auto envelope = DecodeEnvelope(data, length, PROCEDURE_HANDOVER_PREPARATION,
+                                   static_cast<int>(Criticality::REJECT));
+    if (envelope.choice != 0)
+        throw CodecError("Handover Required is not an initiating message");
+
+    HandoverRequired result{};
+    bool mmePresent = false;
+    bool enbPresent = false;
+    bool typePresent = false;
+    bool causePresent = false;
+    bool targetPresent = false;
+    bool containerPresent = false;
+    bool directPath = false;
+
+    for (const auto &ie : DecodeIeContainer(envelope.value))
+    {
+        if (ie.id == IE_MME_UE_S1AP_ID)
+        {
+            if (ie.criticality != Criticality::REJECT)
+                throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                      "MME-UE-S1AP-ID has invalid criticality in Handover Required");
+            result.mmeUeS1apId = DecodeUeId(ie.value, 0xFFFFFFFFU);
+            mmePresent = true;
+        }
+        else if (ie.id == IE_ENB_UE_S1AP_ID)
+        {
+            if (ie.criticality != Criticality::REJECT)
+                throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                      "eNB-UE-S1AP-ID has invalid criticality in Handover Required");
+            result.enbUeS1apId = DecodeUeId(ie.value, 0xFFFFFFU);
+            enbPresent = true;
+        }
+        else if (ie.id == IE_HANDOVER_TYPE)
+        {
+            if (ie.criticality != Criticality::REJECT)
+                throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                      "HandoverType has invalid criticality in Handover Required");
+            BitReader reader(ie.value);
+            result.handoverType = ReadHandoverType(reader);
+            reader.requireFinished();
+            typePresent = true;
+        }
+        else if (ie.id == IE_CAUSE)
+        {
+            if (ie.criticality != Criticality::IGNORE)
+                throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                      "Cause has invalid criticality in Handover Required");
+            DecodeCauseValue(ie.value, result.causeCategory, result.causeValue);
+            causePresent = true;
+        }
+        else if (ie.id == IE_TARGET_ID)
+        {
+            if (ie.criticality != Criticality::REJECT)
+                throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                      "TargetID has invalid criticality in Handover Required");
+            result.target = ReadTargetId(ie.value);
+            targetPresent = true;
+        }
+        else if (ie.id == IE_DIRECT_FORWARDING_PATH_AVAILABILITY)
+        {
+            // Presence means directPathAvailable. The enumeration has one root
+            // value, so its only content bit is the extension marker, which
+            // must be clear: there is no second value to choose.
+            if (ie.criticality != Criticality::IGNORE)
+                throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                      "Direct-Forwarding-Path-Availability has invalid criticality");
+            BitReader reader(ie.value);
+            if (reader.readBit())
+                throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                      "Extended Direct-Forwarding-Path-Availability is not supported");
+            while (reader.remainingBits() != 0)
+            {
+                if (reader.readBit())
+                    throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                          "Malformed Direct-Forwarding-Path-Availability");
+            }
+            directPath = true;
+        }
+        else if (ie.id == IE_SOURCE_TO_TARGET_TRANSPARENT_CONTAINER)
+        {
+            if (ie.criticality != Criticality::REJECT)
+                throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                      "Source-ToTarget-TransparentContainer has invalid criticality");
+            result.sourceToTarget = DecodeOpaqueContainer(ie.value);
+            containerPresent = true;
+        }
+        else if (ie.id == IE_SOURCE_TO_TARGET_TRANSPARENT_CONTAINER_SECONDARY ||
+                 ie.id == IE_TARGET_TO_SOURCE_TRANSPARENT_CONTAINER_SECONDARY)
+            throw HandoverRefused(HandoverRefusal::INVALID_TRANSPARENT_CONTAINER,
+                                  "A secondary transparent container is not an intra-LTE element");
+        else if (ie.criticality == Criticality::REJECT)
+            throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                  "Unexpected reject-criticality IE in Handover Required");
+    }
+
+    if (!mmePresent || !enbPresent || !typePresent || !causePresent || !targetPresent || !containerPresent)
+        throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                              "Handover Required is missing a mandatory information element");
+    RequireUeIdentities(result.mmeUeS1apId, result.enbUeS1apId, true, "Handover Required");
+    result.directForwardingPathAvailable = directPath;
+    return result;
+}
+
+// --- Handover Command (procedure 0, successful outcome) ---------------------
+
+std::vector<uint8_t> EncodeHandoverCommand(const HandoverCommand &message)
+{
+    RequireUeIdentities(message.mmeUeS1apId, message.enbUeS1apId, true, "Handover Command");
+
+    std::vector<uint8_t> forwardingList;
+    if (!message.dataForwarding.empty())
+    {
+        std::vector<std::vector<uint8_t>> items;
+        items.reserve(message.dataForwarding.size());
+        for (const auto &item : message.dataForwarding)
+        {
+            BitWriter writer;
+            WriteErabDataForwardingItem(writer, item);
+            items.push_back(writer.take());
+        }
+        BitWriter list;
+        AppendHoList(list, IE_E_RAB_DATA_FORWARDING_ITEM, items, "E-RABSubjecttoDataForwardingList");
+        forwardingList = list.take();
+    }
+
+    std::vector<std::pair<std::pair<uint16_t, Criticality>, std::vector<uint8_t>>> ies;
+    ies.push_back({{IE_MME_UE_S1AP_ID, Criticality::REJECT}, EncodeUeId(message.mmeUeS1apId, 0xFFFFFFFFU)});
+    ies.push_back({{IE_ENB_UE_S1AP_ID, Criticality::REJECT}, EncodeUeId(message.enbUeS1apId, 0xFFFFFFU)});
+    {
+        BitWriter writer;
+        WriteHandoverType(writer, message.handoverType);
+        ies.push_back({{IE_HANDOVER_TYPE, Criticality::REJECT}, writer.take()});
+    }
+    if (!forwardingList.empty())
+        ies.push_back({{IE_E_RAB_SUBJECT_TO_DATA_FORWARDING_LIST, Criticality::IGNORE}, forwardingList});
+    ies.push_back({{IE_TARGET_TO_SOURCE_TRANSPARENT_CONTAINER, Criticality::REJECT},
+                   EncodeOpaqueContainer(message.targetToSource)});
+    return EncodePdu(1, PROCEDURE_HANDOVER_PREPARATION, Criticality::REJECT, ies);
+}
+
+HandoverCommand DecodeHandoverCommand(const uint8_t *data, size_t length)
+{
+    auto envelope = DecodeEnvelope(data, length, PROCEDURE_HANDOVER_PREPARATION,
+                                   static_cast<int>(Criticality::REJECT));
+    if (envelope.choice != 1)
+        throw CodecError("Handover Command is not a successful outcome message");
+
+    HandoverCommand result{};
+    bool mmePresent = false;
+    bool enbPresent = false;
+    bool typePresent = false;
+    bool containerPresent = false;
+
+    for (const auto &ie : DecodeIeContainer(envelope.value))
+    {
+        if (ie.id == IE_MME_UE_S1AP_ID)
+        {
+            if (ie.criticality != Criticality::REJECT)
+                throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                      "MME-UE-S1AP-ID has invalid criticality in Handover Command");
+            result.mmeUeS1apId = DecodeUeId(ie.value, 0xFFFFFFFFU);
+            mmePresent = true;
+        }
+        else if (ie.id == IE_ENB_UE_S1AP_ID)
+        {
+            if (ie.criticality != Criticality::REJECT)
+                throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                      "eNB-UE-S1AP-ID has invalid criticality in Handover Command");
+            result.enbUeS1apId = DecodeUeId(ie.value, 0xFFFFFFU);
+            enbPresent = true;
+        }
+        else if (ie.id == IE_HANDOVER_TYPE)
+        {
+            if (ie.criticality != Criticality::REJECT)
+                throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                      "HandoverType has invalid criticality in Handover Command");
+            BitReader reader(ie.value);
+            result.handoverType = ReadHandoverType(reader);
+            reader.requireFinished();
+            typePresent = true;
+        }
+        else if (ie.id == IE_E_RAB_SUBJECT_TO_DATA_FORWARDING_LIST)
+        {
+            if (ie.criticality != Criticality::IGNORE)
+                throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                      "E-RABSubjecttoDataForwardingList has invalid criticality");
+            result.dataForwarding = ReadHoList<ErabDataForwardingItem>(
+                ie.value, IE_E_RAB_DATA_FORWARDING_ITEM, ReadErabDataForwardingItem,
+                "E-RABSubjecttoDataForwardingList");
+        }
+        else if (ie.id == IE_E_RAB_TO_RELEASE_LIST_HO_CMD)
+        {
+            // E-RABtoReleaseListHOCmd has type E-RABList, not
+            // E-RABReleaseItemHOCmd. It names E-RABs the source eNB is to drop
+            // after the handover, and Phase 18-A models no source-side
+            // post-handover release, so the list is recognised and left alone
+            // rather than decoded into a shape it does not have.
+            if (ie.criticality != Criticality::IGNORE)
+                throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                      "E-RABtoReleaseListHOCmd has invalid criticality");
+        }
+        else if (ie.id == IE_SOURCE_TO_TARGET_TRANSPARENT_CONTAINER_SECONDARY ||
+                 ie.id == IE_TARGET_TO_SOURCE_TRANSPARENT_CONTAINER_SECONDARY)
+        {
+            // The secondary containers exist only for inter-RAT handover. An
+            // intra-LTE handover carries neither; one that does is recognised
+            // here and refused rather than passed through as an unknown IE.
+            throw HandoverRefused(HandoverRefusal::INVALID_TRANSPARENT_CONTAINER,
+                                  "A secondary transparent container is not an intra-LTE element");
+        }
+        else if (ie.id == IE_TARGET_TO_SOURCE_TRANSPARENT_CONTAINER)
+        {
+            if (ie.criticality != Criticality::REJECT)
+                throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                      "Target-ToSource-TransparentContainer has invalid criticality");
+            result.targetToSource = DecodeOpaqueContainer(ie.value);
+            containerPresent = true;
+        }
+        else if (ie.criticality == Criticality::REJECT)
+            throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                  "Unexpected reject-criticality IE in Handover Command");
+    }
+
+    if (!mmePresent || !enbPresent || !typePresent || !containerPresent)
+        throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                              "Handover Command is missing a mandatory information element");
+    RequireUeIdentities(result.mmeUeS1apId, result.enbUeS1apId, true, "Handover Command");
+    return result;
+}
+
+// --- Handover Preparation Failure (procedure 0, unsuccessful outcome) -------
+
+std::vector<uint8_t> EncodeHandoverPreparationFailure(const HandoverPreparationFailure &message)
+{
+    RequireUeIdentities(message.mmeUeS1apId, message.enbUeS1apId, true, "Handover Preparation Failure");
+    std::vector<std::pair<std::pair<uint16_t, Criticality>, std::vector<uint8_t>>> ies;
+    ies.push_back({{IE_MME_UE_S1AP_ID, Criticality::IGNORE}, EncodeUeId(message.mmeUeS1apId, 0xFFFFFFFFU)});
+    ies.push_back({{IE_ENB_UE_S1AP_ID, Criticality::IGNORE}, EncodeUeId(message.enbUeS1apId, 0xFFFFFFU)});
+    ies.push_back({{IE_CAUSE, Criticality::IGNORE},
+                   EncodeCauseValue(message.causeCategory, message.causeValue)});
+    return EncodePdu(2, PROCEDURE_HANDOVER_PREPARATION, Criticality::REJECT, ies);
+}
+
+HandoverPreparationFailure DecodeHandoverPreparationFailure(const uint8_t *data, size_t length)
+{
+    auto envelope = DecodeEnvelope(data, length, PROCEDURE_HANDOVER_PREPARATION,
+                                   static_cast<int>(Criticality::REJECT));
+    if (envelope.choice != 2)
+        throw CodecError("Handover Preparation Failure is not an unsuccessful outcome message");
+
+    HandoverPreparationFailure result{};
+    bool mmePresent = false;
+    bool enbPresent = false;
+    bool causePresent = false;
+
+    for (const auto &ie : DecodeIeContainer(envelope.value))
+    {
+        if (ie.id == IE_MME_UE_S1AP_ID)
+        {
+            if (ie.criticality != Criticality::IGNORE)
+                throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                      "MME-UE-S1AP-ID has invalid criticality in Handover Preparation Failure");
+            result.mmeUeS1apId = DecodeUeId(ie.value, 0xFFFFFFFFU);
+            mmePresent = true;
+        }
+        else if (ie.id == IE_ENB_UE_S1AP_ID)
+        {
+            if (ie.criticality != Criticality::IGNORE)
+                throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                      "eNB-UE-S1AP-ID has invalid criticality in Handover Preparation Failure");
+            result.enbUeS1apId = DecodeUeId(ie.value, 0xFFFFFFU);
+            enbPresent = true;
+        }
+        else if (ie.id == IE_CAUSE)
+        {
+            if (ie.criticality != Criticality::IGNORE)
+                throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                      "Cause has invalid criticality in Handover Preparation Failure");
+            DecodeCauseValue(ie.value, result.causeCategory, result.causeValue);
+            causePresent = true;
+        }
+        else if (ie.criticality == Criticality::REJECT)
+            throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                  "Unexpected reject-criticality IE in Handover Preparation Failure");
+    }
+
+    if (!mmePresent || !enbPresent || !causePresent)
+        throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                              "Handover Preparation Failure is missing a mandatory information element");
+    RequireUeIdentities(result.mmeUeS1apId, result.enbUeS1apId, true, "Handover Preparation Failure");
+    return result;
+}
+
+// --- Handover Request (procedure 1, initiating) -----------------------------
+
+std::vector<uint8_t> EncodeHandoverRequest(const HandoverRequest &message)
+{
+    RequireUeIdentities(message.mmeUeS1apId, 0, false, "Handover Request");
+
+    std::vector<std::vector<uint8_t>> erabItems;
+    erabItems.reserve(message.erabs.size());
+    for (const auto &erab : message.erabs)
+    {
+        BitWriter writer;
+        WriteErabToBeSetupItemHoReq(writer, erab);
+        erabItems.push_back(writer.take());
+    }
+
+    BitWriter erabList;
+    AppendHoList(erabList, IE_E_RAB_TO_BE_SETUP_ITEM_HO_REQ, erabItems, "E-RABToBeSetupListHOReq");
+
+    BitWriter ambr;
+    ambr.writeBit(false); // SEQUENCE extension marker
+    ambr.writeBit(false); // iE-Extensions absent
+    WriteBitRate(ambr, message.ueAmbr.downlink);
+    WriteBitRate(ambr, message.ueAmbr.uplink);
+
+    BitWriter capabilities;
+    WriteUeSecurityCapabilities(capabilities, message.encryptionAlgorithms, message.integrityAlgorithms);
+
+    BitWriter security;
+    WriteSecurityContext(security, message.securityContext);
+
+    std::vector<std::pair<std::pair<uint16_t, Criticality>, std::vector<uint8_t>>> ies;
+    ies.push_back({{IE_MME_UE_S1AP_ID, Criticality::REJECT}, EncodeUeId(message.mmeUeS1apId, 0xFFFFFFFFU)});
+    {
+        BitWriter writer;
+        WriteHandoverType(writer, message.handoverType);
+        ies.push_back({{IE_HANDOVER_TYPE, Criticality::REJECT}, writer.take()});
+    }
+    ies.push_back({{IE_CAUSE, Criticality::IGNORE},
+                   EncodeCauseValue(message.causeCategory, message.causeValue)});
+    ies.push_back({{IE_UE_AGGREGATE_MAXIMUM_BITRATE, Criticality::REJECT}, ambr.take()});
+    ies.push_back({{IE_E_RAB_TO_BE_SETUP_LIST_HO_REQ, Criticality::REJECT}, erabList.take()});
+    ies.push_back({{IE_SOURCE_TO_TARGET_TRANSPARENT_CONTAINER, Criticality::REJECT},
+                   EncodeOpaqueContainer(message.sourceToTarget)});
+    ies.push_back({{IE_UE_SECURITY_CAPABILITIES, Criticality::REJECT}, capabilities.take()});
+    ies.push_back({{IE_SECURITY_CONTEXT, Criticality::REJECT}, security.take()});
+    return EncodePdu(0, PROCEDURE_HANDOVER_RESOURCE_ALLOCATION, Criticality::REJECT, ies);
+}
+
+HandoverRequest DecodeHandoverRequest(const uint8_t *data, size_t length)
+{
+    auto envelope = DecodeEnvelope(data, length, PROCEDURE_HANDOVER_RESOURCE_ALLOCATION,
+                                   static_cast<int>(Criticality::REJECT));
+    if (envelope.choice != 0)
+        throw CodecError("Handover Request is not an initiating message");
+
+    HandoverRequest result{};
+    bool mmePresent = false;
+    bool typePresent = false;
+    bool causePresent = false;
+    bool ambrPresent = false;
+    bool erabsPresent = false;
+    bool containerPresent = false;
+    bool capabilitiesPresent = false;
+    bool securityPresent = false;
+
+    for (const auto &ie : DecodeIeContainer(envelope.value))
+    {
+        if (ie.id == IE_MME_UE_S1AP_ID)
+        {
+            if (ie.criticality != Criticality::REJECT)
+                throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                      "MME-UE-S1AP-ID has invalid criticality in Handover Request");
+            result.mmeUeS1apId = DecodeUeId(ie.value, 0xFFFFFFFFU);
+            mmePresent = true;
+        }
+        else if (ie.id == IE_HANDOVER_TYPE)
+        {
+            if (ie.criticality != Criticality::REJECT)
+                throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                      "HandoverType has invalid criticality in Handover Request");
+            BitReader reader(ie.value);
+            result.handoverType = ReadHandoverType(reader);
+            reader.requireFinished();
+            typePresent = true;
+        }
+        else if (ie.id == IE_CAUSE)
+        {
+            if (ie.criticality != Criticality::IGNORE)
+                throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                      "Cause has invalid criticality in Handover Request");
+            DecodeCauseValue(ie.value, result.causeCategory, result.causeValue);
+            causePresent = true;
+        }
+        else if (ie.id == IE_UE_AGGREGATE_MAXIMUM_BITRATE)
+        {
+            if (ie.criticality != Criticality::REJECT)
+                throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                      "UEAggregateMaximumBitrate has invalid criticality in Handover Request");
+            BitReader reader(ie.value);
+            if (reader.readBit() || reader.readBit())
+                throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                      "Unsupported UEAggregateMaximumBitrate extension");
+            result.ueAmbr.downlink = ReadBitRate(reader);
+            result.ueAmbr.uplink = ReadBitRate(reader);
+            reader.requireFinished();
+            ambrPresent = true;
+        }
+        else if (ie.id == IE_E_RAB_TO_BE_SETUP_LIST_HO_REQ)
+        {
+            if (ie.criticality != Criticality::REJECT)
+                throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                      "E-RABToBeSetupListHOReq has invalid criticality");
+            result.erabs = ReadHoList<ErabToBeSetupItemHoReq>(
+                ie.value, IE_E_RAB_TO_BE_SETUP_ITEM_HO_REQ, ReadErabToBeSetupItemHoReq,
+                "E-RABToBeSetupListHOReq");
+            erabsPresent = true;
+        }
+        else if (ie.id == IE_SOURCE_TO_TARGET_TRANSPARENT_CONTAINER)
+        {
+            if (ie.criticality != Criticality::REJECT)
+                throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                      "Source-ToTarget-TransparentContainer has invalid criticality");
+            result.sourceToTarget = DecodeOpaqueContainer(ie.value);
+            containerPresent = true;
+        }
+        else if (ie.id == IE_UE_SECURITY_CAPABILITIES)
+        {
+            if (ie.criticality != Criticality::REJECT)
+                throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                      "UESecurityCapabilities has invalid criticality in Handover Request");
+            BitReader reader(ie.value);
+            ReadUeSecurityCapabilities(reader, result.encryptionAlgorithms, result.integrityAlgorithms);
+            reader.requireFinished();
+            capabilitiesPresent = true;
+        }
+        else if (ie.id == IE_SECURITY_CONTEXT)
+        {
+            if (ie.criticality != Criticality::REJECT)
+                throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                      "SecurityContext has invalid criticality in Handover Request");
+            BitReader reader(ie.value);
+            result.securityContext = ReadSecurityContext(reader);
+            reader.requireFinished();
+            securityPresent = true;
+        }
+        else if (ie.criticality == Criticality::REJECT)
+            throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                  "Unexpected reject-criticality IE in Handover Request");
+    }
+
+    if (!mmePresent || !typePresent || !causePresent || !ambrPresent || !erabsPresent || !containerPresent ||
+        !capabilitiesPresent || !securityPresent)
+        throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                              "Handover Request is missing a mandatory information element");
+    RequireUeIdentities(result.mmeUeS1apId, 0, false, "Handover Request");
+    return result;
+}
+
+// --- Handover Request Acknowledge (procedure 1, successful outcome) ---------
+
+std::vector<uint8_t> EncodeHandoverRequestAcknowledge(const HandoverRequestAcknowledge &message)
+{
+    RequireUeIdentities(message.mmeUeS1apId, message.enbUeS1apId, true, "Handover Request Acknowledge");
+
+    std::vector<std::vector<uint8_t>> admittedItems;
+    admittedItems.reserve(message.admitted.size());
+    for (const auto &item : message.admitted)
+    {
+        BitWriter writer;
+        WriteErabAdmittedItem(writer, item);
+        admittedItems.push_back(writer.take());
+    }
+    BitWriter admittedList;
+    AppendHoList(admittedList, IE_E_RAB_ADMITTED_ITEM, admittedItems, "E-RABAdmittedList");
+
+    std::vector<std::pair<std::pair<uint16_t, Criticality>, std::vector<uint8_t>>> ies;
+    ies.push_back({{IE_MME_UE_S1AP_ID, Criticality::IGNORE}, EncodeUeId(message.mmeUeS1apId, 0xFFFFFFFFU)});
+    ies.push_back({{IE_ENB_UE_S1AP_ID, Criticality::IGNORE}, EncodeUeId(message.enbUeS1apId, 0xFFFFFFU)});
+    ies.push_back({{IE_E_RAB_ADMITTED_LIST, Criticality::IGNORE}, admittedList.take()});
+    if (!message.failed.empty())
+    {
+        std::vector<std::vector<uint8_t>> failedItems;
+        failedItems.reserve(message.failed.size());
+        for (const auto &item : message.failed)
+        {
+            BitWriter writer;
+            WriteErabFailedItemHoReqAck(writer, item);
+            failedItems.push_back(writer.take());
+        }
+        BitWriter failedList;
+        AppendHoList(failedList, IE_E_RAB_FAILED_TO_SETUP_ITEM_HO_REQ_ACK, failedItems,
+                     "E-RABFailedToSetupListHOReqAck");
+        ies.push_back({{IE_E_RAB_FAILED_TO_SETUP_LIST_HO_REQ_ACK, Criticality::IGNORE}, failedList.take()});
+    }
+    ies.push_back({{IE_TARGET_TO_SOURCE_TRANSPARENT_CONTAINER, Criticality::REJECT},
+                   EncodeOpaqueContainer(message.targetToSource)});
+    return EncodePdu(1, PROCEDURE_HANDOVER_RESOURCE_ALLOCATION, Criticality::REJECT, ies);
+}
+
+HandoverRequestAcknowledge DecodeHandoverRequestAcknowledge(const uint8_t *data, size_t length)
+{
+    auto envelope = DecodeEnvelope(data, length, PROCEDURE_HANDOVER_RESOURCE_ALLOCATION,
+                                   static_cast<int>(Criticality::REJECT));
+    if (envelope.choice != 1)
+        throw CodecError("Handover Request Acknowledge is not a successful outcome message");
+
+    HandoverRequestAcknowledge result{};
+    bool mmePresent = false;
+    bool enbPresent = false;
+    bool admittedPresent = false;
+    bool containerPresent = false;
+
+    for (const auto &ie : DecodeIeContainer(envelope.value))
+    {
+        if (ie.id == IE_MME_UE_S1AP_ID)
+        {
+            if (ie.criticality != Criticality::IGNORE)
+                throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                      "MME-UE-S1AP-ID has invalid criticality in Handover Request Acknowledge");
+            result.mmeUeS1apId = DecodeUeId(ie.value, 0xFFFFFFFFU);
+            mmePresent = true;
+        }
+        else if (ie.id == IE_ENB_UE_S1AP_ID)
+        {
+            if (ie.criticality != Criticality::IGNORE)
+                throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                      "eNB-UE-S1AP-ID has invalid criticality in Handover Request Acknowledge");
+            result.enbUeS1apId = DecodeUeId(ie.value, 0xFFFFFFU);
+            enbPresent = true;
+        }
+        else if (ie.id == IE_E_RAB_ADMITTED_LIST)
+        {
+            if (ie.criticality != Criticality::IGNORE)
+                throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                      "E-RABAdmittedList has invalid criticality");
+            result.admitted = ReadHoList<ErabAdmittedItem>(ie.value, IE_E_RAB_ADMITTED_ITEM,
+                                                          ReadErabAdmittedItem, "E-RABAdmittedList");
+            admittedPresent = true;
+        }
+        else if (ie.id == IE_E_RAB_FAILED_TO_SETUP_LIST_HO_REQ_ACK)
+        {
+            if (ie.criticality != Criticality::IGNORE)
+                throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                      "E-RABFailedToSetupListHOReqAck has invalid criticality");
+            result.failed = ReadHoList<ErabFailedItemHoReqAck>(
+                ie.value, IE_E_RAB_FAILED_TO_SETUP_ITEM_HO_REQ_ACK, ReadErabFailedItemHoReqAck,
+                "E-RABFailedToSetupListHOReqAck");
+        }
+        else if (ie.id == IE_TARGET_TO_SOURCE_TRANSPARENT_CONTAINER)
+        {
+            if (ie.criticality != Criticality::REJECT)
+                throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                      "Target-ToSource-TransparentContainer has invalid criticality");
+            result.targetToSource = DecodeOpaqueContainer(ie.value);
+            containerPresent = true;
+        }
+        else if (ie.criticality == Criticality::REJECT)
+            throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                  "Unexpected reject-criticality IE in Handover Request Acknowledge");
+    }
+
+    if (!mmePresent || !enbPresent || !admittedPresent || !containerPresent)
+        throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                              "Handover Request Acknowledge is missing a mandatory information element");
+    RequireUeIdentities(result.mmeUeS1apId, result.enbUeS1apId, true, "Handover Request Acknowledge");
+    return result;
+}
+
+// --- Handover Failure (procedure 1, unsuccessful outcome) -------------------
+//
+// HandoverFailureIEs carries no eNB-UE-S1AP-ID: the target has failed before it
+// bound one. A message that does carry one is not a Handover Failure.
+
+std::vector<uint8_t> EncodeHandoverFailure(const HandoverFailure &message)
+{
+    RequireUeIdentities(message.mmeUeS1apId, 0, false, "Handover Failure");
+    std::vector<std::pair<std::pair<uint16_t, Criticality>, std::vector<uint8_t>>> ies;
+    ies.push_back({{IE_MME_UE_S1AP_ID, Criticality::IGNORE}, EncodeUeId(message.mmeUeS1apId, 0xFFFFFFFFU)});
+    ies.push_back({{IE_CAUSE, Criticality::IGNORE},
+                   EncodeCauseValue(message.causeCategory, message.causeValue)});
+    return EncodePdu(2, PROCEDURE_HANDOVER_RESOURCE_ALLOCATION, Criticality::REJECT, ies);
+}
+
+HandoverFailure DecodeHandoverFailure(const uint8_t *data, size_t length)
+{
+    auto envelope = DecodeEnvelope(data, length, PROCEDURE_HANDOVER_RESOURCE_ALLOCATION,
+                                   static_cast<int>(Criticality::REJECT));
+    if (envelope.choice != 2)
+        throw CodecError("Handover Failure is not an unsuccessful outcome message");
+
+    HandoverFailure result{};
+    bool mmePresent = false;
+    bool causePresent = false;
+
+    for (const auto &ie : DecodeIeContainer(envelope.value))
+    {
+        if (ie.id == IE_MME_UE_S1AP_ID)
+        {
+            if (ie.criticality != Criticality::IGNORE)
+                throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                      "MME-UE-S1AP-ID has invalid criticality in Handover Failure");
+            result.mmeUeS1apId = DecodeUeId(ie.value, 0xFFFFFFFFU);
+            mmePresent = true;
+        }
+        else if (ie.id == IE_ENB_UE_S1AP_ID)
+            throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                  "Handover Failure carries an eNB-UE-S1AP-ID it must not");
+        else if (ie.id == IE_CAUSE)
+        {
+            if (ie.criticality != Criticality::IGNORE)
+                throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                      "Cause has invalid criticality in Handover Failure");
+            DecodeCauseValue(ie.value, result.causeCategory, result.causeValue);
+            causePresent = true;
+        }
+        else if (ie.criticality == Criticality::REJECT)
+            throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                  "Unexpected reject-criticality IE in Handover Failure");
+    }
+
+    if (!mmePresent || !causePresent)
+        throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                              "Handover Failure is missing a mandatory information element");
+    RequireUeIdentities(result.mmeUeS1apId, 0, false, "Handover Failure");
+    return result;
+}
+
+// --- Handover Notify (procedure 2, initiating) ------------------------------
+//
+// The procedure criticality of handoverNotification is ignore, not reject.
+// Handover Notify carries no CriticalityDiagnostics.
+
+std::vector<uint8_t> EncodeHandoverNotify(const HandoverNotify &message)
+{
+    RequireUeIdentities(message.mmeUeS1apId, message.enbUeS1apId, true, "Handover Notify");
+
+    BitWriter cgi;
+    cgi.writeBit(false); // EUTRAN-CGI extension marker
+    cgi.writeBit(false); // EUTRAN-CGI iE-Extensions absent
+    auto plmn = EncodePlmn(message.cgi.plmn);
+    WriteFixedOctets(cgi, plmn.data(), plmn.size());
+    cgi.writeBits(message.cgi.cellId & 0x0FFFFFFFU, 28);
+
+    BitWriter tai;
+    tai.writeBit(false); // TAI extension marker
+    tai.writeBit(false); // TAI iE-Extensions absent
+    auto taiPlmn = EncodePlmn(message.tai.plmn);
+    WriteFixedOctets(tai, taiPlmn.data(), taiPlmn.size());
+    tai.writeBits(message.tai.tac, 16);
+
+    std::vector<std::pair<std::pair<uint16_t, Criticality>, std::vector<uint8_t>>> ies;
+    ies.push_back({{IE_MME_UE_S1AP_ID, Criticality::REJECT}, EncodeUeId(message.mmeUeS1apId, 0xFFFFFFFFU)});
+    ies.push_back({{IE_ENB_UE_S1AP_ID, Criticality::REJECT}, EncodeUeId(message.enbUeS1apId, 0xFFFFFFU)});
+    ies.push_back({{IE_EUTRAN_CGI, Criticality::IGNORE}, cgi.take()});
+    ies.push_back({{IE_TAI, Criticality::IGNORE}, tai.take()});
+    return EncodePdu(0, PROCEDURE_HANDOVER_NOTIFICATION, Criticality::IGNORE, ies);
+}
+
+HandoverNotify DecodeHandoverNotify(const uint8_t *data, size_t length)
+{
+    auto envelope = DecodeEnvelope(data, length, PROCEDURE_HANDOVER_NOTIFICATION,
+                                   static_cast<int>(Criticality::IGNORE));
+    if (envelope.choice != 0)
+        throw CodecError("Handover Notify is not an initiating message");
+
+    HandoverNotify result{};
+    bool mmePresent = false;
+    bool enbPresent = false;
+    bool cgiPresent = false;
+    bool taiPresent = false;
+
+    for (const auto &ie : DecodeIeContainer(envelope.value))
+    {
+        if (ie.id == IE_MME_UE_S1AP_ID)
+        {
+            if (ie.criticality != Criticality::REJECT)
+                throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                      "MME-UE-S1AP-ID has invalid criticality in Handover Notify");
+            result.mmeUeS1apId = DecodeUeId(ie.value, 0xFFFFFFFFU);
+            mmePresent = true;
+        }
+        else if (ie.id == IE_ENB_UE_S1AP_ID)
+        {
+            if (ie.criticality != Criticality::REJECT)
+                throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                      "eNB-UE-S1AP-ID has invalid criticality in Handover Notify");
+            result.enbUeS1apId = DecodeUeId(ie.value, 0xFFFFFFU);
+            enbPresent = true;
+        }
+        else if (ie.id == IE_EUTRAN_CGI)
+        {
+            if (ie.criticality != Criticality::IGNORE)
+                throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                      "EUTRAN-CGI has invalid criticality in Handover Notify");
+            BitReader reader(ie.value);
+            if (reader.readBit() || reader.readBit())
+                throw HandoverRefused(HandoverRefusal::INVALID_CONTEXT_IDENTITY,
+                                      "Unsupported EUTRAN-CGI extension in Handover Notify");
+            auto plmn = ReadFixedOctets(reader, 3);
+            result.cgi.plmn = DecodePlmn(plmn.data(), plmn.size());
+            result.cgi.cellId = static_cast<uint32_t>(reader.readBits(28));
+            reader.requireFinished();
+            cgiPresent = true;
+        }
+        else if (ie.id == IE_TAI)
+        {
+            if (ie.criticality != Criticality::IGNORE)
+                throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                      "TAI has invalid criticality in Handover Notify");
+            BitReader reader(ie.value);
+            if (reader.readBit() || reader.readBit())
+                throw HandoverRefused(HandoverRefusal::INVALID_CONTEXT_IDENTITY,
+                                      "Unsupported TAI extension in Handover Notify");
+            auto plmn = ReadFixedOctets(reader, 3);
+            result.tai.plmn = DecodePlmn(plmn.data(), plmn.size());
+            result.tai.tac = static_cast<uint16_t>(reader.readBits(16));
+            reader.requireFinished();
+            taiPresent = true;
+        }
+        else if (ie.criticality == Criticality::REJECT)
+            throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                                  "Unexpected reject-criticality IE in Handover Notify");
+    }
+
+    if (!mmePresent || !enbPresent || !cgiPresent || !taiPresent)
+        throw HandoverRefused(HandoverRefusal::MISSING_MANDATORY_IE,
+                              "Handover Notify is missing a mandatory information element");
+    RequireUeIdentities(result.mmeUeS1apId, result.enbUeS1apId, true, "Handover Notify");
+    return result;
 }
 
 } // namespace lte::enb::s1ap
