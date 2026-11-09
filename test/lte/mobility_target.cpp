@@ -1270,7 +1270,14 @@ TEST_CASE("lte/mobility_target: another UE's repeated restorations leave a separ
     REQUIRE(untouched->bearer.restorationPending());
     const auto frames = DrainRadio(second);
     REQUIRE(CountType(frames, MessageType::S1_CONTEXT_RESTORED) == 1);
-    const auto announced = lte::ue::link::DecodeBearerRestoration(frames.front().payload);
+    // The cell also states the S1AP identity pair this UE's S1 context is bound
+    // to once it makes the restored default bearer UE-ready, so this batch
+    // holds more than the restoration announcement and the restoration has to
+    // be picked out by type rather than taken from the front of the batch.
+    const auto restoration =
+        std::find_if(frames.begin(), frames.end(), [](const auto &frame) { return frame.type == MessageType::S1_CONTEXT_RESTORED; });
+    REQUIRE(restoration != frames.end());
+    const auto announced = lte::ue::link::DecodeBearerRestoration(restoration->payload);
     CHECK(announced.second == untouched->accessGeneration);
     CHECK(announced.second == 1);
     Confirm(lab.source, second, 5, announced.second, PdnAddress(second.ueId));

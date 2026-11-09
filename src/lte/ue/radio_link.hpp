@@ -115,7 +115,22 @@ enum class MessageType : uint8_t
     // already serves. SIMULATED_HANDOVER_ACCESS is uplink only: the UE to the
     // target eNB it has just reached.
     SIMULATED_HANDOVER_COMMAND = 21,
-    SIMULATED_HANDOVER_ACCESS = 22
+    SIMULATED_HANDOVER_ACCESS = 22,
+    // Phase 18-D: the eNB stating the S1AP identity pair a UE's S1 context is
+    // bound to. It is an INTERNAL simulator abstraction and nothing else.
+    //
+    // It is NOT a 3GPP message. The eNB-UE-S1AP-ID and the MME-UE-S1AP-ID
+    // belong to the S1-MME association between the eNB and the MME and a real
+    // UE never sees either of them. The simulator's UE tracks its own S1
+    // context so that a connected-mode handover command can be checked against
+    // a session binding this UE already holds rather than adopted from the
+    // command that is to be checked, and this frame is what establishes that
+    // binding. It carries no subscriber key, no security material and no NAS,
+    // and it authorizes nothing on its own: it only states what the eNB already
+    // holds about the UE it is sent to.
+    //
+    // It is downlink only: eNB to the UE it has just made bearer-ready.
+    S1_CONTEXT_ESTABLISHED = 23
 };
 
 struct Message
@@ -155,6 +170,18 @@ std::vector<uint8_t> EncodeBearerTransportReady(uint8_t ebi, uint32_t generation
 // The two bounded forms: five octets naming only the bearer and the epoch, or
 // nine also restating the PDN address. Nothing else is a confirmation.
 BearerTransportReady DecodeBearerTransportReady(const uint8_t *data, size_t size);
+
+// The S1AP identity pair a UE's S1 context is bound to. Both halves are
+// identifiers of the S1-MME association and both are non-zero; a zero either
+// side names no session and is refused at encode and at decode alike.
+struct S1ContextIdentity
+{
+    uint32_t enbUeS1apId{};
+    uint32_t mmeUeS1apId{};
+};
+
+std::vector<uint8_t> EncodeS1ContextEstablished(const S1ContextIdentity &identity);
+S1ContextIdentity DecodeS1ContextEstablished(const uint8_t *data, size_t size);
 
 bool IsUplink(MessageType type);
 bool IsDownlink(MessageType type);

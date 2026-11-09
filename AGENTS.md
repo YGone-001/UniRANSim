@@ -473,6 +473,120 @@ path against real registry resources:
 ./cmake-build-release/nr-tests --no-version --test-case="lte/handover/arrival:*"
 ```
 
+## Connected-mode handover orchestration and UE-side execution
+
+The two-eNB coordination contract is
+`src/lte/enb/handover_orchestration.{hpp,cpp}`. The UE-side execution is in the
+UE's own production radio receive path, `src/lte/ue/app.cpp`, driven through
+`MobilityContext` in `src/lte/ue/lifecycle.{hpp,cpp}`. These rules are what a
+change must not weaken.
+
+- The isolated MME relay is a transport between two simulator-owned eNBs and
+  nothing more. Every message that crosses it is a real encoded S1AP PDU
+  produced and consumed by the accepted production codec, so nothing may turn a
+  message into a method call to get around the codec. It holds no subscriber
+  state, it is not an MME and it performs no core procedure. What it accepts is
+  evidence that the target really sent a Handover Notify and that the two eNBs
+  agree about the transaction. It is not evidence that a live EPC executed a
+  Modify Bearer Request, redirected any real downlink traffic or updated a
+  bearer path. Do not claim an MME-controlled bearer path update, a core path
+  update or live EPC continuity from it, and do not add a Path Switch Request as
+  a shortcut to one.
+- The orchestration state machine ends at `AWAITING_CORE_PATH_UPDATE` on
+  purpose. Everything after it is the MME-controlled bearer path update and the
+  source release, and neither is implemented here. Do not report a transaction
+  that reached that state as a completed handover.
+- Source eNB identity is supplied by the caller as an explicit `SourceContext`
+  and is verified against the live source registry before a transaction can
+  open. It is never derived from the MME-facing SCTP association, from TAC or
+  PLMN equality, from a matching EBI or TEID, or by parsing an opaque container.
+  A preparation whose source identity cannot be established from a documented
+  contract is refused, not guessed.
+- Target selection and every target endpoint are explicit simulator
+  configuration in a `HandoverTargetBinding`: the target's identity, CGI, TAI,
+  radio endpoint, S1-U address, security algorithm sets, association epoch, and
+  the one source it permits. Nothing about a target is discovered. A binding
+  naming two networks, one that does not name this source as permitted, and one
+  offered under an association epoch this side no longer holds are each refused.
+- The arrival token is a correlation value the preparation issues and the UE
+  repeats. It is not a credential, it proves nothing about the UE and it is not
+  an authorisation to enter a cell. What the target accepts as an arrival is the
+  whole frame that carries it — both cells, both S1AP identities and the PDN
+  address — agreeing with the committed preparation, checked in the target's own
+  production radio receive path. A replayed token, a token that disagrees with
+  the record, and a frame naming another cell each confirm nothing and move
+  nothing.
+- The PDN address is never adopted from a frame. The UE compares the command's
+  address against the one its own NAS was assigned, and the relay compares the
+  arrival's address against the one the transaction already binds. Both checks
+  happen before anything moves.
+- A connected-mode handover command is consumed in the UE's own production
+  radio receive path, and every part of it is checked before any transport
+  moves. The command names a cell and never an address: the radio endpoint is
+  resolved from the UE's own configuration, so a frame cannot redirect a UE to
+  an endpoint nobody authorized. A command naming a cell this configuration
+  never stated, or naming the serving cell as its target, is refused, and a
+  refusal leaves the UE serving the cell it is already on.
+- The S1AP session binding is checked against what the UE already holds and is
+  never adopted from the command. That binding reaches the UE through
+  `S1_CONTEXT_ESTABLISHED`, an internal simulator frame the serving cell sends
+  at the moment it makes a bearer UE-ready, carrying the eNB-UE-S1AP-ID and the
+  MME-UE-S1AP-ID its S1 context is bound to. It is downlink only, both halves
+  are non-zero at encode and at decode, and it states a binding a later command
+  is checked against. No command can establish one. This frame is a simulator
+  abstraction and not 3GPP: it never leaves the simulator's radio layer.
+- The radio endpoint moves only after the last check has passed, and the
+  arrival frame is transmitted from the UE's own socket naming both cells from
+  the UE's own configuration and never from the command, so the source identity
+  in the arrival is the one the source eNB states about itself and the one the
+  target's preparation was verified against.
+- A connected-mode handover is not an Attach and not a Service Request. The UE
+  starts neither. One EPS registration is one registration whatever accesses
+  carry it, so a run that reports a second Attach or a Service Request during a
+  handover has not performed one.
+- `SIMULATED_HANDOVER_COMMAND` and `SIMULATED_HANDOVER_ACCESS` are internal
+  simulator frames and not 3GPP RRC. The arrival binding is a correlation value
+  and not a credential, it has no S1AP representation, and nothing here derives
+  or fabricates a NAS or AS security key. Never place one in a transparent
+  container, send one to an MME, or describe the exchange as 3GPP RRC.
+- Source release and the MME-controlled bearer path update remain deferred. No
+  source TEID is retired by a handover, nothing here sends a UE Context Release
+  and nothing redirects real EPC downlink traffic. What the source still owns
+  must still resolve and must still be unretired, and its own tunnel still
+  forwards: that is the deferred boundary, not a completed handover. Do not
+  simulate the deferred work by retiring anything early.
+- A delayed G-PDU for a source TEID reaches no tunnel the handover created. The
+  target never bound that identifier, so the packet is refused before it can
+  touch the reached UE's bearers or its radio endpoint, and no counter of the
+  reached UE moves on its behalf. An End Marker is still only recorded: for an
+  identifier a cell never held and for its own active tunnel alike, it releases
+  nothing and starts nothing.
+- A handover of one UE leaves every other UE on the same cell alone: its S1
+  context, its access generation, its bearers, its local transport and its data
+  path.
+
+The detail, including the sequence the acceptance case drives and the
+implemented-versus-deferred boundary, is in
+`docs/lte-s1-connected-handover.md`. The focused cases live in
+`test/lte/handover_orchestration.cpp`:
+
+```bash
+./cmake-build-release/nr-tests --no-version --test-case="lte/handover/orchestration:*"
+```
+
+The end-to-end acceptance case is `test/lte/handover_acceptance.cpp`. It needs
+a real kernel TUN, so it is a `doctest::skip()` case and has no `ctest` entry at
+all; the privileged CI job runs it as its own invocation with its own log and
+its own sentinels, `UNIRANSIM-PHASE18D-PRIVILEGED-EXECUTED` and
+`UNIRANSIM-PHASE18D-PRIVILEGED-COMPLETE`. The privileged job therefore runs
+three invocations, one per skipped case:
+
+```bash
+sudo unshare --net -- env UNIRANSIM_RUN_PRIVILEGED_TUN_TESTS=1 \
+  ./cmake-build-release/nr-tests --no-skip \
+  --test-case="lte/handover/acceptance: a connected-mode handover executes end to end between two real eNBs"
+```
+
 ## What must never be committed
 
 - `config/*.local.yaml` — private laboratory configurations, including

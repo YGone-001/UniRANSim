@@ -960,6 +960,20 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                             "No Attach and no Service Request is started by this UE");
                 continue;
             }
+            if (message.type == link::MessageType::S1_CONTEXT_ESTABLISHED)
+            {
+                // The cell already serving this UE states which S1AP identity
+                // pair its S1 context is bound to. It is only ever a binding
+                // this UE checks a later connected-mode handover command
+                // against: no command can establish one, and nothing here
+                // adopts an identity out of a frame that is to be checked.
+                const auto identity =
+                    link::DecodeS1ContextEstablished(message.payload.data(), message.payload.size());
+                mobility.onS1ContextEstablished(identity.enbUeS1apId, identity.mmeUeS1apId);
+                Log("INFO", "S1 context established (eNB-UE-S1AP-ID=" + std::to_string(identity.enbUeS1apId) +
+                                ", MME-UE-S1AP-ID=" + std::to_string(identity.mmeUeS1apId) + ")");
+                continue;
+            }
             if (message.type != link::MessageType::NAS_DOWNLINK)
                 throw link::DecodeError("Data/NAS direction mismatch");
             if (!security.securityActive)

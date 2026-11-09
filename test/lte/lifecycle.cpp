@@ -600,3 +600,44 @@ TEST_CASE("lte/security: compact Service Request matches independent AES-CMAC fi
     context.securityActive = false;
     CHECK_THROWS(lte::ue::nas::EncodeServiceRequest(context));
 }
+
+TEST_CASE("lte/lifecycle: a connected-mode handover checks the held MME identity and never adopts one")
+{
+    auto context = Registered();
+    context.onS1ContextEstablished(1, 201);
+    REQUIRE(context.enbUeS1apId == 1);
+    REQUIRE(context.mmeUeS1apId == 201);
+    context.enbTeid = 0x11111111;
+    context.sgwTeid = 0x22222222;
+
+    // A command naming another UE's MME identity is refused before anything
+    // moves. The session binding is checked and never adopted, so the identity
+    // this UE already holds and everything bound to it survive the refusal.
+    CHECK_THROWS(context.onConnectedHandover(202));
+    CHECK_THROWS(context.onConnectedHandover(0));
+    CHECK(context.mmeUeS1apId == 201);
+    CHECK(context.enbUeS1apId == 1);
+    CHECK(context.enbTeid == 0x11111111);
+    CHECK(context.accessBootstrap == lte::ue::AccessBootstrap::ROLES_RETAINED);
+    CHECK(context.canForwardUserPlane());
+
+    // The command that names this UE's own identity is accepted, and it is a
+    // move between two accesses of one live connection: no Attach and no
+    // Service Request is started, the network-assigned PDN address and the
+    // SGW-side TEID survive the move, and the source's local transport does not.
+    context.onConnectedHandover(201);
+    CHECK(context.emm == lte::ue::EmmState::REGISTERED);
+    CHECK(context.ecm == lte::ue::EcmState::CONNECTED);
+    CHECK(context.mmeUeS1apId == 201);
+    CHECK(context.assignedIpv4 == std::array<uint8_t, 4>{10, 45, 0, 5});
+    CHECK(context.sgwTeid == 0x22222222);
+    CHECK_FALSE(context.enbUeS1apId.has_value());
+    CHECK_FALSE(context.enbTeid.has_value());
+    CHECK(context.accessGeneration == 1);
+    CHECK(context.accessBootstrap == lte::ue::AccessBootstrap::DECLARE_REQUIRED);
+    CHECK(context.handover == lte::ue::HandoverExecution::RELOCATING);
+
+    // A second command while one is executing is a conflicting handover and is
+    // refused, so one access cannot carry two half-finished relocations.
+    CHECK_THROWS(context.onConnectedHandover(201));
+}

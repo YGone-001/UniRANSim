@@ -200,10 +200,60 @@ jobs:
             grep -q "drops(malformed/teid/peer/inactive)=0/0/0/0" privileged-tun-p17.log
             ! grep -q "control-plane-only" privileged-tun-p17.log
           '
+      # The connected-mode handover acceptance is a third skipped case: two
+      # real eNBs, one running UE and an isolated MME relay. It gets its own
+      # invocation, its own log and its own sentinels, so one case's pass
+      # cannot be mistaken for another's.
+      - name: Run the privileged connected-mode handover acceptance
+        run: |
+          sudo unshare --net -- bash -euo pipefail -c '
+            ip link set lo up
+            test "$(id -u)" = "0"
+            test -c /dev/net/tun
+            export UNIRANSIM_RUN_PRIVILEGED_TUN_TESTS=1
+            ./cmake-build-privileged/nr-tests \
+              --no-skip \
+              --test-case="lte/handover/acceptance: a connected-mode handover executes end to end between two real eNBs" \
+              2>&1 | tee privileged-tun-p18d.log
+
+            # A skipped case never reaches its own body, so it prints neither
+            # sentinel and the job must not be able to call that a pass.
+            grep -q "UNIRANSIM-PHASE18D-PRIVILEGED-EXECUTED" privileged-tun-p18d.log
+            grep -q "UNIRANSIM-PHASE18D-PRIVILEGED-COMPLETE" privileged-tun-p18d.log
+            grep -Eq "test cases: +1 \| +1 passed \| 0 failed" privileged-tun-p18d.log
+
+            # Exactly one Attach: a connected-mode handover is not an Attach
+            # and must not fall back to a Service Request either.
+            test "$(grep -c "State=ATTACH_REQUEST_SENT" privileged-tun-p18d.log)" -eq 1
+            test "$(grep -c "State=ATTACH_COMPLETE_SENT" privileged-tun-p18d.log)" -eq 1
+            ! grep -q "compact EPS Service Request" privileged-tun-p18d.log
+            ! grep -q "bearer-inventory Service Request" privileged-tun-p18d.log
+
+            # The UE consumed the command in its own runtime and moved its
+            # radio transport to the authorized target cell, and the target
+            # verified the arrival in its own production receive path.
+            grep -q "S1 context established (eNB-UE-S1AP-ID=1, MME-UE-S1AP-ID=201)" privileged-tun-p18d.log
+            grep -q "Connected-mode handover command accepted (MME-UE-S1AP-ID=201)" privileged-tun-p18d.log
+            grep -q "SIMULATED_HANDOVER_ACCESS sent to the target cell" privileged-tun-p18d.log
+            grep -q "Verified handover arrival of LTE UE 7 to this cell from eNB 74565" privileged-tun-p18d.log
+
+            # The transaction reached the intentional final state and stopped
+            # there: no source release and no core path update is claimed.
+            grep -q "AWAITING_CORE_PATH_UPDATE" privileged-tun-p18d.log
+
+            # Real IPv4 crossed a kernel TUN in both directions on both bearers
+            # and the dedicated bearer carried its own flow. A run that stayed
+            # control-plane-only reports zeros here.
+            grep -q "tun-ul=2/" privileged-tun-p18d.log
+            grep -q "tun-dl=2/" privileged-tun-p18d.log
+            grep -q "dedicated-ul=1 dedicated-dl=1" privileged-tun-p18d.log
+            grep -q "LTE UE shutdown complete" privileged-tun-p18d.log
+            ! grep -q "control-plane-only" privileged-tun-p18d.log
+          '
       - name: Report
         if: always()
         run: |
-          for log in privileged-tun.log privileged-tun-p17.log; do
+          for log in privileged-tun.log privileged-tun-p17.log privileged-tun-p18d.log; do
             if [ -f "$log" ]; then
               { echo "### $log"; echo '```'; cat "$log"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
             else

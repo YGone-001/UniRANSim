@@ -314,7 +314,16 @@ TEST_CASE("restoration/setup: default-only request leaves retained dedicated tra
         CHECK_FALSE(b.active());
         CHECK(b.parameters().localTeid == 0);
     }
-    CHECK(lab.notifications().size() == 1);
+    // Exactly one bearer restoration announcement and none for the dedicated
+    // bearers, which is what "inactive" means on the radio. The cell separately
+    // states the S1AP identity pair this UE's S1 context is bound to when it
+    // makes the default bearer UE-ready, and that frame is not a bearer
+    // announcement, so it is not counted here.
+    const auto frames = lab.notifications();
+    CHECK(std::count_if(frames.begin(), frames.end(), [](const link::Message &frame) {
+              return frame.type == link::MessageType::S1_CONTEXT_RESTORED ||
+                     frame.type == link::MessageType::DEDICATED_BEARER_RESTORED;
+          }) == 1);
 }
 
 TEST_CASE("restoration/setup: duplicate EBI fails without transport or notifications")

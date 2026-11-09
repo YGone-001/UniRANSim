@@ -1224,6 +1224,7 @@ void EnbMultiplexer::handleRadioFrame(const uint8_t *data, size_t size, const In
             if (bearer->kind() == BearerKind::DEFAULT)
             {
                 entry->s1 = UeS1State::BEARER_ACTIVE;
+                announceS1Context(*entry);
                 ++m_recovery.successfulUeRestorations;
                 if (m_recovery.accessInvalidations != 0 && m_restorationLatencyMs == 0)
                     m_restorationLatencyMs = static_cast<uint64_t>(
@@ -1287,6 +1288,22 @@ void EnbMultiplexer::onBearerReady(EnbUeEntry &entry, const std::vector<uint8_t>
     entry.s1 = UeS1State::BEARER_ACTIVE;
     Log("INFO", "S1-U user plane ready for LTE UE " + std::to_string(entry.radioUeId) + " IPv4 " +
                     Ipv4ToString(ipv4));
+    announceS1Context(entry);
+}
+
+void EnbMultiplexer::announceS1Context(EnbUeEntry &entry)
+{
+    // The identity is read out of this eNB's own registry entry and never out
+    // of a frame, so it can only restate what the Initial Context Setup already
+    // bound. A context that is not yet UE-ready, or whose MME half the MME has
+    // not yet stated, has nothing to state and is left alone.
+    if (!entry.s1Active() || entry.enbUeS1apId == 0 || entry.mmeUeS1apId == 0)
+        return;
+    lte::ue::link::S1ContextIdentity identity;
+    identity.enbUeS1apId = entry.enbUeS1apId;
+    identity.mmeUeS1apId = entry.mmeUeS1apId;
+    sendRadio(entry, lte::ue::link::MessageType::S1_CONTEXT_ESTABLISHED,
+              lte::ue::link::EncodeS1ContextEstablished(identity));
 }
 
 void EnbMultiplexer::startInitialUeMessage(EnbUeEntry &entry, std::vector<uint8_t> nasPdu,

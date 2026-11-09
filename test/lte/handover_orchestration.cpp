@@ -35,6 +35,7 @@
 
 #include <lib/udp/server.hpp>
 #include <lte/enb/codec.hpp>
+#include <lte/enb/gtpu.hpp>
 #include <lte/enb/handover_admission.hpp>
 #include <lte/enb/handover_orchestration.hpp>
 #include <lte/enb/handover_preparation.hpp>
@@ -179,20 +180,28 @@ struct SourceLab
     // E-RAB Setup Request per dedicated bearer. Nothing is written into the
     // registry by hand. `activate` stops short of the UE's bearer
     // confirmation, which is how a session with no network-confirmed PDN
-    // address is reached through production.
-    void establish(const std::vector<uint8_t> &dedicatedEbis = {}, bool activate = true)
+    // address is reached through production. `who` and `mmeUeS1apId` name the
+    // radio endpoint and the S1 context identity a second UE is established
+    // under, so two UEs can share one cell without sharing one S1 context; the
+    // defaults establish this fixture's own UE, which is what every case that
+    // runs a single UE uses. The return value is the entry that was brought
+    // up, which is also left in `entry` and, for the default bearer, in
+    // `defaultTeid`.
+    EnbUeEntry *establish(const std::vector<uint8_t> &dedicatedEbis = {}, bool activate = true,
+                          FakeUe *who = nullptr, uint32_t mmeUeS1apId = MmeUeS1apId)
     {
-        SendRadio(mux, ue, link::MessageType::NAS_UPLINK, {0x41, 0x01, 0x02, 0x03});
-        entry = mux.registry().find(ue.ueId);
+        FakeUe &radio = who ? *who : ue;
+        SendRadio(mux, radio, link::MessageType::NAS_UPLINK, {0x41, 0x01, 0x02, 0x03});
+        entry = mux.registry().find(radio.ueId);
         REQUIRE(entry != nullptr);
         REQUIRE(entry->s1 == UeS1State::CONTEXT_PENDING);
 
         s1ap::InitialContextSetupRequest request{};
-        request.mmeUeS1apId = MmeUeS1apId;
+        request.mmeUeS1apId = mmeUeS1apId;
         request.enbUeS1apId = entry->enbUeS1apId;
         request.ueAmbrUl = 1000;
         request.ueAmbrDl = 2000;
-        request.erabs = {Item(5, 9, 30 + ue.ueId)};
+        request.erabs = {Item(5, 9, 30 + radio.ueId)};
         const auto pdu = s1ap::EncodeInitialContextSetupRequest(request);
         mux.handleS1ap(pdu.data(), pdu.size(), 1);
         REQUIRE(entry->bearer.signalingEstablished());
@@ -201,7 +210,7 @@ struct SourceLab
 
         if (activate)
         {
-            SendRadio(mux, ue, link::MessageType::BEARER_READY, {5, 10, 45, 0, static_cast<uint8_t>(ue.ueId)});
+            SendRadio(mux, radio, link::MessageType::BEARER_READY, {5, 10, 45, 0, static_cast<uint8_t>(radio.ueId)});
             REQUIRE(entry->bearer.active());
             REQUIRE(entry->s1 == UeS1State::BEARER_ACTIVE);
         }
@@ -209,18 +218,19 @@ struct SourceLab
         for (const uint8_t ebi : dedicatedEbis)
         {
             s1ap::ErabSetupRequest setup{};
-            setup.mmeUeS1apId = MmeUeS1apId;
+            setup.mmeUeS1apId = mmeUeS1apId;
             setup.enbUeS1apId = entry->enbUeS1apId;
-            setup.erabs = {Item(ebi, 7, 30 + ue.ueId + ebi, {0x2E, 0x01})};
+            setup.erabs = {Item(ebi, 7, 30 + radio.ueId + ebi, {0x2E, 0x01})};
             const auto frame = s1ap::EncodeErabSetupRequest(setup);
             mux.handleS1ap(frame.data(), frame.size(), 1);
-            SendRadio(mux, ue, link::MessageType::BEARER_ACTIVATED, {ebi});
+            SendRadio(mux, radio, link::MessageType::BEARER_ACTIVATED, {ebi});
         }
         REQUIRE(entry->dedicatedBearers.size() == dedicatedEbis.size());
 
         // Whatever the establishment sent to the UE is not the traffic of any
         // of these cases, so it is cleared before the action under test.
-        DrainRadio(ue);
+        DrainRadio(radio);
+        return entry;
     }
 };
 
@@ -1701,4 +1711,259 @@ TEST_CASE("lte/handover/orchestration: the handover notify the target really sen
 
     // Nothing about a refused message moved the transaction.
     CHECK(record->state == OrchestrationState::AWAITING_CORE_PATH_UPDATE);
+}
+
+// --- I: multi-UE isolation and K: what the handover must not disturb --------
+
+namespace
+{
+
+// A minimal but complete IPv4 packet. The shared S1-U endpoint checks a
+// downlink packet before it forwards it, so a test that wants one delivered has
+// to send one that is a packet. `mark` distinguishes one flow from another and
+// sits in the source address, which nothing on this path validates.
+std::vector<uint8_t> Ipv4Payload(const std::array<uint8_t, 4> &destination, uint8_t mark = 1)
+{
+    return {0x45, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00,
+            0x40, 0x01, 0x00, 0x00, 0x7F, mark, 0x00, 0x01,
+            destination[0], destination[1], destination[2], destination[3]};
+}
+
+// A real downlink G-PDU at the real shared S1-U endpoint of `mux`, sent from
+// the SGW peer every E-RAB of these fixtures names and polled through the same
+// receive path a running eNB uses. Nothing is handed to the endpoint directly,
+// so what the endpoint refuses is refused on the wire.
+void DownlinkGpdu(EnbMultiplexer &mux, uint32_t teid, const std::vector<uint8_t> &payload)
+{
+    udp::UdpServer sgw{"127.0.0.9", 2152};
+    const std::vector<uint8_t> wire = gtpu::EncodeTPdu(teid, payload.data(), payload.size());
+    sgw.Send(mux.s1uAddress(), wire.data(), wire.size());
+    mux.poll(0, 16);
+}
+
+// A genuine End Marker on the wire: flags 0x30, message type 254, length 0 and
+// the TEID of the tunnel whose payload stream is ending. It is a control
+// message about a tunnel and never carries a T-PDU.
+void EndMarkerGpdu(EnbMultiplexer &mux, uint32_t teid)
+{
+    const std::vector<uint8_t> wire{0x30, gtpu::EndMarker,
+                                    0x00,
+                                    0x00,
+                                    static_cast<uint8_t>(teid >> 24U),
+                                    static_cast<uint8_t>(teid >> 16U),
+                                    static_cast<uint8_t>(teid >> 8U),
+                                    static_cast<uint8_t>(teid)};
+    udp::UdpServer sgw{"127.0.0.9", 2152};
+    sgw.Send(mux.s1uAddress(), wire.data(), wire.size());
+    mux.poll(0, 16);
+}
+
+// One whole connected-mode handover of the fixture's own UE, driven through the
+// relay from the source's Handover Required to the target's accepted arrival.
+// It returns the target's reached entry and fills the identifiers the two cells
+// hold afterwards, so a case about what must not move can move the handover and
+// then look at everything around it.
+EnbUeEntry *RunToArrival(RelayLab &lab, uint32_t &sourceDefaultTeid, uint32_t &sourceDedicatedTeid,
+                         uint32_t &targetDefaultTeid, uint32_t &targetDedicatedTeid)
+{
+    sourceDefaultTeid = lab.source.defaultTeid;
+    REQUIRE(lab.source.entry->dedicatedBearers.size() == 1);
+    sourceDedicatedTeid = lab.source.entry->dedicatedBearers.front().parameters().localTeid;
+
+    lab.open();
+    const PreparationHop hop = lab.runPreparation();
+    REQUIRE(hop.delivered);
+
+    // The transport the target committed is what its acknowledge names, and it
+    // is what the reached UE must still hold after the arrival: an arrival is a
+    // move of one registry entry and allocates nothing.
+    const HandoverRequestAcknowledge ack =
+        DecodeHandoverRequestAcknowledge(hop.acknowledgePdu.data(), hop.acknowledgePdu.size());
+    REQUIRE(ack.admitted.size() == 2);
+    targetDefaultTeid = TeidFromBytes(ack.admitted[0].gtpTeid);
+    targetDedicatedTeid = TeidFromBytes(ack.admitted[1].gtpTeid);
+    REQUIRE(targetDefaultTeid != 0);
+    REQUIRE(targetDedicatedTeid != 0);
+    REQUIRE(targetDefaultTeid != sourceDefaultTeid);
+
+    const HandoverCommand command = DecodeHandoverCommand(hop.commandPdu.data(), hop.commandPdu.size());
+    REQUIRE(DeliverHandoverCommand(lab.source.mux, *lab.source.entry, lab.coordinator, lab.transaction, command,
+                                   TargetBinding())
+                .delivered);
+    DrainRadio(lab.source.ue);
+
+    const auto frame = link::Encode({link::MessageType::SIMULATED_HANDOVER_ACCESS, 1,
+                                     link::EncodeSimulatedHandoverAccess(AccessFor(hop.arrivalToken))});
+    lab.target.handleRadioFrame(frame.data(), frame.size(), lab.source.ue.radio.LocalAddress());
+    REQUIRE(lab.target.lastVerifiedArrival().has_value());
+
+    EnbUeEntry *reached = lab.target.registry().find(lab.source.ue.ueId);
+    REQUIRE(reached != nullptr);
+    // The arrival moved the prepared entry and allocated nothing: the reached UE
+    // holds exactly the transport the acknowledge named.
+    CHECK(reached->bearer.parameters().localTeid == targetDefaultTeid);
+    REQUIRE(reached->dedicatedBearers.size() == 1);
+    CHECK(reached->dedicatedBearers.front().parameters().localTeid == targetDedicatedTeid);
+    return reached;
+}
+
+} // namespace
+
+TEST_CASE("lte/handover/orchestration: a handover of one ue leaves a second ue's session and data path alone")
+{
+    RelayLab lab;
+
+    // A second UE is established on the same cell first, so the fixture's own
+    // UE is the one that moves and `source.entry` names it throughout. The two
+    // share a cell and an SGW peer and share nothing else: separate S1 contexts,
+    // separate access, separate transport.
+    FakeUe staying{2};
+    EnbUeEntry *stayingEntry = lab.source.establish({6}, true, &staying, MmeUeS1apId + 1);
+    REQUIRE(stayingEntry != nullptr);
+    const uint32_t stayingEnbUeS1apId = stayingEntry->enbUeS1apId;
+    const uint32_t stayingDefaultTeid = lab.source.defaultTeid;
+    REQUIRE(stayingEntry->dedicatedBearers.size() == 1);
+    const uint32_t stayingDedicatedTeid = stayingEntry->dedicatedBearers.front().parameters().localTeid;
+
+    lab.source.establish({6});
+    EnbUeEntry *moving = lab.source.entry;
+    REQUIRE(moving != nullptr);
+    REQUIRE(moving != stayingEntry);
+    REQUIRE(stayingDefaultTeid != lab.source.defaultTeid);
+
+    // Both UEs carry a downlink packet before the trigger, so the data path the
+    // second UE must keep is a working one and not an idle socket.
+    const std::vector<uint8_t> stayingPayload = Ipv4Payload(PdnAddress(staying.ueId));
+    DownlinkGpdu(lab.source.mux, stayingDefaultTeid, stayingPayload);
+    {
+        auto frames = DrainRadio(staying);
+        REQUIRE(frames.size() == 1);
+        CHECK(frames.front().type == link::MessageType::DATA_DOWNLINK);
+    }
+    REQUIRE(DrainRadio(lab.source.ue).empty());
+
+    uint32_t sourceDefaultTeid = 0;
+    uint32_t sourceDedicatedTeid = 0;
+    uint32_t targetDefaultTeid = 0;
+    uint32_t targetDedicatedTeid = 0;
+    EnbUeEntry *reached =
+        RunToArrival(lab, sourceDefaultTeid, sourceDedicatedTeid, targetDefaultTeid, targetDedicatedTeid);
+    REQUIRE(reached != nullptr);
+
+    // The second UE was never part of the transaction. Its whole session is
+    // exactly what it was: the same S1 context, the same access generation, the
+    // same bearers and the same local transport.
+    CHECK(lab.source.mux.registry().find(staying.ueId) == stayingEntry);
+    CHECK(stayingEntry->s1 == UeS1State::BEARER_ACTIVE);
+    CHECK(stayingEntry->enbUeS1apId == stayingEnbUeS1apId);
+    CHECK(stayingEntry->mmeUeS1apId == MmeUeS1apId + 1);
+    CHECK(stayingEntry->bearer.active());
+    CHECK(stayingEntry->dedicatedBearers.front().active());
+    CHECK(lab.source.mux.registry().findByLocalTeid(stayingDefaultTeid) == stayingEntry);
+    CHECK(lab.source.mux.registry().findByLocalTeid(stayingDedicatedTeid) == stayingEntry);
+    CHECK_FALSE(lab.source.mux.registry().isRetiredTeid(stayingDefaultTeid));
+    CHECK_FALSE(lab.source.mux.registry().isRetiredTeid(stayingDedicatedTeid));
+
+    // And its data path is still a data path, on the same TEIDs, to the same
+    // radio endpoint. The UE that moved sees none of it.
+    DownlinkGpdu(lab.source.mux, stayingDefaultTeid, stayingPayload);
+    {
+        auto frames = DrainRadio(staying);
+        REQUIRE(frames.size() == 1);
+        CHECK(frames.front().type == link::MessageType::DATA_DOWNLINK);
+        CHECK(frames.front().payload == stayingPayload);
+    }
+    CHECK(DrainRadio(lab.source.ue).empty());
+    CHECK(lab.target.registry().find(staying.ueId) == nullptr);
+
+    // The moved UE's source transport is untouched too. Source release is
+    // deferred work and is not simulated by retiring anything early: what the
+    // source still owns must still resolve and must still be unretired, and its
+    // own tunnel still forwards, which is the deferred boundary and not a
+    // completed handover.
+    CHECK(moving->s1 == UeS1State::BEARER_ACTIVE);
+    CHECK(lab.source.mux.registry().find(lab.source.ue.ueId) == moving);
+    CHECK(lab.source.mux.registry().findByLocalTeid(sourceDefaultTeid) == moving);
+    CHECK(lab.source.mux.registry().findByLocalTeid(sourceDedicatedTeid) == moving);
+    CHECK_FALSE(lab.source.mux.registry().isRetiredTeid(sourceDefaultTeid));
+    CHECK_FALSE(lab.source.mux.registry().isRetiredTeid(sourceDedicatedTeid));
+    const std::vector<uint8_t> movingPayload = Ipv4Payload(PdnAddress(lab.source.ue.ueId));
+    DownlinkGpdu(lab.source.mux, sourceDefaultTeid, movingPayload);
+    {
+        auto frames = DrainRadio(lab.source.ue);
+        REQUIRE(frames.size() == 1);
+        CHECK(frames.front().type == link::MessageType::DATA_DOWNLINK);
+        CHECK(frames.front().payload == movingPayload);
+    }
+    CHECK(DrainRadio(staying).empty());
+}
+
+TEST_CASE("lte/handover/orchestration: a delayed packet for a source teid reaches no tunnel the handover created")
+{
+    RelayLab lab;
+    lab.source.establish({6});
+
+    uint32_t sourceDefaultTeid = 0;
+    uint32_t sourceDedicatedTeid = 0;
+    uint32_t targetDefaultTeid = 0;
+    uint32_t targetDedicatedTeid = 0;
+    EnbUeEntry *reached =
+        RunToArrival(lab, sourceDefaultTeid, sourceDedicatedTeid, targetDefaultTeid, targetDedicatedTeid);
+    REQUIRE(reached != nullptr);
+
+    // The target's own tunnel forwards, which is what makes the refusals below
+    // a statement about the identifier and not about a dead endpoint.
+    const std::vector<uint8_t> payload = Ipv4Payload(PdnAddress(lab.source.ue.ueId), 0xC0);
+    DownlinkGpdu(lab.target, targetDefaultTeid, payload);
+    {
+        auto frames = DrainRadio(lab.source.ue);
+        REQUIRE(frames.size() == 1);
+        CHECK(frames.front().type == link::MessageType::DATA_DOWNLINK);
+    }
+    REQUIRE(reached->counters.s1uDownlinkPackets == 1);
+
+    // A delayed downlink for the source's own TEID reaches no tunnel the
+    // handover created. The target never bound that identifier, so the packet
+    // is refused before it can touch the reached UE's bearers or its radio
+    // endpoint, and no counter of the reached UE moves on its behalf.
+    DownlinkGpdu(lab.target, sourceDefaultTeid, payload);
+    DownlinkGpdu(lab.target, sourceDedicatedTeid, payload);
+    CHECK(DrainRadio(lab.source.ue).empty());
+    CHECK(reached->counters.s1uDownlinkPackets == 1);
+    CHECK(reached->bearer.counters().downlinkPackets == 1);
+    CHECK(reached->dedicatedBearers.front().counters().downlinkPackets == 0);
+    CHECK(reached->counters.bearerInactiveDrops == 0);
+    CHECK(reached->counters.invalidTeidDrops == 0);
+    CHECK(reached->counters.unexpectedPeerDrops == 0);
+    CHECK(reached->counters.malformedDrops == 0);
+    CHECK(lab.target.registry().findByLocalTeid(sourceDefaultTeid) == nullptr);
+    CHECK(lab.target.registry().findByLocalTeid(sourceDedicatedTeid) == nullptr);
+
+    // An End Marker is a control message about one tunnel and never a release.
+    // For an identifier this target never held it is recorded and nothing moves;
+    // for the target's own tunnel it is recorded and nothing moves either. Both
+    // are the standing rule and neither may release the bearer the handover
+    // created.
+    EndMarkerGpdu(lab.target, sourceDefaultTeid);
+    EndMarkerGpdu(lab.target, targetDefaultTeid);
+    EndMarkerGpdu(lab.target, targetDedicatedTeid);
+    CHECK(lab.target.registry().findByLocalTeid(targetDefaultTeid) == reached);
+    CHECK(lab.target.registry().findByLocalTeid(targetDedicatedTeid) == reached);
+    CHECK_FALSE(lab.target.registry().isRetiredTeid(targetDefaultTeid));
+    CHECK_FALSE(lab.target.registry().isRetiredTeid(targetDedicatedTeid));
+    CHECK(reached->bearer.active());
+    CHECK(reached->dedicatedBearers.front().active());
+    CHECK(reached->counters.s1uDownlinkPackets == 1);
+    CHECK(reached->bearer.counters().downlinkPackets == 1);
+    CHECK(DrainRadio(lab.source.ue).empty());
+
+    // The End Markers moved no user-plane credit onto either bearer.
+    DownlinkGpdu(lab.target, targetDedicatedTeid, payload);
+    {
+        auto frames = DrainRadio(lab.source.ue);
+        REQUIRE(frames.size() == 1);
+        CHECK(frames.front().type == link::MessageType::DATA_DOWNLINK_BEARER);
+    }
+    CHECK(reached->dedicatedBearers.front().counters().downlinkPackets == 1);
+    CHECK(reached->bearer.counters().downlinkPackets == 1);
 }

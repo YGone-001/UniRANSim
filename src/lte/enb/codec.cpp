@@ -1236,6 +1236,86 @@ std::vector<uint8_t> EncodeDownlinkNasTransport(uint32_t mmeUeS1apId, uint32_t e
     return EncodeUeMessage(PROCEDURE_DOWNLINK_NAS_TRANSPORT, Criticality::IGNORE, ies);
 }
 
+UplinkNas DecodeUplinkNas(const uint8_t *data, size_t length)
+{
+    // Which of the two messages this is decides only which identifiers are
+    // mandatory. The NAS payload is the same octet string in both, and neither
+    // is interpreted here.
+    const S1apPdu probe = ProbeS1apPdu(data, length);
+    if (probe.kind != S1apPdu::Kind::INITIATING)
+        throw CodecError("an uplink NAS message is not an initiating message");
+    if (probe.procedureCode != PROCEDURE_INITIAL_UE_MESSAGE && probe.procedureCode != PROCEDURE_UPLINK_NAS_TRANSPORT)
+        throw CodecError("this message does not carry a UE's NAS uplink");
+    const bool initial = probe.procedureCode == PROCEDURE_INITIAL_UE_MESSAGE;
+    auto envelope = DecodeEnvelope(data, length, probe.procedureCode, static_cast<int>(Criticality::IGNORE));
+    if (envelope.choice != 0)
+        throw CodecError("an uplink NAS message is not an initiating message");
+
+    UplinkNas result{};
+    bool enbPresent = false;
+    bool nasPresent = false;
+    for (const auto &ie : DecodeIeContainer(envelope.value))
+    {
+        if (ie.id == IE_MME_UE_S1AP_ID)
+        {
+            // An Initial UE Message carries none: it is what names the UE to
+            // the MME in the first place. One appearing there is a message that
+            // does not match the procedure it was sent under.
+            if (initial)
+                throw CodecError("an Initial UE Message carries no MME-UE-S1AP-ID");
+            if (ie.criticality != Criticality::REJECT) throw CodecError("MME-UE-S1AP-ID has invalid criticality");
+            result.mmeUeS1apId = DecodeUeId(ie.value, 0xFFFFFFFFU);
+        }
+        else if (ie.id == IE_ENB_UE_S1AP_ID)
+        {
+            if (ie.criticality != Criticality::REJECT) throw CodecError("eNB-UE-S1AP-ID has invalid criticality");
+            result.enbUeS1apId = DecodeUeId(ie.value, 0xFFFFFFU);
+            enbPresent = true;
+        }
+        else if (ie.id == IE_NAS_PDU)
+        {
+            if (ie.criticality != Criticality::REJECT) throw CodecError("NAS-PDU has invalid criticality");
+            result.nasPdu = DecodeNasPdu(ie.value);
+            nasPresent = true;
+        }
+        // Beyond those, each procedure carries a fixed, named set of IEs that
+        // say where the message came from and not what the UE said. TS 36.413
+        // states every one of them and its criticality, and the encoders above
+        // emit exactly that, so they are read and dropped here. This function
+        // answers for the NAS payload and the UE it belongs to, not for a
+        // conformance verdict on the message around it; anything a receiver
+        // must reject is still rejected.
+        else if (ie.id == IE_TAI)
+        {
+            // Reject in an Initial UE Message (§9.1.7.1), ignore in an Uplink
+            // NAS Transport (§9.1.3.2).
+            const Criticality expected = initial ? Criticality::REJECT : Criticality::IGNORE;
+            if (ie.criticality != expected) throw CodecError("TAI has invalid criticality");
+        }
+        else if (ie.id == IE_EUTRAN_CGI)
+        {
+            if (ie.criticality != Criticality::IGNORE) throw CodecError("E-UTRAN CGI has invalid criticality");
+        }
+        else if (ie.id == IE_RRC_ESTABLISHMENT_CAUSE)
+        {
+            if (!initial) throw CodecError("an Uplink NAS Transport carries no RRC Establishment Cause");
+            if (ie.criticality != Criticality::IGNORE) throw CodecError("RRC Establishment Cause has invalid criticality");
+        }
+        else if (ie.id == IE_S_TMSI)
+        {
+            if (!initial) throw CodecError("an Uplink NAS Transport carries no S-TMSI");
+            if (ie.criticality != Criticality::REJECT) throw CodecError("S-TMSI has invalid criticality");
+        }
+        else if (ie.criticality == Criticality::REJECT)
+            throw CodecError("Unknown reject-criticality IE in an uplink NAS message");
+    }
+    if (!enbPresent || !nasPresent)
+        throw CodecError("an uplink NAS message is missing a mandatory IE");
+    if (!initial && !result.mmeUeS1apId.has_value())
+        throw CodecError("Uplink NAS Transport is missing MME-UE-S1AP-ID");
+    return result;
+}
+
 S1apPdu ProbeS1apPdu(const uint8_t *data, size_t length)
 {
     if (data == nullptr || length == 0)

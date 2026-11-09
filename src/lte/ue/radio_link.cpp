@@ -33,7 +33,8 @@ bool IsKnown(MessageType type)
            type == MessageType::DEDICATED_BEARER_RESTORED || type == MessageType::BEARER_TRANSPORT_READY ||
            type == MessageType::EPS_SESSION_DELETED || type == MessageType::S1_ACCESS_LOST ||
            type == MessageType::NAS_UPLINK_MOBILITY || type == MessageType::NAS_UPLINK_MOBILITY_CONTEXT ||
-           type == MessageType::SIMULATED_HANDOVER_COMMAND || type == MessageType::SIMULATED_HANDOVER_ACCESS;
+           type == MessageType::SIMULATED_HANDOVER_COMMAND || type == MessageType::SIMULATED_HANDOVER_ACCESS ||
+           type == MessageType::S1_CONTEXT_ESTABLISHED;
 }
 
 size_t MaximumPayload(MessageType type)
@@ -74,6 +75,9 @@ size_t MaximumPayload(MessageType type)
         return SimulatedHandoverCommandSize;
     if (type == MessageType::SIMULATED_HANDOVER_ACCESS)
         return SimulatedHandoverAccessSize;
+    // Two non-zero S1AP identifiers, four octets each.
+    if (type == MessageType::S1_CONTEXT_ESTABLISHED)
+        return 8;
     return 1;
 }
 }
@@ -93,7 +97,8 @@ std::vector<uint8_t> Encode(const Message &message)
         (message.type == MessageType::SIMULATED_HANDOVER_COMMAND &&
          message.payload.size() != SimulatedHandoverCommandSize) ||
         (message.type == MessageType::SIMULATED_HANDOVER_ACCESS &&
-         message.payload.size() != SimulatedHandoverAccessSize))
+         message.payload.size() != SimulatedHandoverAccessSize) ||
+        (message.type == MessageType::S1_CONTEXT_ESTABLISHED && message.payload.size() != 8))
         throw DecodeError("Invalid LTE radio-link message");
     if ((message.type == MessageType::S1_CONTEXT_RELEASED || message.type == MessageType::S1_CONTEXT_RESTORED) &&
         message.payload.size() != 1 && message.payload.size() != 5)
@@ -114,6 +119,8 @@ std::vector<uint8_t> Encode(const Message &message)
         DecodeSimulatedHandoverCommand(message.payload.data(), message.payload.size());
     if (message.type == MessageType::SIMULATED_HANDOVER_ACCESS)
         DecodeSimulatedHandoverAccess(message.payload.data(), message.payload.size());
+    if (message.type == MessageType::S1_CONTEXT_ESTABLISHED)
+        DecodeS1ContextEstablished(message.payload.data(), message.payload.size());
     std::vector<uint8_t> out(HeaderSize + message.payload.size());
     out[0] = Version;
     out[1] = static_cast<uint8_t>(message.type);
@@ -144,7 +151,8 @@ Message Decode(const uint8_t *data, size_t size)
         ((type == MessageType::BEARER_RELEASED || type == MessageType::S1_CONTEXT_RELEASE_REQUEST ||
           type == MessageType::BEARER_ACTIVATED) && length != 1) ||
         (type == MessageType::SIMULATED_HANDOVER_COMMAND && length != SimulatedHandoverCommandSize) ||
-        (type == MessageType::SIMULATED_HANDOVER_ACCESS && length != SimulatedHandoverAccessSize))
+        (type == MessageType::SIMULATED_HANDOVER_ACCESS && length != SimulatedHandoverAccessSize) ||
+        (type == MessageType::S1_CONTEXT_ESTABLISHED && length != 8))
         throw DecodeError("Malformed LTE radio-link payload length");
     if ((type == MessageType::S1_CONTEXT_RELEASED || type == MessageType::S1_CONTEXT_RESTORED) &&
         length != 1 && length != 5)
@@ -165,6 +173,8 @@ Message Decode(const uint8_t *data, size_t size)
         DecodeSimulatedHandoverCommand(data + HeaderSize, length);
     if (type == MessageType::SIMULATED_HANDOVER_ACCESS)
         DecodeSimulatedHandoverAccess(data + HeaderSize, length);
+    if (type == MessageType::S1_CONTEXT_ESTABLISHED)
+        DecodeS1ContextEstablished(data + HeaderSize, length);
     uint32_t ueId = (static_cast<uint32_t>(data[2]) << 24U) | (static_cast<uint32_t>(data[3]) << 16U) |
                     (static_cast<uint32_t>(data[4]) << 8U) | data[5];
     if (ueId == 0)
@@ -214,6 +224,36 @@ BearerTransportReady DecodeBearerTransportReady(const uint8_t *data, size_t size
         ready.ueIpv4 = address;
     }
     return ready;
+}
+
+std::vector<uint8_t> EncodeS1ContextEstablished(const S1ContextIdentity &identity)
+{
+    if (identity.enbUeS1apId == 0 || identity.mmeUeS1apId == 0)
+        throw DecodeError("An S1 context identity must name both S1AP identifiers");
+    std::vector<uint8_t> payload(8);
+    payload[0] = static_cast<uint8_t>(identity.enbUeS1apId >> 24U);
+    payload[1] = static_cast<uint8_t>(identity.enbUeS1apId >> 16U);
+    payload[2] = static_cast<uint8_t>(identity.enbUeS1apId >> 8U);
+    payload[3] = static_cast<uint8_t>(identity.enbUeS1apId);
+    payload[4] = static_cast<uint8_t>(identity.mmeUeS1apId >> 24U);
+    payload[5] = static_cast<uint8_t>(identity.mmeUeS1apId >> 16U);
+    payload[6] = static_cast<uint8_t>(identity.mmeUeS1apId >> 8U);
+    payload[7] = static_cast<uint8_t>(identity.mmeUeS1apId);
+    return payload;
+}
+
+S1ContextIdentity DecodeS1ContextEstablished(const uint8_t *data, size_t size)
+{
+    if (data == nullptr || size != 8)
+        throw DecodeError("Malformed S1 context identity payload");
+    S1ContextIdentity identity{};
+    identity.enbUeS1apId = (static_cast<uint32_t>(data[0]) << 24U) | (static_cast<uint32_t>(data[1]) << 16U) |
+                           (static_cast<uint32_t>(data[2]) << 8U) | data[3];
+    identity.mmeUeS1apId = (static_cast<uint32_t>(data[4]) << 24U) | (static_cast<uint32_t>(data[5]) << 16U) |
+                           (static_cast<uint32_t>(data[6]) << 8U) | data[7];
+    if (identity.enbUeS1apId == 0 || identity.mmeUeS1apId == 0)
+        throw DecodeError("An S1 context identity must name both S1AP identifiers");
+    return identity;
 }
 
 std::vector<uint8_t> EncodeBearerInventory(const BearerInventory &inventory)
@@ -417,7 +457,8 @@ bool IsDownlink(MessageType type)
            type == MessageType::DATA_DOWNLINK_BEARER || type == MessageType::BEARER_RELEASED ||
            type == MessageType::S1_CONTEXT_RELEASED || type == MessageType::S1_CONTEXT_RESTORED ||
            type == MessageType::PAGING_INDICATION || type == MessageType::DEDICATED_BEARER_RESTORED ||
-           type == MessageType::S1_ACCESS_LOST || type == MessageType::SIMULATED_HANDOVER_COMMAND;
+           type == MessageType::S1_ACCESS_LOST || type == MessageType::SIMULATED_HANDOVER_COMMAND ||
+           type == MessageType::S1_CONTEXT_ESTABLISHED;
 }
 
 std::vector<uint8_t> EncodePagingNotification(const PagingNotification &notification)

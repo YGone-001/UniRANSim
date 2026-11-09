@@ -254,6 +254,12 @@ class EnbMultiplexer
     void onPaging(const uint8_t *data, size_t size, uint16_t stream);
     [[nodiscard]] bool servesPagingTai(const std::vector<s1ap::Tai> &taiList) const;
     void onBearerReady(EnbUeEntry &entry, const std::vector<uint8_t> &payload);
+    // States the S1AP identity pair this UE's S1 context is bound to, once the
+    // eNB has made its bearer UE-ready and both identifiers are known. It is
+    // the only way the simulator's UE learns a binding that a connected-mode
+    // handover command can later be checked against instead of adopted from,
+    // and it states only what this eNB already holds. It authorizes nothing.
+    void announceS1Context(EnbUeEntry &entry);
     void startInitialUeMessage(EnbUeEntry &entry, std::vector<uint8_t> nasPdu,
                                std::optional<s1ap::STmsi> sTmsi);
     void sendRadio(EnbUeEntry &entry, lte::ue::link::MessageType type, std::vector<uint8_t> payload);

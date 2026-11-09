@@ -1289,3 +1289,203 @@ A handover is not an Attach and not an idle-mode Service Request, and none of
 these may be reached by substituting one. A sent Handover Notify is not
 end-to-end S1 handover completion.
 
+## 44. Phase 18-D: two-eNB coordination and UE-side execution
+
+This stage put the preparation slice and the arrival slice into one executed
+sequence between two independently instantiated LTE eNBs and one running LTE UE.
+
+New in the tree:
+
+* `src/lte/enb/handover_orchestration.{hpp,cpp}` — the coordination contract,
+  the orchestration state machine and the isolated MME relay.
+* `S1_CONTEXT_ESTABLISHED` in `src/lte/ue/radio_link.{hpp,cpp}` and its handlers
+  in `src/lte/enb/multiplexer.{hpp,cpp}` and `src/lte/ue/app.cpp`.
+* UE-side execution of `SIMULATED_HANDOVER_COMMAND` in the UE's own production
+  radio receive path.
+* `test/lte/handover_orchestration.cpp` and `test/lte/handover_acceptance.cpp`.
+
+### The isolated MME relay
+
+`IsolatedMmeRelay` is a transport between two simulator-owned eNBs and nothing
+more. Every message that crosses it is a real encoded S1AP PDU produced and
+consumed by the accepted production codec. It holds no subscriber state, it is
+not an MME and it performs no core procedure: it relays a Handover Request to
+the target, relays the Acknowledge or the Failure back to the source, observes
+the Handover Notify the target really sends, and advances the state machine.
+
+What its acceptance of a Handover Notify proves is that the target sent one and
+that the two eNBs agree about the transaction. It does not prove, and must not
+be reported as, any of the following: that a live EPC executed a Modify Bearer
+Request, that real downlink traffic was redirected to the target, that a bearer
+path was updated by an MME, or that there is live EPC continuity. There is no
+Path Switch Request in this repository and none is added to reach one.
+
+### Source identity and target selection
+
+The source context is supplied by the caller and is verified against the live
+source registry before a transaction opens. It is not derived from the
+MME-facing SCTP association, from TAC or PLMN equality, from a matching EBI or
+TEID, or by parsing an opaque container. The live S1AP dispatcher still starts
+no preparation, because it cannot establish that provenance.
+
+Target selection is explicit configuration in a `HandoverTargetBinding`: the
+target's Global-ENB-ID, CGI, TAI, radio endpoint, S1-U address, the security
+algorithm sets, the association epoch, and the one source it permits. Nothing
+is discovered. A target identity whose PLMN halves disagree is refused as an
+invalid context identity, and a target that does not permit this source is
+refused.
+
+### The session binding the UE checks a command against
+
+A connected-mode handover command names an MME-UE-S1AP-ID. The UE checks it
+against the identity it already holds; it never adopts one. Until this stage
+the production UE had no way to learn that identity, so `onConnectedHandover`
+was unreachable and the check could not be honoured.
+
+The fix is one internal simulator frame, `S1_CONTEXT_ESTABLISHED`, eight octets
+carrying a non-zero eNB-UE-S1AP-ID and a non-zero MME-UE-S1AP-ID. The serving
+cell sends it at the moment it makes a bearer UE-ready, which is exactly when
+its own registry entry holds the pair: from `onBearerReady` on a fresh attach
+and from the default-bearer branch of `BEARER_TRANSPORT_READY` on a
+restoration. Both placements are the same event in production terms — a new S1
+context with a new identity pair — and neither is a statement about bearer
+roles.
+
+The frame is downlink only and both halves are refused at encode and at decode
+when zero. It states a binding; it does not grant one. No command establishes
+one, and nothing adopts an identity out of a frame that is to be checked. It is
+a simulator abstraction and not 3GPP: it never leaves the simulator's radio
+layer and it is never described as RRC or NAS.
+
+### How the UE consumes a command
+
+The command is handled in the UE's own production radio receive path, in
+`app.cpp`, and every part of it is checked before any transport moves. The
+command names a cell and never an address: the radio endpoint is resolved from
+the UE's own `targetCell` configuration, so a frame cannot redirect a UE to an
+endpoint nobody authorized. The PDN address is compared against the one the UE's
+own NAS was assigned. The MME identity is checked inside
+`MobilityContext::onConnectedHandover`, which is check-then-mutate. A refusal
+therefore leaves the UE serving the cell it is already on.
+
+Only after the last check passes does the UE change its radio peer, and the
+`SIMULATED_HANDOVER_ACCESS` it then transmits comes from its own socket and
+names both cells from the UE's own configuration rather than from the command.
+The target correlates that frame against the committed preparation: the arrival
+token, both cells, both S1AP identities and the PDN address must all agree. The
+token is a correlation value and not a credential; it has no S1AP
+representation and nothing derives a key from it.
+
+The UE starts no NAS procedure. A run of this sequence reports exactly one
+Attach and no Service Request.
+
+## 45. The acceptance sequence
+
+`test/lte/handover_acceptance.cpp` drives the whole of it against two real
+`EnbMultiplexer` instances, the real `lte::ue::Run()`, an isolated MME relay and
+a scripted EPS peer that is moved up one layer from radio to S1AP. The eighteen
+steps end in `AWAITING_CORE_PATH_UPDATE`, and every step is observed in the
+run's own transcript:
+
+| Step | Observation |
+|---|---|
+| 1 | `State=UE_CONNECTED_TO_ENB` |
+| 2 | `Dedicated EPS bearer 6 ready for forwarding on LTE UE 7` |
+| 3–5 | Handover Required, then a Handover Request on the wire to the target |
+| 6–7 | admission, a real committed transport set and its Acknowledge |
+| 8 | the Handover Command relayed back to the source |
+| 9–10 | `Connected-mode handover command accepted (MME-UE-S1AP-ID=201)` |
+| 11 | `radio transport moved to the authorized target cell 460/02/2` |
+| 12 | `SIMULATED_HANDOVER_ACCESS sent to the target cell` |
+| 13 | `Verified handover arrival of LTE UE 7 to this cell from eNB 74565` |
+| 14–15 | promotion preserving the prepared TEIDs and S1AP identities |
+| 16–17 | the Handover Notify observed on the real association and accepted |
+| 18 | the transaction reaches `AWAITING_CORE_PATH_UPDATE` |
+
+The run closes through the UE's own clean shutdown and reports
+`tun-ul=2/128 tun-dl=2/132` and `dedicated-ul=1 dedicated-dl=1`, and it reports
+exactly one `State=ATTACH_REQUEST_SENT` and one `State=ATTACH_COMPLETE_SENT`.
+
+## 46. User-plane boundary
+
+Before the trigger the case moves real traffic on both of the source's active
+bearers. After verified arrival it moves two test-owned downlink G-PDUs through
+the isolated production S1-U receiver, one per bearer, and checks each delivered
+datagram's payload and source four-tuple at the application socket. The kernel
+only hands a datagram to a socket after checking the IPv4 header and the UDP
+checksum of the whole datagram the UE wrote into its TUN, so a delivered
+payload and source four-tuple is delivery evidence and not a loopback
+assertion.
+
+What this shows: the prepared TEIDs are the ones that carry the traffic, they
+are active only after arrival, the downlink reaches the UE now associated with
+the target, the PDN IPv4 is unchanged and the default and dedicated roles are
+correct. What it does not show, and must not be claimed: that a real SGW
+redirected anything, that an MME Modify Bearer Request was executed, or that
+there is live EPC continuity.
+
+A benign `[WARN] Dropped invalid LTE TUN uplink packet: Packet is not IPv4`
+appears in every run of the acceptance. It is kernel IPv6 noise in the private
+network namespace, counted as `drops(malformed/inactive)=1/0`, and it is not
+part of the sequence.
+
+## 47. What the handover must not disturb
+
+Two focused cases in `test/lte/handover_orchestration.cpp` close the negative
+side of the sequence.
+
+* A handover of one UE leaves a second UE on the same cell alone: the same S1
+  context, the same access generation, the same bearers, the same local
+  transport, and a working downlink data path on the same TEIDs. The moved UE's
+  source transport is likewise untouched — it still resolves, it is unretired
+  and its own tunnel still forwards, because source release is deferred work
+  and is not simulated by retiring anything early.
+* A delayed G-PDU for a source TEID reaches no tunnel the handover created. The
+  target never bound that identifier, so the packet is refused before it can
+  touch the reached UE's bearers or its radio endpoint and no counter of the
+  reached UE moves. An End Marker is still only recorded: for an identifier the
+  cell never held and for its own active tunnel alike, it releases nothing and
+  starts nothing.
+
+## 48. Implemented versus deferred after Phase 18-D
+
+Implemented: the two-eNB coordination contract, the relayed preparation with
+real S1AP bytes on every hop, the source Handover Command gate, the UE-side
+execution of the command in the production receive path with a checked MME
+session binding, the correlated arrival, the promotion, and the Handover Notify
+gate. The end of the slice is `AWAITING_CORE_PATH_UPDATE` and it stays there.
+
+Still deferred, unchanged:
+
+* **Source release.** Nothing releases a source context or retires a source
+  TEID, and a source eNB that has sent a handover command still serves the UE.
+* **MME-controlled bearer path update.** A Handover Notify is the trigger and
+  is gated; the update it triggers is not implemented and must not be replaced
+  by a Path Switch Request.
+* **Data forwarding.** Neither direct nor indirect.
+* **A production arrival-binding path.** The binding is still produced by the
+  preparation and repeated by the UE from the command; a live two-eNB run
+  against a real core needs a mechanism this repository does not have.
+* **Chained handovers.** One connected-mode handover at a time per access; a
+  second command while one is executing is refused.
+
+## 49. Test coverage
+
+`test/lte/handover_orchestration.cpp`, twenty-eight cases under
+`lte/handover/orchestration:*`, covering source provenance, coordinator binding
+and its refusal set, the source Handover Command gate, the isolated MME relay
+and its refusals, multi-UE isolation and the source-lifetime invariants.
+
+`test/lte/handover_acceptance.cpp`, one privileged case,
+`lte/handover/acceptance: a connected-mode handover executes end to end between
+two real eNBs`. It needs a real kernel TUN, so it is a `doctest::skip()` case
+with no `ctest` entry at all, and the privileged CI job runs it as its own
+invocation with its own log and its own sentinels,
+`UNIRANSIM-PHASE18D-PRIVILEGED-EXECUTED` and
+`UNIRANSIM-PHASE18D-PRIVILEGED-COMPLETE`. The privileged job runs three
+invocations, one per skipped case, so one case's pass cannot be mistaken for
+another's.
+
+Every Phase 17 and Phase 18-A/B/C case file is unchanged and still runs in the
+ordinary suite: `test/lte/ue_mobility_target.cpp`, `test/lte/handover_s1.cpp`,
+`test/lte/handover_preparation.cpp` and `test/lte/handover_target_arrival.cpp`.

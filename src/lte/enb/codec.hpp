@@ -77,6 +77,22 @@ DownlinkNasTransport DecodeDownlinkNasTransport(const uint8_t *data, size_t leng
 std::vector<uint8_t> EncodeDownlinkNasTransport(uint32_t mmeUeS1apId, uint32_t enbUeS1apId,
                                                 const std::vector<uint8_t> &nasPdu);
 
+// The NAS payload of an uplink S1AP message and the UE it belongs to. It
+// accepts the two messages an eNB sends a UE's NAS uplink in — an Initial UE
+// Message and an Uplink NAS Transport — and returns their content without
+// interpreting it. The NAS belongs to the UE and to its MME; this codec only
+// carries it, exactly as it carries an opaque handover container.
+struct UplinkNas
+{
+    uint32_t enbUeS1apId{};
+    // Absent on an Initial UE Message, which is what starts the association
+    // and is sent before the MME has named the UE.
+    std::optional<uint32_t> mmeUeS1apId;
+    std::vector<uint8_t> nasPdu;
+};
+
+UplinkNas DecodeUplinkNas(const uint8_t *data, size_t length);
+
 struct ServedGummei
 {
     std::vector<Plmn> plmns;
