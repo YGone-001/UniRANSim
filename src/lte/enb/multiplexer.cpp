@@ -1476,6 +1476,11 @@ void EnbMultiplexer::onHandoverAccess(const lte::ue::link::Message &radio, const
         throw lte::ue::link::DecodeError(std::string("Refused a handover arrival: ") +
                                          s1ap::ToString(failure.refusal) + " (" + failure.detail + ")");
 
+    // What the arrival gate produced is the evidence a coordinator may be told
+    // about. Nothing else is: no decoded request, no committed resource set and
+    // no caller-set flag ever becomes one.
+    m_lastVerifiedArrival = verified;
+
     Log("INFO", "Verified handover arrival of LTE UE " + std::to_string(verified.radioUeId) +
                     " to this cell from eNB " + std::to_string(verified.source.enbId) + "; MME-UE-S1AP-ID=" +
                     std::to_string(verified.transaction.mmeUeS1apId) +
@@ -1490,6 +1495,11 @@ UeRegistry &EnbMultiplexer::registry()
 const UeRegistry &EnbMultiplexer::registry() const
 {
     return m_registry;
+}
+
+const std::optional<s1ap::VerifiedTargetArrival> &EnbMultiplexer::lastVerifiedArrival() const
+{
+    return m_lastVerifiedArrival;
 }
 
 InetAddress EnbMultiplexer::ueLinkAddress() const

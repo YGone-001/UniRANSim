@@ -99,6 +99,12 @@ struct RemoteCell
     uint16_t tac{};
     std::string radioAddress;
     uint16_t radioPort{};
+    // The cell's eNB identifier, stated here so a handover command naming a
+    // cell can be checked against an identity this UE was authorized for rather
+    // than trusted. Zero means "not stated", and a command naming a cell this
+    // configuration did not state an identifier for is refused rather than
+    // accepted on the strength of a matching address and port.
+    uint32_t enbId{};
 };
 
 struct LinkConfig
@@ -107,6 +113,11 @@ struct LinkConfig
     uint16_t localPort{};
     std::string enbAddress;
     uint16_t enbPort{};
+    // The serving cell's eNB identifier, stated here for the same reason
+    // RemoteCell::enbId is: a handover command names both cells, and the UE
+    // checks those names against identities its own configuration authorized
+    // instead of adopting whatever the frame asserted. Zero means "not stated".
+    uint32_t enbId{};
     // The serving cell's own tracking area code. The serving PLMN is the one
     // the UE is configured for. A reselection compares its target against the
     // resulting tracking area identity to tell a move within the same tracking

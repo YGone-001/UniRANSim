@@ -216,6 +216,15 @@ class EnbMultiplexer
     // recorded as a notification.
     s1ap::HandoverNotifyOutcome notifyHandover(const s1ap::HandoverTransactionId &id);
 
+    // Target side: what the production radio receive path last accepted as a
+    // verified arrival. It is the output of
+    // `HandoverPreparationOwner::acceptArrival` and nothing else, so it is
+    // arrival evidence rather than a claim a caller made: a caller cannot
+    // obtain one by setting a flag, and a decoded Handover Request or a
+    // committed resource set produces none. It is the only thing that may be
+    // reported to a handover coordinator as an arrival.
+    [[nodiscard]] const std::optional<s1ap::VerifiedTargetArrival> &lastVerifiedArrival() const;
+
     [[nodiscard]] UeRegistry &registry();
     [[nodiscard]] const UeRegistry &registry() const;
     [[nodiscard]] InetAddress ueLinkAddress() const;
@@ -262,6 +271,10 @@ class EnbMultiplexer
     // UE through the committed preparation, and the arrival is what promotes
     // it.
     void onHandoverAccess(const lte::ue::link::Message &radio, const InetAddress &peer);
+
+    // The arrival the radio receive path last accepted, when one has been.
+    // Set only by `onHandoverAccess`, and only after `acceptArrival` agreed.
+    std::optional<s1ap::VerifiedTargetArrival> m_lastVerifiedArrival;
 
     EnbConfig m_config;
     S1apSenderBinding m_sender;

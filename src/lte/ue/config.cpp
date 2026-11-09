@@ -202,6 +202,12 @@ Config ParseNode(const YAML::Node &root)
     config.link.localPort = static_cast<uint16_t>(yaml::GetInt32(link, "localPort", 1, 65535));
     config.link.enbAddress = yaml::GetIpAddress(link, "address");
     config.link.enbPort = static_cast<uint16_t>(yaml::GetInt32(link, "port", 1, 65535));
+    // Optional. Absent means "this configuration states no identifier for the
+    // serving cell", which is the ordinary case for everything that does not
+    // execute a connected-mode handover. A handover command naming a cell whose
+    // identifier was never stated here is refused rather than accepted.
+    if (yaml::HasField(link, "enbId"))
+        config.link.enbId = static_cast<uint32_t>(yaml::GetInt32(link, "enbId", 1, 0x7FFFFFFF));
     // The serving tracking area is only ever consulted to decide whether
     // arriving at a target cell calls for a Normal TAU, so a configuration that
     // cannot reselect has no use for it and must keep loading without it.
@@ -219,6 +225,12 @@ Config ParseNode(const YAML::Node &root)
         cell.tac = static_cast<uint16_t>(yaml::GetInt32(target, "tac", 1, 0xFFFF));
         cell.radioAddress = yaml::GetIpAddress(target, "address");
         cell.radioPort = static_cast<uint16_t>(yaml::GetInt32(target, "port", 1, 65535));
+        // Optional for the same reason the serving cell's is: a reselection has
+        // no use for it. A connected-mode handover command naming this cell is
+        // refused unless the identifier is stated here, because a matching
+        // address and port is not proof of an authorized identity.
+        if (yaml::HasField(target, "enbId"))
+            cell.enbId = static_cast<uint32_t>(yaml::GetInt32(target, "enbId", 1, 0x7FFFFFFF));
         config.link.targetCell = cell;
     }
     if (yaml::HasField(link, "timeoutMs")) config.link.timeoutMs = yaml::GetInt32(link, "timeoutMs", 100, 60000);

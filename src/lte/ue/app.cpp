@@ -24,6 +24,7 @@
 #include <memory>
 #include <sstream>
 
+#include <lte/enb/codec.hpp>
 #include <lte/ip_packet.hpp>
 #include <lte/tft.hpp>
 
@@ -293,8 +294,15 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
         // security context and GUTI. It never re-Attaches silently and never
         // invents a network procedure; the MME decides whether the old EPS
         // context still exists.
+        //
+        // A connected-mode handover is explicitly not a reason to start one. A
+        // UE that has accepted a handover command is between two accesses of one
+        // live ECM connection and must await the target's outcome; the clause is
+        // stated here so the rule is enforced where a Service Request would be
+        // sent rather than only implied by the ECM-CONNECTED state.
         if (restorationTrigger.recoveryArmed() && mobility.emm == EmmState::REGISTERED &&
-            mobility.ecm == EcmState::IDLE && mobility.pending == PendingProcedure::NONE && now >= recoveryDeadline)
+            mobility.ecm == EcmState::IDLE && mobility.pending == PendingProcedure::NONE &&
+            mobility.handover == HandoverExecution::NONE && now >= recoveryDeadline)
         {
             if (recoveryAttempts >= config.lifecycle.recoveryMaxAttempts)
             {
@@ -880,6 +888,78 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 continue;
             }
 
+            if (message.type == link::MessageType::SIMULATED_HANDOVER_COMMAND)
+            {
+                // A connected-mode handover command is executed here, in the
+                // UE's own production receive path, and every part of it is
+                // checked before any transport moves. A refusal therefore
+                // leaves this UE serving the cell it is already on: the radio
+                // endpoint is redirected only after the last check has passed.
+                const auto command =
+                    link::DecodeSimulatedHandoverCommand(message.payload.data(), message.payload.size());
+
+                // The command names a cell and never an address. The endpoint
+                // is resolved from this UE's own configuration, so a frame
+                // cannot redirect it to an endpoint nobody authorized, and a
+                // cell this configuration never stated an identifier for is
+                // refused rather than accepted on the strength of a command
+                // that happens to name the right address and port.
+                if (!config.link.targetCell.has_value())
+                    throw link::DecodeError("No target cell is authorized for a connected-mode handover");
+                const auto &target = *config.link.targetCell;
+                if (config.link.enbId == 0 || config.link.servingTac == 0)
+                    throw link::DecodeError("This configuration does not state the identity of its serving cell");
+                if (target.enbId == 0)
+                    throw link::DecodeError("This configuration does not state the identifier of the target cell");
+                const auto targetPlmn = enb::s1ap::EncodePlmn(target.plmn);
+                if (command.targetPlmn != targetPlmn || command.targetEnbId != target.enbId ||
+                    command.targetTac != target.tac)
+                    throw link::DecodeError("The handover command names a cell this UE is not authorized to enter");
+                // A command naming the cell already being served is not a
+                // handover, and acting on one would retire a live access for
+                // nothing.
+                if (command.targetEnbId == config.link.enbId && command.targetTac == config.link.servingTac)
+                    throw link::DecodeError("The handover command names the serving cell as its target");
+                // The address is compared against the one the network assigned
+                // this UE's own NAS. Nothing here adopts an address from a
+                // frame, so a command restating a different one is refused
+                // before any transport moves.
+                if (command.ueIpv4 != mobility.assignedIpv4)
+                    throw link::DecodeError("The handover command names a different PDN address");
+
+                // The S1AP session binding is checked inside, against the MME
+                // UE identity this UE already holds, and that call is
+                // check-then-mutate: a command naming another UE is refused
+                // there with nothing changed.
+                mobility.onConnectedHandover(command.mmeUeS1apId);
+
+                enb = InetAddress(target.radioAddress, target.radioPort);
+                Log("INFO", "Connected-mode handover command accepted (MME-UE-S1AP-ID=" +
+                                std::to_string(command.mmeUeS1apId) + "); radio transport moved to the authorized " +
+                                "target cell " + target.plmn.toString() + "/" + std::to_string(target.tac) + " at " +
+                                target.radioAddress + ":" + std::to_string(target.radioPort));
+
+                // Both cells are named from this UE's own configuration and
+                // never from the command, so the source identity in the arrival
+                // is the same one the source eNB states about itself and the
+                // same one the target's preparation was verified against.
+                link::SimulatedHandoverAccess access;
+                access.arrivalToken = command.arrivalToken;
+                access.sourcePlmn = enb::s1ap::EncodePlmn(config.plmn);
+                access.sourceEnbId = config.link.enbId;
+                access.sourceTac = config.link.servingTac;
+                access.targetPlmn = targetPlmn;
+                access.targetEnbId = target.enbId;
+                access.targetTac = target.tac;
+                access.mmeUeS1apId = command.mmeUeS1apId;
+                access.ueIpv4 = mobility.assignedIpv4;
+                auto frame = link::Encode({link::MessageType::SIMULATED_HANDOVER_ACCESS, ueId,
+                                           link::EncodeSimulatedHandoverAccess(access)});
+                socket.Send(enb, frame.data(), frame.size());
+                Log("INFO", "SIMULATED_HANDOVER_ACCESS sent to the target cell; awaiting its access outcome. "
+                            "No Attach and no Service Request is started by this UE");
+                continue;
+            }
             if (message.type != link::MessageType::NAS_DOWNLINK)
                 throw link::DecodeError("Data/NAS direction mismatch");
             if (!security.securityActive)

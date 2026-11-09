@@ -47,6 +47,16 @@ const char *ToString(PendingProcedure procedure)
     return "UNKNOWN_PENDING_PROCEDURE";
 }
 
+const char *ToString(HandoverExecution execution)
+{
+    switch (execution)
+    {
+    case HandoverExecution::NONE: return "NONE";
+    case HandoverExecution::RELOCATING: return "RELOCATING";
+    }
+    return "UNKNOWN_HANDOVER_EXECUTION";
+}
+
 const char *ToString(AccessBootstrap bootstrap)
 {
     return bootstrap == AccessBootstrap::ROLES_RETAINED ? "ROLES_RETAINED" : "DECLARE_REQUIRED";
@@ -117,6 +127,12 @@ void MobilityContext::onS1ContextReleased()
     mmeUeS1apId.reset();
     enbTeid.reset();
     sgwTeid.reset();
+    // A handover execution is a property of one access. When that access ends —
+    // however it ends, and whichever cell was carrying it — the execution is
+    // over and nothing about it is carried into the next one. RELOCATING that
+    // reaches this point was interrupted before its outcome was observed, and
+    // reporting it as still running would refuse every later command.
+    handover = HandoverExecution::NONE;
     if (emm == EmmState::REGISTERED && bearer != EpsBearerState::INACTIVE)
         bearer = EpsBearerState::SIGNALING_ESTABLISHED;
     else
@@ -167,6 +183,9 @@ void MobilityContext::beginNewAttach()
     // A fresh Attach is a new logical session, so whatever roles a previous
     // session's access left with a cell describe nothing this UE still holds.
     accessBootstrap = AccessBootstrap::DECLARE_REQUIRED;
+    // The same is true of any handover execution of the session being left
+    // behind: it belongs to that session and cannot still be running here.
+    handover = HandoverExecution::NONE;
 }
 
 void MobilityContext::onCellReselected()
@@ -199,6 +218,60 @@ void MobilityContext::onCellReselected()
     // only their access transport is gone, which is what ECM-IDLE means.
     if (bearer != EpsBearerState::INACTIVE)
         bearer = EpsBearerState::SIGNALING_ESTABLISHED;
+}
+
+void MobilityContext::onConnectedHandover(uint32_t commandMmeUeS1apId)
+{
+    // A connected-mode handover is a move between two accesses of one live ECM
+    // connection. Everything that makes this UE's session its own is already
+    // established and is not re-derived here: no Attach, no Service Request, no
+    // NAS procedure of any kind is started by this transition.
+    if (emm != EmmState::REGISTERED)
+        throw LifecycleError("A connected-mode handover requires a registered UE");
+    if (ecm != EcmState::CONNECTED)
+        throw LifecycleError("A connected-mode handover requires an ECM-CONNECTED UE");
+    if (pending != PendingProcedure::NONE)
+        throw LifecycleError("A connected-mode handover cannot run alongside another procedure");
+    // A command that arrives while one is already executing is a conflicting
+    // second handover and is refused. This is the deliberate scope of the
+    // phase: one connected-mode handover at a time per access. Chaining a
+    // second move onto one that has not been settled would leave two
+    // half-finished relocations on one UE, and nothing here can tell them
+    // apart, so the answer is no until the access carrying the first one ends.
+    if (handover == HandoverExecution::RELOCATING)
+        throw LifecycleError("A connected-mode handover is already executing");
+    if (!mmeUeS1apId.has_value())
+        throw LifecycleError("A connected-mode handover requires an established MME UE identity");
+    // The command states the MME's identity for this UE. It is the second half
+    // of the session binding and is checked, never adopted: a command naming a
+    // different UE is refused before any transport moves.
+    if (commandMmeUeS1apId == 0)
+        throw LifecycleError("A connected-mode handover command must name the MME UE identity");
+    if (commandMmeUeS1apId != *mmeUeS1apId)
+        throw LifecycleError("The handover command names a different MME UE identity");
+    if (assignedIpv4 == std::array<uint8_t, 4>{})
+        throw LifecycleError("A connected-mode handover requires an assigned PDN address");
+
+    // The source cell's own identifier for this UE. It belongs to the cell
+    // being left and must not be presented at the target: the target allocates
+    // its own, and holding a stale one here would let a later message be
+    // attributed to the wrong access.
+    enbUeS1apId.reset();
+    // The SGW-side TEID is the bearer's rather than the access's and is kept
+    // across the move; only the source's local transport goes away.
+    enbTeid.reset();
+    // The access epoch is shared with the serving cell, and the cell being
+    // entered restarts it, so the UE restarts it in step. One rather than zero:
+    // zero is "no epoch at all" and every generation-bound message is refused
+    // when it carries it.
+    accessGeneration = 1;
+    // The new endpoint has never been told which E-RAB plays which role. The
+    // roles themselves are not deleted — the network still holds them — so this
+    // is the same reset a reselection performs, for the same reason.
+    accessBootstrap = AccessBootstrap::DECLARE_REQUIRED;
+    // Preserved on purpose and untouched above: emm, ecm, bearer, security,
+    // guti, taiList, t3412, defaultEbi, assignedIpv4, mmeUeS1apId, sgwTeid.
+    handover = HandoverExecution::RELOCATING;
 }
 
 void MobilityContext::startServiceRequest()

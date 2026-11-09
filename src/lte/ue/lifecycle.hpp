@@ -46,6 +46,32 @@ enum class PendingProcedure
     TAU_PERIODIC
 };
 
+// Where a connected-mode handover execution has got to. It is deliberately not
+// a PendingProcedure: no NAS procedure is running, nothing is being requested
+// of the MME, and an Attach or a Service Request would be exactly the wrong
+// answer at every one of these points.
+//
+// RELOCATING is entered when a source command has been accepted and the radio
+// transport has been redirected to the authorized target endpoint. The UE is
+// then serving the new endpoint of one ECM connection: it holds its
+// registration, its PDN address, its bearer identities and its NAS security
+// context, and it is waiting for the network to finish what the move started.
+//
+// There is deliberately no "completed" value. Nothing this UE can observe means
+// a handover has finished: the two steps that would mean it — the MME moving
+// the downlink bearer path and the MME releasing the source context — are
+// deferred to later stages and are not reported over this radio link. Adding a
+// state here that claims otherwise would report an end-to-end completion the
+// system does not have, so the execution stays RELOCATING until the access
+// itself ends, whichever cell is carrying it.
+enum class HandoverExecution
+{
+    NONE,
+    RELOCATING
+};
+
+const char *ToString(HandoverExecution execution);
+
 // Whether the radio endpoint this UE is currently speaking to has to be told
 // which E-RAB is its default bearer and which are dedicated, or already holds
 // those roles confirmed from an earlier access of this EPS session.
@@ -119,6 +145,9 @@ struct MobilityContext
     std::optional<uint32_t> mmeUeS1apId;
     std::optional<uint32_t> enbTeid;
     std::optional<uint32_t> sgwTeid;
+    // The connected-mode handover execution this UE is in, if any. See
+    // HandoverExecution above.
+    HandoverExecution handover{HandoverExecution::NONE};
 
     void onAttachComplete(uint8_t ebi, const std::array<uint8_t, 4> &ipv4,
                           std::optional<std::array<uint8_t, 11>> assignedGuti,
@@ -142,6 +171,30 @@ struct MobilityContext
     // belong to the session rather than to any one cell, so they survive. The
     // access generation restarts alongside the target cell's own counter.
     void onCellReselected();
+    // The UE executes a connected-mode handover its serving cell authorised.
+    // This is the one transition that changes the radio endpoint without
+    // touching the EPS session, and it is deliberately the opposite of
+    // `onCellReselected` in every respect but the endpoint: the UE is still
+    // ECM-CONNECTED throughout, so the registration, the PDN address, the
+    // default and dedicated bearer identities, the NAS security context, the
+    // GUTI, the tracking areas and the MME's identity for this UE all survive
+    // unchanged.
+    //
+    // What does move is the access. The source cell's eNB-UE-S1AP-ID is that
+    // cell's own identifier for this UE and does not belong to the cell being
+    // entered, so it is dropped and the target allocates its own; the SGW-side
+    // TEID is the bearer's rather than the access's and is kept. The access
+    // generation restarts alongside the target cell's own counter, exactly as a
+    // reselection does, because the epoch is shared with the serving cell. The
+    // bearer-role bootstrap resets for the same reason a reselection resets it:
+    // the new endpoint has never been told which E-RAB plays which role, and
+    // the roles themselves are not deleted.
+    //
+    // `mmeUeS1apId` is the identity the command states and is checked against
+    // the one this UE already holds; a disagreement is refused here rather than
+    // recorded as a session move. Nothing in this transition starts an Attach,
+    // a Service Request or any NAS procedure.
+    void onConnectedHandover(uint32_t commandMmeUeS1apId);
     void startServiceRequest();
     void onServiceRestored(bool userPlaneReady = true);
     void onServiceRestored(uint32_t enbId, uint32_t mmeId, uint32_t localTeid, uint32_t remoteTeid);
