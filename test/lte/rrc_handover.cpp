@@ -195,11 +195,11 @@ TEST_CASE("lte/rrc: a handover command round-trips through uper")
 {
     const HandoverCommand message = SampleCommand();
     std::vector<uint8_t> uper;
-    REQUIRE(EncodeHandoverCommand(message, &uper));
+    REQUIRE(EncodeHandoverCommandLegacy(message, &uper));
     REQUIRE_FALSE(uper.empty());
 
     HandoverCommand decoded;
-    const RrcOutcome commandOutcome = DecodeHandoverCommand(uper.data(), uper.size(), &decoded);
+    const RrcOutcome commandOutcome = DecodeHandoverCommandLegacy(uper.data(), uper.size(), &decoded);
     INFO(commandOutcome.detail);
     REQUIRE(commandOutcome.ok);
     CHECK(decoded.rrcTransactionIdentifier == 1);
@@ -226,11 +226,11 @@ TEST_CASE("lte/rrc: encoding is deterministic across repeated runs")
     }
 
     std::vector<uint8_t> command;
-    REQUIRE(EncodeHandoverCommand(SampleCommand(), &command));
+    REQUIRE(EncodeHandoverCommandLegacy(SampleCommand(), &command));
     for (int i = 0; i < 16; ++i)
     {
         std::vector<uint8_t> again;
-        REQUIRE(EncodeHandoverCommand(SampleCommand(), &again));
+        REQUIRE(EncodeHandoverCommandLegacy(SampleCommand(), &again));
         CHECK(again == command);
     }
 }
@@ -270,7 +270,7 @@ TEST_CASE("lte/rrc: the rrc octets survive the s1ap transparent container unchan
     // Target side: the HandoverCommand travels as the Target-ToSource container
     // of a Handover Request Acknowledge.
     std::vector<uint8_t> command;
-    REQUIRE(EncodeHandoverCommand(SampleCommand(), &command));
+    REQUIRE(EncodeHandoverCommandLegacy(SampleCommand(), &command));
 
     HandoverRequestAcknowledge acknowledge;
     acknowledge.mmeUeS1apId = 201;
@@ -286,7 +286,7 @@ TEST_CASE("lte/rrc: the rrc octets survive the s1ap transparent container unchan
     CHECK(decodedAcknowledge.targetToSource == command);
 
     lte::rrc::HandoverCommand unpackedCommand;
-    REQUIRE(DecodeHandoverCommand(decodedAcknowledge.targetToSource.data(), decodedAcknowledge.targetToSource.size(),
+    REQUIRE(DecodeHandoverCommandLegacy(decodedAcknowledge.targetToSource.data(), decodedAcknowledge.targetToSource.size(),
                                   &unpackedCommand));
     CHECK(unpackedCommand.targetPhysCellId == 42);
     CHECK(unpackedCommand.newUeIdentity == 0x1234);
@@ -305,7 +305,7 @@ TEST_CASE("lte/rrc: malformed and unsupported containers are refused")
     std::vector<uint8_t> preparation;
     REQUIRE(EncodeHandoverPreparationInformation(SamplePreparation(), &preparation));
     std::vector<uint8_t> command;
-    REQUIRE(EncodeHandoverCommand(SampleCommand(), &command));
+    REQUIRE(EncodeHandoverCommandLegacy(SampleCommand(), &command));
 
     SUBCASE("an empty container")
     {
@@ -348,7 +348,7 @@ TEST_CASE("lte/rrc: malformed and unsupported containers are refused")
         CHECK(outcome.refusal == RrcRefusal::NOT_HANDOVER_MESSAGE);
 
         lte::rrc::HandoverCommand commandOut;
-        const auto commandOutcome = DecodeHandoverCommand(simulator.data(), simulator.size(), &commandOut);
+        const auto commandOutcome = DecodeHandoverCommandLegacy(simulator.data(), simulator.size(), &commandOut);
         CHECK_FALSE(commandOutcome.ok);
         CHECK(commandOutcome.refusal == RrcRefusal::NOT_HANDOVER_MESSAGE);
     }
@@ -361,7 +361,7 @@ TEST_CASE("lte/rrc: malformed and unsupported containers are refused")
     SUBCASE("a preparation container decoded as a command")
     {
         lte::rrc::HandoverCommand out;
-        const auto outcome = DecodeHandoverCommand(preparation.data(), preparation.size(), &out);
+        const auto outcome = DecodeHandoverCommandLegacy(preparation.data(), preparation.size(), &out);
         CHECK_FALSE(outcome.ok);
     }
     SUBCASE("a single flipped octet in the preparation")
@@ -388,7 +388,7 @@ TEST_CASE("lte/rrc: encoding refuses values outside the constraints it declares"
     {
         auto command = SampleCommand();
         command.targetPhysCellId = 504;
-        const auto outcome = EncodeHandoverCommand(command, &out);
+        const auto outcome = EncodeHandoverCommandLegacy(command, &out);
         CHECK_FALSE(outcome.ok);
         CHECK(outcome.refusal == RrcRefusal::INVALID_CONSTRAINT);
     }
@@ -396,7 +396,7 @@ TEST_CASE("lte/rrc: encoding refuses values outside the constraints it declares"
     {
         auto command = SampleCommand();
         command.rrcTransactionIdentifier = 4;
-        const auto outcome = EncodeHandoverCommand(command, &out);
+        const auto outcome = EncodeHandoverCommandLegacy(command, &out);
         CHECK_FALSE(outcome.ok);
         CHECK(outcome.refusal == RrcRefusal::INVALID_CONSTRAINT);
     }
@@ -458,14 +458,14 @@ TEST_CASE("lte/rrc: pinned uper vectors decode to the values an independent diss
 
     const auto command = Hex("005a080054848d00002c000008");
     lte::rrc::HandoverCommand decodedCommand;
-    REQUIRE(DecodeHandoverCommand(command.data(), command.size(), &decodedCommand));
+    REQUIRE(DecodeHandoverCommandLegacy(command.data(), command.size(), &decodedCommand));
     CHECK(decodedCommand.rrcTransactionIdentifier == 1);
     CHECK(decodedCommand.targetPhysCellId == 42);
     CHECK(decodedCommand.t304 == 2);
     CHECK(decodedCommand.newUeIdentity == 0x1234);
 
     std::vector<uint8_t> reencodedCommand;
-    REQUIRE(EncodeHandoverCommand(decodedCommand, &reencodedCommand));
+    REQUIRE(EncodeHandoverCommandLegacy(decodedCommand, &reencodedCommand));
     CHECK(reencodedCommand == command);
 }
 

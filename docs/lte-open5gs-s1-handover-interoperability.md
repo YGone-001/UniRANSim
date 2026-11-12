@@ -160,7 +160,7 @@ gap: **the wire form expects RRC, and this repository has none.**
 | Blocker | Why it blocks | What would close it |
 |---|---|---|
 | Source provenance at the target | No S1AP field names the source eNB, and this repository refuses to infer one from the peer address, TAC, PLMN, EBI or the container | A defined and verified ownership contract, or a target that trusts the MME's association by an explicitly accepted policy |
-| RRC container | Both 36.413 container SEQUENCEs are now encoded and dissected independently; what remains is runtime provenance: real UE history from a running source and a real target CGI | Runtime-recorded UE history and a verified target cell identity |
+| RRC container | Both 36.413 container SEQUENCEs are encoded and dissected, and since Phase 18-F-B3 the runtime supplies the history and target CGI from components that own them (simulator runtime evidence) | Real-RF AS configuration, AS security and UE RRC execution |
 | AS security | The UE has no KeNB/NH derivation and no RRC/UP keys | TS 33.401 key derivation and RRC security in the UE runtime |
 | UE radio execution | The UE moves on a simulator control frame, not an RRC reconfiguration | An RRC execution path in the UE |
 | Core path observability | The eNB cannot see the SGW's map | Nothing on the eNB side; the evidence has to come from the core's own state |

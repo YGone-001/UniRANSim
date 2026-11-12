@@ -24,6 +24,13 @@
 #include <lte/enb/transparent_container.hpp>
 #include <lte/rrc/rrc_handover.hpp>
 
+#include "AccessStratumRelease.h"
+#include "BandInfoEUTRA.h"
+#include "InterFreqBandInfo.h"
+#include "SupportedBandEUTRA.h"
+#include "UE-EUTRA-Capability.h"
+#include <per_encoder.h>
+
 namespace
 {
 
@@ -142,7 +149,7 @@ TEST_CASE("lte/rrc-container: a source-to-target container round-trips with its 
     CHECK(decoded.targetCellId.plmn.mcc == "460");
     CHECK(decoded.targetCellId.plmn.mnc == "02");
     CHECK(decoded.targetCellId.cellId == 0x0ABCDE0);
-    CHECK(decoded.targetCellId.provenance == EutranCgiProvenance::CALLER_UNVERIFIED);
+    CHECK(decoded.targetCellId.provenance == EutranCgiProvenance::WIRE_UNVERIFIED);
     REQUIRE(decoded.subscriberProfileIdForRfp.has_value());
     CHECK(*decoded.subscriberProfileIdForRfp == 42);
     REQUIRE(decoded.ueHistory.visitedCells.size() == 2);
@@ -557,4 +564,107 @@ TEST_CASE("lte/rrc-container: pinned container vectors decode to the fields an i
     CHECK(command.newUeIdentity == 0x1234);
     CHECK(command.prachRootSequenceIndex == 22);
     CHECK(command.ulCyclicPrefixLength == 1);
+}
+
+// --- A fully valid nested UE-EUTRA-Capability -------------------------------
+
+namespace
+{
+
+// A synthetic but structurally valid UE-EUTRA-Capability, built from the
+// asn1c-generated TS 36.331 V15.6.0 types. Every value in it is a deliberately
+// chosen standards-valid fixture: it is not a capability captured from a real
+// UE and no LTE band support, MIMO capability or feature set in it is claimed
+// to be a real measurement.
+int AppendBytes(const void *buffer, size_t size, void *key)
+{
+    auto *out = static_cast<std::vector<uint8_t> *>(key);
+    const auto *bytes = static_cast<const uint8_t *>(buffer);
+    out->insert(out->end(), bytes, bytes + size);
+    return 0;
+}
+
+std::vector<uint8_t> SyntheticUeEutraCapability()
+{
+    UE_EUTRA_Capability_t capability{};
+    capability.accessStratumRelease = AccessStratumRelease_rel8;
+    capability.ue_Category = 1;
+    capability.pdcp_Parameters.supportedROHC_Profiles.profile0x0001_r15 = 1;
+    capability.pdcp_Parameters.supportedROHC_Profiles.profile0x0006_r15 = 1;
+    capability.phyLayerParameters.ue_TxAntennaSelectionSupported = 0;
+    capability.phyLayerParameters.ue_SpecificRefSigsSupported = 0;
+
+    // One supported band: band 1, full duplex.
+    auto *band = static_cast<SupportedBandEUTRA_t *>(std::calloc(1, sizeof(SupportedBandEUTRA_t)));
+    band->bandEUTRA = 1;
+    band->halfDuplex = 0;
+    ASN_SEQUENCE_ADD(&capability.rf_Parameters.supportedBandListEUTRA, band);
+
+    // The measurement parameters need one band entry, which needs one
+    // inter-frequency band info.
+    auto *info = static_cast<InterFreqBandInfo_t *>(std::calloc(1, sizeof(InterFreqBandInfo_t)));
+    info->interFreqNeedForGaps = 0;
+    InterFreqBandInfo_t **list =
+        static_cast<InterFreqBandInfo_t **>(std::calloc(1, sizeof(InterFreqBandInfo_t *)));
+    list[0] = info;
+    auto *bandInfo = static_cast<BandInfoEUTRA_t *>(std::calloc(1, sizeof(BandInfoEUTRA_t)));
+    bandInfo->interFreqBandList.list.array = list;
+    bandInfo->interFreqBandList.list.count = 1;
+    bandInfo->interFreqBandList.list.size = 1;
+    ASN_SEQUENCE_ADD(&capability.measParameters.bandListEUTRA, bandInfo);
+
+    std::vector<uint8_t> encoded;
+    const asn_enc_rval_t result =
+        uper_encode(&asn_DEF_UE_EUTRA_Capability, nullptr, &capability, AppendBytes, &encoded);
+    ASN_STRUCT_FREE_CONTENTS_ONLY(asn_DEF_UE_EUTRA_Capability, &capability);
+    if (result.encoded < 0)
+        return {};
+    return encoded;
+}
+
+} // namespace
+
+TEST_CASE("lte/rrc-container: a fully valid nested ue-eutra-capability vector dissects end to end")
+{
+    const auto capability = SyntheticUeEutraCapability();
+    REQUIRE_FALSE(capability.empty());
+
+    // The preparation message carries it as the UE's E-UTRA capability
+    // container, exactly where the fixture belongs.
+    lte::rrc::HandoverPreparation preparation;
+    preparation.ueCapabilities.push_back(lte::rrc::UeCapabilityContainer{0, capability});
+    std::vector<uint8_t> rrc;
+    REQUIRE(lte::rrc::EncodeHandoverPreparationInformation(preparation, &rrc));
+
+    SourceToTargetContainer container;
+    container.rrcPayload = rrc;
+    container.targetCellId = FixtureCgi(0x0ABCDE0);
+    container.ueHistory = FixtureHistory();
+    std::vector<uint8_t> bytes;
+    REQUIRE(EncodeSourceToTargetTransparentContainer(container, &bytes));
+
+    // Every layer comes back out.
+    SourceToTargetContainer unpacked;
+    REQUIRE(DecodeSourceToTargetTransparentContainer(bytes.data(), bytes.size(), &unpacked));
+    CHECK(unpacked.rrcPayload == rrc);
+
+    lte::rrc::HandoverPreparation unpackedRrc;
+    REQUIRE(lte::rrc::DecodeHandoverPreparationInformation(unpacked.rrcPayload.data(),
+                                                           unpacked.rrcPayload.size(), &unpackedRrc));
+    REQUIRE(unpackedRrc.ueCapabilities.size() == 1);
+    CHECK(unpackedRrc.ueCapabilities[0].container == capability);
+
+    // The complete container travels in a real S1AP Handover Required, whose
+    // message layer treats it as the opaque octet string it is.
+    HandoverRequired required;
+    required.mmeUeS1apId = 201;
+    required.enbUeS1apId = 1;
+    required.handoverType = HandoverType::INTRA_LTE;
+    required.causeCategory = "radioNetwork";
+    required.causeValue = 16;
+    required.target = EnbIdentity{TestPlmn(), 0x00ABCDEu, 2};
+    required.sourceToTarget = bytes;
+    const auto pdu = EncodeHandoverRequired(required);
+    const auto decoded = DecodeHandoverRequired(pdu.data(), pdu.size());
+    CHECK(decoded.sourceToTarget == bytes);
 }

@@ -126,7 +126,10 @@ const char *ToString(HandoverCapability capability)
     case HandoverCapability::S1AP_RUNTIME_INGRESS_READY: return "S1AP_RUNTIME_INGRESS_READY";
     case HandoverCapability::SOURCE_PROVENANCE_READY: return "SOURCE_PROVENANCE_READY";
     case HandoverCapability::TARGET_CONTEXT_READY: return "TARGET_CONTEXT_READY";
-    case HandoverCapability::RRC_CONTAINER_READY: return "RRC_CONTAINER_READY";
+    case HandoverCapability::LTE_RRC_UPER_CODEC_READY: return "LTE_RRC_UPER_CODEC_READY";
+    case HandoverCapability::S1AP_TRANSPARENT_CONTAINER_CODEC_READY: return "S1AP_TRANSPARENT_CONTAINER_CODEC_READY";
+    case HandoverCapability::RRC_CONFIGURATION_COMPLETE: return "RRC_CONFIGURATION_COMPLETE";
+    case HandoverCapability::RRC_RUNTIME_INPUT_AVAILABLE: return "RRC_RUNTIME_INPUT_AVAILABLE";
     case HandoverCapability::HANDOVER_SECURITY_READY: return "HANDOVER_SECURITY_READY";
     case HandoverCapability::UE_RADIO_EXECUTION_READY: return "UE_RADIO_EXECUTION_READY";
     case HandoverCapability::MME_PATH_UPDATE_OBSERVABLE: return "MME_PATH_UPDATE_OBSERVABLE";
@@ -204,7 +207,24 @@ std::vector<HandoverCapability> LiveHandoverReadiness::missing() const
         // itself a mandatory capability a caller could satisfy.
         if (assessment.capability == HandoverCapability::LIVE_HANDOVER_EXECUTION_READY)
             continue;
+        // External acceptance evidence is not an execution prerequisite: a
+        // target eNB never reads the SGW's forwarding map to perform a
+        // handover. It is reported separately and a future live campaign
+        // obtains it from the core side.
+        if (assessment.capability == HandoverCapability::MME_PATH_UPDATE_OBSERVABLE)
+            continue;
         if (!assessment.available)
+            out.push_back(assessment.capability);
+    }
+    return out;
+}
+
+std::vector<HandoverCapability> LiveHandoverReadiness::externalEvidenceGaps() const
+{
+    std::vector<HandoverCapability> out;
+    for (const auto &assessment : assessments)
+    {
+        if (assessment.capability == HandoverCapability::MME_PATH_UPDATE_OBSERVABLE && !assessment.available)
             out.push_back(assessment.capability);
     }
     return out;
@@ -227,16 +247,29 @@ LiveHandoverReadiness AssessLiveHandoverCapabilities()
         Assess(HandoverCapability::S1AP_RUNTIME_INGRESS_READY, true,
                "the live dispatcher classifies the handover family and refuses it without side effects; see the "
                "lte/handover/live cases"),
+        Assess(HandoverCapability::LTE_RRC_UPER_CODEC_READY, true,
+               "src/lte/rrc/rrc_handover.{hpp,cpp} encodes and decodes HandoverPreparationInformation and the "
+               "HandoverCommand payload with UPER over asn1c-generated TS 36.331 V15.6.0 types; "
+               "test/lte/rrc_handover.cpp pins the vectors"),
+        Assess(HandoverCapability::S1AP_TRANSPARENT_CONTAINER_CODEC_READY, true,
+               "src/lte/enb/transparent_container.{hpp,cpp} encodes and decodes both TS 36.413 container "
+               "SEQUENCEs; test/lte/transparent_container.cpp pins the vectors and the nested dissection"),
+        Assess(HandoverCapability::RRC_CONFIGURATION_COMPLETE, false,
+               "the AS-Config the source would send is incomplete: sourceMeasConfig and "
+               "sourceRadioResourceConfig are legal empty structures because this simulated radio has no "
+               "measurement or dedicated-radio state to populate them; AssessAsConfigCompleteness names every "
+               "gap"),
+        Assess(HandoverCapability::RRC_RUNTIME_INPUT_AVAILABLE, true,
+               "the runtime supplies the handover inputs from state it owns: the UE's serving-cell history "
+               "(src/lte/enb/handover_runtime_provenance) is recorded from real serving-cell transitions and "
+               "the target CGI comes from the authorized simulator cell inventory; this is simulator runtime "
+               "evidence, not real-RF evidence"),
         Assess(HandoverCapability::SOURCE_PROVENANCE_READY, false,
                "a target receives no standards-compliant source eNB identity: Handover Request carries none, and "
                "this repository refuses to derive one from the MME peer, TAC, PLMN, EBI or the opaque container"),
         Assess(HandoverCapability::TARGET_CONTEXT_READY, false,
                "a provisional target context is created only from a SourceSession that ExtractSourceSession read "
                "out of the source's own live registry, which a target eNB does not hold"),
-        Assess(HandoverCapability::RRC_CONTAINER_READY, false,
-               "the RRC payload codec now exists (src/lte/rrc, UPER, TS 36.331 V15.6.0), but the S1AP container "
-               "that carries it is the 36.413 SourceeNB-ToTargeteNB-TransparentContainer SEQUENCE, which this "
-               "repository does not encode yet; a payload alone is not a container"),
         Assess(HandoverCapability::HANDOVER_SECURITY_READY, false,
                "lte::ue::SecurityContext holds KASME, CK, IK and the NAS keys only: there is no KeNB, no NH "
                "handling and no RRC/UP key derivation, so the nextHopParameter the MME sends cannot be applied"),

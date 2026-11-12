@@ -48,7 +48,11 @@ enum class EutranCgiProvenance : uint8_t
     // Read out of a real running target cell's configuration.
     RUNNING_TARGET_CELL,
     // Supplied by a caller with no verification behind it.
-    CALLER_UNVERIFIED
+    CALLER_UNVERIFIED,
+    // Read off the wire: a peer asserted this identity and no local authority
+    // has checked it. Decoding keeps it here; matching a PLMN, a TAC or a cell
+    // identifier does not raise it, and neither does a valid ASN.1 structure.
+    WIRE_UNVERIFIED
 };
 
 const char *ToString(EutranCgiProvenance provenance);
@@ -67,7 +71,12 @@ enum class HistoryProvenance : uint8_t
     // The history is known but older than its validity window.
     STALE,
     // Cells before this entry are unknown.
-    UNKNOWN_PREDECESSOR
+    UNKNOWN_PREDECESSOR,
+    // Read off the wire. The TS 36.413 message carries no provenance, so
+    // decoded history is never fixture data and never runtime observation:
+    // it is what a peer asserted and nothing more. Only a runtime authority
+    // can raise it, and decoding is not one.
+    WIRE_UNVERIFIED
 };
 
 const char *ToString(HistoryProvenance provenance);

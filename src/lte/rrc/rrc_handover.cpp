@@ -770,7 +770,7 @@ RrcOutcome BuildHandoverReconfiguration(const HandoverCommand &message, RRCConne
 
 } // namespace
 
-RrcOutcome EncodeHandoverCommand(const HandoverCommand &message, std::vector<uint8_t> *uper)
+RrcOutcome EncodeHandoverCommandLegacy(const HandoverCommand &message, std::vector<uint8_t> *uper)
 {
     if (uper == nullptr)
         return Refuse(RrcRefusal::EMPTY_INPUT, "no output was named");
@@ -807,7 +807,7 @@ RrcOutcome EncodeHandoverCommand(const HandoverCommand &message, std::vector<uin
     return outcome;
 }
 
-RrcOutcome DecodeHandoverCommand(const uint8_t *data, size_t size, HandoverCommand *message)
+RrcOutcome DecodeHandoverCommandLegacy(const uint8_t *data, size_t size, HandoverCommand *message)
 {
     if (message == nullptr)
         return Refuse(RrcRefusal::EMPTY_INPUT, "no output was named");

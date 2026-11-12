@@ -258,19 +258,23 @@ RrcOutcome EncodeHandoverPreparationInformation(const HandoverPreparation &messa
 // something this model cannot represent is refused rather than truncated.
 RrcOutcome DecodeHandoverPreparationInformation(const uint8_t *data, size_t size, HandoverPreparation *message);
 
-RrcOutcome EncodeHandoverCommand(const HandoverCommand &message, std::vector<uint8_t> *uper);
-RrcOutcome DecodeHandoverCommand(const uint8_t *data, size_t size, HandoverCommand *message);
+// LEGACY: Phase 18-F-B1 form. Its handoverCommandMessage carries the bare
+// reconfiguration instead of the DL-DCCH-Message TS 36.331 requires. Kept for
+// its pinned vectors; never use it for anything a live path would transmit.
+RrcOutcome EncodeHandoverCommandLegacy(const HandoverCommand &message, std::vector<uint8_t> *uper);
+RrcOutcome DecodeHandoverCommandLegacy(const uint8_t *data, size_t size, HandoverCommand *message);
 
-// The conformant target-to-source payload.
+// The conformant target-to-source payload. This is the only form the live
+// handover path may use.
 //
 // TS 36.331 defines HandoverCommand-r8-IEs.handoverCommandMessage as an
 // OCTET STRING (CONTAINING DL-DCCH-Message): the octet string holds a
 // DL-DCCH-Message whose c1 carries the rrcConnectionReconfiguration, not the
-// reconfiguration on its own. Phase 18-F-B1's EncodeHandoverCommand above
-// stores the bare reconfiguration in that field; its pinned vectors are
-// historical evidence and are left untouched. These functions produce and
-// parse the form the specification states, and are what the TS 36.413
-// transparent container carries.
+// reconfiguration on its own. Phase 18-F-B1's EncodeHandoverCommandLegacy
+// below stores the bare reconfiguration in that field; its pinned vectors are
+// historical evidence and are kept decodable. The legacy pair is named so it
+// cannot be mistaken for the standards form, and the runtime handover builder
+// calls only these two.
 RrcOutcome EncodeHandoverCommandPayload(const HandoverCommand &message, std::vector<uint8_t> *uper);
 RrcOutcome DecodeHandoverCommandPayload(const uint8_t *data, size_t size, HandoverCommand *message);
 

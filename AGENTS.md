@@ -836,6 +836,29 @@ TS 36.413 S1AP message         APER   src/lte/enb/codec.cpp
   AssessAsConfigCompleteness names the difference; do not substitute defaults
   without a normative basis, and keep fixture values labelled as fixture input.
 
+## Handover runtime provenance
+
+Where a handover's typed inputs come from is as important as how they are
+encoded. `src/lte/enb/handover_runtime_provenance.{hpp,cpp}` owns that.
+
+- Decoding is not verification. A value read off the wire is `WIRE_UNVERIFIED`
+  until a runtime authority raises it, and a decoder is not an authority.
+  Matching a PLMN, a TAC, a cell ID or a well-formed structure raises nothing.
+- A cell identity is only real when an authority owns it: this eNB's own
+  `EnbConfig`, or a current `TargetInventory` entry. A physical cell identity
+  alone is not a globally unique E-UTRAN CGI.
+- The UE's serving-cell history belongs to one EPS session and is recorded from
+  real transitions on a monotonic clock. An access release is not a cell visit,
+  a same-cell re-establishment is not a duplicate entry, and a fresh Attach
+  starts a new session history. `Time-UE-StayedInCell` saturates at 4095 with
+  the saturation named.
+- A `SourceHandoverSnapshot` can only be built from live runtime components;
+  a missing input is named and nothing is produced. Never substitute a fixture
+  into a live-use configuration.
+- `EncodeHandoverCommandPayload` is the only HandoverCommand form a live path
+  may emit. The `...Legacy` pair exists for its historical pinned vectors and
+  is refused by the conformant decoder.
+
 ## What must never be committed
 
 - `config/*.local.yaml` — private laboratory configurations, including

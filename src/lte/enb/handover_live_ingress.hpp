@@ -64,10 +64,22 @@ enum class HandoverCapability : uint8_t
     SOURCE_PROVENANCE_READY,
     // A target can hold a provisional context for a UE that has not arrived.
     TARGET_CONTEXT_READY,
-    // An LTE RRC (TS 36.331) container can be produced and consumed: the
-    // HandoverPreparationInformation and HandoverCommand messages, not opaque
-    // bytes labelled as a simulator frame.
-    RRC_CONTAINER_READY,
+    // The TS 36.331 RRC (UPER) codec encodes and decodes the handover
+    // messages: HandoverPreparationInformation and the HandoverCommand payload.
+    LTE_RRC_UPER_CODEC_READY,
+    // The TS 36.413 transparent-container SEQUENCEs wrap and unwrap those
+    // messages, so the S1AP octet string carries a complete container.
+    S1AP_TRANSPARENT_CONTAINER_CODEC_READY,
+    // The AS-Config the source would send is complete for the supported
+    // profile. It is not: the measurement and dedicated-radio contents have no
+    // runtime source in this simulated radio, and the codec encodes them as
+    // legal empty structures.
+    RRC_CONFIGURATION_COMPLETE,
+    // The runtime supplies the handover inputs from its own state: the UE's
+    // serving-cell history and a verified target-cell identity, both from
+    // components that own them. This is simulator runtime evidence, not
+    // real-RF evidence.
+    RRC_RUNTIME_INPUT_AVAILABLE,
     // The UE runtime can derive and apply AS handover security (KeNB, NH, and
     // the RRC/UP keys) from the SecurityContext the MME sends.
     HANDOVER_SECURITY_READY,
@@ -75,8 +87,12 @@ enum class HandoverCapability : uint8_t
     // access to the target cell.
     UE_RADIO_EXECUTION_READY,
     // The eNB can observe that the MME actually moved the core's downlink path.
+    // This is external acceptance evidence, not an execution prerequisite: a
+    // target eNB never reads the SGW's forwarding map to perform a handover. It
+    // is reported separately and a future live campaign must obtain it from the
+    // core side.
     MME_PATH_UPDATE_OBSERVABLE,
-    // The conjunction of the mandatory capabilities above. It is derived and
+    // The conjunction of the execution prerequisites above. It is derived and
     // never set.
     LIVE_HANDOVER_EXECUTION_READY
 };
@@ -99,9 +115,13 @@ struct LiveHandoverReadiness
     std::vector<CapabilityAssessment> assessments;
 
     [[nodiscard]] bool available(HandoverCapability capability) const;
-    // Every mandatory capability that is missing, in the order above.
+    // Every execution prerequisite that is missing, in the order above. These
+    // are what a running eNB needs before it may execute a handover.
     [[nodiscard]] std::vector<HandoverCapability> missing() const;
-    // True only when every mandatory capability is available. Nothing in this
+    // What a future live acceptance campaign must obtain elsewhere. It is not
+    // an execution prerequisite and no eNB is required to satisfy it.
+    [[nodiscard]] std::vector<HandoverCapability> externalEvidenceGaps() const;
+    // True only when every execution prerequisite is available. Nothing in this
     // repository can make it true today, and that is the honest answer.
     [[nodiscard]] bool liveExecutionReady() const { return missing().empty(); }
 };

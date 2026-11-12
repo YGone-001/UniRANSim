@@ -101,6 +101,8 @@ if (BUILD_TESTS)
     target_link_libraries(nr-tests ext)
     target_link_libraries(nr-tests lte-enb-lib)
     target_link_libraries(nr-tests lte-rrc)
+    target_include_directories(nr-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/asn/lte-rrc
+                                                ${CMAKE_CURRENT_SOURCE_DIR}/src/asn/asn1c)
     target_link_libraries(nr-tests lte-ue-lib)
 
     enable_testing()

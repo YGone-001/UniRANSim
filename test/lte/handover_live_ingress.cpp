@@ -212,29 +212,39 @@ TEST_CASE("lte/handover/live: the capability model names every missing live prer
     CHECK(readiness.available(HandoverCapability::ISOLATED_SIMULATOR_READY));
     CHECK(readiness.available(HandoverCapability::S1AP_CODEC_READY));
     CHECK(readiness.available(HandoverCapability::S1AP_RUNTIME_INGRESS_READY));
+    CHECK(readiness.available(HandoverCapability::LTE_RRC_UPER_CODEC_READY));
+    CHECK(readiness.available(HandoverCapability::S1AP_TRANSPARENT_CONTAINER_CODEC_READY));
+    CHECK(readiness.available(HandoverCapability::RRC_RUNTIME_INPUT_AVAILABLE));
 
     // What does not exist is named, not hidden behind a switch.
+    CHECK_FALSE(readiness.available(HandoverCapability::RRC_CONFIGURATION_COMPLETE));
     CHECK_FALSE(readiness.available(HandoverCapability::SOURCE_PROVENANCE_READY));
     CHECK_FALSE(readiness.available(HandoverCapability::TARGET_CONTEXT_READY));
-    CHECK_FALSE(readiness.available(HandoverCapability::RRC_CONTAINER_READY));
     CHECK_FALSE(readiness.available(HandoverCapability::HANDOVER_SECURITY_READY));
     CHECK_FALSE(readiness.available(HandoverCapability::UE_RADIO_EXECUTION_READY));
-    CHECK_FALSE(readiness.available(HandoverCapability::MME_PATH_UPDATE_OBSERVABLE));
 
     CHECK_FALSE(readiness.available(HandoverCapability::LIVE_HANDOVER_EXECUTION_READY));
     CHECK_FALSE(readiness.liveExecutionReady());
 
+    // Execution prerequisites: what a running eNB needs before it may execute.
     const auto missing = readiness.missing();
-    REQUIRE(missing.size() == 6);
-    CHECK(missing[0] == HandoverCapability::SOURCE_PROVENANCE_READY);
-    CHECK(missing[1] == HandoverCapability::TARGET_CONTEXT_READY);
-    CHECK(missing[2] == HandoverCapability::RRC_CONTAINER_READY);
+    REQUIRE(missing.size() == 5);
+    CHECK(missing[0] == HandoverCapability::RRC_CONFIGURATION_COMPLETE);
+    CHECK(missing[1] == HandoverCapability::SOURCE_PROVENANCE_READY);
+    CHECK(missing[2] == HandoverCapability::TARGET_CONTEXT_READY);
     CHECK(missing[3] == HandoverCapability::HANDOVER_SECURITY_READY);
     CHECK(missing[4] == HandoverCapability::UE_RADIO_EXECUTION_READY);
-    CHECK(missing[5] == HandoverCapability::MME_PATH_UPDATE_OBSERVABLE);
+
+    // External acceptance evidence is reported separately: no eNB reads the
+    // SGW's forwarding map to perform a handover, and a future live campaign
+    // obtains this from the core side.
+    const auto external = readiness.externalEvidenceGaps();
+    REQUIRE(external.size() == 1);
+    CHECK(external[0] == HandoverCapability::MME_PATH_UPDATE_OBSERVABLE);
+    CHECK_FALSE(readiness.available(HandoverCapability::MME_PATH_UPDATE_OBSERVABLE));
 
     // Every assessment carries the fact it rests on.
-    REQUIRE(readiness.assessments.size() == 10);
+    REQUIRE(readiness.assessments.size() == 13);
     for (const auto &assessment : readiness.assessments)
     {
         CHECK_FALSE(assessment.evidence.empty());
@@ -294,7 +304,7 @@ TEST_CASE("lte/handover/live: the refusal names every missing capability and mut
     CHECK(outcome.refusal == HandoverIngressRefusal::SOURCE_PROVENANCE_NOT_ESTABLISHED);
     CHECK(outcome.mmeUeS1apId == 7);
     CHECK_FALSE(outcome.mutatedState);
-    REQUIRE(outcome.missing.size() == 6);
+    REQUIRE(outcome.missing.size() == 5);
     CHECK_FALSE(outcome.responsePdu.empty());
     CHECK(lab.mux.registry().size() == 0);
     CHECK(lab.wire.sent.empty());
@@ -386,7 +396,7 @@ TEST_CASE("lte/handover/live: a handover command with a pending handover is refu
     CHECK(outcome.disposition == LiveHandoverDisposition::RECOGNIZED_BUT_NOT_EXECUTABLE);
     CHECK(outcome.refusal == HandoverIngressRefusal::RRC_CONTAINER_NOT_READY);
     CHECK_FALSE(outcome.mutatedState);
-    REQUIRE(outcome.missing.size() == 6);
+    REQUIRE(outcome.missing.size() == 5);
 
     // The UE is still where it was, on the same transport, and nothing was
     // handed to it over the radio.

@@ -2055,3 +2055,27 @@ Unchanged: `LIVE_S1_HANDOVER_NO_GO`. A complete container is not proof that a
 UE can perform a handover; `HANDOVER_SECURITY_READY` and
 `UE_RADIO_EXECUTION_READY` remain false, and the live ingress still fails
 closed on every handover message.
+
+## 69. Phase 18-F-B3: runtime provenance
+
+Section 68.3 recorded the remaining model gaps. The runtime now supplies the
+handover inputs from state it owns: the UE's serving-cell history is recorded
+from real serving-cell transitions on a monotonic clock, the target CGI comes
+from the authorized simulator inventory with its generation, and a source
+snapshot can only be assembled from live runtime components. See
+`docs/lte-handover-runtime-provenance.md`.
+
+Two corrections came with it. Decoded wire data is no longer labelled fixture
+data: it is `WIRE_UNVERIFIED` until a runtime authority raises it. And the
+capability model now separates what is implemented (RRC UPER codec, transparent
+containers, simulator runtime inputs) from what is not (AS-Config completeness,
+source provenance at the target, AS security, UE RRC execution), with core-path
+evidence reported as external acceptance evidence rather than an eNB execution
+prerequisite. `liveExecutionReady()` remains false and the live ingress remains
+fail-closed.
+
+A synthetic but structurally valid `UE-EUTRA-Capability` is now carried in a
+`HandoverPreparationInformation`, wrapped in the complete container and
+embedded in an S1AP Handover Required; Wireshark dissects every nested layer
+with zero malformation. It is labelled synthetic: no capability in it is a real
+UE measurement.

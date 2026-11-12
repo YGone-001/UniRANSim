@@ -190,6 +190,7 @@ const char *ToString(EutranCgiProvenance provenance)
     case EutranCgiProvenance::SIMULATOR_CELL: return "SIMULATOR_CELL";
     case EutranCgiProvenance::RUNNING_TARGET_CELL: return "RUNNING_TARGET_CELL";
     case EutranCgiProvenance::CALLER_UNVERIFIED: return "CALLER_UNVERIFIED";
+    case EutranCgiProvenance::WIRE_UNVERIFIED: return "WIRE_UNVERIFIED";
     }
     return "UNKNOWN_CGI_PROVENANCE";
 }
@@ -203,6 +204,7 @@ const char *ToString(HistoryProvenance provenance)
     case HistoryProvenance::MISSING: return "MISSING";
     case HistoryProvenance::STALE: return "STALE";
     case HistoryProvenance::UNKNOWN_PREDECESSOR: return "UNKNOWN_PREDECESSOR";
+    case HistoryProvenance::WIRE_UNVERIFIED: return "WIRE_UNVERIFIED";
     }
     return "UNKNOWN_HISTORY_PROVENANCE";
 }
@@ -324,7 +326,10 @@ ContainerOutcome DecodeSourceToTargetTransparentContainer(const uint8_t *data, s
         out.rrcPayload = reader.readBytes(payloadSize);
 
         ReadEutranCgi(reader, &out.targetCellId.plmn, &out.targetCellId.cellId);
-        out.targetCellId.provenance = EutranCgiProvenance::CALLER_UNVERIFIED;
+        // Decoding is not verification. The wire carries no provenance, so
+        // what came out of it is asserted by a peer and stays that way until a
+        // runtime authority says otherwise.
+        out.targetCellId.provenance = EutranCgiProvenance::WIRE_UNVERIFIED;
 
         if (hasProfile)
         {
@@ -353,7 +358,12 @@ ContainerOutcome DecodeSourceToTargetTransparentContainer(const uint8_t *data, s
             }
             out.ueHistory.visitedCells.push_back(cell);
         }
-        out.ueHistory.provenance = HistoryProvenance::FIXTURE;
+        out.ueHistory.provenance = HistoryProvenance::WIRE_UNVERIFIED;
+        for (auto &cell : out.ueHistory.visitedCells)
+        {
+            cell.provenance = HistoryProvenance::WIRE_UNVERIFIED;
+            cell.globalCellId.provenance = EutranCgiProvenance::WIRE_UNVERIFIED;
+        }
 
         if (HasTrailingData(reader))
             return Refuse(ContainerRefusal::TRAILING_DATA,
