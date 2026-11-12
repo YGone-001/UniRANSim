@@ -128,7 +128,9 @@ class HandoverSourceReleaseDecision
 
 // Builds the release decision for a transaction whose isolated core path was
 // confirmed. It refuses — by throwing — when the record has not reached that
-// point: a decision is only ever a statement about a UE that really moved.
+// point: a decision is only ever a statement about a UE that really moved. It
+// stays buildable for the whole release window, because a reconciliation of a
+// lost Complete is the same decision read against the source's registry.
 HandoverSourceReleaseDecision BuildHandoverSourceReleaseDecision(const CoordinationRecord &record,
                                                                  uint64_t corePathGeneration);
 

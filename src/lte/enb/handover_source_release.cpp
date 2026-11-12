@@ -78,8 +78,14 @@ HandoverSourceReleaseDecision BuildHandoverSourceReleaseDecision(const Coordinat
     // installed, and the generation it names must be the one that was confirmed.
     if (!record.complete())
         throw std::logic_error("a source release decision needs a complete coordination record");
+    // The decision is built for the release itself and again for a
+    // reconciliation of an answer that was never observed, so it stays
+    // buildable for the whole release window. It is never buildable before the
+    // core update was confirmed, which is the point of the gate.
     if (record.state != OrchestrationState::CORE_PATH_UPDATED &&
-        record.state != OrchestrationState::SOURCE_RELEASE_WAIT)
+        record.state != OrchestrationState::SOURCE_RELEASE_WAIT &&
+        record.state != OrchestrationState::SOURCE_RELEASE_COMMAND_SENT &&
+        record.state != OrchestrationState::SOURCE_RELEASE_CONFIRMED)
         throw std::logic_error("a source release decision is only built after a confirmed core path update");
     if (!record.corePath.committed || record.corePath.pathGeneration == 0)
         throw std::logic_error("no isolated core path update was confirmed for this transaction");

@@ -1754,23 +1754,25 @@ no new claim about a live core:
 
 ## 59. Test coverage
 
-`test/lte/handover_core_path.cpp`, fifteen cases under
+`test/lte/handover_core_path.cpp`, sixteen cases under
 `lte/handover/core-path:*`, drives the map and its sender against real UDP
 sockets standing in for two cells: provisioning, atomic publication, reverse
-bearer order, partial and malformed replacements, the same numeric TEID on two
-cells, duplicates and conflicting duplicates, stale generation and association,
-the sender before and after the update, the confirmation and its refusals, the
-End Marker and the live-mode refusal.
+bearer order, partial and malformed replacements, a mapping without exactly one
+default bearer, the same numeric TEID on two cells, duplicates and conflicting
+duplicates, stale generation and association, the sender before and after the
+update, the confirmation and its refusals, the End Marker and the live-mode
+refusal.
 
-`test/lte/handover_core_phase.cpp`, ten cases under
+`test/lte/handover_core_phase.cpp`, thirteen cases under
 `lte/handover/core-phase:*`, drives the full production pipeline — two real
 `EnbMultiplexer` instances, the isolated MME relay, a real encoded radio
 arrival and the isolated SGW — through the notify, the update, the confirmation,
 the End Marker, the guard, the release and the reconciliation, plus the
 refusals: an update before the notify, an update without a reached target, a
-reconciled lost answer, an unreadable installation, a second update, an
-unverified release decision, an unchanged ordinary idle release, a duplicate
-release command and multi-UE isolation.
+lost answer before and after the SGW published, an unreadable installation, a
+second update, an unverified or stale release decision, an unchanged ordinary
+idle release, a duplicate release command, a release whose Complete was never
+observed and multi-UE isolation.
 
 The privileged case is the second one in `test/lte/handover_acceptance.cpp`. It
 is a `doctest::skip()` case with no `ctest` entry, run by the privileged CI

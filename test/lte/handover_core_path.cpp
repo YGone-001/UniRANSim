@@ -601,3 +601,46 @@ TEST_CASE("lte/handover/core-path: a live-mode instance refuses every operation"
     CHECK(commit.refusal->refusal == CorePathRefusal::LIVE_MODE_DISABLED);
     CHECK_FALSE(sgw.sendDownlink(Session(), DefaultEbi, nullptr, 0));
 }
+
+TEST_CASE("lte/handover/core-path: a mapping without exactly one default bearer is refused")
+{
+    Fixture fixture;
+    const IsolatedSessionKey other{203, {10, 0, 0, 3}};
+
+    SUBCASE("no default bearer at all")
+    {
+        CorePathRefusalRecord failure;
+        const bool installed = fixture.sgw.installSession(
+            other, 1,
+            {Bearer(DedicatedEbi, BearerRole::DEDICATED, DefaultEbi, SgwDedicatedTeid, fixture.SourceDedicated())},
+            &failure);
+        CHECK_FALSE(installed);
+        CHECK(failure.refusal == CorePathRefusal::DEFAULT_BEARER_INVALID);
+        CHECK_FALSE(fixture.sgw.generationOf(other).has_value());
+    }
+    SUBCASE("two default bearers")
+    {
+        CorePathRefusalRecord failure;
+        const bool installed = fixture.sgw.installSession(
+            other, 1,
+            {Bearer(DefaultEbi, BearerRole::DEFAULT, std::nullopt, SgwDefaultTeid, fixture.SourceDefault()),
+             Bearer(DedicatedEbi, BearerRole::DEFAULT, std::nullopt, SgwDedicatedTeid, fixture.SourceDedicated())},
+            &failure);
+        CHECK_FALSE(installed);
+        CHECK(failure.refusal == CorePathRefusal::DEFAULT_BEARER_INVALID);
+        CHECK_FALSE(fixture.sgw.generationOf(other).has_value());
+    }
+    SUBCASE("a dedicated bearer linked to a default outside its own set")
+    {
+        CorePathRefusalRecord failure;
+        const bool installed = fixture.sgw.installSession(
+            other, 1,
+            {Bearer(DefaultEbi, BearerRole::DEFAULT, std::nullopt, SgwDefaultTeid, fixture.SourceDefault()),
+             Bearer(DedicatedEbi, BearerRole::DEDICATED, 9, SgwDedicatedTeid, fixture.SourceDedicated())},
+            &failure);
+        CHECK_FALSE(installed);
+        CHECK(failure.refusal == CorePathRefusal::BEARER_RELATIONSHIP_INVALID);
+        CHECK_FALSE(fixture.sgw.generationOf(other).has_value());
+    }
+}
+

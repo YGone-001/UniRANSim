@@ -141,15 +141,31 @@ s1ap::ErabToBeSetupItem Item(uint8_t ebi, uint8_t qci, uint32_t sgwTeid, std::ve
     return item;
 }
 
+// A capture sink for the source's S1AP uplink. A lab built with one delivers
+// the source's UE Context Release Complete to this file instead of to the
+// isolated MME, which is how a lost answer is reached without changing any
+// production component.
+struct CaptureSender final : IS1apSender
+{
+    void sendS1ap(uint16_t, const std::vector<uint8_t> &pdu) override { sent.push_back(pdu); }
+    std::vector<std::vector<uint8_t>> sent;
+};
+
 // The whole isolated two-eNB pipeline, and the transaction it brought to the
 // Phase 18-D boundary.
 struct PhaseLab
 {
+    PhaseLab() = default;
+    explicit PhaseLab(bool captureSourceWire) : captureSource(captureSourceWire) {}
+
     HandoverCoordinator coordinator{ExecutionMode::ISOLATED_SIMULATOR};
     IsolatedMmeRelay relay{coordinator};
     IsolatedMmeRelay::Endpoint sourceMme{relay, false};
     IsolatedMmeRelay::Endpoint targetMme{relay, true};
-    EnbMultiplexer source{Config(SourceEnbId, "127.0.0.1", 1), sourceMme};
+    CaptureSender capture;
+    bool captureSource{};
+    EnbMultiplexer source{Config(SourceEnbId, "127.0.0.1", 1),
+                          captureSource ? static_cast<IS1apSender &>(capture) : static_cast<IS1apSender &>(sourceMme)};
     EnbMultiplexer target{Config(TargetEnbId, "127.0.0.3", 2), targetMme};
     IsolatedSgw sgw{ExecutionMode::ISOLATED_SIMULATOR, Ipv4ToString(SgwIp), SgwPort};
     FakeUe ue{UeRadioId};
@@ -731,3 +747,145 @@ TEST_CASE("lte/handover/core-phase: a handover of one ue leaves another ue on th
     CHECK(lab.source.registry().find(UeRadioId) == nullptr);
     CHECK(lab.source.registry().findByMmeUeS1apId(MmeUeS1apId) == nullptr);
 }
+
+TEST_CASE("lte/handover/core-phase: a lost answer before the sgw commits leaves the path indeterminate")
+{
+    PhaseLab lab;
+    lab.reachNotify();
+    REQUIRE(lab.InstallSourcePath());
+
+    CorePathRefusalRecord beginFailure;
+    REQUIRE(BeginIsolatedCorePathUpdate(lab.coordinator, lab.target, lab.sgw, lab.transaction, &beginFailure));
+    CoordinationRefusalRecord step;
+    REQUIRE(lab.coordinator.advance(lab.transaction, OrchestrationState::CORE_UPDATE_COMMITTING, &step));
+
+    // The request never reached the SGW, so the map still holds generation 1.
+    // Reconciliation must not apply it, and must not report the path as moved.
+    const CorePathOutcome reconciled = ReconcileIsolatedPathUpdate(lab.sgw, lab.coordinator, lab.transaction);
+    CHECK_FALSE(reconciled.confirmed);
+    CHECK(reconciled.indeterminate);
+    REQUIRE(reconciled.state.has_value());
+    CHECK(*reconciled.state == OrchestrationState::CORE_UPDATE_COMMITTING);
+    CHECK(*lab.sgw.generationOf(lab.Session()) == 1);
+    CHECK(lab.sgw.installed(lab.Session(), DefaultEbi)->endpoint.teid == lab.sourceDefaultTeid);
+
+    // And nothing was released on either side.
+    CHECK(lab.source.registry().find(UeRadioId) != nullptr);
+    CHECK(lab.target.registry().find(UeRadioId) != nullptr);
+}
+
+TEST_CASE("lte/handover/core-phase: a release complete that was never observed is reconciled from the source registry")
+{
+    PhaseLab lab(/*captureSourceWire=*/true);
+    lab.reachNotify();
+    REQUIRE(lab.InstallSourcePath());
+    REQUIRE(lab.relay.requestCorePathUpdate(lab.sgw, lab.target, lab.transaction).confirmed);
+    REQUIRE(lab.relay.armSourceRelease(lab.transaction, Clock::now(), std::chrono::milliseconds{0}, nullptr));
+
+    // The command really reaches the source and the source really releases, but
+    // its answer goes to a sink instead of to the MME: this is a lost Complete,
+    // not a failed release.
+    const SourceReleaseStepOutcome released = lab.relay.releaseSource(lab.source, lab.transaction, Clock::now());
+    CHECK(released.sent);
+    CHECK_FALSE(released.confirmed);
+    const CoordinationRecord *record = lab.coordinator.find(lab.transaction);
+    REQUIRE(record != nullptr);
+    CHECK(record->state == OrchestrationState::SOURCE_RELEASE_COMMAND_SENT);
+    CHECK(record->sourceRelease.evidence == SourceReleaseEvidence::NONE);
+    CHECK(lab.source.registry().find(UeRadioId) == nullptr);
+    CHECK(lab.source.registry().isRetiredTeid(lab.sourceDefaultTeid));
+
+    // What the MME never saw, and can decode here because this file captured it.
+    REQUIRE_FALSE(lab.capture.sent.empty());
+    const auto complete = DecodeUeContextReleaseComplete(lab.capture.sent.back().data(), lab.capture.sent.back().size());
+    CHECK(complete.mmeUeS1apId == MmeUeS1apId);
+
+    const SourceReleaseStepOutcome reconciled =
+        lab.relay.reconcileSourceRelease(lab.source, lab.transaction, Clock::now());
+    REQUIRE(reconciled.confirmed);
+    CHECK(reconciled.reconciled);
+    REQUIRE(reconciled.state.has_value());
+    CHECK(*reconciled.state == OrchestrationState::ISOLATED_HANDOVER_COMPLETE);
+    // The evidence is named as a reconciliation, never as a received Complete.
+    CHECK(record->sourceRelease.evidence == SourceReleaseEvidence::RECONCILED_REGISTRY);
+    CHECK(record->sourceRelease.completePdu.empty());
+    CHECK(record->sourceRelease.retiredTeids.size() == 2);
+
+    // The cleanup was not run a second time and the target is untouched.
+    CHECK(lab.target.registry().find(UeRadioId) != nullptr);
+    CHECK_FALSE(lab.target.registry().isRetiredTeid(lab.target.registry().find(UeRadioId)
+                                                          ->bearer.parameters().localTeid));
+}
+
+TEST_CASE("lte/handover/core-phase: a stale or mismatched release decision releases nothing")
+{
+    PhaseLab lab;
+    lab.reachNotify();
+    REQUIRE(lab.InstallSourcePath());
+    REQUIRE(lab.relay.requestCorePathUpdate(lab.sgw, lab.target, lab.transaction).confirmed);
+
+    const CoordinationRecord *record = lab.coordinator.find(lab.transaction);
+    REQUIRE(record != nullptr);
+    const HandoverSourceReleaseDecision decision =
+        BuildHandoverSourceReleaseDecision(*record, record->corePath.pathGeneration);
+    EnbUeEntry *entry = lab.source.registry().find(UeRadioId);
+    REQUIRE(entry != nullptr);
+
+    s1ap::UeContextReleaseCommand command{};
+    command.mmeUeS1apId = MmeUeS1apId;
+    command.enbUeS1apId = entry->enbUeS1apId;
+    command.causeCategory = "radioNetwork";
+    command.causeValue = CauseSuccessfulHandover;
+
+    HandoverSourceRecord own;
+    own.transaction = lab.transaction;
+    own.radioUeId = entry->radioUeId;
+    own.enbUeS1apId = entry->enbUeS1apId;
+    own.mmeUeS1apId = entry->mmeUeS1apId;
+    own.accessGeneration = entry->accessGeneration;
+    own.associationEpoch = lab.source.associationEpoch();
+    own.target = TargetIdentity();
+
+    HandoverSourceReleaseDecision accepted;
+    SourceReleaseRefusalRecord failure;
+    CHECK(VerifyHandoverSourceRelease(*entry, lab.source.associationEpoch(), command, {own}, {decision}, &accepted,
+                                      &failure));
+    CHECK(accepted.isVerified());
+
+    SUBCASE("the decision was made under another association epoch")
+    {
+        CHECK_FALSE(VerifyHandoverSourceRelease(*entry, 99, command, {own}, {decision}, &accepted, &failure));
+        CHECK(failure.refusal == SourceReleaseRefusal::STALE_ASSOCIATION);
+    }
+    SUBCASE("the source's own record names another access epoch")
+    {
+        auto stale = own;
+        stale.accessGeneration = own.accessGeneration + 1;
+        CHECK_FALSE(VerifyHandoverSourceRelease(*entry, lab.source.associationEpoch(), command, {stale}, {decision},
+                                                &accepted, &failure));
+        CHECK(failure.refusal == SourceReleaseRefusal::SOURCE_GENERATION_CHANGED);
+    }
+    SUBCASE("the decision names another transport")
+    {
+        auto wrongTransport = decision;
+        wrongTransport.defaultTeid = decision.defaultTeid + 1;
+        const auto release =
+            ReleaseHandoverSourceContext(wrongTransport, lab.source.registry(), lab.source.associationEpoch(),
+                                         &failure);
+        CHECK_FALSE(release.released);
+        CHECK(failure.refusal == SourceReleaseRefusal::TRANSPORT_MISMATCH);
+        CHECK(lab.source.registry().find(UeRadioId) != nullptr);
+        CHECK_FALSE(lab.source.registry().isRetiredTeid(lab.sourceDefaultTeid));
+    }
+    SUBCASE("the decision claims no confirmed core path")
+    {
+        auto unconfirmed = decision;
+        unconfirmed.corePathGeneration = 0;
+        const auto release = ReleaseHandoverSourceContext(unconfirmed, lab.source.registry(),
+                                                          lab.source.associationEpoch(), &failure);
+        CHECK_FALSE(release.released);
+        CHECK(failure.refusal == SourceReleaseRefusal::CORE_PATH_NOT_CONFIRMED);
+        CHECK(lab.source.registry().find(UeRadioId) != nullptr);
+    }
+}
+
