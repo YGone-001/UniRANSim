@@ -360,6 +360,11 @@ EnbUeEntry *UeRegistry::findByPeer(const InetAddress &peer)
     return it == m_byPeer.end() ? nullptr : it->second;
 }
 
+const EnbUeEntry *UeRegistry::findByEnbUeS1apId(uint32_t enbUeS1apId) const
+{
+    return const_cast<UeRegistry *>(this)->findByEnbUeS1apId(enbUeS1apId);
+}
+
 EnbUeEntry *UeRegistry::findByEnbUeS1apId(uint32_t enbUeS1apId)
 {
     const auto it = m_byEnbUeS1apId.find(enbUeS1apId);

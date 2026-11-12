@@ -362,6 +362,8 @@ void EnbMultiplexer::handleS1ap(const uint8_t *data, size_t size, uint16_t strea
             onErabReleaseCommand(data, size);
         else if (pdu.kind == s1ap::S1apPdu::Kind::INITIATING && pdu.procedureCode == 10)
             onPaging(data, size, stream);
+        else if (s1ap::ClassifyHandoverMessage(pdu) != s1ap::LiveHandoverMessage::NONE)
+            onLiveHandover(pdu, data, size);
         else
             throw s1ap::CodecError("Unexpected S1AP procedure code " + std::to_string(pdu.procedureCode));
     }
@@ -373,6 +375,55 @@ void EnbMultiplexer::handleS1ap(const uint8_t *data, size_t size, uint16_t strea
         Log("WARN", std::string("Rejected post-setup S1AP message on stream ") + std::to_string(stream) + ": " +
                        e.what());
     }
+}
+
+void EnbMultiplexer::onLiveHandover(const s1ap::S1apPdu &probe, const uint8_t *data, size_t size)
+{
+    s1ap::LiveHandoverContext context;
+    context.registry = &m_registry;
+    context.sourceRecords = &m_handoverSources;
+    context.associationEpoch = m_associationEpoch;
+    context.associationBound = associationBound();
+
+    const s1ap::LiveHandoverOutcome outcome = s1ap::HandleLiveHandoverPdu(probe, data, size, context);
+
+    switch (outcome.message)
+    {
+    case s1ap::LiveHandoverMessage::HANDOVER_REQUEST: ++m_liveHandover.requests; break;
+    case s1ap::LiveHandoverMessage::HANDOVER_COMMAND: ++m_liveHandover.commands; break;
+    case s1ap::LiveHandoverMessage::HANDOVER_PREPARATION_FAILURE: ++m_liveHandover.preparationFailures; break;
+    case s1ap::LiveHandoverMessage::HANDOVER_CANCEL: ++m_liveHandover.cancels; break;
+    default: break;
+    }
+
+    switch (outcome.disposition)
+    {
+    case s1ap::LiveHandoverDisposition::RECOGNIZED_BUT_NOT_EXECUTABLE: ++m_liveHandover.notExecutable; break;
+    case s1ap::LiveHandoverDisposition::REJECTED: ++m_liveHandover.rejected; break;
+    case s1ap::LiveHandoverDisposition::EXECUTED: ++m_liveHandover.executed; break;
+    default: break;
+    }
+    if (outcome.mutatedState)
+        ++m_liveHandover.mutations;
+
+    // The refusal is signalled with the standard message when one was built.
+    // A response that cannot be carried is counted and logged; the message is
+    // refused either way, and nothing was acted on.
+    if (!outcome.responsePdu.empty())
+    {
+        const uint16_t stream = SctpStreamForUe(m_outboundStreams, outcome.mmeUeS1apId);
+        if (sendS1ap(stream, outcome.responsePdu))
+            ++m_liveHandover.responsesSent;
+        else
+        {
+            ++m_liveHandover.responsesUnsent;
+            Log("WARN", "A live handover refusal could not be transmitted on the current association");
+        }
+    }
+
+    Log(outcome.disposition == s1ap::LiveHandoverDisposition::REJECTED ? "WARN" : "INFO",
+        std::string("Live ") + s1ap::ToString(outcome.message) + " " + s1ap::ToString(outcome.disposition) + ": " +
+            s1ap::ToString(outcome.refusal) + " (" + outcome.detail + ")");
 }
 
 void EnbMultiplexer::onPaging(const uint8_t *data, size_t size, uint16_t stream)
@@ -1639,6 +1690,11 @@ const PagingCounters &EnbMultiplexer::pagingCounters() const
 const S1uEndpointCounters &EnbMultiplexer::s1uCounters() const
 {
     return m_s1u.counters();
+}
+
+const LiveHandoverCounters &EnbMultiplexer::liveHandoverCounters() const
+{
+    return m_liveHandover;
 }
 
 void EnbMultiplexer::shutdown()

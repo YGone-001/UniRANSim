@@ -9,6 +9,7 @@
 #pragma once
 
 #include "codec.hpp"
+#include "handover_live_ingress.hpp"
 #include "handover_preparation.hpp"
 #include "handover_source_release.hpp"
 #include "s1u_endpoint.hpp"
@@ -64,6 +65,28 @@ class S1apSenderBinding
     uint32_t m_epoch{};
     uint64_t m_staleRejects{};
     uint64_t m_unboundRejects{};
+};
+
+// What the live S1AP dispatcher did with the handover procedure family.
+//
+// A message that reaches this counter block has been classified by the live
+// ingress and refused or rejected; none of these counts can be produced by the
+// isolated simulator, which never routes a handover message through the raw
+// dispatcher.
+struct LiveHandoverCounters
+{
+    uint64_t requests{};
+    uint64_t commands{};
+    uint64_t preparationFailures{};
+    uint64_t cancels{};
+    uint64_t notExecutable{};
+    uint64_t rejected{};
+    uint64_t executed{};
+    // Messages that mutated this eNB's state. The live path is expected to
+    // leave this at zero for every input; it is a tripwire, not a feature.
+    uint64_t mutations{};
+    uint64_t responsesSent{};
+    uint64_t responsesUnsent{};
 };
 
 // Diagnostics for the non-UE-associated S1AP Paging path. A delivered
@@ -253,6 +276,7 @@ class EnbMultiplexer
     [[nodiscard]] InetAddress ueLinkAddress() const;
     [[nodiscard]] InetAddress s1uAddress() const;
     [[nodiscard]] const PagingCounters &pagingCounters() const;
+    [[nodiscard]] const LiveHandoverCounters &liveHandoverCounters() const;
     // The shared S1-U endpoint's own counters. They are endpoint-level and not
     // per-UE, so a retired-TEID drop read here is a statement about this cell
     // and not about any one bearer.
@@ -278,6 +302,11 @@ class EnbMultiplexer
     void onErabModifyRequest(const uint8_t *data, size_t size);
     // Releases named dedicated E-RABs without touching the default bearer.
     void onErabReleaseCommand(const uint8_t *data, size_t size);
+    // One S1AP PDU the live dispatcher classified as part of the handover
+    // procedure family. It is the same dispatcher, not a second one: the
+    // classification happens after the ordinary procedures have not matched and
+    // before the message would be reported as an unknown procedure code.
+    void onLiveHandover(const s1ap::S1apPdu &probe, const uint8_t *data, size_t size);
     void onPaging(const uint8_t *data, size_t size, uint16_t stream);
     [[nodiscard]] bool servesPagingTai(const std::vector<s1ap::Tai> &taiList) const;
     void onBearerReady(EnbUeEntry &entry, const std::vector<uint8_t> &payload);
@@ -338,6 +367,7 @@ class EnbMultiplexer
     // touched by that cleanup at all.
     std::unique_ptr<s1ap::HandoverPreparationOwner> m_preparations;
     PagingCounters m_paging;
+    LiveHandoverCounters m_liveHandover;
     RecoveryCounters m_recovery;
 };
 

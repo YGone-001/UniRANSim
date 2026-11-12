@@ -292,6 +292,7 @@ class UeRegistry
     EnbUeEntry *find(uint32_t radioUeId);
     EnbUeEntry *findByPeer(const InetAddress &peer);
     EnbUeEntry *findByEnbUeS1apId(uint32_t enbUeS1apId);
+    [[nodiscard]] const EnbUeEntry *findByEnbUeS1apId(uint32_t enbUeS1apId) const;
     EnbUeEntry *findByMmeUeS1apId(uint32_t mmeUeS1apId);
     EnbUeEntry *findByLocalTeid(uint32_t teid);
     BearerLocation findBearerByLocalTeid(uint32_t teid);

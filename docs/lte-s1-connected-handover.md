@@ -1781,3 +1781,155 @@ job as its own invocation with its own log and its own sentinels,
 `UNIRANSIM-PHASE18E-PRIVILEGED-COMPLETE`. The job runs four invocations, one
 per skipped case.
 
+
+## 60. Phase 18-F-A: the live S1AP ingress
+
+Every earlier section describes an isolated procedure. This one describes what a
+real MME's messages meet when they arrive on a live association, and why the
+answer is a refusal.
+
+The gap was concrete. `EnbMultiplexer::handleS1ap` dispatched Initial Context
+Setup, Downlink NAS, UE Context Release, E-RAB Setup/Modify/Release and Paging,
+and answered everything else — including Handover Request, Handover Command and
+Handover Preparation Failure — with `Unexpected S1AP procedure code`. A real
+MME's first handover message would have produced a generic rejection and an
+incremented `staleMessagesRejected` count, with nothing recording that a
+handover had even been attempted.
+
+`src/lte/enb/handover_live_ingress.{hpp,cpp}` now classifies the family, checks
+what a target or a source may legitimately check, and refuses the message with a
+typed reason. It is the same dispatcher, not a second one: the classification
+happens after the ordinary procedures have not matched.
+
+Nothing about the isolated path changed. The isolated coordinator still reaches
+its target through `EnbMultiplexer::prepareHandover`, which the raw dispatcher
+still does not call; the acceptance cases are untouched.
+
+## 61. The ingress matrix
+
+| Message | PDU category | Procedure | Stream | What the ingress does | Label |
+|---|---|---|---|---|---|
+| Handover Request | initiating | 1 | UE-associated | Decodes, validates type/container/E-RAB/security, assesses capabilities, sends a Handover Failure with `radioNetwork/6` when an identity is available | `RECOGNIZED_BUT_NOT_EXECUTABLE` |
+| Handover Command | successful outcome | 0 | UE-associated | Decodes, matches the live source context and its own pending-handover record, refuses because no RRC container can be consumed | `RECOGNIZED_BUT_NOT_EXECUTABLE` |
+| Handover Preparation Failure | unsuccessful outcome | 0 | UE-associated | Decodes, matches the context, changes nothing (there is no live transaction to cancel) | `RECOGNIZED_BUT_NOT_EXECUTABLE` |
+| Handover Cancel | initiating | 4 | UE-associated | Recognised by procedure code; no codec exists and no response is invented | `REJECTED / UNSUPPORTED_PROCEDURE` |
+| Handover Notify | initiating | 2 | — | Never accepted from the MME: it is the eNB's message. It does not classify and falls through to the unknown-procedure rejection | `REJECTED` by the ordinary path |
+| Handover Required | initiating | 0 | — | eNB-to-MME; never accepted from the MME. Same fall-through | `REJECTED` by the ordinary path |
+
+The streams are the ordinary UE-associated ones; a target that has not bound an
+eNB-UE-S1AP-ID yet answers on `SctpStreamForUe(outbound, mmeUeS1apId)`.
+
+A message that is not a handover message returns `NOT_A_HANDOVER_MESSAGE` and
+the dispatcher's existing behaviour is unchanged.
+
+## 62. The capability model
+
+`AssessLiveHandoverCapabilities()` returns ten entries, each with the fact it
+rests on. Three are true because the code and its tests exist; six are false
+because the code they would need does not; the tenth is derived.
+
+| Capability | Value | Evidence |
+|---|---|---|
+| `ISOLATED_SIMULATOR_READY` | true | the 18-D and 18-E acceptance cases |
+| `S1AP_CODEC_READY` | true | the byte-pinned, tshark-checked codecs |
+| `S1AP_RUNTIME_INGRESS_READY` | true | this phase's ingress and its `lte/handover/live` cases |
+| `SOURCE_PROVENANCE_READY` | false | no standards-compliant source identity reaches a target |
+| `TARGET_CONTEXT_READY` | false | a provisional context needs a `SourceSession` from the source's registry |
+| `RRC_CONTAINER_READY` | false | no TS 36.331 codec exists |
+| `HANDOVER_SECURITY_READY` | false | the UE has KASME and NAS keys only |
+| `UE_RADIO_EXECUTION_READY` | false | the UE executes a simulator frame, not an RRC reconfiguration |
+| `MME_PATH_UPDATE_OBSERVABLE` | false | the eNB cannot see the SGW's map |
+| `LIVE_HANDOVER_EXECUTION_READY` | false | derived: the conjunction of the nine above |
+
+There is no switch. Nothing in the configuration, the command line or an S1AP
+message sets one of these values: the assessment is computed on every call from
+the state of this build.
+
+## 63. Real-MME identity provenance
+
+The isolated coordinator's `SourceSession` comes from `ExtractSourceSession`,
+which reads one live source-registry entry. A target eNB has no such entry for
+the source, and TS 36.413 gives a Handover Request no source-eNB field: the
+message names the target (by being addressed to it) and carries an opaque
+container whose RRC content names a physical cell and a C-RNTI, not an eNB
+identity.
+
+So the live target has three options, and this repository takes the third:
+
+1. infer a source from the MME's SCTP peer, the TAC, a PLMN match or a bearer
+   identity — every one of which the accepted contract forbids;
+2. trust whatever an opaque container appears to say — which is not verification;
+3. record `SOURCE_PROVENANCE_NOT_ESTABLISHED` and refuse.
+
+The consequence is that a live Handover Request is refused before any target
+resource exists, and no promotion or Notify can follow from one. A future phase
+that wants to accept a live request has to define an ownership contract that
+does not exist in S1AP today, and it has to be explicit about its trust
+assumption rather than borrowing the isolated one.
+
+## 64. RRC container requirements
+
+TS 36.413 makes both handover containers opaque OCTET STRINGs "coded according
+to the specifications of the target system", and TS 36.331 says what that coding
+is:
+
+* **Source-ToTarget** carries `SourceeNB-ToTargeteNB-TransparentContainer`,
+  whose `rRC-Container` is a `HandoverPreparationInformation` message: the UE's
+  `AS-Config` (source radio resource configuration, security algorithm, UE
+  capability), `sourcePhysCellId`, `sourceUeIdentity`, and the mobility state.
+* **Target-ToSource** carries `TargeteNB-ToSourceeNB-TransparentContainer`,
+  whose `rRC-Container` is an `RRCConnectionReconfiguration` containing
+  `mobilityControlInfo`: target physical cell identity, carrier frequency,
+  `t304`, the new `radioResourceConfigCommon` and `radioResourceConfigDedicated`,
+  and the security configuration derived from the NCC/NH the MME sent.
+
+This build has neither. `src/asn/rrc` is NR RRC (38.331), there is no TS 36.331
+module, and the only handover container the simulator produces is the labelled
+`SIM-HOv1` frame. tshark demonstrates the difference: dissecting the Phase 18-A
+request fixture, it decodes the container as
+`SourceeNB-ToTargeteNB-TransparentContainer` and reports the inner bytes as
+`Malformed` — which is exactly what a real target eNB or a real UE would do with
+a simulator container.
+
+| Container | Format implemented | Standards-compatible | Independently decoded | Populated from trustworthy state | Consumable by the UE |
+|---|---|---|---|---|---|
+| Source-ToTarget | no | no | no | no | no |
+| Target-ToSource | no | no | no | no | no |
+
+Carrying a container byte-for-byte is not generating one. The ingress validates
+only its presence and its size bound, and never its contents.
+
+## 65. Security provenance
+
+The MME derives the handover security material itself: it increments its NCC and
+recomputes `NH = KDF(KASME, NH)` before sending the request, then sends
+`nextHopChainingCount` and a 32-octet `nextHopParameter` plus the UE's algorithm
+bitmaps.
+
+`lte::ue::SecurityContext` holds KASME, CK, IK, KNasInt and KNasEnc — the NAS
+keys. There is no KeNB, no NH, no KRRCint/KRRCenc/KUPenc, and no RRC to protect.
+The `nextHopParameter` therefore reaches the eNB and stops there: it is carried,
+never applied. A request whose NH is all zero, or whose algorithm bitmaps state
+no algorithm, is refused as `SECURITY_CONTEXT_INVALID` — the opposite of
+accepting a zero-filled key as a success.
+
+`HANDOVER_SECURITY_READY` is false, and no test in this repository may make it
+true by supplying fixture keys.
+
+## 66. What a live deployment would still need
+
+In the order the ingress refuses them:
+
+1. a source-ownership contract for the target, with a stated trust assumption;
+2. a provisional target context that can exist before a `SourceSession` does;
+3. an LTE RRC codec for both containers, and a UE that can execute the
+   reconfiguration it carries;
+4. TS 33.401 AS key derivation and RRC/UP security in the UE runtime;
+5. a way for the eNB to obtain evidence that the core moved the downlink path —
+   which is the core's own state, not the eNB's;
+6. a fresh, separately scoped authorization for any live experiment.
+
+Until then `LIVE_S1_HANDOVER_EXECUTION_READY` is false, a live handover message
+is refused with a typed reason, and the isolated path remains the only one that
+executes.
+

@@ -712,6 +712,58 @@ privileged acceptance case is the second one in `test/lte/handover_acceptance.cp
 ./cmake-build-release/nr-tests --no-version --test-case="lte/handover/core-path:*,lte/handover/core-phase:*"
 ```
 
+## Live S1AP handover ingress
+
+`src/lte/enb/handover_live_ingress.{hpp,cpp}` is what a real MME's handover
+messages meet on the raw S1 association. Its whole job is to recognise, check
+and refuse them; it must never be loosened into executing one without the
+capabilities below actually existing.
+
+- The handover family is classified by PDU category *and* procedure code. A
+  message is the procedure it claims only when both match the direction that
+  procedure uses: Handover Request is an initiating message of procedure 1,
+  Handover Command a successful outcome of procedure 0, Handover Preparation
+  Failure an unsuccessful outcome of procedure 0, Handover Cancel an initiating
+  message of procedure 4.
+- A live handover message is refused, not executed. Nothing in this dispatcher
+  allocates a target TEID, creates a provisional context, promotes a UE, sends a
+  Handover Notify, touches the isolated SGW map or releases a source context.
+  `LiveHandoverOutcome::mutatedState` is a tripwire that must stay false.
+- A refusal is signalled only with a message this build can encode: a Handover
+  Failure naming the MME-UE-S1AP-ID and `radioNetwork/ho-failure-in-target-EPC-eNB-or-target-system`.
+  When the decode failed before an identifier was read, no response is
+  invented; the refusal is recorded and nothing is sent.
+- The capability model is the authority for what may run. It is computed on
+  every call and nothing sets it: not a command-line option, not a
+  configuration value, not an S1AP message, not a test. A capability becomes
+  true when the code and the tests behind it exist, never because someone asked
+  for a live experiment.
+- `SOURCE_PROVENANCE_READY` is false and stays false until a real ownership
+  contract exists. A target eNB receives no standards-compliant source identity,
+  and the accepted contract forbids inferring one from the MME peer, the TAC, a
+  PLMN match, an EBI, a TEID, a timestamp or an opaque container.
+- `RRC_CONTAINER_READY` is false because there is no LTE RRC (TS 36.331) codec.
+  The `SIM-HOv1` container is a simulator frame and must never be sent to a real
+  MME, a real eNB or a real UE, and no opaque bytes may be translated into a
+  simulator command.
+- `HANDOVER_SECURITY_READY` is false because the UE has no KeNB, no NH handling
+  and no AS keys. The `nextHopParameter` the MME sends is carried, never
+  applied, and a handover request whose NH is zero or whose algorithms are empty
+  is refused rather than accepted with fabricated material.
+- `MME_PATH_UPDATE_OBSERVABLE` is false because an eNB cannot see the SGW's
+  forwarding map. A sent Handover Notify is not evidence that the core moved the
+  path, and the isolated SGW map is not the core's.
+- The isolated path is unchanged. It still reaches its target through
+  `EnbMultiplexer::prepareHandover` and still stops at
+  `AWAITING_CORE_PATH_UPDATE` / `ISOLATED_HANDOVER_COMPLETE`; the live ingress
+  neither calls nor bypasses it.
+- No live handover is authorized by this repository's state. Running one needs
+  a fresh, separately scoped authorization naming every participating resource
+  and the rollback.
+
+The source-level record of what the real EPC implements, and the reasoning
+behind the live NO-GO, is `docs/lte-open5gs-s1-handover-interoperability.md`.
+
 ## What must never be committed
 
 - `config/*.local.yaml` — private laboratory configurations, including
