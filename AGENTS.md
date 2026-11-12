@@ -798,6 +798,44 @@ carries, with UPER. `src/asn/lte-rrc/` is asn1c output and is never hand-edited.
   measurement/security IEs of the reconfiguration — are omitted or encoded as
   empty legal structures, and the design record says which.
 
+## S1AP transparent containers
+
+The handover transparent containers are not the RRC messages. TS 36.413 puts a
+SEQUENCE around each one, and that SEQUENCE is what the S1AP IE's OCTET STRING
+carries. The layers are:
+
+```
+TS 36.331 RRC message          UPER   src/lte/rrc/rrc_handover.cpp
+TS 36.413 container SEQUENCE   APER   src/lte/enb/transparent_container.cpp
+TS 36.413 S1AP message         APER   src/lte/enb/codec.cpp
+```
+
+- The three layers stay separate. Never encode one with another's writer, and
+  never put raw RRC octets where an S1AP IE expects a container.
+- The container's own fields are typed and carry provenance: a target E-UTRAN-CGI
+  states whether it came from a fixture, a simulator cell or a running target,
+  and a UE history entry states whether the runtime recorded it, it is fixture
+  data, it is stale or the preceding cells are unknown. A decoded CGI is not
+  proof that the cell exists.
+- A source container must carry UE history the responsible runtime recorded.
+  For offline fixtures, fixture history is acceptable and labelled. For live
+  use, missing or stale history refuses the container; a timestamp difference
+  is not a history.
+- The target-to-source payload is the RRC HandoverCommand whose
+  handoverCommandMessage is an OCTET STRING (CONTAINING DL-DCCH-Message)
+  carrying the rrcConnectionReconfiguration (TS 36.331 V15.6.0). Phase
+  18-F-B1's EncodeHandoverCommand stores the bare reconfiguration in that
+  field; it is kept for its historical pinned vectors, and
+  EncodeHandoverCommandPayload produces the conformant form the container
+  carries.
+- Unsupported optional fields are refused, not dropped: supplying
+  e-RABInformationList or iE-Extensions fails the encoding. Omission is only
+  ever used where the specification makes the field optional.
+- A handover AS-Config can be syntactically valid with legal empty optional
+  structures and still be an incomplete runtime configuration.
+  AssessAsConfigCompleteness names the difference; do not substitute defaults
+  without a normative basis, and keep fixture values labelled as fixture input.
+
 ## What must never be committed
 
 - `config/*.local.yaml` — private laboratory configurations, including

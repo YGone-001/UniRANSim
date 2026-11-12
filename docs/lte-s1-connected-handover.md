@@ -2000,3 +2000,58 @@ because no AS keys and no RRC execution exist. The live verdict remains
 3. AS security (KeNB/NH derivation, RRC/UP keys) before any container is
    presented as executable.
 
+
+## 68. Phase 18-F-B2: the transparent container
+
+Section 67.1 recorded that the repository produced the `rRC-Container` payload
+and not the 36.413 SEQUENCE around it. That is now closed:
+`src/lte/enb/transparent_container.{hpp,cpp}` encodes and decodes both
+`SourceeNB-ToTargeteNB-TransparentContainer` and
+`TargeteNB-ToSourceeNB-TransparentContainer`, and the four S1AP handover
+messages carry them as opaque OCTET STRINGs exactly as before.
+
+### 68.1 The three layers, verified independently
+
+```
+LTE RRC message            UPER   rrc_handover.cpp
+transparent container      APER   transparent_container.cpp
+S1AP message               APER   codec.cpp
+```
+
+tshark 4.2.2 dissects a generated Handover Required and finds the container
+SEQUENCE, its `rRC-Container`, the `HandoverPreparationInformation` inside it,
+`targetCell-ID`, `subscriberProfileIDforRFP` and both UE history entries with
+their cell sizes and stay times. A generated Handover Command dissects
+end to end down to `mobilityControlInfo`'s `targetPhysCellId: 42`,
+`t304: ms150` and `newUE-Identity: 1234`.
+
+### 68.2 Target-cell and UE-history provenance
+
+The container's typed model carries provenance for both mandatory fields. A
+target EUTRAN-CGI states whether it came from a fixture, a verified simulator
+cell or a running target cell; a UE history entry states whether the runtime
+recorded it, it is fixture data, it is stale or the preceding cells are
+unknown. Nothing here is inferred from a TAC, a PLMN, a UDP address or a TEID,
+and no history is invented: a source container with missing history is refused.
+
+### 68.3 What is still not modelled
+
+`e-RABInformationList` and `iE-Extensions` are refused when supplied rather than
+silently dropped. The AS-Config assessment names the remaining model gaps; a
+syntactically valid message with legal empty optional structures is not a
+complete runtime handover configuration.
+
+### 68.4 A B1 defect, found by dissection
+
+TS 36.331 defines `handoverCommandMessage` as `OCTET STRING (CONTAINING
+DL-DCCH-Message)`. B1 stored the bare `RRCConnectionReconfiguration` there. The
+historical codec and its pinned vectors are preserved; the conformant payload
+(`EncodeHandoverCommandPayload`) is what the container carries, and the
+dissection above is the evidence.
+
+### 68.5 Live readiness
+
+Unchanged: `LIVE_S1_HANDOVER_NO_GO`. A complete container is not proof that a
+UE can perform a handover; `HANDOVER_SECURITY_READY` and
+`UE_RADIO_EXECUTION_READY` remain false, and the live ingress still fails
+closed on every handover message.

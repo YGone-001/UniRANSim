@@ -17,6 +17,7 @@
 #include "AS-Config.h"
 #include "AntennaInfoCommon.h"
 #include "BCCH-Config.h"
+#include "DL-DCCH-Message.h"
 #include "DeltaFList-PUCCH.h"
 #include "HandoverCommand-r8-IEs.h"
 #include "HandoverCommand.h"
@@ -695,6 +696,57 @@ RrcOutcome DecodeHandoverPreparationInformation(const uint8_t *data, size_t size
 namespace
 {
 
+void ReadReconfiguration(const RRCConnectionReconfiguration_t &reconfiguration, HandoverCommand *out)
+{
+    out->rrcTransactionIdentifier = static_cast<uint8_t>(reconfiguration.rrc_TransactionIdentifier);
+    const auto *ies = reconfiguration.criticalExtensions.choice.c1->choice.rrcConnectionReconfiguration_r8;
+    if (ies == nullptr || ies->mobilityControlInfo == nullptr)
+        return;
+    out->targetPhysCellId = static_cast<uint16_t>(ies->mobilityControlInfo->targetPhysCellId);
+    out->t304 = static_cast<uint8_t>(ies->mobilityControlInfo->t304);
+    out->newUeIdentity = static_cast<uint16_t>(GetBits(ies->mobilityControlInfo->newUE_Identity));
+    const auto &common = ies->mobilityControlInfo->radioResourceConfigCommon;
+    out->prachRootSequenceIndex = static_cast<uint16_t>(common.prach_Config.rootSequenceIndex);
+    out->puschNSb = static_cast<uint8_t>(common.pusch_ConfigCommon.pusch_ConfigBasic.n_SB);
+    out->puschHoppingMode = static_cast<uint8_t>(common.pusch_ConfigCommon.pusch_ConfigBasic.hoppingMode);
+    out->puschHoppingOffset = static_cast<uint8_t>(common.pusch_ConfigCommon.pusch_ConfigBasic.pusch_HoppingOffset);
+    out->puschEnable64Qam = common.pusch_ConfigCommon.pusch_ConfigBasic.enable64QAM != 0;
+    out->puschGroupHoppingEnabled = common.pusch_ConfigCommon.ul_ReferenceSignalsPUSCH.groupHoppingEnabled != 0;
+    out->puschGroupAssignmentPusch =
+        static_cast<uint8_t>(common.pusch_ConfigCommon.ul_ReferenceSignalsPUSCH.groupAssignmentPUSCH);
+    out->puschSequenceHoppingEnabled = common.pusch_ConfigCommon.ul_ReferenceSignalsPUSCH.sequenceHoppingEnabled != 0;
+    out->puschCyclicShift = static_cast<uint8_t>(common.pusch_ConfigCommon.ul_ReferenceSignalsPUSCH.cyclicShift);
+    out->ulCyclicPrefixLength = static_cast<uint8_t>(common.ul_CyclicPrefixLength);
+}
+
+RrcOutcome ValidateCommand(const HandoverCommand &message)
+{
+    if (!InRange(message.rrcTransactionIdentifier, 0, 3))
+        return Refuse(RrcRefusal::INVALID_CONSTRAINT, "the RRC transaction identifier is outside 0..3");
+    if (!InRange(message.targetPhysCellId, 0, 503))
+        return Refuse(RrcRefusal::INVALID_CONSTRAINT, "the target physical cell identity is outside 0..503");
+    if (!InRange(message.t304, 0, 7))
+        return Refuse(RrcRefusal::INVALID_CONSTRAINT, "t304 is outside its enumeration");
+    if (!InRange(message.newUeIdentity, 0, 65535))
+        return Refuse(RrcRefusal::INVALID_CONSTRAINT, "the new C-RNTI is outside 0..65535");
+    if (!InRange(message.prachRootSequenceIndex, 0, 837))
+        return Refuse(RrcRefusal::INVALID_CONSTRAINT, "the PRACH root sequence index is outside 0..837");
+    if (!InRange(message.puschNSb, 1, 4))
+        return Refuse(RrcRefusal::INVALID_CONSTRAINT, "n-SB is outside 1..4");
+    if (!InRange(message.puschHoppingMode, 0, 1))
+        return Refuse(RrcRefusal::INVALID_CONSTRAINT, "the PUSCH hopping mode is outside its enumeration");
+    if (!InRange(message.puschHoppingOffset, 0, 98))
+        return Refuse(RrcRefusal::INVALID_CONSTRAINT, "the PUSCH hopping offset is outside 0..98");
+    if (!InRange(message.puschGroupAssignmentPusch, 0, 29))
+        return Refuse(RrcRefusal::INVALID_CONSTRAINT, "the PUSCH group assignment is outside 0..29");
+    if (!InRange(message.puschCyclicShift, 0, 7))
+        return Refuse(RrcRefusal::INVALID_CONSTRAINT, "the PUSCH cyclic shift is outside 0..7");
+    if (!InRange(message.ulCyclicPrefixLength, 1, 2))
+        return Refuse(RrcRefusal::INVALID_CONSTRAINT, "the UL cyclic prefix length is outside 1..2");
+
+    return RrcOutcome{true, RrcRefusal::NONE, {}};
+}
+
 RrcOutcome BuildHandoverReconfiguration(const HandoverCommand &message, RRCConnectionReconfiguration_t **out)
 {
     auto *pdu = Alloc<RRCConnectionReconfiguration_t>();
@@ -722,28 +774,9 @@ RrcOutcome EncodeHandoverCommand(const HandoverCommand &message, std::vector<uin
 {
     if (uper == nullptr)
         return Refuse(RrcRefusal::EMPTY_INPUT, "no output was named");
-    if (!InRange(message.rrcTransactionIdentifier, 0, 3))
-        return Refuse(RrcRefusal::INVALID_CONSTRAINT, "the RRC transaction identifier is outside 0..3");
-    if (!InRange(message.targetPhysCellId, 0, 503))
-        return Refuse(RrcRefusal::INVALID_CONSTRAINT, "the target physical cell identity is outside 0..503");
-    if (!InRange(message.t304, 0, 7))
-        return Refuse(RrcRefusal::INVALID_CONSTRAINT, "t304 is outside its enumeration");
-    if (!InRange(message.newUeIdentity, 0, 65535))
-        return Refuse(RrcRefusal::INVALID_CONSTRAINT, "the new C-RNTI is outside 0..65535");
-    if (!InRange(message.prachRootSequenceIndex, 0, 837))
-        return Refuse(RrcRefusal::INVALID_CONSTRAINT, "the PRACH root sequence index is outside 0..837");
-    if (!InRange(message.puschNSb, 1, 4))
-        return Refuse(RrcRefusal::INVALID_CONSTRAINT, "n-SB is outside 1..4");
-    if (!InRange(message.puschHoppingMode, 0, 1))
-        return Refuse(RrcRefusal::INVALID_CONSTRAINT, "the PUSCH hopping mode is outside its enumeration");
-    if (!InRange(message.puschHoppingOffset, 0, 98))
-        return Refuse(RrcRefusal::INVALID_CONSTRAINT, "the PUSCH hopping offset is outside 0..98");
-    if (!InRange(message.puschGroupAssignmentPusch, 0, 29))
-        return Refuse(RrcRefusal::INVALID_CONSTRAINT, "the PUSCH group assignment is outside 0..29");
-    if (!InRange(message.puschCyclicShift, 0, 7))
-        return Refuse(RrcRefusal::INVALID_CONSTRAINT, "the PUSCH cyclic shift is outside 0..7");
-    if (!InRange(message.ulCyclicPrefixLength, 1, 2))
-        return Refuse(RrcRefusal::INVALID_CONSTRAINT, "the UL cyclic prefix length is outside 1..2");
+    const RrcOutcome validated = ValidateCommand(message);
+    if (!validated.ok)
+        return validated;
 
     RRCConnectionReconfiguration_t *reconfiguration = nullptr;
     const RrcOutcome built = BuildHandoverReconfiguration(message, &reconfiguration);
@@ -866,27 +899,197 @@ RrcOutcome DecodeHandoverCommand(const uint8_t *data, size_t size, HandoverComma
     }
 
     HandoverCommand out;
-    out.rrcTransactionIdentifier = static_cast<uint8_t>(reconfiguration->rrc_TransactionIdentifier);
-    out.targetPhysCellId = static_cast<uint16_t>(ies2->mobilityControlInfo->targetPhysCellId);
-    out.t304 = static_cast<uint8_t>(ies2->mobilityControlInfo->t304);
-    out.newUeIdentity = static_cast<uint16_t>(GetBits(ies2->mobilityControlInfo->newUE_Identity));
-    const auto &common = ies2->mobilityControlInfo->radioResourceConfigCommon;
-    out.prachRootSequenceIndex = static_cast<uint16_t>(common.prach_Config.rootSequenceIndex);
-    out.puschNSb = static_cast<uint8_t>(common.pusch_ConfigCommon.pusch_ConfigBasic.n_SB);
-    out.puschHoppingMode = static_cast<uint8_t>(common.pusch_ConfigCommon.pusch_ConfigBasic.hoppingMode);
-    out.puschHoppingOffset = static_cast<uint8_t>(common.pusch_ConfigCommon.pusch_ConfigBasic.pusch_HoppingOffset);
-    out.puschEnable64Qam = common.pusch_ConfigCommon.pusch_ConfigBasic.enable64QAM != 0;
-    out.puschGroupHoppingEnabled = common.pusch_ConfigCommon.ul_ReferenceSignalsPUSCH.groupHoppingEnabled != 0;
-    out.puschGroupAssignmentPusch =
-        static_cast<uint8_t>(common.pusch_ConfigCommon.ul_ReferenceSignalsPUSCH.groupAssignmentPUSCH);
-    out.puschSequenceHoppingEnabled = common.pusch_ConfigCommon.ul_ReferenceSignalsPUSCH.sequenceHoppingEnabled != 0;
-    out.puschCyclicShift = static_cast<uint8_t>(common.pusch_ConfigCommon.ul_ReferenceSignalsPUSCH.cyclicShift);
-    out.ulCyclicPrefixLength = static_cast<uint8_t>(common.ul_CyclicPrefixLength);
+    ReadReconfiguration(*reconfiguration, &out);
 
     ASN_STRUCT_FREE(asn_DEF_RRCConnectionReconfiguration, reconfiguration);
     *message = out;
     return RrcOutcome{true, RrcRefusal::NONE, {}};
 }
 
+// --- The conformant target-to-source payload -------------------------------
+//
+// TS 36.331: HandoverCommand-r8-IEs.handoverCommandMessage is an OCTET STRING
+// (CONTAINING DL-DCCH-Message), and that DL-DCCH-Message carries the
+// rrcConnectionReconfiguration. The functions below produce and parse exactly
+// that; EncodeHandoverCommand above stores the bare reconfiguration in the
+// field and is kept for its Phase 18-F-B1 pinned vectors.
+
+RrcOutcome EncodeHandoverCommandPayload(const HandoverCommand &message, std::vector<uint8_t> *uper)
+{
+    if (uper == nullptr)
+        return Refuse(RrcRefusal::EMPTY_INPUT, "no output was named");
+    const RrcOutcome validated = ValidateCommand(message);
+    if (!validated.ok)
+        return validated;
+
+    RRCConnectionReconfiguration_t *reconfiguration = nullptr;
+    const RrcOutcome built = BuildHandoverReconfiguration(message, &reconfiguration);
+    if (!built.ok)
+        return built;
+
+    auto *dl = Alloc<DL_DCCH_Message_t>();
+    dl->message.present = DL_DCCH_MessageType_PR_c1;
+    using C1 = std::remove_pointer_t<decltype(dl->message.choice.c1)>;
+    dl->message.choice.c1 = static_cast<C1 *>(std::calloc(1, sizeof(C1)));
+    dl->message.choice.c1->present = DL_DCCH_MessageType__c1_PR_rrcConnectionReconfiguration;
+    dl->message.choice.c1->choice.rrcConnectionReconfiguration = reconfiguration;
+
+    std::vector<uint8_t> dlBytes;
+    const RrcOutcome inner = EncodePdu(asn_DEF_DL_DCCH_Message, dl, &dlBytes);
+    ASN_STRUCT_FREE(asn_DEF_DL_DCCH_Message, dl);
+    if (!inner.ok)
+        return inner;
+
+    auto *pdu = Alloc<HandoverCommand_t>();
+    pdu->criticalExtensions.present = HandoverCommand__criticalExtensions_PR_c1;
+    using OuterC1 = std::remove_pointer_t<decltype(pdu->criticalExtensions.choice.c1)>;
+    pdu->criticalExtensions.choice.c1 = static_cast<OuterC1 *>(std::calloc(1, sizeof(OuterC1)));
+    pdu->criticalExtensions.choice.c1->present = HandoverCommand__criticalExtensions__c1_PR_handoverCommand_r8;
+    auto *ies = Alloc<HandoverCommand_r8_IEs_t>();
+    pdu->criticalExtensions.choice.c1->choice.handoverCommand_r8 = ies;
+    if (!SetOctets(ies->handoverCommandMessage, dlBytes))
+    {
+        ASN_STRUCT_FREE(asn_DEF_HandoverCommand, pdu);
+        return Refuse(RrcRefusal::INVALID_CONSTRAINT, "the DL-DCCH-Message could not be carried");
+    }
+
+    const RrcOutcome outcome = EncodePdu(asn_DEF_HandoverCommand, pdu, uper);
+    ASN_STRUCT_FREE(asn_DEF_HandoverCommand, pdu);
+    return outcome;
+}
+
+RrcOutcome DecodeHandoverCommandPayload(const uint8_t *data, size_t size, HandoverCommand *message)
+{
+    if (message == nullptr)
+        return Refuse(RrcRefusal::EMPTY_INPUT, "no output was named");
+    if (data == nullptr || size == 0)
+        return Refuse(RrcRefusal::EMPTY_INPUT, "the container is empty");
+    if (size > MaxRrcContainerSize)
+        return Refuse(RrcRefusal::OVERSIZED, "the container exceeds the receiver bound");
+    if (IsSimulatorContainer(std::vector<uint8_t>(data, data + size)))
+        return Refuse(RrcRefusal::NOT_HANDOVER_MESSAGE,
+                      "the container is the isolated simulator's own frame, not LTE RRC");
+
+    void *decoded = nullptr;
+    const asn_codec_ctx_t context = BoundedDecodeContext();
+    const asn_dec_rval_t rval = uper_decode_complete(&context, &asn_DEF_HandoverCommand, &decoded, data, size);
+    auto *pdu = static_cast<HandoverCommand_t *>(decoded);
+    if (rval.code != RC_OK || pdu == nullptr)
+    {
+        if (pdu != nullptr)
+            ASN_STRUCT_FREE(asn_DEF_HandoverCommand, pdu);
+        return Refuse(RrcRefusal::TRUNCATED, "the octets do not decode as an RRC HandoverCommand");
+    }
+    if (static_cast<size_t>(rval.consumed) != size)
+    {
+        ASN_STRUCT_FREE(asn_DEF_HandoverCommand, pdu);
+        return Refuse(RrcRefusal::TRUNCATED, "the container carries octets after the message");
+    }
+    if (pdu->criticalExtensions.present != HandoverCommand__criticalExtensions_PR_c1 ||
+        pdu->criticalExtensions.choice.c1 == nullptr ||
+        pdu->criticalExtensions.choice.c1->present != HandoverCommand__criticalExtensions__c1_PR_handoverCommand_r8 ||
+        pdu->criticalExtensions.choice.c1->choice.handoverCommand_r8 == nullptr)
+    {
+        ASN_STRUCT_FREE(asn_DEF_HandoverCommand, pdu);
+        return Refuse(RrcRefusal::UNSUPPORTED_EXTENSION, "the message carries no handoverCommand-r8 body");
+    }
+
+    const auto *ies = pdu->criticalExtensions.choice.c1->choice.handoverCommand_r8;
+    const OCTET_STRING_t &inner = ies->handoverCommandMessage;
+    const size_t innerSize = static_cast<size_t>(inner.size);
+    const uint8_t *innerBytes = inner.buf;
+    if (innerBytes == nullptr || innerSize == 0)
+    {
+        ASN_STRUCT_FREE(asn_DEF_HandoverCommand, pdu);
+        return Refuse(RrcRefusal::MISSING_MANDATORY, "the handover command carries no DL-DCCH-Message");
+    }
+
+    void *dlDecoded = nullptr;
+    const asn_codec_ctx_t dlContext = BoundedDecodeContext();
+    const asn_dec_rval_t dlRval =
+        uper_decode_complete(&dlContext, &asn_DEF_DL_DCCH_Message, &dlDecoded, innerBytes, innerSize);
+    auto *dl = static_cast<DL_DCCH_Message_t *>(dlDecoded);
+    ASN_STRUCT_FREE(asn_DEF_HandoverCommand, pdu);
+    if (dlRval.code != RC_OK || dl == nullptr)
+    {
+        if (dl != nullptr)
+            ASN_STRUCT_FREE(asn_DEF_DL_DCCH_Message, dl);
+        return Refuse(RrcRefusal::TRUNCATED,
+                      "the handover command's payload does not decode as a DL-DCCH-Message");
+    }
+    if (static_cast<size_t>(dlRval.consumed) != innerSize)
+    {
+        ASN_STRUCT_FREE(asn_DEF_DL_DCCH_Message, dl);
+        return Refuse(RrcRefusal::TRUNCATED, "the DL-DCCH-Message carries octets after the message");
+    }
+    if (dl->message.present != DL_DCCH_MessageType_PR_c1 || dl->message.choice.c1 == nullptr ||
+        dl->message.choice.c1->present != DL_DCCH_MessageType__c1_PR_rrcConnectionReconfiguration ||
+        dl->message.choice.c1->choice.rrcConnectionReconfiguration == nullptr)
+    {
+        ASN_STRUCT_FREE(asn_DEF_DL_DCCH_Message, dl);
+        return Refuse(RrcRefusal::NOT_HANDOVER_MESSAGE,
+                      "the DL-DCCH-Message carries no rrcConnectionReconfiguration");
+    }
+
+    const auto *reconfiguration = dl->message.choice.c1->choice.rrcConnectionReconfiguration;
+    if (reconfiguration->criticalExtensions.present != RRCConnectionReconfiguration__criticalExtensions_PR_c1 ||
+        reconfiguration->criticalExtensions.choice.c1 == nullptr ||
+        reconfiguration->criticalExtensions.choice.c1->present !=
+            RRCConnectionReconfiguration__criticalExtensions__c1_PR_rrcConnectionReconfiguration_r8 ||
+        reconfiguration->criticalExtensions.choice.c1->choice.rrcConnectionReconfiguration_r8 == nullptr ||
+        reconfiguration->criticalExtensions.choice.c1->choice.rrcConnectionReconfiguration_r8->mobilityControlInfo ==
+            nullptr)
+    {
+        ASN_STRUCT_FREE(asn_DEF_DL_DCCH_Message, dl);
+        return Refuse(RrcRefusal::NOT_HANDOVER_MESSAGE,
+                      "the reconfiguration carries no mobilityControlInfo and moves no UE");
+    }
+
+    HandoverCommand out;
+    ReadReconfiguration(*reconfiguration, &out);
+    ASN_STRUCT_FREE(asn_DEF_DL_DCCH_Message, dl);
+    *message = out;
+    return RrcOutcome{true, RrcRefusal::NONE, {}};
+}
+
+bool AsConfigCompleteness::completeForRuntime() const
+{
+    return notModelled.empty() && emptyStructures.empty();
+}
+
+AsConfigCompleteness AssessAsConfigCompleteness(const SourceAsConfig &config)
+{
+    (void)config;
+    AsConfigCompleteness assessment;
+    assessment.modelled = {
+        "sourceSecurityAlgorithmConfig.cipheringAlgorithm",
+        "sourceSecurityAlgorithmConfig.integrityProtAlgorithm",
+        "sourceUE-Identity",
+        "sourceMasterInformationBlock (mandatory members)",
+        "sourceSystemInformationBlockType1 (mandatory members)",
+        "sourceSystemInformationBlockType2 (mandatory members)",
+        "antennaInfoCommon.antennaPortsCount",
+        "sourceDl-CarrierFreq",
+    };
+    assessment.emptyStructures = {
+        "sourceMeasConfig (encoded empty: every member is OPTIONAL and none is modelled)",
+        "sourceRadioResourceConfig (encoded empty: every member is OPTIONAL and none is modelled)",
+    };
+    assessment.notModelled = {
+        "sourceMeasConfig.measObjectList and every measurement configuration member",
+        "sourceRadioResourceConfig.srb-ToAddModList / drb-ToAddModList / mac-MainConfig / physicalConfigDedicated",
+        "sourceMasterInformationBlock schedulingInfoSIB1-BR-r13 and systemInfoUnchanged-BR-r15 (modelled, but the "
+        "values must come from the source cell's own broadcast)",
+        "SystemInformationBlockType1 optional members (p-Max, tdd-Config, nonCriticalExtension)",
+        "SystemInformationBlockType2 optional members (ac-BarringInfo, mbsfn-SubframeConfigList, "
+        "lateNonCriticalExtension and the extension additions)",
+        "RadioResourceConfigCommonSIB optional members (uplinkPowerControlCommon-v1020 and the extension additions)",
+        "mobilityControlInfo.carrierFreq / carrierBandwidth / additionalSpectrumEmission / rach-ConfigDedicated",
+        "radioResourceConfigCommon optional members and the securityConfigHO dependency",
+    };
+    return assessment;
+}
+
 } // namespace lte::rrc
+
 

@@ -183,3 +183,87 @@ container is not a handover.
 * negative vectors: empty, truncated, trailing octets, oversized, the simulator
   container, the wrong message type, a flipped octet, and out-of-range inputs;
 * the semantic check that a valid container does not make a handover executable.
+
+## 8. The container layer around the RRC message (Phase 18-F-B2)
+
+The RRC message is not the transparent container. TS 36.413 defines a SEQUENCE
+around it, and `src/lte/enb/transparent_container.{hpp,cpp}` is that SEQUENCE,
+encoded and decoded with the same aligned-PER primitives the S1AP message codec
+uses (`src/lte/enb/aper_bits.hpp`, extracted from `codec.cpp` so both agree bit
+for bit).
+
+### 8.1 Target-to-source
+
+`TargeteNB-ToSourceeNB-TransparentContainer ::= SEQUENCE { rRC-Container,
+iE-Extensions OPTIONAL, ... }`. The supported profile carries the mandatory
+`rRC-Container` and omits `iE-Extensions`; supplying it is refused rather than
+dropped. The container is 2 prefix bits, an octet-aligned length determinant
+and the RRC octets — 15 octets around a 13-octet RRC message.
+
+### 8.2 Source-to-target
+
+`SourceeNB-ToTargeteNB-TransparentContainer ::= SEQUENCE { rRC-Container,
+e-RABInformationList OPTIONAL, targetCell-ID, subscriberProfileIDforRFP
+OPTIONAL, uE-HistoryInformation, iE-Extensions OPTIONAL, ... }`. The supported
+profile carries the mandatory fields plus `subscriberProfileIDforRFP`;
+`e-RABInformationList` and `iE-Extensions` are refused if supplied.
+
+`targetCell-ID` is an `EUTRAN-CGI` (PLMN plus a 28-bit cell identifier), and
+`uE-HistoryInformation` is a `SEQUENCE (SIZE (1..16)) OF LastVisitedCell-Item`
+whose e-UTRAN alternative carries `global-Cell-ID`, `cellType` (a `Cell-Size`
+enumeration) and `time-UE-StayedInCell` (INTEGER 0..4095).
+
+### 8.3 A defect found in the B1 layer
+
+TS 36.331 V15.6.0 defines `HandoverCommand-r8-IEs.handoverCommandMessage` as
+`OCTET STRING (CONTAINING DL-DCCH-Message)`: the octet string holds a
+`DL-DCCH-Message` whose `c1` carries the `rrcConnectionReconfiguration`.
+Phase 18-F-B1's `EncodeHandoverCommand` stores the bare reconfiguration in that
+field.
+
+That codec and its pinned vectors are preserved untouched as historical
+evidence. `EncodeHandoverCommandPayload` and `DecodeHandoverCommandPayload`
+produce and parse the form the specification states, and the transparent
+container carries those octets. The independent dissection in section 8.4 is
+what found the difference.
+
+### 8.4 Independent dissection
+
+The two pinned container vectors were dissected with Wireshark's S1AP and LTE
+RRC dissectors (tshark 4.2.2):
+
+* source container — `SourceeNB-ToTargeteNB-TransparentContainer`, `rRC-Container`
+  carrying a `HandoverPreparationInformation`, `targetCell-ID` cell identity
+  `0x0abcde0`, `subscriberProfileIDforRFP` 42, and two `LastVisitedCell-Item:
+  e-UTRAN-Cell` entries (`cell-Size: medium`, `time-UE-StayedInCell: 1200s`;
+  cell `0x0123456`, `small`, `4095s`);
+* target container — `TargeteNB-ToSourceeNB-TransparentContainer`,
+  `rRC-Container` carrying a `HandoverCommand`, its `handoverCommandMessage`
+  carrying a `DL-DCCH-Message` with `c1: rrcConnectionReconfiguration (4)`,
+  whose `mobilityControlInfo` reports `targetPhysCellId: 42`, `t304: ms150`,
+  `newUE-Identity: 1234` and the `radioResourceConfigCommon` values.
+
+The innermost structure of the *source* fixture is a 5-octet UE capability
+container of fixture data; the dissector reports the `UE-EUTRA-Capability`
+inside it as malformed. That is a labelled limitation of the fixture, not of
+the container layer.
+
+## 9. AS-Config completeness
+
+`AssessAsConfigCompleteness` names what the AS-Config model covers and what it
+does not. `sourceMeasConfig` and `sourceRadioResourceConfig` are encoded as
+empty structures (the specification makes every member of both optional), and
+the optional members of MIB, SIB1, SIB2 and `RadioResourceConfigCommonSIB` are
+omitted. A message can therefore be syntactically valid and still be an
+incomplete runtime handover configuration; the assessment is what says so, and
+it cannot be made complete by a fixture.
+
+## 10. Decoder resource bounds
+
+The LTE RRC decoder runs with `max_stack_size = 0` because asn1c's stack-depth
+heuristic (measured against the codec context's own address) reports an overflow
+under sanitizers long before the message is exhausted. What bounds the decoder
+instead: the 4096-byte input bound, the fixed nesting of the exposed message
+types, and the ASN.1's own `SEQUENCE (SIZE (1..16))` bounds. Truncation at every
+prefix length and 2000 repeated decode-and-cleanup passes over corrupted input
+are exercised under Release, ASan and UBSan.

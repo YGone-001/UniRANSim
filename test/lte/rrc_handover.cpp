@@ -469,3 +469,31 @@ TEST_CASE("lte/rrc: pinned uper vectors decode to the values an independent diss
     CHECK(reencodedCommand == command);
 }
 
+
+TEST_CASE("lte/rrc: the as-config model names what it does not cover")
+{
+    const SourceAsConfig config = SampleSourceConfig();
+    const AsConfigCompleteness assessment = AssessAsConfigCompleteness(config);
+    // The model is explicit about its own limits: a syntactically valid
+    // message with legal empty optional structures is not a complete runtime
+    // configuration, and this is what says so.
+    CHECK_FALSE(assessment.completeForRuntime());
+    CHECK_FALSE(assessment.modelled.empty());
+    CHECK_FALSE(assessment.emptyStructures.empty());
+    CHECK_FALSE(assessment.notModelled.empty());
+    for (const auto &entry : assessment.modelled)
+        CHECK_FALSE(entry.empty());
+    for (const auto &entry : assessment.notModelled)
+        CHECK_FALSE(entry.empty());
+
+    // The difference is observable in the message itself: sourceMeasConfig and
+    // sourceRadioResourceConfig are encoded as empty structures, so a decoded
+    // message carries no measurement or dedicated radio configuration at all.
+    const HandoverPreparation message = SamplePreparation();
+    std::vector<uint8_t> uper;
+    REQUIRE(EncodeHandoverPreparationInformation(message, &uper));
+    HandoverPreparation decoded;
+    REQUIRE(DecodeHandoverPreparationInformation(uper.data(), uper.size(), &decoded));
+    REQUIRE(decoded.asConfig.has_value());
+    CHECK(decoded.asConfig->mib.systemFrameNumber == 0x5A);
+}

@@ -113,7 +113,7 @@ the MME has already advanced its NCC when it finds out.
 | Source identity at the target | **Nothing.** No S1AP IE names the source eNB; the RRC container carries a `sourcePhysCellId` and a C-RNTI, not an eNB identity the target can verify | The isolated path uses `ExtractSourceSession` over the source's own registry, which a target does not have |
 | Bearer inventory | E-RABToBeSetupListHOReq per bearer with QCI/ARP and the **SGW-side** transport | Decodable; the codec and the target's checks exist |
 | Target transport | The MME expects the target's own endpoint per admitted bearer in the acknowledge | The target can allocate it, and the isolated commit already does |
-| RRC | Opaque; produced by the source, consumed by the UE, echoed by the MME | A TS 36.331 V15.6.0 codec now exists (`src/lte/rrc`, UPER) for both messages; the 36.413 container SEQUENCE that carries them is still missing |
+| RRC | Opaque; produced by the source, consumed by the UE, echoed by the MME | Implemented: a TS 36.331 V15.6.0 codec (`src/lte/rrc`, UPER) and, since Phase 18-F-B2, the 36.413 container SEQUENCEs (`src/lte/enb/transparent_container.cpp`, APER) that carry them |
 | AS security | NCC + NH, derived from KASME by the MME | The UE has KASME and NAS keys only; no KeNB, no NH handling |
 | Core path update | S11 Modify Bearer → Sxa → SGW-U, invisible to the eNB | Invisible; the isolated SGW map is not the core's |
 
@@ -160,7 +160,7 @@ gap: **the wire form expects RRC, and this repository has none.**
 | Blocker | Why it blocks | What would close it |
 |---|---|---|
 | Source provenance at the target | No S1AP field names the source eNB, and this repository refuses to infer one from the peer address, TAC, PLMN, EBI or the container | A defined and verified ownership contract, or a target that trusts the MME's association by an explicitly accepted policy |
-| RRC container | The RRC messages can now be produced, but the 36.413 `SourceeNB-ToTargeteNB-TransparentContainer` / `TargeteNB-ToSourceeNB-TransparentContainer` SEQUENCEs are not encoded, so what this repository sends is the `rRC-Container` payload rather than a container | The two 36.413 container SEQUENCEs, with real UE history and target CGI |
+| RRC container | Both 36.413 container SEQUENCEs are now encoded and dissected independently; what remains is runtime provenance: real UE history from a running source and a real target CGI | Runtime-recorded UE history and a verified target cell identity |
 | AS security | The UE has no KeNB/NH derivation and no RRC/UP keys | TS 33.401 key derivation and RRC security in the UE runtime |
 | UE radio execution | The UE moves on a simulator control frame, not an RRC reconfiguration | An RRC execution path in the UE |
 | Core path observability | The eNB cannot see the SGW's map | Nothing on the eNB side; the evidence has to come from the core's own state |

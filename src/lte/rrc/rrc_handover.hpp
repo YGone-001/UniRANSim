@@ -229,6 +229,25 @@ struct HandoverCommand
     uint8_t ulCyclicPrefixLength{};      // INTEGER (1..2)
 };
 
+// What the AS-Config model covers. A syntactically valid message with legal
+// empty optional structures is not a complete runtime handover configuration,
+// and this is what says so: the assessment names the fields that are modelled,
+// the ones that are not, and the ones that are encoded as empty structures
+// because the specification makes them optional and this phase does not model
+// their contents.
+struct AsConfigCompleteness
+{
+    std::vector<std::string> modelled;
+    std::vector<std::string> notModelled;
+    std::vector<std::string> emptyStructures;
+
+    // True only when every field of the supported profile is modelled. It is
+    // false today, and no fixture may make it true.
+    [[nodiscard]] bool completeForRuntime() const;
+};
+
+AsConfigCompleteness AssessAsConfigCompleteness(const SourceAsConfig &config);
+
 // --- Codec -----------------------------------------------------------------
 
 // Encodes the message with UPER. On success `uper` holds the message octets,
@@ -241,6 +260,19 @@ RrcOutcome DecodeHandoverPreparationInformation(const uint8_t *data, size_t size
 
 RrcOutcome EncodeHandoverCommand(const HandoverCommand &message, std::vector<uint8_t> *uper);
 RrcOutcome DecodeHandoverCommand(const uint8_t *data, size_t size, HandoverCommand *message);
+
+// The conformant target-to-source payload.
+//
+// TS 36.331 defines HandoverCommand-r8-IEs.handoverCommandMessage as an
+// OCTET STRING (CONTAINING DL-DCCH-Message): the octet string holds a
+// DL-DCCH-Message whose c1 carries the rrcConnectionReconfiguration, not the
+// reconfiguration on its own. Phase 18-F-B1's EncodeHandoverCommand above
+// stores the bare reconfiguration in that field; its pinned vectors are
+// historical evidence and are left untouched. These functions produce and
+// parse the form the specification states, and are what the TS 36.413
+// transparent container carries.
+RrcOutcome EncodeHandoverCommandPayload(const HandoverCommand &message, std::vector<uint8_t> *uper);
+RrcOutcome DecodeHandoverCommandPayload(const uint8_t *data, size_t size, HandoverCommand *message);
 
 // Whether a container is the isolated simulator's own frame rather than LTE
 // RRC. It is the boundary the S1AP side already enforces; this is the RRC
