@@ -764,6 +764,40 @@ capabilities below actually existing.
 The source-level record of what the real EPC implements, and the reasoning
 behind the live NO-GO, is `docs/lte-open5gs-s1-handover-interoperability.md`.
 
+## LTE RRC handover codec
+
+`src/lte/rrc/` encodes and decodes the two LTE RRC messages an S1 handover
+carries, with UPER. `src/asn/lte-rrc/` is asn1c output and is never hand-edited.
+
+- LTE RRC is UPER; S1AP is APER. Never encode one with the other's writer, and
+  never decode an S1AP octet string by reinterpreting it as an S1AP PDU.
+- The pinned release is TS 36.331 V15.6.0, kept as `tools/lte-rrc-15.6.0.asn1`
+  with its SHA-256 in `docs/lte-rrc-handover-codec.md`. Regenerate; do not patch
+  the ASN.1 or the generated sources to make a compiler or a test pass.
+- Release 16 does not compile with the available asn1c (extension-addition
+  groups inside a CHOICE). That is recorded, not worked around.
+- The source-to-target container carries a `HandoverPreparationInformation`;
+  the target-to-source container carries an RRC `HandoverCommand` whose
+  `handoverCommandMessage` is an `RRCConnectionReconfiguration`. Both layers are
+  encoded and checked; neither may be replaced by simulator bytes.
+- The S1AP container is a 36.413 SEQUENCE
+  (`SourceeNB-ToTargeteNB-TransparentContainer` /
+  `TargeteNB-ToSourceeNB-TransparentContainer`) whose first field is the RRC
+  octet string. This repository does not encode that wrapper yet, so what it
+  produces is the `rRC-Container` payload, one layer inside a real container.
+  Do not describe that as a complete transparent container.
+- `SIM-HOv1` remains simulator-only and is refused by the RRC decoder. It is
+  never sent to a real MME, eNB or UE.
+- A valid UPER message is not an executable handover. `RRC_CODEC_VALID`,
+  `RRC_CONFIGURATION_VALID`, `RRC_RUNTIME_INPUT_AVAILABLE`,
+  `RRC_SECURITY_READY` and `RRC_UE_EXECUTION_READY` are separate, and only the
+  first is true. The codec does not derive, log or invent security material.
+- Fields this phase does not model — `sourceMeasConfig`,
+  `sourceRadioResourceConfig`, the optional members of MIB/SIB1/SIB2 and of
+  `radioResourceConfigCommon`, `carrierFreq`, `rach-ConfigDedicated` and the
+  measurement/security IEs of the reconfiguration — are omitted or encoded as
+  empty legal structures, and the design record says which.
+
 ## What must never be committed
 
 - `config/*.local.yaml` — private laboratory configurations, including

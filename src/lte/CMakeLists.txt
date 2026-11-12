@@ -16,6 +16,16 @@ target_link_libraries(lte-tft PUBLIC lte-user-plane-common)
 add_library(lte-radio-link ue/radio_link.cpp ue/radio_link.hpp)
 target_compile_options(lte-radio-link PRIVATE -Wall -Wextra -pedantic)
 
+# LTE RRC (TS 36.331) UPER codec for the handover transparent containers.
+# It is deliberately its own library: the RRC layer sits inside the S1AP
+# container and must not be linked into the S1AP codec's translation units.
+file(GLOB_RECURSE LTE_RRC_HDR_FILES rrc/*.hpp)
+file(GLOB_RECURSE LTE_RRC_SRC_FILES rrc/*.cpp)
+add_library(lte-rrc ${LTE_RRC_HDR_FILES} ${LTE_RRC_SRC_FILES})
+target_compile_options(lte-rrc PRIVATE -Wall -Wextra -pedantic)
+target_include_directories(lte-rrc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../asn/lte-rrc)
+target_link_libraries(lte-rrc PUBLIC asn-lte-rrc asn-asn1c)
+
 add_library(lte-enb-lib ${LTE_ENB_HDR_FILES} ${LTE_ENB_SRC_FILES})
 target_compile_options(lte-enb-lib PRIVATE -Wall -Wextra -pedantic)
 target_link_libraries(lte-enb-lib PUBLIC common-lib lte-radio-link lte-user-plane-common lte-tft)

@@ -1933,3 +1933,70 @@ Until then `LIVE_S1_HANDOVER_EXECUTION_READY` is false, a live handover message
 is refused with a typed reason, and the isolated path remains the only one that
 executes.
 
+
+## 67. Phase 18-F-B1: the LTE RRC codec
+
+The containers Phase 18-D and 18-E carried as opaque bytes now have a standards
+codec behind them. `src/lte/rrc/rrc_handover.{hpp,cpp}` encodes and decodes
+`HandoverPreparationInformation` and the RRC `HandoverCommand` wrapping an
+`RRCConnectionReconfiguration` with `mobilityControlInfo`, using the
+asn1c-generated types in `src/asn/lte-rrc` and UPER.
+
+The pinned module is TS 36.331 V15.6.0 (`tools/lte-rrc-15.6.0.asn1`,
+SHA-256 `9f85c0ef…4a94`), the newest release the available asn1c 0.9.29 parses.
+Release 16 fails to compile: its extension-addition groups appear inside a
+CHOICE, which asn1c's grammar does not admit. The full record, including the
+generation command and the licensing position, is
+`docs/lte-rrc-handover-codec.md`.
+
+### 67.1 The two layers that were one layer
+
+The S1AP IE is an OCTET STRING, but its contents are a 36.413 SEQUENCE whose
+first field is the RRC message. Phase 18-F-B1 implements the RRC layer and
+proves, by dissection, that the outer 36.413 wrapper is still missing:
+
+```
+S1AP Source-ToTarget-TransparentContainer (OCTET STRING)
+  └── SourceeNB-ToTargeteNB-TransparentContainer   (36.413 SEQUENCE)  ← missing
+        └── rRC-Container (OCTET STRING)
+              └── HandoverPreparationInformation   (36.331, UPER)      ← implemented
+```
+
+Wrapping the codec's octets in a real S1AP Handover Required and dissecting the
+frame, tshark reads the container as the 36.413 SEQUENCE, takes a nonsense
+`rRC-Container` from the first length octet and reports the rest as
+`Malformed`. The isolated simulator is unaffected — its container is
+`SIM-HOv1`, which is its own format and never leaves the simulator.
+
+### 67.2 What the codec does and does not carry
+
+Implemented: the UE capability list; AS-Config with security algorithms, C-RNTI,
+MIB, SIB1, SIB2, antenna ports and DL carrier frequency; `mobilityControlInfo`
+with the target PCI, t304, the new C-RNTI and the mandatory members of
+`radioResourceConfigCommon`.
+
+Not modelled, and omitted or encoded as legal empty structures:
+`sourceMeasConfig`, `sourceRadioResourceConfig`, the optional members of
+MIB/SIB1/SIB2 and of `radioResourceConfigCommon`, `carrierFreq`,
+`carrierBandwidth`, `additionalSpectrumEmission`, `rach-ConfigDedicated`, and
+the measurement, dedicated-radio and security-handover IEs of the
+reconfiguration.
+
+### 67.3 Readiness is still a statement about execution
+
+The codec does not move a UE. `RRC_CONTAINER_READY` stays false in the live
+capability model because the container that carries these octets is still not
+produced; `HANDOVER_SECURITY_READY` and `UE_RADIO_EXECUTION_READY` stay false
+because no AS keys and no RRC execution exist. The live verdict remains
+`LIVE_S1_HANDOVER_NO_GO`.
+
+### 67.4 What the next phase must add
+
+1. the two 36.413 container SEQUENCEs, with real `uE-HistoryInformation` and
+   `targetCell-ID` from the source — the target container is the smaller of the
+   two and could come first;
+2. the remaining AS-Config members, so a source can state its real measurement
+   and dedicated radio configuration;
+3. AS security (KeNB/NH derivation, RRC/UP keys) before any container is
+   presented as executable.
+

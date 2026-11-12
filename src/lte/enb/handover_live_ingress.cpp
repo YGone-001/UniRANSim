@@ -234,8 +234,9 @@ LiveHandoverReadiness AssessLiveHandoverCapabilities()
                "a provisional target context is created only from a SourceSession that ExtractSourceSession read "
                "out of the source's own live registry, which a target eNB does not hold"),
         Assess(HandoverCapability::RRC_CONTAINER_READY, false,
-               "no LTE RRC (TS 36.331) codec exists in this repository: src/asn/rrc is NR RRC, and the only "
-               "handover container this build produces is the labelled SIM-HOv1 simulator frame"),
+               "the RRC payload codec now exists (src/lte/rrc, UPER, TS 36.331 V15.6.0), but the S1AP container "
+               "that carries it is the 36.413 SourceeNB-ToTargeteNB-TransparentContainer SEQUENCE, which this "
+               "repository does not encode yet; a payload alone is not a container"),
         Assess(HandoverCapability::HANDOVER_SECURITY_READY, false,
                "lte::ue::SecurityContext holds KASME, CK, IK and the NAS keys only: there is no KeNB, no NH "
                "handling and no RRC/UP key derivation, so the nextHopParameter the MME sends cannot be applied"),
