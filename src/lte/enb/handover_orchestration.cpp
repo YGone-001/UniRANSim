@@ -9,6 +9,7 @@
 #include "handover_orchestration.hpp"
 
 #include <algorithm>
+#include <iostream>
 #include <limits>
 #include <utility>
 
@@ -18,6 +19,11 @@ namespace lte::enb::s1ap
 {
 namespace
 {
+
+void Log(const char *level, const std::string &message)
+{
+    std::cout << "[lte-enb] [" << level << "] " << message << std::endl;
+}
 
 // The normative comparison for a PLMN anywhere in this handover code: the
 // encoded identity, never a string compare and never a substring of one.
@@ -83,6 +89,16 @@ const char *ToString(OrchestrationState state)
     case OrchestrationState::TARGET_ARRIVAL_CONFIRMED: return "TARGET_ARRIVAL_CONFIRMED";
     case OrchestrationState::HANDOVER_NOTIFY_SENT: return "HANDOVER_NOTIFY_SENT";
     case OrchestrationState::AWAITING_CORE_PATH_UPDATE: return "AWAITING_CORE_PATH_UPDATE";
+    case OrchestrationState::CORE_UPDATE_REQUESTED: return "CORE_UPDATE_REQUESTED";
+    case OrchestrationState::CORE_UPDATE_COMMITTING: return "CORE_UPDATE_COMMITTING";
+    case OrchestrationState::CORE_PATH_UPDATED: return "CORE_PATH_UPDATED";
+    case OrchestrationState::SOURCE_RELEASE_WAIT: return "SOURCE_RELEASE_WAIT";
+    case OrchestrationState::SOURCE_RELEASE_COMMAND_SENT: return "SOURCE_RELEASE_COMMAND_SENT";
+    case OrchestrationState::SOURCE_RELEASE_CONFIRMED: return "SOURCE_RELEASE_CONFIRMED";
+    case OrchestrationState::ISOLATED_HANDOVER_COMPLETE: return "ISOLATED_HANDOVER_COMPLETE";
+    case OrchestrationState::CORE_UPDATE_FAILED: return "CORE_UPDATE_FAILED";
+    case OrchestrationState::CORE_UPDATE_INDETERMINATE: return "CORE_UPDATE_INDETERMINATE";
+    case OrchestrationState::SOURCE_RELEASE_FAILED: return "SOURCE_RELEASE_FAILED";
     case OrchestrationState::PREPARATION_FAILED: return "PREPARATION_FAILED";
     case OrchestrationState::EXECUTION_FAILED: return "EXECUTION_FAILED";
     case OrchestrationState::CANCELLED: return "CANCELLED";
@@ -93,7 +109,10 @@ const char *ToString(OrchestrationState state)
 bool IsTerminal(OrchestrationState state)
 {
     return state == OrchestrationState::AWAITING_CORE_PATH_UPDATE || state == OrchestrationState::PREPARATION_FAILED ||
-           state == OrchestrationState::EXECUTION_FAILED || state == OrchestrationState::CANCELLED;
+           state == OrchestrationState::EXECUTION_FAILED || state == OrchestrationState::CANCELLED ||
+           state == OrchestrationState::CORE_UPDATE_FAILED ||
+           state == OrchestrationState::SOURCE_RELEASE_FAILED ||
+           state == OrchestrationState::ISOLATED_HANDOVER_COMPLETE;
 }
 
 std::optional<OrchestrationState> ApplyOrchestrationEvent(OrchestrationState state, OrchestrationState event)
@@ -102,10 +121,24 @@ std::optional<OrchestrationState> ApplyOrchestrationEvent(OrchestrationState sta
     // is what makes a duplicated event idempotent rather than a second step.
     if (event == state)
         return state;
+
     // A terminal transaction never moves again. Reopening one would let a
     // cancelled or failed handover start authorizing things after the fact.
+    //
+    // AWAITING_CORE_PATH_UPDATE is the one exception, and it is the exception
+    // Phase 18-E adds on purpose: it is where Phase 18-D stops and it is also
+    // the single state the isolated core phase may continue from, towards
+    // CORE_UPDATE_REQUESTED and nothing else. The coordinator only offers that
+    // continuation to a record that has entered the core phase, so a Phase
+    // 18-D transaction stays exactly as terminal as it was.
     if (IsTerminal(state))
+    {
+        if (state == OrchestrationState::AWAITING_CORE_PATH_UPDATE &&
+            event == OrchestrationState::CORE_UPDATE_REQUESTED)
+            return event;
         return std::nullopt;
+    }
+
     // The three failure and cancellation outcomes are reachable from every
     // non-terminal state: an attempt that cannot continue is refused and
     // recorded, not left half-alive waiting for an event that will not come.
@@ -131,15 +164,68 @@ std::optional<OrchestrationState> ApplyOrchestrationEvent(OrchestrationState sta
     case OrchestrationState::TARGET_ARRIVAL_CONFIRMED:
         return event == OrchestrationState::HANDOVER_NOTIFY_SENT ? std::optional<OrchestrationState>(event) : std::nullopt;
     case OrchestrationState::HANDOVER_NOTIFY_SENT:
-        // The last step this phase takes. It is deliberately not a completion:
-        // the MME-controlled downlink bearer path update and the source context
-        // release are later work and nothing here performs or reports them.
+        // The last step Phase 18-D takes. It is deliberately not a completion:
+        // the downlink bearer path is untouched and the source still serves the
+        // UE.
         return event == OrchestrationState::AWAITING_CORE_PATH_UPDATE ? std::optional<OrchestrationState>(event)
+                                                                      : std::nullopt;
+    case OrchestrationState::CORE_UPDATE_REQUESTED:
+        return event == OrchestrationState::CORE_UPDATE_COMMITTING ? std::optional<OrchestrationState>(event)
+                                                                   : std::nullopt;
+    case OrchestrationState::CORE_UPDATE_COMMITTING:
+        // Three outcomes, and only one of them is a success. An answer that
+        // cannot be correlated is a state of its own, never a success with a
+        // caveat.
+        return (event == OrchestrationState::CORE_PATH_UPDATED || event == OrchestrationState::CORE_UPDATE_FAILED ||
+                event == OrchestrationState::CORE_UPDATE_INDETERMINATE)
+                   ? std::optional<OrchestrationState>(event)
+                   : std::nullopt;
+    case OrchestrationState::CORE_UPDATE_INDETERMINATE:
+        // Only reconciliation moves an indeterminate update, and it may only
+        // prove the update or prove that nothing was installed.
+        return (event == OrchestrationState::CORE_PATH_UPDATED || event == OrchestrationState::CORE_UPDATE_FAILED)
+                   ? std::optional<OrchestrationState>(event)
+                   : std::nullopt;
+    case OrchestrationState::CORE_PATH_UPDATED:
+        return event == OrchestrationState::SOURCE_RELEASE_WAIT ? std::optional<OrchestrationState>(event)
+                                                                : std::nullopt;
+    case OrchestrationState::SOURCE_RELEASE_WAIT:
+        return (event == OrchestrationState::SOURCE_RELEASE_COMMAND_SENT ||
+                event == OrchestrationState::SOURCE_RELEASE_FAILED)
+                   ? std::optional<OrchestrationState>(event)
+                   : std::nullopt;
+    case OrchestrationState::SOURCE_RELEASE_COMMAND_SENT:
+        return (event == OrchestrationState::SOURCE_RELEASE_CONFIRMED ||
+                event == OrchestrationState::SOURCE_RELEASE_FAILED)
+                   ? std::optional<OrchestrationState>(event)
+                   : std::nullopt;
+    case OrchestrationState::SOURCE_RELEASE_CONFIRMED:
+        return event == OrchestrationState::ISOLATED_HANDOVER_COMPLETE ? std::optional<OrchestrationState>(event)
                                                                       : std::nullopt;
     default:
         break;
     }
     return std::nullopt;
+}
+
+bool IsCorePathState(OrchestrationState state)
+{
+    switch (state)
+    {
+    case OrchestrationState::CORE_UPDATE_REQUESTED:
+    case OrchestrationState::CORE_UPDATE_COMMITTING:
+    case OrchestrationState::CORE_PATH_UPDATED:
+    case OrchestrationState::SOURCE_RELEASE_WAIT:
+    case OrchestrationState::SOURCE_RELEASE_COMMAND_SENT:
+    case OrchestrationState::SOURCE_RELEASE_CONFIRMED:
+    case OrchestrationState::ISOLATED_HANDOVER_COMPLETE:
+    case OrchestrationState::CORE_UPDATE_FAILED:
+    case OrchestrationState::CORE_UPDATE_INDETERMINATE:
+    case OrchestrationState::SOURCE_RELEASE_FAILED:
+        return true;
+    default:
+        return false;
+    }
 }
 
 SourceSession ExtractSourceSession(const EnbUeEntry &entry, const EnbIdentity &sourceCell, EutranCgi sourceCgi,
@@ -203,6 +289,12 @@ SourceSession ExtractSourceSession(const EnbUeEntry &entry, const EnbIdentity &s
     session.ueIpv4 = entry.bearer.ueIpv4();
     session.accessGeneration = entry.accessGeneration;
     session.ueAmbr = *entry.ueAmbr;
+    // The transport this cell would give up if the UE moved. A session whose
+    // default bearer holds no local TEID has no access transport to release and
+    // is refused rather than recorded with a zero in it.
+    if (entry.bearer.parameters().localTeid == 0)
+        throw SourceProvenanceError("the source default bearer holds no local S1-U TEID");
+    session.defaultLocalTeid = entry.bearer.parameters().localTeid;
 
     // Roles come from the registry's own classification of each bearer, which
     // is the network's statement of the EPS session. Neither QCI nor the order
@@ -244,7 +336,14 @@ SourceSession ExtractSourceSession(const EnbUeEntry &entry, const EnbIdentity &s
                   return a->parameters().erabId < b->parameters().erabId;
               });
     for (const BearerContext *bearer : dedicated)
+    {
+        if (bearer->parameters().localTeid == 0)
+            throw SourceProvenanceError("a source dedicated bearer holds no local S1-U TEID");
         add(*bearer, BearerRole::DEDICATED, bearer->parameters().linkedDefaultEbi);
+        // The same order as `roles`: default first, then the dedicated ones by
+        // ascending E-RAB identity.
+        session.dedicatedLocalTeids.push_back(bearer->parameters().localTeid);
+    }
 
     session.verified = true;
     return session;
@@ -443,6 +542,14 @@ bool HandoverCoordinator::advance(const HandoverTransactionId &transaction, Orch
                           "the coordination record does not bind everything a handover step needs");
     }
 
+    // The states beyond the Phase 18-D boundary belong to the isolated core
+    // phase, and only a transaction that has entered it can reach them. A
+    // Phase 18-D record therefore cannot be walked past AWAITING_CORE_PATH_UPDATE
+    // by an event it was never scoped for.
+    if (IsCorePathState(event) && !found->corePath.enabled)
+        return refuse(CoordinationRefusal::WRONG_TRANSACTION_STATE,
+                      "this handover transaction has not entered the isolated core phase");
+
     const auto next = ApplyOrchestrationEvent(found->state, event);
     if (!next.has_value())
         return refuse(CoordinationRefusal::WRONG_TRANSACTION_STATE,
@@ -500,6 +607,19 @@ bool HandoverCoordinator::cancel(const HandoverTransactionId &transaction, Coord
         CoordinationRecord &record = item.second;
         if (!(record.transaction == transaction))
             continue;
+        // A dispatched or installed core path cannot be cancelled away. A
+        // cancellation would discard the only record that a mapping may be
+        // installed, and an update whose answer was never observed has to be
+        // reconciled rather than forgotten.
+        if (record.corePath.enabled &&
+            (record.corePath.committed || record.state == OrchestrationState::CORE_UPDATE_COMMITTING ||
+             record.state == OrchestrationState::CORE_UPDATE_INDETERMINATE))
+        {
+            if (failure != nullptr)
+                *failure = CoordinationRefusalRecord{CoordinationRefusal::WRONG_TRANSACTION_STATE,
+                                                     "a dispatched isolated core path cannot be cancelled"};
+            return false;
+        }
         // Idempotent. A record is cancelled once and stays cancelled; there is
         // no path that withdraws the cancellation and no path that revives it.
         record.cancelled = true;
@@ -519,7 +639,11 @@ size_t HandoverCoordinator::expireDue(std::chrono::steady_clock::time_point now)
     for (auto &item : m_records)
     {
         CoordinationRecord &record = item.second;
-        if (record.cancelled || IsTerminal(record.state) || record.expiresAt > now)
+        // A transaction that has entered the isolated core phase is not
+        // expired: it may hold an installed path or a source release in
+        // flight, and discarding the record would discard the only statement
+        // that either exists. Its own bounded guard is what ends it.
+        if (record.cancelled || IsTerminal(record.state) || record.expiresAt > now || record.corePath.enabled)
             continue;
         // Expiry stops a record from authorizing anything. It is not itself an
         // authorization, and it never releases anything on either eNB.
@@ -745,6 +869,20 @@ CommandDelivery DeliverHandoverCommand(EnbMultiplexer &source, EnbUeEntry &entry
                       std::string("the source could not hand the command to its UE: ") + e.what());
     }
 
+    // What the source just did, recorded on the source. It is the first half of
+    // what a handover-specific release will later be checked against, and it is
+    // written here — where the command really left this cell — rather than by a
+    // caller that could assert it.
+    HandoverSourceRecord sourceRecord;
+    sourceRecord.transaction = transaction;
+    sourceRecord.radioUeId = entry.radioUeId;
+    sourceRecord.enbUeS1apId = entry.enbUeS1apId;
+    sourceRecord.mmeUeS1apId = entry.mmeUeS1apId;
+    sourceRecord.accessGeneration = entry.accessGeneration;
+    sourceRecord.associationEpoch = source.associationEpoch();
+    sourceRecord.target = record->target;
+    source.noteHandoverSourceCommand(sourceRecord);
+
     // Two events, both about the command that was just delivered. The frame is
     // the one that redirects the UE's radio transport, so the relocation is
     // pending from the moment it reaches the UE; what proves the redirect
@@ -866,8 +1004,56 @@ void IsolatedMmeRelay::onUplink(bool fromTarget, const std::vector<uint8_t> &pdu
         return refuse(CoordinationRefusal::LIVE_MODE_DISABLED,
                       "the isolated MME simulator refuses to act while attached to a live EPC");
 
-    // The only uplink this stage understands is the target's Handover Notify.
-    // Everything else is refused rather than guessed at, and a Notify from the
+    // Two uplinks exist in this stage, and they are told apart by the PDU
+    // category the envelope itself states: the target's Handover Notify is an
+    // initiating message and the source's UE Context Release Complete is a
+    // successful outcome. Nothing is guessed from a procedure code that a
+    // malformed frame could spoof into the other's shape.
+    S1apPdu probe;
+    try
+    {
+        probe = ProbeS1apPdu(pdu.data(), pdu.size());
+    }
+    catch (const std::exception &e)
+    {
+        return refuse(CoordinationRefusal::INCOMPLETE_COORDINATION_RECORD,
+                      std::string("the isolated MME simulator carries no such uplink message: ") + e.what());
+    }
+
+    if (probe.kind == S1apPdu::Kind::SUCCESSFUL_OUTCOME)
+    {
+        if (fromTarget)
+            return refuse(CoordinationRefusal::WRONG_TRANSACTION_STATE,
+                          "a UE Context Release Complete is the source's message and is refused from the target side");
+        UeContextReleaseComplete complete;
+        try
+        {
+            complete = DecodeUeContextReleaseComplete(pdu.data(), pdu.size());
+        }
+        catch (const std::exception &e)
+        {
+            return refuse(CoordinationRefusal::INCOMPLETE_COORDINATION_RECORD,
+                          std::string("the isolated MME simulator carries no such uplink message: ") + e.what());
+        }
+        const CoordinationRecord *record = m_coordinator.findByMmeUeS1apId(complete.mmeUeS1apId);
+        if (record == nullptr)
+            return refuse(CoordinationRefusal::WRONG_TRANSACTION_STATE,
+                          "the UE Context Release Complete names no open handover transaction");
+        const SourceReleaseStepOutcome released = AcceptSourceReleaseComplete(m_coordinator, record->transaction, pdu);
+        if (!released.confirmed)
+        {
+            if (failure != nullptr && released.refusal.has_value())
+                *failure = CoordinationRefusalRecord{CoordinationRefusal::WRONG_TRANSACTION_STATE,
+                                                     released.refusal->detail};
+            m_lastRefusal = CoordinationRefusalRecord{CoordinationRefusal::WRONG_TRANSACTION_STATE,
+                                                      released.refusal.has_value() ? released.refusal->detail
+                                                                                   : std::string{}};
+            return;
+        }
+        return;
+    }
+
+    // Everything else is the target's Handover Notify, and a Notify from the
     // source side is refused for the same reason a Notify from anywhere else
     // would be: this message is the target's to send.
     HandoverNotify notify;
@@ -1237,6 +1423,54 @@ bool IsolatedMmeRelay::acceptHandoverNotify(const std::vector<uint8_t> &notifyPd
     // and nothing here performs or reports them.
     m_lastNotifiedMmeUeS1apId = record->mmeUeS1apId;
     return true;
+}
+
+// --- Phase 18-E: the isolated core path and the source release ------------
+
+CorePathOutcome IsolatedMmeRelay::requestCorePathUpdate(IsolatedSgw &sgw, EnbMultiplexer &target,
+                                                        const HandoverTransactionId &transaction)
+{
+    CorePathOutcome outcome;
+    if (!m_coordinator.enabled())
+    {
+        outcome.refusal = CorePathRefusalRecord{CorePathRefusal::LIVE_MODE_DISABLED,
+                                                "the isolated MME simulator refuses to act while attached to a live EPC"};
+        return outcome;
+    }
+
+    CorePathRefusalRecord failure;
+    if (!BeginIsolatedCorePathUpdate(m_coordinator, target, sgw, transaction, &failure))
+    {
+        outcome.refusal = failure;
+        const CoordinationRecord *record = m_coordinator.find(transaction);
+        if (record != nullptr)
+            outcome.state = record->state;
+        Log("WARN", std::string("Isolated MME refused to dispatch a bearer path update: ") + ToString(failure.refusal) +
+                        " (" + failure.detail + ")");
+        return outcome;
+    }
+    return ApplyIsolatedBearerPathUpdate(sgw, m_coordinator, transaction);
+}
+
+bool IsolatedMmeRelay::armSourceRelease(const HandoverTransactionId &transaction,
+                                        std::chrono::steady_clock::time_point now, std::chrono::milliseconds guard,
+                                        SourceReleaseRefusalRecord *failure)
+{
+    return EnterSourceReleaseWait(m_coordinator, transaction, now, guard, failure);
+}
+
+SourceReleaseStepOutcome IsolatedMmeRelay::releaseSource(EnbMultiplexer &source,
+                                                         const HandoverTransactionId &transaction,
+                                                         std::chrono::steady_clock::time_point now)
+{
+    return SendSourceReleaseCommand(m_coordinator, source, transaction, now);
+}
+
+SourceReleaseStepOutcome IsolatedMmeRelay::reconcileSourceRelease(EnbMultiplexer &source,
+                                                                  const HandoverTransactionId &transaction,
+                                                                  std::chrono::steady_clock::time_point now)
+{
+    return ReconcileSourceRelease(m_coordinator, source, transaction, now);
 }
 
 } // namespace lte::enb::s1ap

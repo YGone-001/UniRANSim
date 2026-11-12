@@ -353,6 +353,23 @@ class UeRegistry
     // is retained in IDLE_RETAINED state for a later Service Request or
     // re-Attach. Other entries are untouched.
     void releaseS1(EnbUeEntry &entry);
+
+    // Releases a UE context that a completed connected handover has moved to
+    // another cell.
+    //
+    // It is deliberately not `releaseS1` plus `remove`. `releaseS1` is the
+    // ECM-IDLE transition: it retains the logical EPS bearer contexts, keeps the
+    // entry, marks the session retained and lets the caller tell the UE that its
+    // access ended. None of that is true of a UE that is now connected to the
+    // target, so this path retains nothing, tells nobody and leaves no entry.
+    //
+    // Every bound local S1-U TEID is retired through the ordinary ledger, so a
+    // delayed G-PDU is classified as traffic that outlived its tunnel. The
+    // S1AP identity indexes, the radio identity index and the peer index are
+    // all dropped, and the entry is erased. It refuses a provisional context
+    // and an entry this registry does not hold, so it can never reach another
+    // transaction's resources.
+    void removeHandoverSource(EnbUeEntry &entry);
     // Stops a local TEID resolving. A live mapping of this entry is retired
     // through `retireLocalTeid`, so it becomes identifiable as retired rather
     // than merely missing. A value that is not a live mapping of this entry is

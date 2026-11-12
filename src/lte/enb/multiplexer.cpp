@@ -1035,6 +1035,69 @@ void EnbMultiplexer::onUeContextReleaseCommand(const uint8_t *data, size_t size)
             throw s1ap::CodecError("UE Context Release references an unknown or released MME-UE-S1AP-ID");
     }
 
+    // A successful-handover release is a different transition from the
+    // ECM-IDLE one below, and it is never taken on the strength of the Cause
+    // field alone. The source must hold its own record of having commanded this
+    // UE into this handover, and the isolated MME must have installed a release
+    // decision it could only build from a confirmed core path. If either is
+    // missing the whole command is refused: nothing is released, no TEID is
+    // retired and no Complete is sent.
+    if (s1ap::IsSuccessfulHandoverReleaseCause(command))
+    {
+        s1ap::HandoverSourceReleaseDecision decision;
+        s1ap::SourceReleaseRefusalRecord refusal;
+        if (!s1ap::VerifyHandoverSourceRelease(*entry, m_associationEpoch, command, m_handoverSources,
+                                               m_releaseDecisions, &decision, &refusal))
+        {
+            Log("WARN", "Refused a handover UE Context Release Command: " + std::string(s1ap::ToString(refusal.refusal)) +
+                            " (" + refusal.detail + ")");
+            throw s1ap::CodecError(std::string("UE Context Release Command is not an authorized handover release: ") +
+                                   s1ap::ToString(refusal.refusal));
+        }
+
+        const uint32_t mmeId = decision.mmeUeS1apId;
+        const uint32_t enbId = decision.enbUeS1apId;
+        const s1ap::HandoverTransactionId transaction = decision.transaction;
+        const auto release = s1ap::ReleaseHandoverSourceContext(decision, m_registry, m_associationEpoch, &refusal);
+        if (!release.released)
+        {
+            Log("WARN", std::string("Handover release of the source context failed: ") +
+                            s1ap::ToString(refusal.refusal) + " (" + refusal.detail + ")");
+            throw s1ap::CodecError(std::string("The handover release of the source context failed: ") +
+                                   s1ap::ToString(refusal.refusal));
+        }
+
+        // The records that authorized this release are spent. Nothing may
+        // reuse them, and a duplicate command will find no context at all
+        // rather than re-running the cleanup against whatever holds the
+        // identifier now.
+        m_handoverSources.erase(
+            std::remove_if(m_handoverSources.begin(), m_handoverSources.end(),
+                           [&transaction](const s1ap::HandoverSourceRecord &record) {
+                               return record.transaction == transaction;
+                           }),
+            m_handoverSources.end());
+        m_releaseDecisions.erase(
+            std::remove_if(m_releaseDecisions.begin(), m_releaseDecisions.end(),
+                           [&transaction](const s1ap::HandoverSourceReleaseDecision &candidate) {
+                               return candidate.transaction == transaction;
+                           }),
+            m_releaseDecisions.end());
+
+        // Deliberately no S1_CONTEXT_RELEASED: the UE is connected to the
+        // target, and telling it that the access it left has ended would be a
+        // statement about an access it is no longer on.
+        Log("INFO", "Handover source context released for LTE UE " + std::to_string(decision.radioUeId) +
+                        " (eNB-UE-S1AP-ID=" + std::to_string(enbId) +
+                        ", MME-UE-S1AP-ID=" + std::to_string(mmeId) + "); " +
+                        std::to_string(release.retiredTeids.size()) +
+                        " source TEID(s) retired and no idle-release notification was sent");
+        auto complete = s1ap::EncodeUeContextReleaseComplete(mmeId, enbId);
+        sendS1ap(SctpStreamForUe(m_outboundStreams, enbId), complete);
+        Log("INFO", "UE Context Release Complete sent for eNB-UE-S1AP-ID=" + std::to_string(enbId));
+        return;
+    }
+
     const uint32_t mmeId = command.mmeUeS1apId;
     const uint32_t enbId = entry->enbUeS1apId;
     const uint8_t erabId = entry->bearer.parameters().erabId;
@@ -1436,6 +1499,45 @@ void EnbMultiplexer::sendHandoverCommand(EnbUeEntry &entry, const lte::ue::link:
               lte::ue::link::EncodeSimulatedHandoverCommand(command));
 }
 
+void EnbMultiplexer::noteHandoverSourceCommand(const s1ap::HandoverSourceRecord &record)
+{
+    // One pending handover per UE. A repeat of the same transaction replaces the
+    // record with the same facts, and a different transaction for the same UE
+    // replaces a stale one: a cell that commanded a UE twice is waiting on the
+    // later command, not on the earlier one.
+    m_handoverSources.erase(std::remove_if(m_handoverSources.begin(), m_handoverSources.end(),
+                                           [&record](const s1ap::HandoverSourceRecord &existing) {
+                                               return existing.radioUeId == record.radioUeId;
+                                           }),
+                            m_handoverSources.end());
+    m_handoverSources.push_back(record);
+    Log("INFO", "Source recorded that it commanded LTE UE " + std::to_string(record.radioUeId) +
+                    " into a handover towards eNB " + std::to_string(record.target.enbId) +
+                    " (MME-UE-S1AP-ID=" + std::to_string(record.mmeUeS1apId) + ")");
+}
+
+void EnbMultiplexer::authorizeHandoverSourceRelease(const s1ap::HandoverSourceReleaseDecision &decision)
+{
+    if (!decision.isVerified())
+        throw std::logic_error("A handover source release requires a verified decision");
+    m_releaseDecisions.erase(std::remove_if(m_releaseDecisions.begin(), m_releaseDecisions.end(),
+                                            [&decision](const s1ap::HandoverSourceReleaseDecision &existing) {
+                                                return existing.transaction == decision.transaction;
+                                            }),
+                             m_releaseDecisions.end());
+    m_releaseDecisions.push_back(decision);
+}
+
+const std::vector<s1ap::HandoverSourceRecord> &EnbMultiplexer::handoverSourceRecords() const
+{
+    return m_handoverSources;
+}
+
+const std::vector<s1ap::HandoverSourceReleaseDecision> &EnbMultiplexer::handoverSourceReleaseDecisions() const
+{
+    return m_releaseDecisions;
+}
+
 s1ap::HandoverNotifyOutcome EnbMultiplexer::notifyHandover(const s1ap::HandoverTransactionId &id)
 {
     s1ap::HandoverNotifyOutcome outcome;
@@ -1532,6 +1634,11 @@ InetAddress EnbMultiplexer::s1uAddress() const
 const PagingCounters &EnbMultiplexer::pagingCounters() const
 {
     return m_paging;
+}
+
+const S1uEndpointCounters &EnbMultiplexer::s1uCounters() const
+{
+    return m_s1u.counters();
 }
 
 void EnbMultiplexer::shutdown()

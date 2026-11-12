@@ -106,7 +106,11 @@ a safety boundary. These rules are what a change must not weaken.
   It is not a release, not a bearer transition and not a handover
   authorisation: handling one must never release a bearer, advance an access
   generation, or start any procedure. It is recorded and nothing else moves.
-  No code path generates or transmits an End Marker.
+  No eNB code path generates or transmits an End Marker. The only producer in
+  this repository is the isolated SGW simulator, which builds one in
+  `handover_core_path.cpp` and sends it to the old source endpoint and nowhere
+  else; that is core-side traffic, not an eNB behaviour, and it stays confined
+  to the isolated simulator.
 - The S flag of an End Marker must be clear (TS 29.281 V14.0.0 §5.1). An End
   Marker with the S flag set is refused at decode, and there is no runtime
   switch that relaxes it.
@@ -585,6 +589,127 @@ three invocations, one per skipped case:
 sudo unshare --net -- env UNIRANSIM_RUN_PRIVILEGED_TUN_TESTS=1 \
   ./cmake-build-release/nr-tests --no-skip \
   --test-case="lte/handover/acceptance: a connected-mode handover executes end to end between two real eNBs"
+```
+
+## Isolated core path migration and source handover release
+
+The isolated core phase is `src/lte/enb/handover_core_path.{hpp,cpp}` (the SGW
+forwarding map, the MME's update and its confirmation) and
+`src/lte/enb/handover_source_release.{hpp,cpp}` (the source-side release). It
+continues the accepted Phase 18-D transaction past
+`AWAITING_CORE_PATH_UPDATE`. These rules are what a change must not weaken.
+
+- The isolated MME owns the update decision. `BeginIsolatedCorePathUpdate`
+  validates the whole precondition set — isolated-simulator mode, a transaction
+  at the Phase 18-D boundary, a bound arrival token, a complete coordination
+  record, a target that still holds the reached UE with an active bearer set
+  exactly matching the admitted E-RABs, and an SGW that really holds this
+  session's source path — and only then records the request. Nothing else may
+  dispatch an update, and a Handover Notify on its own never does.
+- The isolated SGW owns the installed forwarding map. `IsolatedSgw` holds one
+  entry per bearer of a session, keyed by the verified EPS session identity
+  (MME-UE-S1AP-ID plus the PDN address the UE's NAS assigned) and the EBI, and
+  each entry carries the SGW-side tunnel identity, the downlink endpoint tuple,
+  the original source endpoint, a path generation and the owning transaction.
+  Nothing outside `IsolatedSgw` writes that map, and the sender
+  (`sendDownlink`) names a bearer and never a destination.
+- A dispatched request is not a committed update. The MME records the request,
+  moves to `CORE_UPDATE_REQUESTED`, then `CORE_UPDATE_COMMITTING`, and only a
+  read-back of the SGW's actual map that matches the request produces
+  `CORE_PATH_UPDATED`. An answer is never taken from the component that asked
+  for the update, and a commit is never inferred from sending a request.
+- A request is written against the generation the MME read before dispatch. The
+  SGW refuses a request whose expected generation is not the one its map holds,
+  so an update can never be applied against a starting point its author did not
+  see.
+- Per-bearer atomicity is a publication boundary, not a promise. The whole
+  replacement set is validated before the first entry is written, and it is
+  published as one assignment of the session's complete state. No reader can
+  observe a session whose default bearer is on the target while its dedicated
+  bearer is still on the source, and a failure on the second bearer leaves the
+  first one exactly where it was. A partial replacement is never reported as a
+  commit.
+- Target endpoint provenance is the target's own reached registry entry. The
+  destination address is the address the target's S1-U socket actually bound,
+  the port is the one it listens on, and the TEID is the one its own allocator
+  bound and its own bearer holds. None of the three is a constant, a
+  caller-supplied value, a UE report or a frame field, and each bearer's SGW
+  TEID, role and linked default must agree with the transaction's own bearer
+  inventory.
+- An eNB-local TEID is not a globally unique identifier. Two eNBs can hold the
+  same numeric local S1-U TEID, so a map entry's destination is the endpoint
+  tuple and never the TEID alone. Two sessions may legitimately resolve to the
+  same number on different cells, and a source retirement must never retire a
+  target's identifier merely because the numbers match. Registry and S1-U
+  endpoint ownership are eNB-local.
+- An indeterminate update is not a success. If the SGW published a replacement
+  the MME cannot correlate — a lost answer, an unreadable session, a
+  generation that does not follow the request — the transaction stays
+  `CORE_UPDATE_INDETERMINATE`, nothing is released and no second update is
+  applied. `ReconcileIsolatedPathUpdate` reads the actual map and moves the
+  transaction only when the exact transaction and the complete endpoint set can
+  be proven; it never re-applies a request.
+- A settled core path cannot be cancelled or expired away. `cancel` refuses a
+  transaction whose update was dispatched, installed or is indeterminate, and
+  `expireDue` leaves every record that entered the isolated core phase alone:
+  discarding one would discard the only statement that a mapping may exist.
+- The isolated MME owns the source-release authority. A release requires a real
+  encoded UE Context Release Command from the MME, the source's own record of
+  having commanded this UE into this handover, and a release decision the MME
+  could only build after the SGW's installed mapping was confirmed. The Cause
+  field is a corroborating statement (`radioNetwork`/`successful-handover`)
+  and never an authorization on its own; the presence of a second UE with a
+  matching identity authorizes nothing.
+- Handover release is not idle release. `UeRegistry::releaseS1` is the
+  ECM-IDLE transition: it retains the logical EPS bearer contexts, keeps the
+  entry, marks the session retained and lets the caller tell the UE that its
+  access ended. `UeRegistry::removeHandoverSource` retains nothing: it retires
+  every bound local TEID through the normal ledger, drops the S1AP identity
+  indexes, releases the bearer contexts and erases the entry, its radio
+  identity and its peer. It is the handover path and only the handover path.
+- A handover release sends no `S1_CONTEXT_RELEASED`. The UE is connected to
+  the target, and a notification from the cell it left would be a statement
+  about an access it is no longer on. The ordinary idle path keeps sending it;
+  that behaviour is unchanged.
+- Release timing is a bounded guard event, not a timer callback. The MME arms a
+  deadline the caller supplies and a release before it is refused as
+  `RELEASE_GUARD_NOT_SATISFIED`. Nothing in the release path deletes a UE
+  context directly: it encodes a message, delivers it through the source's own
+  S1AP receive path, and waits for a real encoded Complete.
+- A sent release command is not a release. `SOURCE_RELEASE_COMMAND_SENT` is
+  not `SOURCE_RELEASE_CONFIRMED`, and only a decoded Complete whose identity
+  pair matches the transaction — or a reconciliation of the source's registry
+  that proves the context is gone and every named TEID is retired — produces
+  `ISOLATED_HANDOVER_COMPLETE`. A reconciliation is reported as
+  `RECONCILED_REGISTRY` and is never described as a received Complete.
+- A duplicate release command reaches no context. The first release erases the
+  entry and spends the source record and the MME decision that authorized it,
+  so a repeat is refused by the dispatcher and cannot re-run a cleanup against
+  whatever holds the identifier now.
+- Source cleanup preserves the target exactly. The target is a different
+  registry; its context, its S1AP identifiers, its local TEIDs, its bearer
+  readiness, its radio peer and its PDN address are untouched by anything the
+  source does, and its counters are not credited with traffic it never carried.
+- An End Marker is not a release and not a core update. The isolated SGW sends
+  one on the old path after a confirmed update, the eNB records it against the
+  tunnel it names, and neither the map's generation, the bearer's readiness,
+  the retention of the source TEIDs nor the transaction's state moves. It is
+  never a substitute for the UE Context Release Command.
+- This is not S11 GTPv2-C and not a Modify Bearer Request. The MME/SGW exchange
+  is an explicitly labelled simulator-internal typed contract
+  (`IsolatedPathUpdateRequest` / `IsolatedPathUpdateCommit`), it has no wire
+  format, no GTP-C message is encoded or decoded anywhere, and no real EPC
+  procedure is claimed. A confirmed isolated mapping is evidence about this
+  simulator's forwarding table and nothing about a live core.
+
+The detail, including the sequence the acceptance case drives, the confirmation
+and reconciliation rules and the retained interoperability gaps, is in
+`docs/lte-s1-connected-handover.md`. The deterministic cases live in
+`test/lte/handover_core_path.cpp` and `test/lte/handover_core_phase.cpp`; the
+privileged acceptance case is the second one in `test/lte/handover_acceptance.cpp`:
+
+```bash
+./cmake-build-release/nr-tests --no-version --test-case="lte/handover/core-path:*,lte/handover/core-phase:*"
 ```
 
 ## What must never be committed

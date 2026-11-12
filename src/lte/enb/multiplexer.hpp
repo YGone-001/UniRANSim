@@ -10,6 +10,7 @@
 
 #include "codec.hpp"
 #include "handover_preparation.hpp"
+#include "handover_source_release.hpp"
 #include "s1u_endpoint.hpp"
 #include "types.hpp"
 #include "ue_registry.hpp"
@@ -216,6 +217,28 @@ class EnbMultiplexer
     // recorded as a notification.
     s1ap::HandoverNotifyOutcome notifyHandover(const s1ap::HandoverTransactionId &id);
 
+    // Source side: records that this eNB has just commanded a UE into a
+    // connected-mode handover.
+    //
+    // It is the source's own statement that it handed the UE to that target,
+    // written by the production delivery path and by nothing else. It is half
+    // of what authorizes a handover-specific release later: a cell that never
+    // sent a command holds no record, and no message can supply one.
+    void noteHandoverSourceCommand(const s1ap::HandoverSourceRecord &record);
+
+    // Source side: installs the isolated MME's verified release decision for one
+    // transaction. It is explicitly MME-supplied provenance, exactly like the
+    // SourceContext a preparation is made with, and it is never derived from a
+    // Release Command. Repeated installation for the same transaction replaces
+    // the earlier decision rather than stacking a second one.
+    void authorizeHandoverSourceRelease(const s1ap::HandoverSourceReleaseDecision &decision);
+
+    // What this cell has been told about handovers it executed, and what the
+    // isolated MME has authorized. Read-only observation for a harness; nothing
+    // acting on a source release depends on a caller reading these.
+    [[nodiscard]] const std::vector<s1ap::HandoverSourceRecord> &handoverSourceRecords() const;
+    [[nodiscard]] const std::vector<s1ap::HandoverSourceReleaseDecision> &handoverSourceReleaseDecisions() const;
+
     // Target side: what the production radio receive path last accepted as a
     // verified arrival. It is the output of
     // `HandoverPreparationOwner::acceptArrival` and nothing else, so it is
@@ -230,6 +253,10 @@ class EnbMultiplexer
     [[nodiscard]] InetAddress ueLinkAddress() const;
     [[nodiscard]] InetAddress s1uAddress() const;
     [[nodiscard]] const PagingCounters &pagingCounters() const;
+    // The shared S1-U endpoint's own counters. They are endpoint-level and not
+    // per-UE, so a retired-TEID drop read here is a statement about this cell
+    // and not about any one bearer.
+    [[nodiscard]] const S1uEndpointCounters &s1uCounters() const;
     [[nodiscard]] const RecoveryCounters &recoveryCounters() const;
     [[nodiscard]] RecoveryCounters &recoveryCounters();
     // Milliseconds between the most recent access invalidation and the first
@@ -281,6 +308,12 @@ class EnbMultiplexer
     // The arrival the radio receive path last accepted, when one has been.
     // Set only by `onHandoverAccess`, and only after `acceptArrival` agreed.
     std::optional<s1ap::VerifiedTargetArrival> m_lastVerifiedArrival;
+
+    // Handovers this cell commanded, and the release decisions the isolated MME
+    // installed for them. Both are per-UE and bounded by the transactions the
+    // cell actually ran; a completed release erases its own entry from each.
+    std::vector<s1ap::HandoverSourceRecord> m_handoverSources;
+    std::vector<s1ap::HandoverSourceReleaseDecision> m_releaseDecisions;
 
     EnbConfig m_config;
     S1apSenderBinding m_sender;

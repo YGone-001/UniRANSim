@@ -643,6 +643,48 @@ void UeRegistry::releaseS1(EnbUeEntry &entry)
     entry.s1 = UeS1State::IDLE_RETAINED;
 }
 
+void UeRegistry::removeHandoverSource(EnbUeEntry &entry)
+{
+    // Only a reached UE this registry really holds can be moved away from this
+    // cell. A provisional context is a UE that has not arrived, and an entry
+    // this registry does not own is another registry's business.
+    if (isProvisional(entry))
+        throw RegistryError("A provisional context is not a UE a handover moved away from this cell");
+    const auto it = m_byRadioUeId.find(entry.radioUeId);
+    if (it == m_byRadioUeId.end() || it->second.get() != &entry)
+        throw RegistryError("The UE entry is not registered");
+
+    if (entry.enbUeS1apId != 0)
+        m_byEnbUeS1apId.erase(entry.enbUeS1apId);
+    if (entry.mmeUeS1apId != 0)
+        m_byMmeUeS1apId.erase(entry.mmeUeS1apId);
+    entry.enbUeS1apId = 0;
+    entry.mmeUeS1apId = 0;
+    entry.sgwPeer = InetAddress{};
+
+    // Both bearers' local identifiers stop resolving and are remembered as
+    // retired, so a delayed T-PDU naming one is classified as traffic that
+    // outlived its tunnel rather than as a packet that never had one.
+    retireLocalTeid(entry.bearer.parameters().localTeid);
+    for (auto &dedicated : entry.dedicatedBearers)
+        retireLocalTeid(dedicated.parameters().localTeid);
+
+    // Nothing is retained. An ECM-IDLE release keeps the logical EPS bearer
+    // contexts because the UE may ask service for them; this UE's session is
+    // now the target's, and keeping a copy here would be a second owner of one
+    // session.
+    entry.bearer.release();
+    entry.dedicatedBearers.clear();
+    entry.ueAmbr.reset();
+    entry.mobilityBootstrap = false;
+    entry.declaredBearers.reset();
+    entry.sessionRetained = false;
+    entry.pagingNotifications = 0;
+
+    m_byPeer.erase(entry.peer.toString());
+    m_byRadioUeId.erase(it);
+}
+
 void UeRegistry::unbindLocalTeid(EnbUeEntry &entry, uint32_t teid)
 {
     const auto it = m_byLocalTeid.find(teid);

@@ -36,14 +36,16 @@
 
 #include "codec.hpp"
 #include "handover_admission.hpp"
+#include "handover_core_path.hpp"
 #include "handover_preparation.hpp"
+#include "handover_source_release.hpp"
 #include "multiplexer.hpp"
 #include "types.hpp"
 #include "user_plane.hpp"
 
 namespace lte::enb
 {
-class EnbUeEntry;
+struct EnbUeEntry;
 class EnbMultiplexer;
 }
 
@@ -146,6 +148,12 @@ struct SourceSession
     // eNB has already validated; it is never a claim a frame restated.
     uint8_t defaultEbi{};
     std::array<uint8_t, 4> ueIpv4{};
+    // 14. The local S1-U TEIDs this cell holds for the session, default first
+    // and then the dedicated ones in the same order as `roles`. They are read
+    // from the same live entry as every other fact here and are what a
+    // handover release retires; no caller ever supplies one.
+    uint32_t defaultLocalTeid{};
+    std::vector<uint32_t> dedicatedLocalTeids;
     // 13. The access epoch the source is currently serving this UE on.
     uint32_t accessGeneration{};
     // 10/11/12. The default and dedicated bearer inventory with the roles, the
@@ -247,11 +255,43 @@ enum class OrchestrationState : uint8_t
     // The Handover Notify has been built behind the accepted gate and handed to
     // the association. It is never a core path update.
     HANDOVER_NOTIFY_SENT,
-    // The deliberately final state of this phase. The MME-controlled downlink
-    // bearer path update and the source context release are later work and are
-    // not performed here, so nothing in this phase ever reports an end-to-end
-    // completed handover.
+    // The Phase 18-D boundary. A transaction that stops here has been notified
+    // and nothing more: the downlink bearer path has not moved and the source
+    // still serves the UE. A Phase 18-D run ends here and is terminal.
+    //
+    // Phase 18-E adds exactly one authorized continuation out of it, and only
+    // for a transaction that has entered the isolated core phase. A record that
+    // never did cannot leave this state.
     AWAITING_CORE_PATH_UPDATE,
+    // The isolated MME has validated and recorded a path-update request. Nothing
+    // has been asked of the SGW yet, and this is not a committed update.
+    CORE_UPDATE_REQUESTED,
+    // The request has been handed to the isolated SGW and its answer is not yet
+    // correlated. This is the state an answer can be lost in.
+    CORE_UPDATE_COMMITTING,
+    // The SGW's installed mapping was read back and matched the request exactly.
+    // The core path moved; nothing has been released.
+    CORE_PATH_UPDATED,
+    // The source-release guard is running. A guard event, not a timer callback,
+    // is what ends it.
+    SOURCE_RELEASE_WAIT,
+    // A real encoded UE Context Release Command has left the isolated MME for
+    // the source eNB. It is not a release.
+    SOURCE_RELEASE_COMMAND_SENT,
+    // The source returned a real encoded UE Context Release Complete whose
+    // identity pair and association matched the transaction.
+    SOURCE_RELEASE_CONFIRMED,
+    // The only state that reports a completed isolated handover.
+    ISOLATED_HANDOVER_COMPLETE,
+    // The SGW refused the replacement. Nothing was installed and no bearer moved.
+    CORE_UPDATE_FAILED,
+    // The SGW holds a mapping this MME cannot correlate: a replacement may be
+    // installed, but it is not proven. It is never a success and it never
+    // releases anything.
+    CORE_UPDATE_INDETERMINATE,
+    // The source release was refused, was not completed, or could not be
+    // reconciled. The source context is not proven released.
+    SOURCE_RELEASE_FAILED,
     // Preparation refused or rolled back before any UE was moved.
     PREPARATION_FAILED,
     // The UE move failed after preparation succeeded. Whatever the outcome of
@@ -308,6 +348,16 @@ struct CoordinationRecord
     bool cancelled{};
 
     OrchestrationState state{OrchestrationState::SOURCE_CONNECTED};
+
+    // The isolated core phase of this transaction. Every field is empty until
+    // the isolated MME dispatches a path update, and a record that never does
+    // stays terminal at AWAITING_CORE_PATH_UPDATE exactly as Phase 18-D left it.
+    CorePathTransaction corePath;
+
+    // The source-release phase that follows a confirmed core update. It holds
+    // the guard deadline, the bytes that were actually sent and answered, and
+    // which kind of evidence, if any, confirmed the cleanup.
+    SourceReleaseTransaction sourceRelease;
 
     // Whether this record is complete in all nine bindings. An incomplete
     // record is refused by every step rather than used with a hole in it.
@@ -532,6 +582,38 @@ class IsolatedMmeRelay
     // commanded and relocated is refused as well, so this cannot skip a step.
     // A repeat of the same confirmation is the same event and moves nothing.
     bool confirmTargetArrival(EnbMultiplexer &target, CoordinationRefusalRecord *failure);
+
+    // --- Phase 18-E: the isolated core path and the source release --------
+
+    // The isolated MME's decision to migrate the downlink bearer path.
+    //
+    // It validates the phase's whole precondition set — an isolated-simulator
+    // coordinator, a transaction at the Phase 18-D boundary whose target
+    // arrival was verified and whose resources were committed, a target that
+    // still holds an active bearer set exactly matching the admitted E-RABs,
+    // and an SGW that really holds this session's source path — then records
+    // the request and moves the transaction to CORE_UPDATE_REQUESTED.
+    //
+    // Only then is the update applied, and only a read-back of the SGW's
+    // installed mapping that matches the request produces CORE_PATH_UPDATED.
+    CorePathOutcome requestCorePathUpdate(IsolatedSgw &sgw, EnbMultiplexer &target,
+                                          const HandoverTransactionId &transaction);
+
+    // Arms the bounded guard between a confirmed core update and the source
+    // release. The clock is the caller's: this is an explicit event with a
+    // deterministic deadline, not a timer.
+    bool armSourceRelease(const HandoverTransactionId &transaction, std::chrono::steady_clock::time_point now,
+                          std::chrono::milliseconds guard, SourceReleaseRefusalRecord *failure);
+
+    // Sends the real encoded UE Context Release Command to the source through
+    // its own production S1AP receive path. A send is not a release.
+    SourceReleaseStepOutcome releaseSource(EnbMultiplexer &source, const HandoverTransactionId &transaction,
+                                           std::chrono::steady_clock::time_point now);
+
+    // Reads the source's own registry when a Release Complete was never
+    // observed. It never re-runs the cleanup.
+    SourceReleaseStepOutcome reconcileSourceRelease(EnbMultiplexer &source, const HandoverTransactionId &transaction,
+                                                    std::chrono::steady_clock::time_point now);
 
     // Records the target's Handover Notify and moves the transaction to
     // AWAITING_CORE_PATH_UPDATE. That state is the deliberate end of this

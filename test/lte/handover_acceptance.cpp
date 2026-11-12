@@ -460,10 +460,25 @@ namespace
 class AcceptanceLab
 {
   public:
-    explicit AcceptanceLab(const std::string &tunBlock)
+    // Which SGW this lab owns. The Phase 18-D case sends its own downlink
+    // datagrams to an endpoint it names; the Phase 18-E case needs the
+    // isolated SGW whose forwarding map decides where a downlink goes. Only one
+    // of them can hold the SGW address, so the lab owns exactly one.
+    enum class SgwMode
+    {
+        RAW,
+        ISOLATED
+    };
+
+    explicit AcceptanceLab(const std::string &tunBlock, SgwMode mode = SgwMode::RAW)
         : m_capture(std::make_unique<lte::test::LogCapture>()), m_sourceMme(m_relay, false),
           m_targetMme(m_relay, true)
     {
+        if (mode == SgwMode::RAW)
+            m_sgw = std::make_unique<SgwEndpoint>();
+        else
+            m_isolatedSgw =
+                std::make_unique<IsolatedSgw>(ExecutionMode::ISOLATED_SIMULATOR, Ipv4Text(SgwAddress), 2152);
         EnbConfig source = TestEnbConfig(SourceEnbId, "127.0.0.1", 1);
         EnbConfig target = TestEnbConfig(TargetEnbId, "127.0.0.3", 2);
         m_source = std::make_unique<EnbMultiplexer>(source, m_sourceMme);
@@ -516,7 +531,8 @@ class AcceptanceLab
     EnbMultiplexer &target() { return *m_target; }
     IsolatedMmeRelay &relay() { return m_relay; }
     HandoverCoordinator &coordinator() { return m_relay.coordinator(); }
-    SgwEndpoint &sgw() { return m_sgw; }
+    SgwEndpoint &sgw() { return *m_sgw; }
+    IsolatedSgw &isolatedSgw() { return *m_isolatedSgw; }
     // Every S1AP PDU the target eNB really transmitted to its MME endpoint.
     const std::vector<std::vector<uint8_t>> &targetMmeWire() const { return m_targetMme.received(); }
     const InetAddress &targetRadio() const { return m_targetRadio; }
@@ -836,7 +852,8 @@ lifecycle:
     IsolatedMmeRelay m_relay{m_coordinator};
     IsolatedMmeRelay::Endpoint m_sourceMme;
     IsolatedMmeRelay::Endpoint m_targetMme;
-    SgwEndpoint m_sgw;
+    std::unique_ptr<SgwEndpoint> m_sgw;
+    std::unique_ptr<IsolatedSgw> m_isolatedSgw;
     std::unique_ptr<EnbMultiplexer> m_source;
     std::unique_ptr<EnbMultiplexer> m_target;
     InetAddress m_targetRadio;
@@ -1342,3 +1359,472 @@ TEST_CASE("lte/handover/acceptance: a connected-mode handover executes end to en
     MESSAGE("UNIRANSIM-PHASE18D-PRIVILEGED-EXECUTED");
     MESSAGE("UNIRANSIM-PHASE18D-PRIVILEGED-COMPLETE");
 }
+
+TEST_CASE("lte/handover/acceptance: mme-controlled core path migration and source release complete an isolated s1 "
+          "handover" *
+          doctest::skip())
+{
+    if (std::getenv("UNIRANSIM_RUN_PRIVILEGED_TUN_TESTS") == nullptr)
+        FAIL("the phase 18-E acceptance requires UNIRANSIM_RUN_PRIVILEGED_TUN_TESTS=1");
+
+    // A different TUN name prefix from the Phase 18-D case, so a run that died
+    // before the production UE could release its interface cannot be mistaken
+    // for one that never made one, and the two cases cannot collide.
+    if (!ListInterfaces("u18e").empty())
+        FAIL("the phase 18-E acceptance needs an unused TUN name prefix");
+
+    std::vector<std::string> steps;
+    auto step = [&steps](int number, const std::string &text) {
+        steps.push_back(std::to_string(number) + ": " + text);
+        MESSAGE("step " << number << " — " << text);
+    };
+
+    AcceptanceLab lab("  required: true\n"
+                      "  namePrefix: \"u18e\"\n"
+                      "  mtu: 1400\n"
+                      "  routes:\n"
+                      "    - \"198.18.0.2/32\"",
+                      AcceptanceLab::SgwMode::ISOLATED);
+
+    // --- Steps 1 to 2: one connected UE with both bearers active. --------
+    lab.startUe();
+    const bool attached = lab.drive([&] { return lab.attachComplete() && lab.dedicatedConfirmed(); }, 20000);
+    REQUIRE(attached);
+    const bool bearerActive = lab.drive(
+        [&] {
+            const auto *entry = lab.source().registry().find(UeRadioId);
+            return entry != nullptr && entry->bearer.active() && !entry->dedicatedBearers.empty() &&
+                   entry->dedicatedBearers.front().active();
+        },
+        10000);
+    REQUIRE(bearerActive);
+    auto *sourceEntry = lab.source().registry().find(UeRadioId);
+    REQUIRE(sourceEntry != nullptr);
+    step(1, "the running UE is attached to the source eNB and holds an S1 connection");
+    REQUIRE(sourceEntry->bearer.ueIpv4() == PdnIpv4);
+    REQUIRE(sourceEntry->dedicatedBearers.size() == 1);
+    const uint32_t sourceDefaultTeid = sourceEntry->bearer.parameters().localTeid;
+    const uint32_t sourceDedicatedTeid = sourceEntry->dedicatedBearers.front().parameters().localTeid;
+    REQUIRE(sourceDefaultTeid != 0);
+    REQUIRE(sourceDedicatedTeid != 0);
+    step(2, "the default and the dedicated bearer are both active on the source");
+
+    // --- Step 3: the SGW map points at the source. ------------------------
+    const IsolatedSessionKey session{MmeUeS1apId, PdnIpv4};
+    const std::array<uint8_t, 4> sourceS1u{127, 0, 0, 1};
+    std::vector<AcceptedTargetEndpoint> sourceEndpoints;
+    {
+        AcceptedTargetEndpoint defaultBearer;
+        defaultBearer.ebi = DefaultEbi;
+        defaultBearer.role = BearerRole::DEFAULT;
+        defaultBearer.sgwTeid = SgwDefaultTeid;
+        defaultBearer.endpoint = IsolatedDownlinkEndpoint{sourceS1u, sourceDefaultTeid, 2152};
+        AcceptedTargetEndpoint dedicated;
+        dedicated.ebi = DedicatedEbi;
+        dedicated.role = BearerRole::DEDICATED;
+        dedicated.linkedDefaultEbi = DefaultEbi;
+        dedicated.sgwTeid = SgwDedicatedTeid;
+        dedicated.endpoint = IsolatedDownlinkEndpoint{sourceS1u, sourceDedicatedTeid, 2152};
+        sourceEndpoints = {defaultBearer, dedicated};
+    }
+    CorePathRefusalRecord installFailure;
+    REQUIRE(lab.isolatedSgw().installSession(session, lab.source().associationEpoch(), sourceEndpoints,
+                                             &installFailure));
+    REQUIRE(*lab.isolatedSgw().generationOf(session) == 1);
+    step(3, "the isolated SGW holds a source downlink mapping for both bearers");
+
+
+    // --- Steps 4 and 5: SGW-originated traffic reaches the source UE. -----
+    // The sender names a bearer and never a destination: the map decides. The
+    // application sockets are the ones each bearer's own flow speaks, so a
+    // datagram arriving on the wrong bearer's socket would be visible.
+    REQUIRE(lab.openApplication());
+    REQUIRE(lab.openDedicatedApplication());
+
+    // The two uplink flows, one per bearer, so the source's own forwarding is
+    // live before anything moves. Each leaves the source's S1-U socket as a
+    // G-PDU on its own bearer's SGW TEID and reaches the SGW's real socket.
+    REQUIRE(lab.sendApplication("uniransim phase 18-E default uplink before the switch"));
+    REQUIRE(lab.sendDedicatedApplication("uniransim phase 18-E dedicated uplink before the switch"));
+    {
+        std::vector<IsolatedSgw::ReceivedUplink> uplink;
+        REQUIRE(lab.drive(
+            [&] {
+                for (auto &item : lab.isolatedSgw().drainUplink())
+                    uplink.push_back(std::move(item));
+                return uplink.size() >= 2;
+            },
+            8000));
+        std::vector<uint32_t> teids;
+        for (const auto &item : uplink)
+            teids.push_back(item.sgwTeid);
+        std::sort(teids.begin(), teids.end());
+        CHECK(teids == std::vector<uint32_t>{SgwDefaultTeid, SgwDedicatedTeid});
+    }
+    {
+        const std::string text = "uniransim phase 18-E default downlink before the switch";
+        const std::vector<uint8_t> expected(text.begin(), text.end());
+        const auto packet = BuildUdpIpv4(PeerIpv4, PdnIpv4, PeerPort, ApplicationPort, text);
+        REQUIRE(lab.isolatedSgw().sendDownlink(session, DefaultEbi, packet.data(), packet.size()));
+        std::vector<Datagram> received;
+        REQUIRE(lab.drive(
+            [&] {
+                received = lab.applicationDatagrams();
+                return !received.empty();
+            },
+            8000));
+        REQUIRE(received.size() == 1);
+        CHECK(received.front().payload == expected);
+        CHECK(received.front().source == PeerIpv4);
+        CHECK(received.front().sourcePort == PeerPort);
+        CHECK(lab.dedicatedSinkDatagrams().empty());
+    }
+    step(4, "the isolated SGW sent a default-bearer downlink that the source UE received");
+    {
+        const std::string text = "uniransim phase 18-E dedicated downlink before the switch";
+        const std::vector<uint8_t> expected(text.begin(), text.end());
+        const auto packet = BuildUdpIpv4(PeerIpv4, PdnIpv4, DedicatedLocalPort, DedicatedPeerPort, text);
+        REQUIRE(lab.isolatedSgw().sendDownlink(session, DedicatedEbi, packet.data(), packet.size()));
+        std::vector<Datagram> received;
+        REQUIRE(lab.drive(
+            [&] {
+                received = lab.dedicatedSinkDatagrams();
+                return !received.empty();
+            },
+            8000));
+        REQUIRE(received.size() == 1);
+        CHECK(received.front().payload == expected);
+        CHECK(received.front().sourcePort == DedicatedLocalPort);
+        CHECK(lab.applicationDatagrams().empty());
+    }
+    step(5, "the isolated SGW sent a dedicated-bearer downlink that the source UE received");
+
+    // --- Steps 6 to 17: the accepted Phase 18-D sequence, unchanged. ------
+    const SourceSession sourceSession = ExtractSourceSession(*sourceEntry, SourceIdentity(),
+                                                             CgiOf(SourceIdentity()), lab.source().associationEpoch());
+    REQUIRE(sourceSession.isVerified());
+    const HandoverTargetBinding binding = TargetBinding(lab.targetRadio());
+    const std::vector<HandoverTargetBinding> inventory{binding};
+    const HandoverTargetBinding *selected = nullptr;
+    CoordinationRefusalRecord selectFailure;
+    REQUIRE(HandoverCoordinator::SelectTarget(sourceSession, inventory, TargetEnbId, selected, &selectFailure));
+
+    CoordinationRecord opened;
+    CoordinationRefusalRecord openFailure;
+    REQUIRE(lab.coordinator().openTransaction(sourceSession, *selected, MmeUeS1apId,
+                                              lab.source().associationEpoch(), binding.associationEpoch,
+                                              std::chrono::seconds{30}, &opened, &openFailure));
+    const HandoverTransactionId transaction = opened.transaction;
+
+    HandoverRequired required;
+    CoordinationRefusalRecord requiredFailure;
+    REQUIRE(BuildHandoverRequired(sourceSession, TargetIdentity(), "radioNetwork",
+                                  CauseHandoverDesirableForRadioReasons, &required, &requiredFailure));
+    const auto requiredPdu = EncodeHandoverRequired(required);
+    step(6, "the source initiated an S1 handover with a Handover Required naming the target");
+
+    const PreparationHop hop = lab.relay().relayPreparation(requiredPdu, transaction, binding, TestSecurity(),
+                                                           lab.target(), binding.associationEpoch);
+    REQUIRE(hop.delivered);
+    REQUIRE(hop.arrivalToken != 0);
+    step(7, "the isolated MME coordinated the target's preparation");
+    step(8, "the target committed its own local S1-U resources");
+
+    const auto command = DecodeHandoverCommand(hop.commandPdu.data(), hop.commandPdu.size());
+    const CommandDelivery delivery =
+        DeliverHandoverCommand(lab.source(), *sourceEntry, lab.coordinator(), transaction, command, binding);
+    REQUIRE(delivery.delivered);
+    step(9, "the source sent the simulated handover command through its own production radio sender");
+
+    const bool arrived = lab.drive([&] { return lab.target().lastVerifiedArrival().has_value(); }, 15000);
+    REQUIRE(arrived);
+    step(10, "the running UE runtime received the command and changed its radio endpoint");
+    step(11, "the target received and verified the UE's arrival in its own production receive path");
+
+    const auto *reached = lab.target().registry().find(UeRadioId);
+    REQUIRE(reached != nullptr);
+    const uint32_t targetDefaultTeid = reached->bearer.parameters().localTeid;
+    const uint32_t targetDedicatedTeid = reached->dedicatedBearers.front().parameters().localTeid;
+    REQUIRE(targetDefaultTeid != 0);
+    REQUIRE(targetDedicatedTeid != 0);
+    REQUIRE(reached->bearer.active());
+    REQUIRE(reached->dedicatedBearers.front().active());
+    step(12, "the target promoted and activated the prepared bearers for the reached UE");
+
+    {
+        CoordinationRefusalRecord arrivalFailure;
+        REQUIRE(lab.relay().confirmTargetArrival(lab.target(), &arrivalFailure));
+    }
+    REQUIRE(lab.target().notifyHandover(transaction).sent);
+    REQUIRE_FALSE(lab.relay().lastRefusal().has_value());
+    step(13, "the target sent the Handover Notify over its own S1AP association");
+    {
+        const auto *record = lab.coordinator().find(transaction);
+        REQUIRE(record != nullptr);
+        REQUIRE(record->state == OrchestrationState::AWAITING_CORE_PATH_UPDATE);
+    }
+    step(14, "the isolated MME verified the Notify and the transaction reached the phase 18-D boundary");
+
+    // --- Steps 15 to 17: the isolated core moves the whole bearer set. ----
+    const CorePathOutcome update = lab.relay().requestCorePathUpdate(lab.isolatedSgw(), lab.target(), transaction);
+    REQUIRE(update.committed);
+    REQUIRE(update.confirmed);
+    REQUIRE(update.state.has_value());
+    REQUIRE(*update.state == OrchestrationState::CORE_PATH_UPDATED);
+    step(15, "the isolated MME requested the bearer path migration");
+    step(16, "the isolated SGW atomically replaced every accepted downlink endpoint");
+    CHECK(lab.isolatedSgw().installed(session, DefaultEbi)->endpoint.teid == targetDefaultTeid);
+    CHECK(lab.isolatedSgw().installed(session, DedicatedEbi)->endpoint.teid == targetDedicatedTeid);
+    CHECK(lab.isolatedSgw().installed(session, DefaultEbi)->originalSource.teid == sourceDefaultTeid);
+    CHECK(lab.isolatedSgw().installed(session, DedicatedEbi)->originalSource.teid == sourceDedicatedTeid);
+    step(17, "the isolated MME verified the installed mapping against the exact request");
+
+    // The source is untouched by the update: it still holds its context and
+    // its transport, because nothing has released it.
+    REQUIRE(lab.source().registry().find(UeRadioId) != nullptr);
+    CHECK_FALSE(lab.source().registry().isRetiredTeid(sourceDefaultTeid));
+
+    // --- Steps 18 to 20: the same SGW instance now sends to the target. ---
+    // The call is identical to steps 4 and 5. Only the map changed.
+    {
+        const std::string text = "uniransim phase 18-E default downlink after the switch";
+        const std::vector<uint8_t> expected(text.begin(), text.end());
+        const auto packet = BuildUdpIpv4(PeerIpv4, PdnIpv4, PeerPort, ApplicationPort, text);
+        REQUIRE(lab.isolatedSgw().sendDownlink(session, DefaultEbi, packet.data(), packet.size()));
+        std::vector<Datagram> received;
+        REQUIRE(lab.drive(
+            [&] {
+                received = lab.applicationDatagrams();
+                return !received.empty();
+            },
+            8000));
+        REQUIRE(received.size() == 1);
+        CHECK(received.front().payload == expected);
+        CHECK(received.front().source == PeerIpv4);
+        CHECK(lab.dedicatedSinkDatagrams().empty());
+    }
+    step(18, "the same SGW instance sent the default downlink to the target's local TEID");
+    {
+        const std::string text = "uniransim phase 18-E dedicated downlink after the switch";
+        const std::vector<uint8_t> expected(text.begin(), text.end());
+        const auto packet = BuildUdpIpv4(PeerIpv4, PdnIpv4, DedicatedLocalPort, DedicatedPeerPort, text);
+        REQUIRE(lab.isolatedSgw().sendDownlink(session, DedicatedEbi, packet.data(), packet.size()));
+        std::vector<Datagram> received;
+        REQUIRE(lab.drive(
+            [&] {
+                received = lab.dedicatedSinkDatagrams();
+                return !received.empty();
+            },
+            8000));
+        REQUIRE(received.size() == 1);
+        CHECK(received.front().payload == expected);
+        CHECK(received.front().sourcePort == DedicatedLocalPort);
+        CHECK(lab.applicationDatagrams().empty());
+    }
+    step(19, "the same SGW instance sent the dedicated downlink to the target's local TEID");
+    {
+        const auto *moved = lab.target().registry().find(UeRadioId);
+        REQUIRE(moved != nullptr);
+        CHECK(moved->bearer.ueIpv4() == PdnIpv4);
+        CHECK(moved->bearer.parameters().erabId == DefaultEbi);
+        CHECK(moved->dedicatedBearers.front().parameters().erabId == DedicatedEbi);
+        CHECK(moved->dedicatedBearers.front().parameters().linkedDefaultEbi == DefaultEbi);
+        CHECK(lab.source().registry().find(UeRadioId) != nullptr);
+    }
+    step(20, "the target UE received both through its own S1-U and radio path with its PDN address unchanged");
+
+    // --- Step 21: an old-path End Marker changes no release state. --------
+    {
+        const uint64_t endMarkersBefore = lab.source().s1uCounters().endMarkers;
+        const uint64_t activeBefore = lab.source().s1uCounters().endMarkerActiveTunnels;
+        REQUIRE(lab.isolatedSgw().sendEndMarker(session, DefaultEbi));
+        const bool recorded =
+            lab.drive([&] { return lab.source().s1uCounters().endMarkers > endMarkersBefore; }, 4000);
+        REQUIRE(recorded);
+        CHECK(lab.source().s1uCounters().endMarkerActiveTunnels == activeBefore + 1);
+        // The End Marker released nothing: the source still holds its context
+        // and its TEIDs, the core path is still generation 2, and the
+        // transaction is still where the core update left it.
+        CHECK(lab.source().registry().find(UeRadioId) != nullptr);
+        CHECK_FALSE(lab.source().registry().isRetiredTeid(sourceDefaultTeid));
+        CHECK(*lab.isolatedSgw().generationOf(session) == 2);
+        const auto *record = lab.coordinator().find(transaction);
+        REQUIRE(record != nullptr);
+        CHECK(record->state == OrchestrationState::CORE_PATH_UPDATED);
+    }
+    step(21, "the old-path End Marker was recorded as a control message and released nothing");
+
+    // --- Steps 22 to 27: the MME authorizes and the source releases. ------
+    SourceReleaseRefusalRecord guardFailure;
+    REQUIRE(lab.relay().armSourceRelease(transaction, Clock::now(), std::chrono::milliseconds{50}, &guardFailure));
+    {
+        const auto *record = lab.coordinator().find(transaction);
+        REQUIRE(record != nullptr);
+        CHECK(record->state == OrchestrationState::SOURCE_RELEASE_WAIT);
+        CHECK_FALSE(SourceReleaseGuardSatisfied(*record, Clock::now()));
+    }
+    CHECK_FALSE(lab.relay().releaseSource(lab.source(), transaction, Clock::now()).sent);
+    CHECK(lab.source().registry().find(UeRadioId) != nullptr);
+    step(22, "the source-release guard was armed and the early release was refused");
+    std::this_thread::sleep_for(std::chrono::milliseconds{70});
+
+    const SourceReleaseStepOutcome released = lab.relay().releaseSource(lab.source(), transaction, Clock::now());
+    REQUIRE(released.sent);
+    REQUIRE(released.confirmed);
+    step(23, "the isolated MME sent a real encoded UE Context Release Command to the source");
+    step(24, "the source validated the original handover identity and association");
+    CHECK(lab.source().registry().find(UeRadioId) == nullptr);
+    CHECK(lab.source().registry().findByMmeUeS1apId(MmeUeS1apId) == nullptr);
+    CHECK(lab.source().registry().isRetiredTeid(sourceDefaultTeid));
+    CHECK(lab.source().registry().isRetiredTeid(sourceDedicatedTeid));
+    step(25, "the source retired its original local S1-U TEIDs");
+    step(26, "the source returned a real encoded UE Context Release Complete");
+    {
+        const auto *record = lab.coordinator().find(transaction);
+        REQUIRE(record != nullptr);
+        REQUIRE(record->state == OrchestrationState::ISOLATED_HANDOVER_COMPLETE);
+        CHECK(record->sourceRelease.evidence == SourceReleaseEvidence::RELEASE_COMPLETE);
+        const auto complete = DecodeUeContextReleaseComplete(record->sourceRelease.completePdu.data(),
+                                                             record->sourceRelease.completePdu.size());
+        CHECK(complete.mmeUeS1apId == MmeUeS1apId);
+        CHECK(complete.enbUeS1apId == record->source.enbUeS1apId);
+    }
+    step(27, "the isolated MME verified the Release Complete against the transaction");
+
+    // --- Step 28: a delayed G-PDU on an old source TEID is rejected. ------
+    {
+        const uint64_t retiredBefore = lab.source().s1uCounters().retiredTeidDrops;
+        const std::string text = "uniransim phase 18-E delayed old-path packet";
+        const auto packet = BuildUdpIpv4(PeerIpv4, PdnIpv4, PeerPort, ApplicationPort, text);
+        const auto datagram = gtpu::EncodeTPdu(sourceDefaultTeid, packet.data(), packet.size());
+        udp::UdpServer lateSender{"127.0.0.2", 2153};
+        lateSender.Send(lab.source().s1uAddress(), datagram.data(), datagram.size());
+        const bool rejected =
+            lab.drive([&] { return lab.source().s1uCounters().retiredTeidDrops > retiredBefore; }, 4000);
+        REQUIRE(rejected);
+        // It reached no socket of the UE's.
+        CHECK(lab.applicationDatagrams().empty());
+    }
+    step(28, "a delayed G-PDU for the retired source TEID was rejected as retired");
+
+    // --- Steps 29 to 31: the target keeps working and nothing else moved. -
+    {
+        const std::string text = "uniransim phase 18-E default downlink after the release";
+        const std::vector<uint8_t> expected(text.begin(), text.end());
+        const auto packet = BuildUdpIpv4(PeerIpv4, PdnIpv4, PeerPort, ApplicationPort, text);
+        REQUIRE(lab.isolatedSgw().sendDownlink(session, DefaultEbi, packet.data(), packet.size()));
+        std::vector<Datagram> received;
+        REQUIRE(lab.drive(
+            [&] {
+                received = lab.applicationDatagrams();
+                return !received.empty();
+            },
+            8000));
+        REQUIRE(received.size() == 1);
+        CHECK(received.front().payload == expected);
+    }
+    {
+        const std::string text = "uniransim phase 18-E dedicated downlink after the release";
+        const std::vector<uint8_t> expected(text.begin(), text.end());
+        const auto packet = BuildUdpIpv4(PeerIpv4, PdnIpv4, DedicatedLocalPort, DedicatedPeerPort, text);
+        REQUIRE(lab.isolatedSgw().sendDownlink(session, DedicatedEbi, packet.data(), packet.size()));
+        std::vector<Datagram> received;
+        REQUIRE(lab.drive(
+            [&] {
+                received = lab.dedicatedSinkDatagrams();
+                return !received.empty();
+            },
+            8000));
+        REQUIRE(received.size() == 1);
+        CHECK(received.front().payload == expected);
+    }
+    {
+        // The target kept exactly what it owned, and the source's cleanup
+        // retired nothing there.
+        const auto *kept = lab.target().registry().find(UeRadioId);
+        REQUIRE(kept != nullptr);
+        CHECK(kept->bearer.parameters().localTeid == targetDefaultTeid);
+        CHECK(kept->dedicatedBearers.front().parameters().localTeid == targetDedicatedTeid);
+        CHECK(kept->bearer.active());
+        CHECK(kept->dedicatedBearers.front().active());
+        CHECK_FALSE(lab.target().registry().isRetiredTeid(targetDefaultTeid));
+        CHECK_FALSE(lab.target().registry().isRetiredTeid(targetDedicatedTeid));
+        CHECK(lab.target().registry().all().size() == 1);
+        CHECK(lab.source().registry().all().empty());
+    }
+    // Both uplink flows still leave the target's S1-U socket on their own
+    // bearer's SGW TEID after the source context is gone.
+    REQUIRE(lab.sendApplication("uniransim phase 18-E default uplink after the release"));
+    REQUIRE(lab.sendDedicatedApplication("uniransim phase 18-E dedicated uplink after the release"));
+    {
+        std::vector<IsolatedSgw::ReceivedUplink> uplink;
+        REQUIRE(lab.drive(
+            [&] {
+                for (auto &item : lab.isolatedSgw().drainUplink())
+                    uplink.push_back(std::move(item));
+                return uplink.size() >= 2;
+            },
+            8000));
+        std::vector<uint32_t> teids;
+        for (const auto &item : uplink)
+            teids.push_back(item.sgwTeid);
+        std::sort(teids.begin(), teids.end());
+        CHECK(teids == std::vector<uint32_t>{SgwDefaultTeid, SgwDedicatedTeid});
+    }
+    step(29, "the target's default and dedicated bearers still carry traffic after the source release");
+    step(30, "no other UE or subscriber context changed");
+    step(31, "the transaction reached ISOLATED_HANDOVER_COMPLETE");
+
+    REQUIRE(steps.size() == 31);
+    lab.finish();
+    REQUIRE(lab.exitCode() == 0);
+
+    // The run's own transcript, read after its clean shutdown.
+    {
+        const std::string &transcript = lab.log;
+        const auto contains = [&transcript](const std::string &needle) {
+            return transcript.find(needle) != std::string::npos;
+        };
+        const auto occurrences = [&transcript](const std::string &needle) {
+            size_t count = 0;
+            for (size_t at = transcript.find(needle); at != std::string::npos; at = transcript.find(needle, at + 1))
+                ++count;
+            return count;
+        };
+
+        CHECK(contains("Isolated SGW holds the source downlink path of MME-UE-S1AP-ID=" + std::to_string(MmeUeS1apId)));
+        CHECK(contains("Isolated SGW published downlink path generation 2"));
+        CHECK(contains("Isolated MME confirmed downlink path generation 2"));
+        CHECK(contains("Isolated SGW sent an End Marker on the old path"));
+        CHECK(contains("GTP-U End Marker for active tunnel TEID"));
+        CHECK(contains("Source-release guard armed"));
+        CHECK(contains("Isolated MME sent a UE Context Release Command (radioNetwork/successful-handover)"));
+        CHECK(contains("Released the source S1 context of LTE UE " + std::to_string(UeRadioId) +
+                       " for a completed handover"));
+        CHECK(contains("Isolated MME verified the UE Context Release Complete"));
+        CHECK(contains("Dropped S1-U T-PDU for retired TEID"));
+        CHECK(contains("no idle-release notification was sent"));
+
+        // One registration, and no Attach or Service Request anywhere in the
+        // handover or the release.
+        CHECK(occurrences("State=ATTACH_REQUEST_SENT") == 1);
+        CHECK(occurrences("State=ATTACH_COMPLETE_SENT") == 1);
+        CHECK_FALSE(contains("compact EPS Service Request"));
+        CHECK_FALSE(contains("bearer-inventory Service Request"));
+
+        // Real user plane through the kernel TUN in both directions: two
+        // uplink datagrams from the UE's own sockets, and four downlink ones —
+        // two before the switch and two after it.
+        CHECK(contains("LTE UE shutdown complete"));
+        CHECK(contains("tun-ul=4/"));
+        // Two downlinks before the migration, two after it, and two more after
+        // the source release.
+        CHECK(contains("tun-dl=6/"));
+    }
+
+    std::fprintf(stderr, "=== production log ===\n%s=== end of production log ===\n", lab.log.c_str());
+
+    MESSAGE("UNIRANSIM-PHASE18E-PRIVILEGED-EXECUTED");
+    MESSAGE("UNIRANSIM-PHASE18E-PRIVILEGED-COMPLETE");
+}
+

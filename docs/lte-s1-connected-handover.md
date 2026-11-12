@@ -1489,3 +1489,293 @@ another's.
 Every Phase 17 and Phase 18-A/B/C case file is unchanged and still runs in the
 ordinary suite: `test/lte/ue_mobility_target.cpp`, `test/lte/handover_s1.cpp`,
 `test/lte/handover_preparation.cpp` and `test/lte/handover_target_arrival.cpp`.
+
+## 50. Phase 18-E: the isolated core path and the source release
+
+Phase 18-D ended at `AWAITING_CORE_PATH_UPDATE` on purpose. This stage is the
+continuation: the isolated MME dispatches a verified bearer path update, the
+isolated SGW installs it atomically, the MME confirms it against the map the
+SGW actually holds, and only then does a bounded guard allow the MME to release
+the source context with a real encoded UE Context Release Command.
+
+New in the tree:
+
+* `src/lte/enb/handover_core_path.{hpp,cpp}` — the isolated SGW's forwarding
+  map, its sender, the MME's request/commit/confirmation contract and the
+  reconciliation of an answer that was never observed.
+* `src/lte/enb/handover_source_release.{hpp,cpp}` — the source's own record of
+  a handover it executed, the MME's verified release decision, the
+  handover-specific release and the MME's release steps.
+* `UeRegistry::removeHandoverSource` — the handover-specific counterpart of
+  `releaseS1`.
+* `DecodeUeContextReleaseComplete` in the S1AP codec.
+* `test/lte/handover_core_path.cpp` and `test/lte/handover_core_phase.cpp`,
+  and a second privileged case in `test/lte/handover_acceptance.cpp`.
+
+The Phase 18-D acceptance, its relay and its state machine are unchanged. The
+only extension to the shared state machine is one authorized continuation out
+of `AWAITING_CORE_PATH_UPDATE`, and the coordinator offers it only to a record
+that has entered the isolated core phase. A Phase 18-D transaction still stops
+where it did and is still terminal there.
+
+## 51. What the isolated core path is, and what it is not
+
+It is a real forwarding map with real sockets. `IsolatedSgw::sendDownlink`
+reads the destination out of the installed map at send time and sends a genuine
+GTP-U T-PDU to that endpoint tuple. A test that builds a target-bound packet
+itself proves nothing about a path migration, so the sender belongs to the map
+and the caller only ever names a bearer.
+
+It is **not** S11 GTPv2-C. The MME/SGW exchange is an explicitly labelled
+simulator-internal typed contract:
+
+```
+IsolatedPathUpdateRequest   the MME's dispatch: transaction, session, epoch,
+                            target identity, target S1-U address, expected
+                            generation, one accepted endpoint per E-RAB
+IsolatedPathUpdateCommit    what the SGW actually installed: generation,
+                            owning transaction, per-bearer destination and the
+                            original source mapping it replaced
+```
+
+No Modify Bearer Request is encoded, decoded or claimed, no GTP-C message exists
+in the tree, and a confirmed mapping says nothing about a live EPC. The
+procedure codes and information elements of the S1AP messages that *are*
+encoded come from TS 36.413 and are unchanged.
+
+## 52. The forwarding map
+
+The map is keyed by the verified EPS session identity — the MME-UE-S1AP-ID plus
+the PDN address the UE's own NAS was assigned — and, within a session, by EBI.
+Each entry holds:
+
+| Field | Meaning |
+|---|---|
+| `sgwTeid` | The SGW-side tunnel identity the eNB sends uplink to. Part of the key: a bearer whose uplink TEID changed is not the same bearer. |
+| `endpoint` | Where downlink goes now: IPv4 address, port and the eNB-local TEID. |
+| `originalSource` | Where it went before the update. It is what an End Marker is sent to and what a confirmation names as replaced. |
+| `generation` | Bumped once per published replacement of the whole session. |
+| `owner` | The transaction that installed the set. |
+
+The destination is an endpoint tuple and never a TEID on its own. Two eNBs can
+legitimately hold the same numeric local TEID — each allocates from its own
+registry and the number means nothing outside that registry — so a map keyed by
+TEID alone would deliver one cell's traffic to the other. The deterministic
+suite contains exactly that case: two sessions, one numeric TEID, two cells, and
+each downlink arrives at the cell the map names.
+
+A session enters the map only through `installSession`, which is how the source
+mapping measured before the handover comes into existence. Nothing else creates
+one.
+
+## 53. The atomic multi-bearer update
+
+`IsolatedSgw::apply` is all-or-nothing, and the ordering is the guarantee:
+
+1. **Mode.** A live-EPC instance refuses every entry point.
+2. **Completeness.** The request must name a session, a transaction, an MME
+   association epoch, a target identity, the target's own S1-U address, the
+   generation it was written against, and at least one bearer.
+3. **Session.** An unknown session has no source path to replace. Another
+   transaction's ownership is a conflict.
+4. **Staleness.** The association epoch and the expected generation must be the
+   ones the session holds.
+5. **The whole proposed set,** before anything is written: every EBI must exist
+   in the session; every SGW-side TEID must be the installed one; every
+   destination must be a complete endpoint on the target's own S1-U address;
+   every role and linked-default relationship must match the session's
+   inventory; no EBI may appear twice; the set must cover every bearer of the
+   session and no others; and there must be exactly one default bearer with
+   every dedicated bearer's linked default inside the same set.
+6. **Publication.** A complete replacement `SessionState` is built and assigned
+   to the session in one step. There is no intermediate state in which the
+   default bearer is on the target and the dedicated one is still on the
+   source.
+
+An exact repeat of the replacement a transaction already installed is a replay:
+it reports the installed generation and publishes nothing. A repeat that
+disagrees with it is a conflicting replacement and is refused.
+
+## 54. The MME's decision, confirmation and the indeterminate case
+
+The MME's precondition set, checked by `BeginIsolatedCorePathUpdate` before
+anything is dispatched:
+
+* isolated-simulator mode;
+* a transaction at `AWAITING_CORE_PATH_UPDATE`, not cancelled, with its
+  arrival token bound and its coordination record complete;
+* a target that still holds the reached UE under the verified arrival's radio
+  identity and this transaction's MME identity;
+* every admitted bearer present, established, `active()` and agreeing with the
+  transaction's own EBI, QCI, role and linked-default statement;
+* exactly one default bearer and every dedicated bearer's linked default inside
+  the set;
+* an isolated SGW that really holds this session's source path.
+
+Only then is the request recorded and the transaction moved to
+`CORE_UPDATE_REQUESTED`. `ApplyIsolatedBearerPathUpdate` moves it to
+`CORE_UPDATE_COMMITTING` before the SGW is entered, asks the SGW, and then
+reads the installed map back through `ReadIsolatedPathState`. The confirmation
+is verified against the request: session, transaction, MME association epoch,
+generation (exactly the request's expected generation plus one), the exact EBI
+set, every destination, every SGW-side TEID, every role relationship and every
+original source mapping.
+
+Three outcomes, and only one is a success:
+
+* `CORE_PATH_UPDATED` — the SGW's installed map matched the request exactly.
+* `CORE_UPDATE_FAILED` — the SGW refused and published nothing.
+* `CORE_UPDATE_INDETERMINATE` — a replacement may be installed but this MME
+  cannot prove it. Nothing is released, no second update is applied, and
+  `cancel` refuses the transaction.
+
+`ReconcileIsolatedPathUpdate` is the only way out of the indeterminate state. It
+re-reads the map, verifies the same confirmation, and moves the transaction to
+`CORE_PATH_UPDATED` only when the exact transaction and the complete endpoint
+set can be proven. It never re-applies the request, so a lost answer cannot
+cause a second publication.
+
+## 55. The source release
+
+Two facts must agree before a UE Context Release Command takes the handover
+path:
+
+1. **The source's own record.** When the source's production radio sender
+   delivers the simulated handover command, it records the transaction, the
+   UE's radio identity, the S1AP pair, the access generation, the association
+   epoch and the target. A cell that never commanded a UE holds no such record,
+   and no message can supply one.
+2. **The MME's verified decision.** `BuildHandoverSourceReleaseDecision` can
+   only be built from a record whose core path was confirmed; it names the
+   transaction, both S1AP identities, the access generation, the association
+   epoch, the confirmed path generation, the target and the exact source
+   transport. The source verifies every one of them against its live context
+   before it retires anything.
+
+The command must additionally state `radioNetwork`/`successful-handover`. The
+cause corroborates; it never authorizes.
+
+`ReleaseHandoverSourceContext` then calls `UeRegistry::removeHandoverSource`,
+which retires the default and dedicated local TEIDs through the ordinary
+ledger, erases the S1AP identity indexes, releases the bearer contexts and
+erases the entry, its radio identity and its peer. Nothing is retained. The
+handler sends a real encoded `UeContextReleaseComplete` and no
+`S1_CONTEXT_RELEASED`.
+
+The ordinary ECM-IDLE path in `onUeContextReleaseCommand` is unchanged: any
+release that is not a successful-handover release still goes through
+`releaseS1`, still retains the session, still keeps the entry in
+`IDLE_RETAINED`, and still tells the UE.
+
+Timing is a bounded guard. `EnterSourceReleaseWait` arms a deadline the caller
+supplies; a release before it is refused as `RELEASE_GUARD_NOT_SATISFIED`. A
+sent command is not a release: only a decoded Complete whose identity pair
+matches the transaction produces `ISOLATED_HANDOVER_COMPLETE`. If the Complete
+is lost, `ReconcileSourceRelease` confirms only when the source's registry no
+longer holds the context and every TEID the decision named is recorded as
+retired, and it reports that as `RECONCILED_REGISTRY`, never as a received
+Complete.
+
+## 56. The accepted sequence
+
+The privileged case
+`lte/handover/acceptance: mme-controlled core path migration and source release complete an isolated s1 handover`
+drives 31 steps and ends in `ISOLATED_HANDOVER_COMPLETE`:
+
+| Step | Observation |
+|---|---|
+| 1–2 | the running UE is attached to the source; both bearers are active |
+| 3 | the isolated SGW holds a source mapping for both bearers |
+| 4–5 | the SGW's own sender delivers a default and a dedicated downlink that the source UE receives, and the source's uplink reaches the SGW's socket on both bearer TEIDs |
+| 6–9 | Handover Required, the relayed preparation, the committed target transport and the simulated command |
+| 10–12 | the UE runtime moves its radio endpoint, the target verifies the arrival, promotes and activates |
+| 13–14 | the target's real Handover Notify is accepted and the transaction reaches `AWAITING_CORE_PATH_UPDATE` |
+| 15–17 | the MME requests the migration, the SGW publishes generation 2 atomically, the MME verifies it against the installed map |
+| 18–20 | the same SGW instance sends the default and the dedicated downlink to the target's local TEIDs; the target UE receives both with its PDN address unchanged |
+| 21 | an End Marker on the old source path is recorded as a control message and changes no release state |
+| 22–27 | the guard elapses, the MME sends the real Release Command, the source releases and retires its TEIDs, and the MME verifies the real Complete |
+| 28 | a delayed G-PDU for the retired source TEID is rejected as retired |
+| 29–30 | the target's downlink and uplink still work on both bearers, and no other context changed |
+| 31 | the transaction reaches `ISOLATED_HANDOVER_COMPLETE` |
+
+The run reports `tun-ul=4/...` and `tun-dl=6/...`, exactly one
+`ATTACH_REQUEST_SENT` and one `ATTACH_COMPLETE_SENT`, and no Service Request.
+
+## 57. Implemented versus deferred after Phase 18-E
+
+| Area | Status |
+|---|---|
+| Isolated MME-owned update decision | **Implemented** |
+| Isolated SGW forwarding map with per-bearer endpoint tuples | **Implemented** |
+| Atomic multi-bearer replacement | **Implemented** |
+| Confirmation read back out of the installed map | **Implemented** |
+| Indeterminate handling and reconciliation | **Implemented** |
+| SGW-originated downlink before and after the switch | **Implemented, with real UDP** |
+| End Marker on the old path | **Implemented (isolated SGW producer, eNB recorder)** |
+| MME-authorized, handover-specific source release | **Implemented** |
+| Real encoded UE Context Release Command/Complete | **Implemented** |
+| Source TEID retirement and delayed-packet rejection | **Implemented** |
+| Target preservation after source cleanup | **Implemented** |
+| Real MME integration | **Deferred** |
+| Real SGW control-plane signalling (GTPv2-C) | **Deferred** |
+| Standards-valid RRC transparent containers | **Deferred** |
+| Real source/target coordination (an over-the-air arrival binding) | **Deferred** |
+| Live Open5GS authorization for a handover | **Deferred, and not requested** |
+| Optional forwarding and packet-loss handling | **Deferred** |
+| Chained handovers | **Deferred** |
+
+## 58. Retained interoperability gaps
+
+Nothing here narrows the gaps the earlier sections recorded, and this stage adds
+no new claim about a live core:
+
+* **Real MME integration.** The isolated MME is a relay between two simulator
+  eNBs. It holds no subscriber state, performs no core procedure, and is not
+  reachable from a live S1AP association.
+* **Real SGW control-plane signalling.** No GTPv2-C message exists. The path
+  update is a typed in-process contract between two components the simulator
+  owns, and it must not be described as a Modify Bearer Request.
+* **Standards-valid RRC transparent containers.** The source-to-target
+  container is the simulator's own labelled bytes, echoed by the acknowledge.
+  No RRC message is produced or parsed.
+* **Real source/target coordination.** The arrival binding is a correlation
+  value handed from the target's preparation to the source by a harness that
+  verified both ends. It is not a credential and it has no S1AP representation.
+* **Live Open5GS authorization.** Phase 18-E performed no live experiment and
+  none is claimed. No PCC rule, subscriber record, HSS datum or EPC process was
+  touched, and a successful isolated simulation authorizes no live handover.
+* **Optional forwarding and loss handling.** There is no direct or indirect
+  data forwarding. The End Marker this stage sends is the isolated SGW's
+  statement that the old path ended; it is not a forwarding mechanism, it does
+  not drain a tunnel, and no packet is reordered, replayed or recovered.
+* **Chained handovers.** One connected-mode handover per access. A second one
+  while the first is executing is refused, and a completed transaction is
+  terminal.
+
+## 59. Test coverage
+
+`test/lte/handover_core_path.cpp`, fifteen cases under
+`lte/handover/core-path:*`, drives the map and its sender against real UDP
+sockets standing in for two cells: provisioning, atomic publication, reverse
+bearer order, partial and malformed replacements, the same numeric TEID on two
+cells, duplicates and conflicting duplicates, stale generation and association,
+the sender before and after the update, the confirmation and its refusals, the
+End Marker and the live-mode refusal.
+
+`test/lte/handover_core_phase.cpp`, ten cases under
+`lte/handover/core-phase:*`, drives the full production pipeline — two real
+`EnbMultiplexer` instances, the isolated MME relay, a real encoded radio
+arrival and the isolated SGW — through the notify, the update, the confirmation,
+the End Marker, the guard, the release and the reconciliation, plus the
+refusals: an update before the notify, an update without a reached target, a
+reconciled lost answer, an unreadable installation, a second update, an
+unverified release decision, an unchanged ordinary idle release, a duplicate
+release command and multi-UE isolation.
+
+The privileged case is the second one in `test/lte/handover_acceptance.cpp`. It
+is a `doctest::skip()` case with no `ctest` entry, run by the privileged CI
+job as its own invocation with its own log and its own sentinels,
+`UNIRANSIM-PHASE18E-PRIVILEGED-EXECUTED` and
+`UNIRANSIM-PHASE18E-PRIVILEGED-COMPLETE`. The job runs four invocations, one
+per skipped case.
+

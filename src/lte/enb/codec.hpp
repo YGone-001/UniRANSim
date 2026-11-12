@@ -211,6 +211,17 @@ std::vector<uint8_t> EncodeUeContextReleaseCommand(uint32_t mmeUeS1apId, std::op
                                                    const std::string &causeCategory, int causeValue);
 std::vector<uint8_t> EncodeUeContextReleaseComplete(uint32_t mmeUeS1apId, uint32_t enbUeS1apId);
 
+// The source eNB's answer to a UE Context Release Command. Both identifiers
+// are mandatory and neither may be zero: the pair is what an MME correlates the
+// answer with, and an answer that named no UE would correlate with everything.
+struct UeContextReleaseComplete
+{
+    uint32_t mmeUeS1apId{};
+    uint32_t enbUeS1apId{};
+};
+
+UeContextReleaseComplete DecodeUeContextReleaseComplete(const uint8_t *data, size_t length);
+
 struct UeContextReleaseRequest
 {
     uint32_t mmeUeS1apId{};

@@ -250,10 +250,69 @@ jobs:
             grep -q "LTE UE shutdown complete" privileged-tun-p18d.log
             ! grep -q "control-plane-only" privileged-tun-p18d.log
           '
+      # The isolated core path migration and source release is a fourth skipped
+      # case: the accepted Phase 18-D sequence extended past its own boundary
+      # into a real SGW forwarding-map switch and an MME-authorized source
+      # release. It gets its own invocation, its own log and its own sentinels,
+      # so one case's pass cannot be mistaken for another's.
+      - name: Run the privileged core path migration and source release acceptance
+        run: |
+          sudo unshare --net -- bash -euo pipefail -c '
+            ip link set lo up
+            test "$(id -u)" = "0"
+            test -c /dev/net/tun
+            export UNIRANSIM_RUN_PRIVILEGED_TUN_TESTS=1
+            ./cmake-build-privileged/nr-tests \
+              --no-skip \
+              --test-case="lte/handover/acceptance: mme-controlled core path migration and source release complete an isolated s1 handover" \
+              2>&1 | tee privileged-tun-p18e.log
+
+            # A skipped case never reaches its own body, so it prints neither
+            # sentinel and the job must not be able to call that a pass.
+            grep -q "UNIRANSIM-PHASE18E-PRIVILEGED-EXECUTED" privileged-tun-p18e.log
+            grep -q "UNIRANSIM-PHASE18E-PRIVILEGED-COMPLETE" privileged-tun-p18e.log
+            grep -Eq "test cases: +1 \| +1 passed \| 0 failed" privileged-tun-p18e.log
+
+            # The isolated SGW really installed the replacement and the MME
+            # verified it against the map it read back, rather than trusting
+            # the answer it asked for.
+            grep -q "Isolated SGW holds the source downlink path" privileged-tun-p18e.log
+            grep -q "Isolated SGW published downlink path generation 2" privileged-tun-p18e.log
+            grep -q "Isolated MME confirmed downlink path generation 2" privileged-tun-p18e.log
+
+            # The old-path End Marker was classified as a control message and
+            # released nothing.
+            grep -q "Isolated SGW sent an End Marker on the old path" privileged-tun-p18e.log
+            grep -q "GTP-U End Marker for active tunnel TEID" privileged-tun-p18e.log
+
+            # The source was released by an MME decision, through a real
+            # encoded command, and answered with a real encoded Complete. The
+            # source TEIDs are retired and the old-path packet is refused.
+            grep -q "Isolated MME sent a UE Context Release Command (radioNetwork/successful-handover)" privileged-tun-p18e.log
+            grep -q "Released the source S1 context of LTE UE 7 for a completed handover" privileged-tun-p18e.log
+            grep -q "Isolated MME verified the UE Context Release Complete" privileged-tun-p18e.log
+            grep -q "Dropped S1-U T-PDU for retired TEID" privileged-tun-p18e.log
+            grep -q "no idle-release notification was sent" privileged-tun-p18e.log
+
+            # Exactly one Attach: a handover is not an Attach and the release is
+            # not an idle Service Request.
+            test "$(grep -c "State=ATTACH_REQUEST_SENT" privileged-tun-p18e.log)" -eq 1
+            test "$(grep -c "State=ATTACH_COMPLETE_SENT" privileged-tun-p18e.log)" -eq 1
+            ! grep -q "compact EPS Service Request" privileged-tun-p18e.log
+            ! grep -q "bearer-inventory Service Request" privileged-tun-p18e.log
+
+            # Real IPv4 crossed a kernel TUN in both directions before and after
+            # the migration: four uplink datagrams and six downlink ones. A run
+            # that stayed control-plane-only reports zeros here.
+            grep -q "tun-ul=4/" privileged-tun-p18e.log
+            grep -q "tun-dl=6/" privileged-tun-p18e.log
+            grep -q "LTE UE shutdown complete" privileged-tun-p18e.log
+            ! grep -q "control-plane-only" privileged-tun-p18e.log
+          '
       - name: Report
         if: always()
         run: |
-          for log in privileged-tun.log privileged-tun-p17.log privileged-tun-p18d.log; do
+          for log in privileged-tun.log privileged-tun-p17.log privileged-tun-p18d.log privileged-tun-p18e.log; do
             if [ -f "$log" ]; then
               { echo "### $log"; echo '```'; cat "$log"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
             else

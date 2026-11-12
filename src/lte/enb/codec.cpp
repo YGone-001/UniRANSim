@@ -1668,6 +1668,41 @@ std::vector<uint8_t> EncodeUeContextReleaseComplete(uint32_t mmeUeS1apId, uint32
     return EncodePdu(1, PROCEDURE_UE_CONTEXT_RELEASE, Criticality::REJECT, ies);
 }
 
+UeContextReleaseComplete DecodeUeContextReleaseComplete(const uint8_t *data, size_t length)
+{
+    auto envelope = DecodeEnvelope(data, length, PROCEDURE_UE_CONTEXT_RELEASE, static_cast<int>(Criticality::REJECT));
+    if (envelope.choice != 1)
+        throw CodecError("UE Context Release Complete is not a successful outcome");
+
+    UeContextReleaseComplete result{};
+    bool mmePresent = false;
+    bool enbPresent = false;
+    for (const auto &ie : DecodeIeContainer(envelope.value))
+    {
+        if (ie.id == IE_MME_UE_S1AP_ID)
+        {
+            if (ie.criticality != Criticality::REJECT)
+                throw CodecError("MME-UE-S1AP-ID has invalid criticality");
+            result.mmeUeS1apId = DecodeUeId(ie.value, 0xFFFFFFFFU);
+            mmePresent = true;
+        }
+        else if (ie.id == IE_ENB_UE_S1AP_ID)
+        {
+            if (ie.criticality != Criticality::REJECT)
+                throw CodecError("eNB-UE-S1AP-ID has invalid criticality");
+            result.enbUeS1apId = DecodeUeId(ie.value, 0xFFFFFFU);
+            enbPresent = true;
+        }
+        else if (ie.criticality == Criticality::REJECT)
+            throw CodecError("Unknown reject-criticality IE in UE Context Release Complete");
+    }
+    if (!mmePresent || !enbPresent)
+        throw CodecError("UE Context Release Complete is missing a mandatory IE");
+    if (result.mmeUeS1apId == 0 || result.enbUeS1apId == 0)
+        throw CodecError("UE Context Release Complete names no UE");
+    return result;
+}
+
 std::vector<uint8_t> EncodeUeContextReleaseRequest(uint32_t mmeUeS1apId, uint32_t enbUeS1apId,
                                                    const std::string &causeCategory, int causeValue)
 {
