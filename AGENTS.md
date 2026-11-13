@@ -949,10 +949,51 @@ receive path. Its rules are what a later change must not weaken.
   claimed from a multiplexer-only fixture.
 - The process-per-UE decision is `KEEP_PROCESS_PER_UE` only while the measured
   512-process fleet stays inside the budget with clean teardown. It covers the
-  measured pre-authentication runtime; post-authentication TUN devices and user
-  plane remain `BLOCKED_AUTHORIZATION` until a real registration campaign.
+  measured pre-authentication runtime. The later 512-subscriber campaign
+  measured the post-authentication TUN and registration state with the
+  authorized cohort; user-plane throughput remains a separate PERF-P1 question.
 - Nothing here changes GTP-U forwarding, TUN packet handling, TEID lifecycle or
   the Phase 19-A iperf3 profiles. PERF-P1 remains a separate workstream.
+
+## Real LTE Attach campaigns
+
+The designated 512 subscribers ran through genuine EPS-AKA, NAS security and
+Attach against the live Open5GS EPC. These rules are what a later
+campaign must not weaken.
+
+- A subscriber inventory is verified as a set, not by a count: every IMSI from
+  the first to the last inclusive must be present exactly once, with a complete
+  K and exactly one usable OPc or OP, an AMF, and the intended APN. A range
+  count alone is not verification.
+- Only the identities explicitly designated for the campaign may be used. Do
+  not create, modify, clone or delete subscribers. Do not print K, OPc, OP or
+  an authentication trace containing them. Generated configurations are mode
+  600, outside Git, and never logged.
+- The campaign builds a one-to-one manifest: index → IMSI → radio UE id →
+  `enbLink.localPort` → TUN prefix. Every runtime identity is unique.
+- TUN naming must be collision-safe under concurrent startup. A shared
+  generated prefix races: two UEs can be offered the same name. Give each UE a
+  unique prefix (or serialize allocation) before starting it.
+- A live campaign is bounded and staged: 1 → 4 → 16 → 32 → 64 → 128 → 256 →
+  512, with the production default radio budget, bounded outstanding Attach
+  transactions, and a stop on the first material failure. Do not launch 512
+  Attach Requests at once.
+- Process execution, radio registration, Attach Request, Attach Accept and EPS
+  registration are five different states. A report must name which one each
+  number is. The MME `enb_ue` gauge and session counters are corroborated, not
+  replaced, by UE state logs.
+- Retention is a measured window, not the last Attach count. Sample the
+  registered population, TUNs, addresses and processes for the whole window.
+- When the UE TUN leaves the host namespace to avoid stealing EPC traffic, the
+  move may clear its address. Restore the exact address the Attach assigned;
+  never invent one.
+- Cleanup goes through the supported UE Detach path. Stopping the eNB clears
+  its eNB-UE contexts but leaves MME/SMF sessions; do not restart Open5GS to
+  make them disappear, and do not delete unrelated sessions. Verify the EPC
+  returns to its pre-campaign counts.
+- The 512-subscriber live campaign is a separately authorized local operation.
+  Never add it to GitHub Actions, and never make an ordinary test depend on the
+  live EPC, MongoDB or subscriber secrets.
 
 ## What must never be committed
 

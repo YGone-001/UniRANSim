@@ -239,8 +239,9 @@ buffer, which is a deployment concern rather than an architecture change.
 
 ## 13. Remaining real-EPC registration prerequisites
 
-`REAL_512_UE_BLOCKED_AUTHORIZATION` is unchanged. A genuine campaign still
-needs separate approval for: 508 additional subscriber identities beyond the
+The subsequent 512-subscriber campaign ran the authorized cohort and reached
+`REAL_512_UE_ACCEPTED`; see `docs/lte-512-real-attach-acceptance.md`. This
+section records the prerequisites that had to be satisfied first: separate approval for: 508 additional subscriber identities beyond the
 authorized four, identity ownership, HSS/authentication provisioning, EPC
 session and IP-pool capacity, registration rate, a sustained observation window,
 independent user-plane verification, cleanup and rollback. No subscriber, IMSI,
