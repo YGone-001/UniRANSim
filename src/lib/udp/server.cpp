@@ -69,6 +69,14 @@ bool UdpServer::TrySend(const InetAddress &address, const uint8_t *buffer, size_
     throw std::runtime_error{"UdpServer::Send failure: No IP socket found"};
 }
 
+int UdpServer::NativeFd() const
+{
+    for (const auto &s : sockets)
+        if (s.hasFd())
+            return s.getFd();
+    return -1;
+}
+
 InetAddress UdpServer::LocalAddress() const
 {
     for (const Socket &s : sockets)

@@ -6,13 +6,14 @@
 // See README, LICENSE, and CONTRIBUTING files for licensing details.
 //
 
-// Phase 19-B: production 512-context capacity, isolated.
+// Phase 19-B/19-C: production 512-context capacity, isolated.
 //
 // These cases exercise the production registry and the production radio
 // ingress with test-owned contexts and test-owned UDP peers. Everything here
-// is ISOLATED_CONTEXT_CAPACITY or SIMULATED_RADIO_CONTEXT_ACTIVE and nothing
-// else: no NAS procedure runs, no EPC is contacted, and a synthetic context is
-// never an authenticated EPS Attach.
+// is ISOLATED_REGISTRY_CONTEXT_ACTIVE, ISOLATED_CONTEXT_RETAINED or
+// SIMULATED_RADIO_ENDPOINT_ACTIVE and nothing else: no NAS procedure runs, no
+// EPC is contacted, and a synthetic context is never an authenticated EPS
+// Attach or a retained EPS registration.
 
 #include <ext/doctest/doctest.h>
 
@@ -25,10 +26,12 @@
 #include <memory>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <lte/enb/capacity_report.hpp>
 #include <lte/enb/config.hpp>
+#include <lte/enb/runtime_metrics.hpp>
 #include <lte/enb/multiplexer.hpp>
 #include <lte/enb/ue_registry.hpp>
 #include <lte/ue/radio_link.hpp>
@@ -47,17 +50,6 @@ constexpr size_t kLadder[] = {1, 2, 4, 8, 16, 32, 64, 128, 256, 512};
 double MillisSince(Clock::time_point start)
 {
     return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
-}
-
-// Resident set size of this process, read from procfs. It is the peak this
-// test can observe for the eNB-side allocation; a UE process has its own.
-uint64_t ReadRssBytes()
-{
-    std::ifstream statm("/proc/self/statm");
-    unsigned long total = 0, resident = 0;
-    if (statm >> total >> resident)
-        return static_cast<uint64_t>(resident) * 4096ULL;
-    return 0;
 }
 
 std::string WriteConfig(const std::string &body)
@@ -87,6 +79,12 @@ CapacityCheckpoint RunRegistryCheckpoint(size_t count)
 {
     CapacityCheckpoint checkpoint;
     checkpoint.requestedCount = count;
+
+    // The three memory observations are taken at distinct points and are never
+    // collapsed into one number. VmHWM is the kernel's peak for this process;
+    // a single current-RSS sample is not a peak.
+    const auto baseline = ReadSelfMemory();
+    checkpoint.baselineRssBytes = baseline.currentRssBytes;
 
     UeRegistry registry(count);
     const auto registrationStart = Clock::now();
@@ -133,7 +131,29 @@ CapacityCheckpoint RunRegistryCheckpoint(size_t count)
         checkpoint.configurationLimitReached = true;
     }
 
-    checkpoint.peakRssBytes = ReadRssBytes();
+    // A declared retention window: the same contexts must still resolve after
+    // it. This is ISOLATED_CONTEXT_RETAINED, not EPS registration retention.
+    const auto retentionStart = Clock::now();
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    size_t retained = 0;
+    for (size_t i = 0; i < count; ++i)
+        if (registry.find(static_cast<uint32_t>(1000 + i)) != nullptr)
+            ++retained;
+    checkpoint.retentionObservationMs = MillisSince(retentionStart);
+    const bool contextRetained = retained == count && registry.size() == count;
+
+    const auto observed = ReadSelfMemory();
+    checkpoint.observedRssBytes = observed.currentRssBytes;
+    checkpoint.peakRssBytes = observed.peakObserved ? observed.peakRssBytes : observed.currentRssBytes;
+    checkpoint.pssBytes = observed.pssBytes;
+    checkpoint.pssAvailable = observed.sharedPagesResolved;
+    checkpoint.rssSampleCount = 2;
+    if (checkpoint.createdContexts != 0)
+    {
+        const int64_t delta = static_cast<int64_t>(checkpoint.observedRssBytes) -
+                              static_cast<int64_t>(checkpoint.baselineRssBytes);
+        checkpoint.perContextRssDeltaBytes = delta / static_cast<int64_t>(checkpoint.createdContexts);
+    }
 
     // Release every context and verify nothing is left behind.
     const auto cleanupStart = Clock::now();
@@ -145,25 +165,38 @@ CapacityCheckpoint RunRegistryCheckpoint(size_t count)
     checkpoint.cleanupDurationMs = MillisSince(cleanupStart);
     checkpoint.remainingContexts = registry.size();
 
-    // Only what was actually observed is claimed.
+    // Only what was actually observed is claimed. A synthetic registry entry
+    // establishes isolated context capacity and context persistence; it is not
+    // an EPS registration, is not retained registration and is not an Attach.
     if (checkpoint.createdContexts == count && checkpoint.failedCreations == 0 &&
         checkpoint.remainingContexts == 0 && checkpoint.configurationLimitReached)
     {
         checkpoint.classifications.isolatedContextCapacity = EvidenceState::PASS;
+        checkpoint.classifications.isolatedRegistryContextActive = EvidenceState::PASS;
         checkpoint.classifications.cleanupComplete = EvidenceState::PASS;
-        checkpoint.classifications.stableRegistrationRetained = EvidenceState::PASS;
     }
     else
     {
         checkpoint.classifications.isolatedContextCapacity = EvidenceState::FAIL;
+        checkpoint.classifications.isolatedRegistryContextActive = EvidenceState::FAIL;
+        checkpoint.classifications.cleanupComplete = EvidenceState::FAIL;
     }
-    // Everything below requires real EPC evidence and is never inferred here.
+    checkpoint.classifications.isolatedContextRetained =
+        contextRetained ? EvidenceState::PASS : EvidenceState::FAIL;
+    // EPS registration retention is never established by a registry workload.
+    // Phase 19-B set this to PASS here; that was a misclassification.
+    checkpoint.classifications.stableRegistrationRetained = EvidenceState::NOT_MEASURED;
+    // Everything below requires real EPC or process evidence and is never
+    // inferred from a synthetic context.
     checkpoint.classifications.simulatedAttachSuccess = EvidenceState::NOT_APPLICABLE;
     checkpoint.classifications.realEpcAuthenticatedAttach = EvidenceState::BLOCKED_AUTHORIZATION;
     checkpoint.classifications.simultaneousEpsRegistration = EvidenceState::BLOCKED_AUTHORIZATION;
     checkpoint.classifications.simultaneousDefaultBearers = EvidenceState::NOT_APPLICABLE;
     checkpoint.classifications.independentUeIpv4Assignment = EvidenceState::NOT_APPLICABLE;
     checkpoint.classifications.userPlaneReady = EvidenceState::NOT_APPLICABLE;
+    checkpoint.classifications.simulatedRadioEndpointActive = EvidenceState::NOT_APPLICABLE;
+    checkpoint.classifications.actualLteUeProcessAlive = EvidenceState::NOT_MEASURED;
+    checkpoint.classifications.preAuthAttachAttempt = EvidenceState::NOT_APPLICABLE;
     return checkpoint;
 }
 
@@ -220,12 +253,62 @@ TEST_CASE("lte/capacity: the complete ladder fills the production registry to 51
         CHECK(checkpoint.configurationLimitReached);
         CHECK(checkpoint.remainingContexts == 0);
         CHECK(checkpoint.classifications.isolatedContextCapacity == EvidenceState::PASS);
+        CHECK(checkpoint.classifications.isolatedRegistryContextActive == EvidenceState::PASS);
+        CHECK(checkpoint.classifications.isolatedContextRetained == EvidenceState::PASS);
         CHECK(checkpoint.classifications.cleanupComplete == EvidenceState::PASS);
         // A synthetic context is never a real EPC Attach and never a simulated
         // one either: no NAS procedure ran.
         CHECK(checkpoint.classifications.realEpcAuthenticatedAttach == EvidenceState::BLOCKED_AUTHORIZATION);
         CHECK(checkpoint.classifications.simulatedAttachSuccess == EvidenceState::NOT_APPLICABLE);
+        CHECK(checkpoint.classifications.actualLteUeProcessAlive == EvidenceState::NOT_MEASURED);
+        CHECK(checkpoint.classifications.preAuthAttachAttempt == EvidenceState::NOT_APPLICABLE);
+        // The Phase 19-B defect: no EPS registration exists, so its retention
+        // cannot be claimed by this workload.
+        CHECK(checkpoint.classifications.stableRegistrationRetained == EvidenceState::NOT_MEASURED);
+        CHECK(checkpoint.classifications.stableRegistrationRetained != EvidenceState::PASS);
+        // Memory: peak is VmHWM, current is VmRSS, baseline was taken first.
+        // VmHWM is the kernel's high-water mark and is updated at the
+        // allocator's own granularity, so a later VmRSS sample can exceed it by
+        // a few pages; the two are separate observations, not one ordering.
+        CHECK(checkpoint.baselineRssBytes > 0);
+        CHECK(checkpoint.observedRssBytes > 0);
+        CHECK(checkpoint.peakRssBytes > 0);
+        CHECK(checkpoint.rssSampleCount == 2);
     }
+}
+
+TEST_CASE("lte/capacity: a synthetic registry cannot claim eps registration or registration retention")
+{
+    // The Phase 19-B checkpoint set STABLE_REGISTRATION_RETAINED to PASS after
+    // an immediate synthetic allocation and cleanup. This case is the
+    // regression: no EPS registration exists, so every EPS concept must stay
+    // unproven while context persistence is reported under its own field.
+    const auto checkpoint = RunRegistryCheckpoint(8);
+
+    CHECK(checkpoint.classifications.isolatedContextCapacity == EvidenceState::PASS);
+    CHECK(checkpoint.classifications.isolatedRegistryContextActive == EvidenceState::PASS);
+    CHECK(checkpoint.classifications.isolatedContextRetained == EvidenceState::PASS);
+
+    const EvidenceState epsConcepts[] = {
+        checkpoint.classifications.stableRegistrationRetained,
+        checkpoint.classifications.simulatedAttachSuccess,
+        checkpoint.classifications.realEpcAuthenticatedAttach,
+        checkpoint.classifications.simultaneousEpsRegistration,
+        checkpoint.classifications.simultaneousDefaultBearers,
+        checkpoint.classifications.independentUeIpv4Assignment,
+        checkpoint.classifications.userPlaneReady,
+    };
+    for (const auto state : epsConcepts)
+        CHECK(state != EvidenceState::PASS);
+
+    CHECK(checkpoint.classifications.stableRegistrationRetained == EvidenceState::NOT_MEASURED);
+    CHECK(checkpoint.classifications.simulatedAttachSuccess == EvidenceState::NOT_APPLICABLE);
+    CHECK(checkpoint.classifications.realEpcAuthenticatedAttach == EvidenceState::BLOCKED_AUTHORIZATION);
+    CHECK(checkpoint.classifications.simultaneousEpsRegistration == EvidenceState::BLOCKED_AUTHORIZATION);
+
+    // A resource-limited workload has its own state and is not folded into a
+    // failure or into NOT_MEASURED.
+    CHECK(std::string(ToString(EvidenceState::BLOCKED_RESOURCE_LIMIT)) == "BLOCKED_RESOURCE_LIMIT");
 }
 
 TEST_CASE("lte/capacity: five hundred and twelve contexts are independently indexed")
@@ -450,4 +533,14 @@ TEST_CASE("lte/capacity: structured checkpoint records are reproducible")
     CHECK(line.find("isolated=PASS") != std::string::npos);
     CHECK(line.find("real_epc=BLOCKED_AUTHORIZATION") != std::string::npos);
     CHECK(line.find("cleanup=PASS") != std::string::npos);
+    // Phase 19-C keys are appended and each names its own workload.
+    CHECK(line.find("registry_active=PASS") != std::string::npos);
+    CHECK(line.find("radio_endpoint=NOT_APPLICABLE") != std::string::npos);
+    CHECK(line.find("ue_process_alive=NOT_MEASURED") != std::string::npos);
+    CHECK(line.find("preauth_attach=NOT_APPLICABLE") != std::string::npos);
+    CHECK(line.find("ctx_retained=PASS") != std::string::npos);
+    CHECK(line.find("retained=NOT_MEASURED") != std::string::npos);
+    CHECK(line.find("rss_samples=2") != std::string::npos);
+    CHECK(line.find("rss_per_context_delta=") != std::string::npos);
+    CHECK(line.find("pss_available=") != std::string::npos);
 }

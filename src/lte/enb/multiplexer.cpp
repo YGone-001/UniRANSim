@@ -9,6 +9,7 @@
 #include "multiplexer.hpp"
 
 #include "codec.hpp"
+#include "runtime_metrics.hpp"
 
 #include <iomanip>
 #include <set>
@@ -345,9 +346,22 @@ void EnbMultiplexer::poll(int radioBudget, int s1uBudget)
             break;
         if (counting)
             m_perf.radioPacketsPolled.fetch_add(1, std::memory_order_relaxed);
+        const auto receivedAt = std::chrono::steady_clock::now();
         handleRadioFrame(buffer, static_cast<size_t>(length), peer);
+        if (m_radioObserver)
+            m_radioObserver(peer, buffer, static_cast<size_t>(length), receivedAt, std::chrono::steady_clock::now());
     }
     m_s1u.poll(s1uBudget);
+}
+
+void EnbMultiplexer::setRadioFrameObserver(RadioFrameObserver observer)
+{
+    m_radioObserver = std::move(observer);
+}
+
+int EnbMultiplexer::radioReceiveBufferBytes() const
+{
+    return ReadSocketReceiveBuffer(m_ueLink.NativeFd());
 }
 
 void EnbMultiplexer::handleS1ap(const uint8_t *data, size_t size, uint16_t stream)

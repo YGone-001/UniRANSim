@@ -291,6 +291,7 @@ class UeRegistry
     void demoteToProvisional(EnbUeEntry &entry);
 
     EnbUeEntry *find(uint32_t radioUeId);
+    const EnbUeEntry *find(uint32_t radioUeId) const;
     EnbUeEntry *findByPeer(const InetAddress &peer);
     EnbUeEntry *findByEnbUeS1apId(uint32_t enbUeS1apId);
     [[nodiscard]] const EnbUeEntry *findByEnbUeS1apId(uint32_t enbUeS1apId) const;

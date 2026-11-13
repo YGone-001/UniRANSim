@@ -367,6 +367,11 @@ EnbUeEntry *UeRegistry::find(uint32_t radioUeId)
     return it == m_byRadioUeId.end() ? nullptr : it->second.get();
 }
 
+const EnbUeEntry *UeRegistry::find(uint32_t radioUeId) const
+{
+    return const_cast<UeRegistry *>(this)->find(radioUeId);
+}
+
 EnbUeEntry *UeRegistry::findByPeer(const InetAddress &peer)
 {
     const auto it = m_byPeer.find(peer.toString());

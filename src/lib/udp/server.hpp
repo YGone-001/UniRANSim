@@ -28,6 +28,8 @@ class UdpServer
     void Send(const InetAddress &address, const uint8_t *buffer, size_t bufferSize) const;
     bool TrySend(const InetAddress &address, const uint8_t *buffer, size_t bufferSize) const;
     [[nodiscard]] InetAddress LocalAddress() const;
+    // Read-only access to the bound descriptor, for socket observation.
+    [[nodiscard]] int NativeFd() const;
 };
 
 } // namespace udp
