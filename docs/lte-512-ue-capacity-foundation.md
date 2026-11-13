@@ -100,10 +100,17 @@ unmeasured and authorization-gated. See `docs/lte-ue-runtime-scalability.md`.
 
 ## 9. Real EPS registration
 
-`REAL_512_UE_BLOCKED_AUTHORIZATION`. The laboratory holds four authorized test
-subscribers. No subscriber was created, no IMSI cloned, no K/OPc invented and
-no bulk Attach campaign run. A successful isolated 512-context acceptance does
-not authorize a 512-subscriber real EPC campaign.
+Real registration was previously `REAL_512_UE_BLOCKED_AUTHORIZATION`; the
+owner's authorized 512-subscriber campaign changed that. The exact range
+`460020000000400` … `460020000000911` was verified as a set, and the real
+production UE/eNB path completed genuine EPS-AKA, NAS security, Attach and
+default-bearer establishment for all 512. They remained simultaneously
+registered for a 300 s window and were then detached cleanly. The authoritative
+record is `docs/lte-512-real-attach-acceptance.md`.
+
+No subscriber was created, modified or deleted. No K/OPc was printed or
+committed. The earlier four-subscriber assumption is superseded by the owner's
+1,000-record inventory; this phase used only the designated 512.
 
 ## 10. Independence from PERF-P1
 

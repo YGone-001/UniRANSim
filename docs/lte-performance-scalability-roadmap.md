@@ -1,6 +1,6 @@
 # LTE Performance and Scalability Roadmap
 
-**Document status: `PHASE 19-C RUNTIME EVIDENCE — 512 PROCESSES MEASURED — GOALS NOT ACHIEVED`**
+**Document status: `REAL 512-UE ATTACH — 512 AUTHENTICATED UEs RETAINED — PERF-P1 STILL OPEN`**
 
 Phase 19-A audited the architecture, established the current hard limits,
 implemented the reproducible isolated capacity harness and the opt-in
@@ -396,12 +396,68 @@ devices, bearer state or user-plane cost, which remain
 | PERF-P2 isolated 512-context capacity | `ISOLATED_512_CONTEXTS_ACCEPTED` (Phase 19-B) |
 | PERF-P2 512 production radio endpoints | `ISOLATED_512_RADIO_CONTEXTS_ACCEPTED` |
 | PERF-P2 512 real UE processes | `LTE_512_PROCESS_FLEET_FEASIBLE` (pre-authentication) |
-| PERF-P2 512 authenticated EPS registrations | `REAL_512_UE_BLOCKED_AUTHORIZATION` |
+| PERF-P2 512 authenticated EPS registrations | `REAL_512_UE_BLOCKED_AUTHORIZATION` (superseded by the real Attach campaign) |
 | PERF-P1 single-UE 1 Gbps | `PERF_P1_BLOCKED_AUTHORIZATION` |
 
 ### 8.5 Next recommendation
 
 The next independent performance phase should be a bounded single-UE throughput
 campaign (PERF-P1), not more registration-framework development. The 512-UE
-registration campaign remains gated on subscriber-provisioning authorization.
-See `docs/lte-ue-runtime-scalability.md` for the complete evidence record.
+registration campaign subsequently ran in the real Attach campaign; see section 9.
+See `docs/lte-ue-runtime-scalability.md` for the Phase 19-C evidence record.
+
+---
+
+## 9. Real 512-UE Attach acceptance
+
+The real Attach campaign ran the designated 512 subscribers through the live
+Open5GS EPC.
+
+### 9.1 Result
+
+`REAL_512_UE_ACCEPTED`. 512 distinct authorized subscribers completed genuine
+EPS-AKA, NAS security, Attach Accept and Attach Complete, held default EPS
+bearers with unique PDN IPv4 addresses, and stayed simultaneously registered for
+a 300 s window. Cleanup returned the EPC to its pre-campaign baseline.
+
+### 9.2 What was executed
+
+- Exact set verification of `460020000000400` … `460020000000911` (512
+  distinct, no gaps, no duplicates, K/OPc/AMF and APN `cmnet`).
+- 512 protected UE configurations with unique radio UE ids, local ports and
+  TUN prefixes.
+- The real production `lte-enb` and `lte-ue` binaries against the running
+  Open5GS MME, SGW-C/SGW-U and SMF/PGW-U.
+- Checkpoints 1 → 4 → 16 → 32 → 64 → 128 → 256 → 512, gated on the previous
+  checkpoint.
+- A 300 s retention window with 60 samples.
+- A low-rate user-plane check through the real S1-U path.
+- Cleanup through the production Detach path, not an EPC restart.
+
+### 9.3 Measured result at 512
+
+| Metric | Value |
+|---|---:|
+| MME-registered UEs | 512 |
+| Default EPS bearers | 512 |
+| Unique PDN IPv4 addresses | 512 |
+| TUN interfaces | 512 |
+| Live UE processes | 512 |
+| MME sessions (owner baseline 1 + campaign) | 513 |
+| SMF GTPv2 / PFCP sessions | 513 / 513 |
+| eNB radio UDP drops | 0 |
+| UE fleet RSS / PSS | 2719.6 / 253.8 MiB |
+| Retention samples with 512 registered | 60 / 60 |
+| Registration window, 1 → 512 | 49.6 s |
+
+### 9.4 Status after the real Attach campaign
+
+| Milestone | Status |
+|---|---|
+| PERF-P2 512 isolated contexts | `ISOLATED_512_CONTEXTS_ACCEPTED` |
+| PERF-P2 512 production radio endpoints | `ISOLATED_512_RADIO_CONTEXTS_ACCEPTED` |
+| PERF-P2 512 real processes | `LTE_512_PROCESS_FLEET_FEASIBLE` |
+| PERF-P2 512 authenticated, retained EPS registrations | `REAL_512_UE_ACCEPTED` |
+| PERF-P1 single-UE 1 Gbps | `PERF_P1_BLOCKED_AUTHORIZATION` |
+
+The complete operational record is `docs/lte-512-real-attach-acceptance.md`.
