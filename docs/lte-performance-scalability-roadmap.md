@@ -1,6 +1,6 @@
 # LTE Performance and Scalability Roadmap
 
-**Document status: `PHASE 19-A BASELINE — HARNESS IMPLEMENTED — GOALS NOT ACHIEVED`**
+**Document status: `PHASE 19-C RUNTIME EVIDENCE — 512 PROCESSES MEASURED — GOALS NOT ACHIEVED`**
 
 Phase 19-A audited the architecture, established the current hard limits,
 implemented the reproducible isolated capacity harness and the opt-in
@@ -348,3 +348,60 @@ cross-UE starvation. See `docs/lte-512-ue-capacity-foundation.md`.
 PERF-P2 remains `REAL_512_UE_BLOCKED_AUTHORIZATION`: isolated context capacity
 is not EPS registration, and the laboratory's four authorized subscribers are
 untouched. PERF-P1 is unchanged and independent.
+
+---
+
+## 8. Phase 19-C runtime evidence
+
+Phase 19-C measured the actual `lte-ue` executable and the production radio
+receive path. It did not measure real EPC throughput or real EPS registration.
+
+### 8.1 What was executed
+
+- The complete process ladder 1 → 2 → 4 → 8 → 16 → 32 → 64 → 128 → 256 → 512
+  with the real `lte-ue` binary, test-only configurations and an isolated
+  loopback eNB multiplexer. Every checkpoint started, observed and stopped
+  cleanly; no checkpoint was resource-limited.
+- 512 distinct test-owned radio endpoints through the production receive path
+  under the production default `poll(16, 16)`: 512 delivered, 0 dropped.
+- Paced, staggered, microburst, hot-peer, teardown and repeated-cycle profiles.
+- Nearest-rank latency distributions at two distinct measurement points.
+
+### 8.2 Measured cost at 512
+
+| Metric | Value | Method |
+|---|---:|---|
+| Processes started / alive | 512 / 512 | real `lte-ue`, `/proc` observation |
+| Launcher spawn duration | 431.7 ms | monotonic clock around fork/exec |
+| Spawn to first radio frame p50 / p99 | 8.7 / 41.2 ms | first production registry observation |
+| RSS sum | 2564.2 MiB | `VmRSS` |
+| PSS sum | 247.6 MiB | `smaps_rollup` |
+| Threads / file descriptors / UDP sockets | 512 / 2048 / 512 | `/proc` |
+| TUN devices before authentication | 0 | `/proc/net/dev` |
+| Stable window | 1.5 s | wall clock |
+| Shutdown | 34.6 ms | SIGTERM to last reap |
+| Orphans / residual sockets | 0 / 0 | pid and `/proc/net/udp` checks |
+
+### 8.3 Process-per-UE decision
+
+`LTE_512_PROCESS_FLEET_FEASIBLE` — `KEEP_PROCESS_PER_UE` for the measured
+pre-authentication runtime. The decision does not cover post-authentication TUN
+devices, bearer state or user-plane cost, which remain
+`BLOCKED_AUTHORIZATION`. A multiplexed LTE UE runtime is **not** implemented.
+
+### 8.4 Status after Phase 19-C
+
+| Milestone | Status |
+|---|---|
+| PERF-P2 isolated 512-context capacity | `ISOLATED_512_CONTEXTS_ACCEPTED` (Phase 19-B) |
+| PERF-P2 512 production radio endpoints | `ISOLATED_512_RADIO_CONTEXTS_ACCEPTED` |
+| PERF-P2 512 real UE processes | `LTE_512_PROCESS_FLEET_FEASIBLE` (pre-authentication) |
+| PERF-P2 512 authenticated EPS registrations | `REAL_512_UE_BLOCKED_AUTHORIZATION` |
+| PERF-P1 single-UE 1 Gbps | `PERF_P1_BLOCKED_AUTHORIZATION` |
+
+### 8.5 Next recommendation
+
+The next independent performance phase should be a bounded single-UE throughput
+campaign (PERF-P1), not more registration-framework development. The 512-UE
+registration campaign remains gated on subscriber-provisioning authorization.
+See `docs/lte-ue-runtime-scalability.md` for the complete evidence record.

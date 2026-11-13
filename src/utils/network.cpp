@@ -248,6 +248,11 @@ bool Socket::trySend(const InetAddress &address, const uint8_t *buffer, size_t s
     return true;
 }
 
+int Socket::getFd() const
+{
+    return fd;
+}
+
 bool Socket::hasFd() const
 {
     return fd >= 0;

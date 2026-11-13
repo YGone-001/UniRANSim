@@ -866,15 +866,17 @@ user-plane goodput over a real EPC path) and PERF-P2 (512 concurrent
 authenticated, EPS-registered LTE UEs). Neither is achieved.
 
 - An isolated registry holding 512 synthetic contexts is `ISOLATED_CONTEXT_CAPACITY`
-  and never a real EPS Attach. The nine checkpoint classifications in
-  `docs/lte-performance-benchmark-profiles.md` must be reported separately.
+  and never a real EPS Attach. The structured checkpoint classifications in
+  `src/lte/enb/capacity_report.hpp` must be reported separately.
 - A loopback or private-namespace throughput number is
   `ISOLATED_SIMULATOR_THROUGHPUT`, never `REAL_EPC_USER_PLANE_THROUGHPUT`.
   Application goodput and GTP-U wire rate are different numbers and both must
   be quoted with their measurement point.
-- The eNB configuration validates `maxUes` in 1..64. That is a validation
-  ceiling, not a measured capacity result; do not raise it and call that
-  scalability support.
+- The eNB configuration validates `maxUes` in 1..512. That is a validation
+  bound, not a measured capacity result; do not raise it and call that
+  scalability support. The measured capacity evidence lives in
+  `docs/lte-512-ue-capacity-foundation.md` and
+  `docs/lte-ue-runtime-scalability.md`.
 - The LTE UE is process-per-UE (`lte-ue -c <config>`): one process, one TUN
   interface and one UDP socket per UE. Do not assume the 5G multi-UE option
   exists for LTE.
@@ -897,10 +899,60 @@ evidence in `docs/lte-512-ue-capacity-foundation.md`.
 - Each simulated radio endpoint is its own UDP socket: the registry keys a UE
   on its peer address, so one shared socket cannot present many UEs.
 - This kernel drops excess UDP datagrams when a burst is queued before any
-  receive (222 of 300 in a raw probe). Interleave sends with polling; that is
-  also how independent radios behave.
+  receive (222 of 300 in a raw probe; 222 of 512 in the Phase 19-C microburst).
+  Read the socket's own drop counter from `/proc/net/udp` and report
+  delivered, dropped and unaccounted separately. Interleave sends with polling;
+  that is also how independent radios behave.
 - A full registry refuses new contexts deterministically and still accepts
   releases and cleanup. Nothing leaks a slot.
+
+## LTE UE runtime fleet and 512 radio endpoints
+
+Phase 19-C measures the actual `lte-ue` executable and the production radio
+receive path. Its rules are what a later change must not weaken.
+
+- A live LTE UE process is `ACTUAL_LTE_UE_PROCESS_ALIVE`, not authentication.
+  A radio peer is `SIMULATED_RADIO_ENDPOINT_ACTIVE`, not an EPS bearer. An
+  Attach Request is `PRE_AUTH_ATTACH_ATTEMPT`, not an Attach Accept. Context
+  persistence is `ISOLATED_CONTEXT_RETAINED`; EPS registration retention is
+  `STABLE_REGISTRATION_RETAINED` and stays `NOT_MEASURED` without a real EPC.
+  Never set the second from the first.
+- `src/lte/enb/capacity_report.hpp` owns the structured states. `PASS`,
+  `FAIL`, `NOT_MEASURED`, `NOT_APPLICABLE`, `BLOCKED_AUTHORIZATION` and
+  `BLOCKED_RESOURCE_LIMIT` are distinct. A checkpoint that was not attempted is
+  not a failure, and a workload stopped by a declared budget is not a feature
+  failure.
+- Memory is three observations, never one: current RSS from `VmRSS`, peak RSS
+  from `VmHWM`, and PSS/private bytes from `smaps_rollup` where available. A
+  single current-RSS sample is not a peak. The page size comes from
+  `sysconf(_SC_PAGESIZE)`, never a hardcoded 4096.
+- The process launcher in `src/lte/enb/process_fleet.{hpp,cpp}` must run the
+  real binary with generated test-only configurations. It closes every inherited
+  descriptor in the child, drains the production radio socket between spawns so
+  a 512-process start is not an accidental microburst, and stops at the declared
+  `MemAvailable` reserve, the file-descriptor limit or a startup deadline.
+  It reaps what it starts and reports orphans and residual sockets.
+- The 512-process fleet is opt-in and local-only
+  (`UNIRANSIM_RUN_PROCESS_FLEET=1`). It must never run as part of the ordinary
+  CI matrix; the sanitizer and coverage jobs do not build `lte-ue`.
+- The principal 512-endpoint acceptance uses the production default
+  `EnbMultiplexer::poll(16, 16)`. A larger test-only budget may be reported as
+  a comparison, never as the principal result. Paced arrival, staggered arrival
+  and deliberate microburst are separate profiles and must be labelled as such.
+- Kernel drops are read from the socket's own counter. `SO_RXQ_OVFL` is tried
+  where available; this host did not surface it, so `/proc/net/udp` is the
+  authoritative measure. Never change `rmem_max`, `wmem_max` or any persistent
+  sysctl; a per-socket `SO_RCVBUF` comparison is allowed.
+- Latency is reported per measurement point, with nearest-rank p50/p95/p99 and
+  the sample count. Synthetic enqueue-to-processing, multiplexer handling and
+  the full eNB main loop are not the same number, and the main loop is not
+  claimed from a multiplexer-only fixture.
+- The process-per-UE decision is `KEEP_PROCESS_PER_UE` only while the measured
+  512-process fleet stays inside the budget with clean teardown. It covers the
+  measured pre-authentication runtime; post-authentication TUN devices and user
+  plane remain `BLOCKED_AUTHORIZATION` until a real registration campaign.
+- Nothing here changes GTP-U forwarding, TUN packet handling, TEID lifecycle or
+  the Phase 19-A iperf3 profiles. PERF-P1 remains a separate workstream.
 
 ## What must never be committed
 

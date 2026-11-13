@@ -18,6 +18,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -171,6 +172,19 @@ class EnbMultiplexer
     // Drains pending simulated-radio and shared S1-U datagrams with bounded
     // per-call budgets so one busy UE cannot starve the other transports.
     void poll(int radioBudget = 16, int s1uBudget = 16);
+
+    // Optional observation seam for latency measurement. It runs after the
+    // production handler has returned, receives the datagram bytes and the two
+    // production timestamps (receive and post-handle), and changes no decision.
+    // Empty by default, so a normal run pays nothing.
+    using RadioFrameObserver = std::function<void(const InetAddress &, const uint8_t *, size_t,
+                                                  std::chrono::steady_clock::time_point,
+                                                  std::chrono::steady_clock::time_point)>;
+    void setRadioFrameObserver(RadioFrameObserver observer);
+
+    // The effective SO_RCVBUF of the production simulated-radio socket, in
+    // bytes, or -1 when the socket is unavailable.
+    [[nodiscard]] int radioReceiveBufferBytes() const;
 
     // Opt-in performance counters for the capacity and throughput baseline.
     // Disabled by default; enable explicitly and read them explicitly.
@@ -362,6 +376,7 @@ class EnbMultiplexer
     uint64_t m_restorationLatencyMs{};
     std::chrono::steady_clock::time_point m_accessInvalidatedAt{};
     udp::UdpServer m_ueLink;
+    RadioFrameObserver m_radioObserver;
     UeRegistry m_registry;
     S1uEndpoint m_s1u;
     PerfCounters m_perf;

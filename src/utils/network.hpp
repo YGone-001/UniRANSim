@@ -65,6 +65,9 @@ class Socket
     bool trySend(const InetAddress &address, const uint8_t *buffer, size_t size) const;
     void close();
     [[nodiscard]] bool hasFd() const;
+    // The native descriptor, for read-only socket observation such as
+    // getsockopt(SO_RCVBUF). No caller may close or reconfigure it.
+    [[nodiscard]] int getFd() const;
     [[nodiscard]] InetAddress getAddress() const;
     [[nodiscard]] int getIpVersion() const;
 
