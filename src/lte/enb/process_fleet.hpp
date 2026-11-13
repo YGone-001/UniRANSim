@@ -51,6 +51,10 @@ struct FleetConfig
     std::string mnc{"01"};
     uint32_t baseUeId{50000};
     uint16_t baseLocalPort{20000};
+    // Optional explicit per-child local ports. When set, they take precedence
+    // over baseLocalPort + index; the smoke test uses two probed free ports so
+    // a busy fixed port cannot turn a launcher test into an environment test.
+    std::vector<uint16_t> localPorts;
     std::string enbAddress{"127.0.0.1"};
     uint16_t enbPort{};
     int ueTimeoutMs{6000};
@@ -161,7 +165,12 @@ class ProcessFleet
     [[nodiscard]] size_t Started() const { return m_spawned; }
     [[nodiscard]] size_t Alive() const;
     [[nodiscard]] uint32_t UeIdAt(size_t index) const { return m_config.baseUeId + static_cast<uint32_t>(index); }
-    [[nodiscard]] uint16_t LocalPortAt(size_t index) const { return static_cast<uint16_t>(m_config.baseLocalPort + index); }
+    [[nodiscard]] uint16_t LocalPortAt(size_t index) const
+    {
+        if (index < m_config.localPorts.size())
+            return m_config.localPorts[index];
+        return static_cast<uint16_t>(m_config.baseLocalPort + index);
+    }
     [[nodiscard]] const FleetConfig &Config() const { return m_config; }
     [[nodiscard]] double ShutdownDurationMs() const { return m_lastShutdownMs; }
 

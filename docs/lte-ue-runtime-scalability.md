@@ -122,16 +122,16 @@ succeeded with clean teardown.
 
 | Requested | Spawn duration | RSS sum | PSS sum | FDs | UDP sockets | Startup p50 / p99 | Shutdown | Orphans |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 1.3 ms | 5.0 MiB | 1.4 MiB | 4 | 1 | 5.9 / 5.9 ms | 2.2 ms | 0 |
-| 2 | 1.5 ms | 10.0 MiB | 2.0 MiB | 8 | 2 | 3.4 / 3.6 ms | 2.1 ms | 0 |
-| 4 | 3.2 ms | 19.8 MiB | 3.1 MiB | 16 | 4 | 4.7 / 5.3 ms | 2.1 ms | 0 |
-| 8 | 7.0 ms | 40.2 MiB | 5.2 MiB | 32 | 8 | 5.4 / 8.6 ms | 2.8 ms | 0 |
-| 16 | 10.5 ms | 80.2 MiB | 9.2 MiB | 64 | 16 | 9.8 / 19.9 ms | 2.7 ms | 0 |
-| 32 | 25.9 ms | 160.1 MiB | 17.2 MiB | 128 | 32 | 5.4 / 13.0 ms | 5.0 ms | 0 |
-| 64 | 52.2 ms | 320.1 MiB | 32.9 MiB | 256 | 64 | 7.8 / 26.1 ms | 5.7 ms | 0 |
-| 128 | 103.6 ms | 640.5 MiB | 63.8 MiB | 512 | 128 | 9.2 / 34.6 ms | 7.9 ms | 0 |
-| 256 | 199.4 ms | 1282.2 MiB | 125.2 MiB | 1024 | 256 | 14.0 / 60.0 ms | 16.4 ms | 0 |
-| **512** | **431.7 ms** | **2564.2 MiB** | **247.6 MiB** | **2048** | **512** | **8.7 / 41.2 ms** | **34.6 ms** | **0** |
+| 1 | 1.3 ms | 4.9 MiB | 1.4 MiB | 4 | 1 | 4.6 / 4.6 ms | 2.1 ms | 0 |
+| 2 | 2.6 ms | 9.8 MiB | 2.0 MiB | 8 | 2 | 5.7 / 6.9 ms | 2.1 ms | 0 |
+| 4 | 3.2 ms | 19.7 MiB | 3.0 MiB | 16 | 4 | 5.9 / 6.5 ms | 2.2 ms | 0 |
+| 8 | 8.8 ms | 39.3 MiB | 5.1 MiB | 32 | 8 | 8.1 / 13.0 ms | 2.5 ms | 0 |
+| 16 | 14.5 ms | 79.2 MiB | 9.1 MiB | 64 | 16 | 4.5 / 10.0 ms | 2.3 ms | 0 |
+| 32 | 25.9 ms | 158.3 MiB | 17.1 MiB | 128 | 32 | 6.6 / 11.5 ms | 2.9 ms | 0 |
+| 64 | 42.4 ms | 315.5 MiB | 32.7 MiB | 256 | 64 | 10.2 / 32.6 ms | 5.6 ms | 0 |
+| 128 | 92.8 ms | 631.1 MiB | 63.6 MiB | 512 | 128 | 7.6 / 20.4 ms | 8.6 ms | 0 |
+| 256 | 202.8 ms | 1262.1 MiB | 125.1 MiB | 1024 | 256 | 7.5 / 14.5 ms | 17.1 ms | 0 |
+| **512** | **400.1 ms** | **2526.2 MiB** | **247.5 MiB** | **2048** | **512** | **8.1 / 21.2 ms** | **29.7 ms** | **0** |
 
 All values are from one run with the freshly built `lte-ue` binary; the earlier
 runs in the same session produced the same structure with small timing
@@ -150,7 +150,7 @@ registry and the production default `poll(16, 16)`.
 
 | Profile | Offered | Delivered | Dropped | Notes |
 |---|---:|---:|---:|---|
-| Uniform, paced by the production loop | 512 | 512 | 0 | 32 poll iterations; all identities independently addressable |
+| Uniform, paced by the production loop | 512 | 512 | 0 | 128 default-budget calls; at most 4 frames offered per call |
 | Microburst, no receive between sends | 512 | 222 | 290 | `delivered + dropped = 512`, unaccounted 0 |
 | Staggered, eight per iteration, three cycles | 512 × 3 | 512 × 3 | 0 | mixed registration/teardown leaves 0 contexts |
 | One hot peer + 511 cold | 512 cold + 128 hot | 512 | 0 | every cold peer served within 600 poll iterations |
@@ -180,12 +180,13 @@ microburst is reported separately and is not retried until it looks loss-free.
 
 ## 9. Event-loop latency (default budget)
 
-512 paced endpoints, 32 poll iterations, one frame per peer. Monotonic clock.
+512 paced endpoints, 128 default-budget calls, at most four frames offered per
+call. Monotonic clock; nearest-rank percentiles.
 
 | Measurement point | n | p50 | p95 | p99 | max |
 |---|---:|---:|---:|---:|---:|
-| Enqueue to handled (synthetic) | 512 | 0.069 ms | 0.120 ms | 0.331 ms | 0.333 ms |
-| Multiplexer handle only | 512 | 0.0032 ms | 0.0047 ms | 0.0094 ms | 0.0204 ms |
+| Enqueue to handled (synthetic) | 512 | 0.019 ms | 0.037 ms | 0.054 ms | 0.056 ms |
+| Multiplexer handle only | 512 | 0.0030 ms | 0.0044 ms | 0.0122 ms | 0.0192 ms |
 
 The enqueue-to-handled number includes the wait in the kernel queue and the
 production decode/handler. The handle number starts when `recvfrom` returns.
@@ -195,7 +196,7 @@ association and is `NOT_MEASURED` here.
 
 ## 10. Resource budgets and stopping rules
 
-- Memory reserve: 512 MiB of `MemAvailable`. At the 512 checkpoint 4,116 MiB
+- Memory reserve: 512 MiB of `MemAvailable`. At the 512 checkpoint 3,656 MiB
   remained, so no checkpoint was resource-limited.
 - Descriptor rule: refuse to spawn when the requested count approaches the
   soft `RLIMIT_NOFILE`.
@@ -205,8 +206,8 @@ association and is `NOT_MEASURED` here.
 
 ## 11. Startup and cleanup evidence
 
-- 512 processes in 431.7 ms of launcher time; per-process spawn-to-first-frame
-  p50 8.7 ms, p95 23.5 ms, p99 41.2 ms, max 51.1 ms.
+- 512 processes in 400.1 ms of launcher time; per-process spawn-to-first-frame
+  p50 8.1 ms, p95 17.4 ms, p99 21.2 ms, max 32.7 ms.
 - 512 processes held for a 1.5 s stable window with zero exits.
 - 512 processes stopped in 34.6 ms; zero orphans, zero residual sockets, all
   children reaped.
@@ -215,9 +216,9 @@ association and is `NOT_MEASURED` here.
   as a precise zero. The workload is idle waiting for an MME by construction.
 
 Memory attribution: RSS sum overcounts shared library pages; PSS is the better
-physical estimate. At 512 processes the RSS sum is 2564.2 MiB while the PSS sum is
-247.6 MiB, about 0.48 MiB per process. Per-process RSS p50 is 5.26 MB and the
-maximum is 5.34 MB.
+physical estimate. At 512 processes the RSS sum is 2526.2 MiB while the PSS sum is
+247.5 MiB, about 0.48 MiB per process. Per-process RSS p50 is 5.18 MB and the
+maximum is 5.25 MB.
 
 ## 12. Process-per-UE decision
 

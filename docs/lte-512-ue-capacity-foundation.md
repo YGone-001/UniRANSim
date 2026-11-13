@@ -56,8 +56,9 @@ identified test-owned peers; every frame is decoded and every peer is registered
 and independently addressable. Phase 19-B exercised 300 peers with an enlarged
 poll budget. Phase 19-C extends this to **512 peers under the production default
 `poll(16, 16)`**, with the production receive path, registry and Initial UE
-Message encoder: 512 delivered, 0 dropped, 32 poll iterations, all 512
-identities independently addressable. This is
+Message encoder: 512 delivered, 0 dropped, 128 default-budget
+calls with at most four frames offered per call, and all 512 identities
+independently addressable. This is
 `SIMULATED_RADIO_ENDPOINT_ACTIVE`: a radio frame is not an authenticated UE.
 
 An environment observation worth recording: the socket's receive buffer is
