@@ -15,6 +15,7 @@
 #include <ext/doctest/doctest.h>
 
 #include <chrono>
+#include <climits>
 #include <cstdint>
 #include <memory>
 #include <thread>
@@ -103,7 +104,7 @@ TEST_CASE("lte/runtime: process memory distinguishes current, peak and proportio
     CHECK(second >= first);
 
     // A process that does not exist is reported as zero, not as an estimate.
-    const auto gone = ReadProcessMemory(999999);
+    const auto gone = ReadProcessMemory(INT_MAX);
     CHECK(gone.currentRssBytes == 0);
     CHECK(gone.peakRssBytes == 0);
 
@@ -116,15 +117,17 @@ TEST_CASE("lte/runtime: a controlled socket burst is fully accounted as delivere
 {
     // A deliberately tiny receive buffer makes the drop path deterministic
     // without changing any sysctl: the kernel clamps the request per socket.
+    // Even the smallest plausible datagram accounting cannot fit the offered
+    // burst in the resulting 4 KiB effective buffer.
     udp::UdpServer receiver{"127.0.0.1", 0};
-    const int requested = 4096;
+    const int requested = 2048;
     REQUIRE(setsockopt(receiver.NativeFd(), SOL_SOCKET, SO_RCVBUF, &requested, sizeof(requested)) == 0);
     const int effective = ReadSocketReceiveBuffer(receiver.NativeFd());
     CHECK(effective >= requested);
     const auto local = receiver.LocalAddress();
     REQUIRE(local.getPort() != 0);
 
-    constexpr size_t kSenders = 100;
+    constexpr size_t kSenders = 200;
     std::vector<std::unique_ptr<udp::UdpServer>> senders;
     for (size_t i = 0; i < kSenders; ++i)
     {

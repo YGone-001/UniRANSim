@@ -95,7 +95,7 @@ bool ProcessFleet::WriteConfig(size_t index)
     out << "pdnType: IPv4\n";
     out << "enbLink:\n";
     out << "  localAddress: " << m_config.enbAddress << "\n";
-    out << "  localPort: " << (m_config.baseLocalPort + index) << "\n";
+    out << "  localPort: " << LocalPortAt(index) << "\n";
     out << "  address: " << m_config.enbAddress << "\n";
     out << "  port: " << m_config.enbPort << "\n";
     out << "  timeoutMs: " << m_config.ueTimeoutMs << "\n";

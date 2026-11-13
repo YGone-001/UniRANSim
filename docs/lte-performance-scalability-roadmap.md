@@ -372,10 +372,10 @@ receive path. It did not measure real EPC throughput or real EPS registration.
 | Metric | Value | Method |
 |---|---:|---|
 | Processes started / alive | 512 / 512 | real `lte-ue`, `/proc` observation |
-| Launcher spawn duration | 431.7 ms | monotonic clock around fork/exec |
-| Spawn to first radio frame p50 / p99 | 8.7 / 41.2 ms | first production registry observation |
-| RSS sum | 2564.2 MiB | `VmRSS` |
-| PSS sum | 247.6 MiB | `smaps_rollup` |
+| Launcher spawn duration | 400.1 ms | monotonic clock around fork/exec |
+| Spawn to first radio frame p50 / p99 | 8.1 / 21.2 ms | first production registry observation |
+| RSS sum | 2526.2 MiB | `VmRSS` |
+| PSS sum | 247.5 MiB | `smaps_rollup` |
 | Threads / file descriptors / UDP sockets | 512 / 2048 / 512 | `/proc` |
 | TUN devices before authentication | 0 | `/proc/net/dev` |
 | Stable window | 1.5 s | wall clock |
