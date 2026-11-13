@@ -859,6 +859,30 @@ encoded. `src/lte/enb/handover_runtime_provenance.{hpp,cpp}` owns that.
   may emit. The `...Legacy` pair exists for its historical pinned vectors and
   is refused by the conformant decoder.
 
+## LTE performance and capacity
+
+Two goals drive the current workstream: PERF-P1 (single UE sustained 1 Gbps
+user-plane goodput over a real EPC path) and PERF-P2 (512 concurrent
+authenticated, EPS-registered LTE UEs). Neither is achieved.
+
+- An isolated registry holding 512 synthetic contexts is `ISOLATED_CONTEXT_CAPACITY`
+  and never a real EPS Attach. The nine checkpoint classifications in
+  `docs/lte-performance-benchmark-profiles.md` must be reported separately.
+- A loopback or private-namespace throughput number is
+  `ISOLATED_SIMULATOR_THROUGHPUT`, never `REAL_EPC_USER_PLANE_THROUGHPUT`.
+  Application goodput and GTP-U wire rate are different numbers and both must
+  be quoted with their measurement point.
+- The eNB configuration validates `maxUes` in 1..64. That is a validation
+  ceiling, not a measured capacity result; do not raise it and call that
+  scalability support.
+- The LTE UE is process-per-UE (`lte-ue -c <config>`): one process, one TUN
+  interface and one UDP socket per UE. Do not assume the 5G multi-UE option
+  exists for LTE.
+- The performance counters in `src/lte/enb/perf_counters.hpp` are opt-in and
+  hold no IMSI, key or authentication material. Keep them that way.
+- Measurements that need real EPC interaction, new subscribers or sustained
+  load are `NOT_MEASURED` or `BLOCKED_AUTHORIZATION`, never a fabricated zero.
+
 ## What must never be committed
 
 - `config/*.local.yaml` — private laboratory configurations, including

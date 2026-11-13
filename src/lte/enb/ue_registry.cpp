@@ -91,7 +91,20 @@ EnbUeEntry &UeRegistry::registerPeer(uint32_t radioUeId, const InetAddress &peer
     EnbUeEntry *pointer = entry.get();
     m_byPeer.emplace(peer.toString(), pointer);
     m_byRadioUeId.emplace(radioUeId, std::move(entry));
+    noteRegistration();
     return *pointer;
+}
+
+void UeRegistry::noteRegistration()
+{
+    if (m_perf == nullptr || !m_perf->enabled.load(std::memory_order_relaxed))
+        return;
+    m_perf->registrations.fetch_add(1, std::memory_order_relaxed);
+    const uint64_t current = static_cast<uint64_t>(m_byRadioUeId.size() + m_provisional.size());
+    uint64_t high = m_perf->registryHighWater.load(std::memory_order_relaxed);
+    while (current > high && !m_perf->registryHighWater.compare_exchange_weak(high, current))
+    {
+    }
 }
 
 EnbUeEntry &UeRegistry::allocateProvisional()
@@ -729,6 +742,8 @@ void UeRegistry::beginNewAttach(EnbUeEntry &entry)
 
 void UeRegistry::remove(EnbUeEntry &entry)
 {
+    if (m_perf != nullptr && m_perf->enabled.load(std::memory_order_relaxed))
+        m_perf->teardowns.fetch_add(1, std::memory_order_relaxed);
     releaseS1(entry);
     const auto it = m_byRadioUeId.find(entry.radioUeId);
     if (it == m_byRadioUeId.end() || it->second.get() != &entry)

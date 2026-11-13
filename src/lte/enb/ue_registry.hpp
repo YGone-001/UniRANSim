@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include "perf_counters.hpp"
 #include "types.hpp"
 #include "user_plane.hpp"
 
@@ -393,6 +394,11 @@ class UeRegistry
 
     [[nodiscard]] size_t size() const;
     [[nodiscard]] size_t capacity() const;
+
+    // Opt-in performance counters. They are not owned here and are only
+    // written when their `enabled` flag is set, so a normal run pays nothing.
+    void setPerfCounters(PerfCounters *counters) { m_perf = counters; }
+    void noteRegistration();
     std::vector<EnbUeEntry *> all();
 
   private:
@@ -402,6 +408,7 @@ class UeRegistry
     void retireLocalTeid(uint32_t teid);
 
     size_t m_maxUes;
+    PerfCounters *m_perf{};
     std::function<uint32_t()> m_allocTeid;
     uint32_t m_nextEnbUeS1apId{1};
     RetiredTeidLedger m_retiredTeids;

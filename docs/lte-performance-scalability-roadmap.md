@@ -1,6 +1,12 @@
 # LTE Performance and Scalability Roadmap
 
-**Document status: `PLANNED — NOT IMPLEMENTED — NOT BENCHMARKED`**
+**Document status: `PHASE 19-A BASELINE — HARNESS IMPLEMENTED — GOALS NOT ACHIEVED`**
+
+Phase 19-A audited the architecture, established the current hard limits,
+implemented the reproducible isolated capacity harness and the opt-in
+instrumentation, and prepared the benchmark profiles. It did **not** achieve
+either goal: PERF-P1 and PERF-P2 both remain unmeasured against a real EPC and
+are blocked on authorization. Sections 6–8 below record the baseline state.
 
 This document records two future performance and capacity objectives for the
 UniRANSim LTE/EPC simulation path. **Neither objective is implemented,
@@ -24,10 +30,10 @@ forwarding through actual Linux TUN interfaces and real GTP-U tunnels.
 Two performance questions follow naturally from that and are **not answered
 here**:
 
-| Workstream | Goal | Status |
+| Workstream | Goal | Status after Phase 19-A |
 |---|---|---|
-| **PERF-P1** | Single LTE UE sustained user-plane throughput approaching **1 Gbps** | **DEFERRED** |
-| **PERF-P2** | **512** concurrent LTE UEs authenticated, registered and retained | **DEFERRED** |
+| **PERF-P1** | Single LTE UE sustained user-plane throughput approaching **1 Gbps** | **NOT MEASURED** — harness and profiles ready; `REAL_1GBPS_BENCHMARK_BLOCKED_AUTHORIZATION` |
+| **PERF-P2** | **512** concurrent LTE UEs authenticated, registered and retained | **NOT MEASURED** — isolated harness holds 512 contexts; `REAL_512_UE_ACCEPTANCE_BLOCKED_AUTHORIZATION` |
 
 They are recorded as two separate workstreams because they stress entirely
 different parts of the system: P1 is a per-packet data-path problem, P2 is a
@@ -279,3 +285,52 @@ registration, and no capacity change is to be introduced merely because these
 goals were documented. When either milestone is authorised, it should begin with
 the isolation requirements of §2.3 (P1) or the acceptance definitions of §3.3
 (P2), not with an optimisation.
+
+---
+
+## 6. Phase 19-A baseline state
+
+### 6.1 Current hard limits
+
+| Limit | Value | Kind |
+|---|---|---|
+| eNB `maxUes` validation range | `1..64` (`src/lte/enb/config.cpp`) | **configuration validation limit** — the first ceiling a 512-UE goal meets |
+| UE Registry capacity | `m_maxUes`, exact bound, refuses beyond | fixed-size bound |
+| Radio UE identity | `uint32_t`, non-zero | wide |
+| eNB-UE-S1AP-ID / MME-UE-S1AP-ID | `uint32_t` | wide |
+| GTP-U local TEID | `uint32_t` allocator | wide |
+| SCTP UE-associated streams | `outboundStreams - 1`, shared beyond | negotiated, shared |
+| Per-UE context | 640 bytes measured (`sizeof(EnbUeEntry)`), ~1.7 KiB with a full dedicated-bearer set | measured |
+| UE process model | **process-per-UE** (`lte-ue -c <config>`), one TUN and one UDP socket per UE | process architecture limit |
+| Shared poll budget | `poll(16, 16)` per main-loop iteration | simulated-radio limit |
+
+### 6.2 Capacity accounting
+
+Memory per UE is measured, not assumed: 640 bytes per `EnbUeEntry` plus 136
+bytes per bearer context and 48 bytes of index pointers. 512 UEs cost well
+under 1 MiB of context, so memory is not the constraint. The eNB's S1-U
+endpoint, UDP socket and event loop are O(1) in the UE count; the UE side is
+O(N) in processes, TUN devices and sockets because the architecture is
+process-per-UE.
+
+### 6.3 Throughput risks (ranked, unmeasured)
+
+| Rank | Candidate | Class |
+|---|---|---|
+| 1 | Kernel socket buffers 208 KiB (`rmem_max`/`wmem_max`) | `ENVIRONMENT_LIMIT` |
+| 2 | Shared poll budget `poll(16, 16)` per iteration | `SOURCE_INFERRED_RISK` |
+| 3 | Polling UDP transport rather than an event-driven one | `SOURCE_INFERRED_RISK` |
+| 4 | Userspace GTP-U encap/decap per packet | `SOURCE_INFERRED_RISK` |
+| 5 | 6 vCPU host shared with the EPC | `ENVIRONMENT_LIMIT` |
+
+None of these is a `MEASURED_BOTTLENECK` yet: no sustained throughput was
+measured in this phase.
+
+### 6.4 What a future campaign needs
+
+PERF-P2 needs explicit authorization for subscriber provisioning (508
+additional identities beyond the four authorized ones), identity ownership, the
+EPC address-pool limits, a traffic rate and a rollback plan. PERF-P1 needs an
+authorized real-EPC iperf3 session with distinct UE and server identities and
+corroborating packet counters. See `docs/lte-performance-benchmark-profiles.md`
+for the exact commands and classification rules.

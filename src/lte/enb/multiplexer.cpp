@@ -75,6 +75,7 @@ EnbMultiplexer::EnbMultiplexer(const EnbConfig &config, IS1apSender &sender)
       m_registry(static_cast<size_t>(config.maxUes)), m_s1u(config.s1uAddress, config.s1uPort, config.allowLoopbackS1u,
                                                            m_registry, m_ueLink)
 {
+    m_registry.setPerfCounters(&m_perf);
     bindAssociation(sender, 1);
 }
 
@@ -83,6 +84,7 @@ EnbMultiplexer::EnbMultiplexer(const EnbConfig &config)
       m_registry(static_cast<size_t>(config.maxUes)), m_s1u(config.s1uAddress, config.s1uPort, config.allowLoopbackS1u,
                                                            m_registry, m_ueLink)
 {
+    m_registry.setPerfCounters(&m_perf);
 }
 
 void S1apSenderBinding::bind(IS1apSender &sender, uint32_t epoch)
@@ -331,6 +333,9 @@ void EnbMultiplexer::setOutboundStreams(int outboundStreams)
 
 void EnbMultiplexer::poll(int radioBudget, int s1uBudget)
 {
+    const bool counting = m_perf.enabled.load(std::memory_order_relaxed);
+    if (counting)
+        m_perf.pollIterations.fetch_add(1, std::memory_order_relaxed);
     uint8_t buffer[lte::ue::link::MaxDataPduSize + lte::ue::link::HeaderSize];
     for (int budget = radioBudget; budget > 0; --budget)
     {
@@ -338,6 +343,8 @@ void EnbMultiplexer::poll(int radioBudget, int s1uBudget)
         const int length = m_ueLink.Receive(buffer, sizeof(buffer), 0, peer);
         if (length <= 0)
             break;
+        if (counting)
+            m_perf.radioPacketsPolled.fetch_add(1, std::memory_order_relaxed);
         handleRadioFrame(buffer, static_cast<size_t>(length), peer);
     }
     m_s1u.poll(s1uBudget);
@@ -345,6 +352,8 @@ void EnbMultiplexer::poll(int radioBudget, int s1uBudget)
 
 void EnbMultiplexer::handleS1ap(const uint8_t *data, size_t size, uint16_t stream)
 {
+    if (m_perf.enabled.load(std::memory_order_relaxed))
+        m_perf.sctpMessagesReceived.fetch_add(1, std::memory_order_relaxed);
     try
     {
         const auto pdu = s1ap::ProbeS1apPdu(data, size);

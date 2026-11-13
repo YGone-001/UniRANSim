@@ -172,6 +172,10 @@ class EnbMultiplexer
     // per-call budgets so one busy UE cannot starve the other transports.
     void poll(int radioBudget = 16, int s1uBudget = 16);
 
+    // Opt-in performance counters for the capacity and throughput baseline.
+    // Disabled by default; enable explicitly and read them explicitly.
+    PerfCounters &perfCounters() { return m_perf; }
+
     // Consumes one UE-associated S1AP PDU received from the MME.
     void handleS1ap(const uint8_t *data, size_t size, uint16_t stream);
 
@@ -360,6 +364,7 @@ class EnbMultiplexer
     udp::UdpServer m_ueLink;
     UeRegistry m_registry;
     S1uEndpoint m_s1u;
+    PerfCounters m_perf;
     // The handover preparations of the currently bound association. Declared
     // after the registry on purpose: it is destroyed first, so its cleanup
     // still finds the registry it holds provisional contexts in. A record
