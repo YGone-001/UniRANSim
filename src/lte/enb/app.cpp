@@ -312,14 +312,18 @@ int Run(const EnbConfig &config, const std::atomic_bool &shutdownRequested)
                         // Keep the shared SCTP association responsive; every
                         // received message is routed by the multiplexer to the
                         // matching UE context only.
-                        client.receiveFor(&handler, 20);
+                        // Drain the user plane first and use the result to
+                        // decide whether the SCTP check may sleep. A busy loop
+                        // checks SCTP without blocking, so signalling still
+                        // runs on every turn without capping packet service.
+                        const int drained = DrainUserPlane(multiplexer);
+                        client.receiveFor(&handler, SctpReceiveWaitAfterDrain(drained));
                         if (!handler.message.empty())
                         {
                             multiplexer.handleS1ap(handler.message.data(), handler.message.size(),
                                                   handler.messageStream);
                             handler.message.clear();
                         }
-                        multiplexer.poll(16, 16);
 
                         if (multiplexer.injectionTriggered())
                         {

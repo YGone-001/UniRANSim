@@ -225,17 +225,20 @@ void S1uEndpoint::handleGPdu(const gtpu::Packet &packet, const InetAddress &peer
     }
 }
 
-void S1uEndpoint::poll(int budget)
+bool S1uEndpoint::poll(int budget)
 {
     uint8_t buffer[lte::ue::link::MaxDataPduSize + lte::ue::link::HeaderSize];
+    bool handled = false;
     for (; budget > 0; --budget)
     {
         InetAddress peer;
         const int length = m_socket->Receive(buffer, sizeof(buffer), 0, peer);
         if (length <= 0)
             break;
+        handled = true;
         handleDatagram(buffer, static_cast<size_t>(length), peer);
     }
+    return handled;
 }
 
 void S1uEndpoint::forwardUplink(EnbUeEntry &entry, const uint8_t *packet, size_t size)

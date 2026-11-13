@@ -1,6 +1,6 @@
 # LTE Performance and Scalability Roadmap
 
-**Document status: `REAL 512-UE ATTACH — 512 AUTHENTICATED UEs RETAINED — PERF-P1 STILL OPEN`**
+**Document status: `PERF-P2 ACCEPTED — PERF-P1 983.8 MBPS PEAK — SUSTAINED BLOCKED BY EPC QUOTA`**
 
 Phase 19-A audited the architecture, established the current hard limits,
 implemented the reproducible isolated capacity harness and the opt-in
@@ -461,3 +461,50 @@ a 300 s window. Cleanup returned the EPC to its pre-campaign baseline.
 | PERF-P1 single-UE 1 Gbps | `PERF_P1_BLOCKED_AUTHORIZATION` |
 
 The complete operational record is `docs/lte-512-real-attach-acceptance.md`.
+
+---
+
+## 10. Single-UE throughput measurement
+
+The authorized single-UE campaign measured the production UE, eNB, S1-U GTP-U,
+SGW-U, PGW-U and a PDN-side iperf3 server. The UE TUN was isolated in a
+namespace and its only route to the server was the TUN.
+
+### 10.1 Two measured event-loop ceilings and their correction
+
+| Ceiling | Evidence | Correction |
+|---|---|---|
+| eNB: 16 packets per 20 ms SCTP wait (about 800 packet/s) | TCP 8.4 Mbps at 1360 B; UDP 100 Mbps lost 97% | Drain radio/S1-U in up to 8 non-empty batches; non-blocking SCTP when busy |
+| UE: 16 TUN packets per 50 ms radio wait (about 320 packet/s) | UDP 10 Mbps delivered 3.2 Mbps with 67.9% loss | Non-blocking radio check when the TUN produced uplink |
+
+The bounded drain and timeout policy have deterministic tests.
+
+### 10.2 Measured result
+
+| Profile | Before | After |
+|---|---:|---:|
+| TCP uplink, 1 stream, 10 s | 8.5 Mbps | **813.0 Mbps** |
+| TCP uplink, 4 streams, 10 s | not run | **983.8 Mbps**; best 1 s **999.71 Mbps** |
+| UDP uplink, 10 Mbps, 5 s | 3.2 Mbps, 67.9% loss | **10.0 Mbps, 0% loss** |
+| UDP uplink, 100 Mbps, 5 s | 3.44 Mbps, 97% loss | 35 Mbps, 65.1% loss |
+
+The UE and eNB each used about 4–6% of one core under the UDP load, so the
+original loss was scheduling, not CPU. UDP at 50–100 Mbps still exceeds the
+212,992 B eNB radio receive buffer; that is a socket-buffer limit for bursty
+UDP, separate from the fixed loop cap.
+
+### 10.3 Verdicts
+
+| Goal | Verdict |
+|---|---|
+| Peak 1 Gbps | `PERF_P1_PEAK_BELOW_TARGET` — best 1 s interval 999.71 Mbps |
+| Sustained 1 Gbps | `PERF_P1_SUSTAINED_NOT_MEASURED` — 60 s run needs about 7.5 GB |
+| Engineering | `BLOCKED_EPC_CONFIGURATION` — subscriber OCS balance exhausted |
+
+The OCS balance is 6,442,450,944 bytes total and used, with 0 available. The
+SMF removed the PDN session on Gy final-unit action; a later Attach received
+Gy 4012 credit-limit-reached. No subscriber or balance was modified. The SMF
+also left one residual PDN context after the failed charging attempt; the MME,
+eNB and TUNs were clean.
+
+The full record is `docs/lte-single-ue-1gbps-benchmark.md`.

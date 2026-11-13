@@ -64,8 +64,9 @@ class S1uEndpoint
     // Consumes one datagram received at the shared endpoint.
     void handleDatagram(const uint8_t *data, size_t size, const InetAddress &peer);
 
-    // Drains up to budget pending datagrams from the shared socket.
-    void poll(int budget = 16);
+    // Drains up to budget pending datagrams from the shared socket. Returns
+    // true when at least one datagram was handled.
+    bool poll(int budget = 16);
 
     // Forwards one uplink IPv4 packet on the UE's default bearer.
     void forwardUplink(EnbUeEntry &entry, const uint8_t *packet, size_t size);

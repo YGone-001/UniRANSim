@@ -39,6 +39,8 @@ class IS1apSender
     virtual void sendS1ap(uint16_t stream, const std::vector<uint8_t> &pdu) = 0;
 };
 
+// Drains up to batchLimit non-empty user-plane batches. Exposed so the loop
+// policy can be exercised by a deterministic test.
 // Association-scoped binding between the multiplexer and one SCTP sender.
 //
 // A sender is only reachable while its association epoch is the current one.
@@ -171,7 +173,9 @@ class EnbMultiplexer
 
     // Drains pending simulated-radio and shared S1-U datagrams with bounded
     // per-call budgets so one busy UE cannot starve the other transports.
-    void poll(int radioBudget = 16, int s1uBudget = 16);
+    // Returns true when at least one radio or S1-U datagram was handled. A
+    // false result means both sockets were drained.
+    bool poll(int radioBudget = 16, int s1uBudget = 16);
 
     // Optional observation seam for latency measurement. It runs after the
     // production handler has returned, receives the datagram bytes and the two
@@ -185,6 +189,12 @@ class EnbMultiplexer
     // The effective SO_RCVBUF of the production simulated-radio socket, in
     // bytes, or -1 when the socket is unavailable.
     [[nodiscard]] int radioReceiveBufferBytes() const;
+
+    // The eNB main loop drains the user plane in bounded batches before it
+    // waits on SCTP, so a 20 ms signalling wait cannot cap radio or S1-U
+    // service at 16 packets per wait.
+    static constexpr int kUserPlaneDrainBatches = 8;
+    static constexpr int kSctpReceiveWaitMs = 1;
 
     // Opt-in performance counters for the capacity and throughput baseline.
     // Disabled by default; enable explicitly and read them explicitly.
@@ -390,5 +400,17 @@ class EnbMultiplexer
     LiveHandoverCounters m_liveHandover;
     RecoveryCounters m_recovery;
 };
+
+// Drains up to batchLimit non-empty user-plane batches. Exposed so the loop
+// policy can be exercised by a deterministic test.
+int DrainUserPlane(EnbMultiplexer &multiplexer, int batchLimit = EnbMultiplexer::kUserPlaneDrainBatches);
+
+// While the user plane is busy, do not sleep in the SCTP receive; check it
+// without blocking and go straight back to the next drain turn. An idle loop
+// keeps the bounded wait so it does not spin.
+constexpr int SctpReceiveWaitAfterDrain(int drained)
+{
+    return drained > 0 ? 0 : EnbMultiplexer::kSctpReceiveWaitMs;
+}
 
 } // namespace lte::enb

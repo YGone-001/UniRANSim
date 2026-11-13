@@ -18,8 +18,8 @@ the EPC proves nothing about the EPC.
 
 ## 2. iperf3 profiles
 
-`iperf3` was **not installed** on the build host during this phase, so none of
-these ran. The commands are the ones a future campaign must use.
+`iperf3` 3.16 is installed on the build host (Ubuntu package, checked
+2026-11-13). The profiles below are the ones the single-UE campaign used.
 
 Sustained window: **60 s** per profile, with the first 5 s discarded as
 slow-start. Throughput is quoted in decimal Mbps (10^6 bit/s); any bytes/s
@@ -73,7 +73,7 @@ mocked NAS authentication outcome never counts as a real EPC Attach.
 Measured on the build host (2026-11-13): 6 vCPU (Intel i5-9600K @ 3.70 GHz),
 7.6 GiB RAM with 3.3 GiB available, kernel 6.17.0-35-generic, soft FD limit
 1,048,576, kernel socket buffers `rmem_max`/`wmem_max` 212,992 bytes (208 KiB),
-`/dev/net/tun` present, `iperf3` **not installed**.
+`/dev/net/tun` present, `iperf3` 3.16 installed.
 
 The 208 KiB socket-buffer ceiling is the single most relevant environment
 limit for PERF-P1: at 1 Gbps a 208 KiB buffer holds roughly 1.6 ms of traffic,
@@ -97,3 +97,31 @@ The laboratory holds four authorized test subscribers. No additional
 subscribers were created, no IMSI was cloned, no K/OPc was invented, no HSS or
 MongoDB record was touched, and no bulk Attach campaign was run against the
 live Open5GS EPC.
+
+## 5. Executed single-UE result
+
+The authorized single-UE campaign used IMSI 460020000000400, the production
+`lte-ue`/`lte-enb`, the PDN endpoint 10.45.0.1 and a UE TUN in an isolated
+namespace. The first measurements exposed two bounded event-loop ceilings:
+the eNB waited 20 ms on SCTP before one 16-packet drain, and the UE waited
+50 ms on radio after 16 uplink TUN packets. The fixed loops produced:
+
+| Profile | Before | After |
+|---|---:|---:|
+| TCP uplink, 1 stream | 8.5 Mbps | **813.0 Mbps** |
+| TCP uplink, 4 streams | not run | **983.8 Mbps** aggregate; best 1 s 999.71 Mbps |
+| UDP uplink, 10 Mbps | 3.2 Mbps, 67.9% loss | **10.0 Mbps, 0% loss** |
+| UDP uplink, 100 Mbps | 3.44 Mbps, 97% loss | 35 Mbps, 65.1% loss |
+
+The best one-second interval (999.71 Mbps) is below 1,000 Mbps, so the peak
+verdict is `PERF_P1_PEAK_BELOW_TARGET`. The 60 s window is
+`PERF_P1_SUSTAINED_NOT_MEASURED`: the subscriber's OCS balance is 6.44 GB
+total, 6.44 GB used, 0 available, and a 60 s 1 Gbps run needs about 7.5 GB.
+The SMF removed the session on Gy final-unit action; a later Attach received
+Gy 4012 credit-limit-reached. No subscriber or balance was modified.
+
+UDP at 50–100 Mbps still drops at the eNB radio socket, whose 212,992 B buffer
+holds about 230 packets; that is a `SOCKET_BUFFER_LIMIT` for bursty UDP, not
+the event-loop ceiling that was fixed. TCP is flow-controlled and reached
+983.8 Mbps. The full operational record is
+`docs/lte-single-ue-1gbps-benchmark.md`.

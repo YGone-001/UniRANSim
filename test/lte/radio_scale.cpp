@@ -376,3 +376,30 @@ TEST_CASE("lte/radio-scale: enqueue-to-processing latency is measured, not infer
     CHECK(iterations > 0);
     CHECK(static_cast<double>(kPeers) / static_cast<double>(iterations) <= 16.0);
 }
+TEST_CASE("lte/radio-scale: the bounded drain policy serves eight 16-frame batches")
+{
+    CapturingSender sender;
+    EnbMultiplexer multiplexer{IsolatedConfig(), sender};
+    const InetAddress radio = multiplexer.ueLinkAddress();
+    REQUIRE(radio.getPort() != 0);
+
+    // One 8-batch turn must cover 128 radio frames, not one 16-frame batch.
+    // This is the policy the production eNB main loop applies before it waits
+    // on SCTP, and it is the difference between 800 packet/s and a usable
+    // high-rate drain.
+    auto senders = MakeSenders(128);
+    for (size_t i = 0; i < senders.size(); ++i)
+        SendFrame(*senders[i], radio, static_cast<uint32_t>(kBaseUeId + i));
+
+    const int drained = DrainUserPlane(multiplexer);
+    CHECK(drained == EnbMultiplexer::kUserPlaneDrainBatches);
+    CHECK(multiplexer.registry().size() == 128);
+    CHECK(sender.messages == 128);
+}
+
+TEST_CASE("lte/radio-scale: a busy user-plane turn does not sleep in SCTP")
+{
+    CHECK(SctpReceiveWaitAfterDrain(0) == EnbMultiplexer::kSctpReceiveWaitMs);
+    CHECK(SctpReceiveWaitAfterDrain(1) == 0);
+    CHECK(SctpReceiveWaitAfterDrain(EnbMultiplexer::kUserPlaneDrainBatches) == 0);
+}

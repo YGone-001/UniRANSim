@@ -8,6 +8,8 @@
 
 #include "app.hpp"
 
+#include "runtime_policy.hpp"
+
 #include "lifecycle.hpp"
 #include "bearer_runtime.hpp"
 #include "nas.hpp"
@@ -388,6 +390,7 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                             ", retry=" + std::to_string(procedureRetries));
         }
 
+        bool tunHadUplink = false;
         if (tun)
         {
             // Bound each turn so continuous application traffic cannot starve
@@ -397,6 +400,7 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 std::vector<uint8_t> packet;
                 if (!tun->readPacket(packet))
                     break;
+                tunHadUplink = true;
                 try
                 {
                     const auto ipv4 = ip::Validate(packet.data(), packet.size(),
@@ -460,7 +464,9 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
         }
 
         InetAddress peer;
-        int received = socket.Receive(buffer, sizeof(buffer), mobility.emm == EmmState::REGISTERED ? 50 : 250, peer);
+        int received = socket.Receive(
+            buffer, sizeof(buffer),
+            RadioReceiveTimeoutMs(mobility.emm == EmmState::REGISTERED, tunHadUplink), peer);
         if (received <= 0)
             continue;
         if (peer != enb)

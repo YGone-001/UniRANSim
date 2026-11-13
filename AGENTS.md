@@ -863,7 +863,11 @@ encoded. `src/lte/enb/handover_runtime_provenance.{hpp,cpp}` owns that.
 
 Two goals drive the current workstream: PERF-P1 (single UE sustained 1 Gbps
 user-plane goodput over a real EPC path) and PERF-P2 (512 concurrent
-authenticated, EPS-registered LTE UEs). Neither is achieved.
+authenticated, EPS-registered LTE UEs). PERF-P2 is accepted by the 512-subscriber
+campaign. PERF-P1 is measured below the strict sustained target and is currently
+blocked by the EPC's per-session online-charging quota; the data-path limits
+that were measured and fixed are recorded in
+`docs/lte-single-ue-1gbps-benchmark.md`.
 
 - An isolated registry holding 512 synthetic contexts is `ISOLATED_CONTEXT_CAPACITY`
   and never a real EPS Attach. The structured checkpoint classifications in
@@ -884,6 +888,22 @@ authenticated, EPS-registered LTE UEs). Neither is achieved.
   hold no IMSI, key or authentication material. Keep them that way.
 - Measurements that need real EPC interaction, new subscribers or sustained
   load are `NOT_MEASURED` or `BLOCKED_AUTHORIZATION`, never a fabricated zero.
+- The eNB main loop must not sleep on SCTP before it drains the user plane. It
+  drains radio and S1-U in bounded batches and, while traffic is present,
+  checks SCTP without blocking. A 16-packet batch after a 20 ms wait is a
+  800 packet/s ceiling, not a scheduler choice.
+- The UE must not wait 50 ms on the radio after it read an uplink TUN packet.
+  With continuous uplink and no downlink, that wait is a 320 packet/s ceiling.
+  Idle turns keep the longer waits; busy turns use a non-blocking radio check.
+- Throughput profiles use iperf3 with a 5 s warm-up and a 60 s measured window,
+  quote decimal Mbps, and separate application goodput from S1-U GTP-U wire
+  rate. The installed tool is recorded with its version.
+- The EPC's online-charging quota (Gy/OCS) is a hard test limit. Never modify a
+  subscriber, balance or tariff to make a test pass. A 60 s 1 Gbps run needs
+  about 7.5 GB; if the available balance is lower, stop before the session is
+  torn down and report `BLOCKED_EPC_CONFIGURATION`.
+- UDP loss, jitter and retransmissions are results. Do not retry until a
+  favorable sample appears or discard earlier samples.
 
 ## LTE 512-UE capacity
 
@@ -953,7 +973,7 @@ receive path. Its rules are what a later change must not weaken.
   measured the post-authentication TUN and registration state with the
   authorized cohort; user-plane throughput remains a separate PERF-P1 question.
 - Nothing here changes GTP-U forwarding, TUN packet handling, TEID lifecycle or
-  the Phase 19-A iperf3 profiles. PERF-P1 remains a separate workstream.
+  the benchmark profiles. PERF-P1 remains a separate workstream.
 
 ## Real LTE Attach campaigns
 

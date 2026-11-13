@@ -332,11 +332,12 @@ void EnbMultiplexer::setOutboundStreams(int outboundStreams)
     m_outboundStreams = outboundStreams;
 }
 
-void EnbMultiplexer::poll(int radioBudget, int s1uBudget)
+bool EnbMultiplexer::poll(int radioBudget, int s1uBudget)
 {
     const bool counting = m_perf.enabled.load(std::memory_order_relaxed);
     if (counting)
         m_perf.pollIterations.fetch_add(1, std::memory_order_relaxed);
+    bool handled = false;
     uint8_t buffer[lte::ue::link::MaxDataPduSize + lte::ue::link::HeaderSize];
     for (int budget = radioBudget; budget > 0; --budget)
     {
@@ -344,6 +345,7 @@ void EnbMultiplexer::poll(int radioBudget, int s1uBudget)
         const int length = m_ueLink.Receive(buffer, sizeof(buffer), 0, peer);
         if (length <= 0)
             break;
+        handled = true;
         if (counting)
             m_perf.radioPacketsPolled.fetch_add(1, std::memory_order_relaxed);
         const auto receivedAt = std::chrono::steady_clock::now();
@@ -351,7 +353,21 @@ void EnbMultiplexer::poll(int radioBudget, int s1uBudget)
         if (m_radioObserver)
             m_radioObserver(peer, buffer, static_cast<size_t>(length), receivedAt, std::chrono::steady_clock::now());
     }
-    m_s1u.poll(s1uBudget);
+    if (m_s1u.poll(s1uBudget))
+        handled = true;
+    return handled;
+}
+
+int DrainUserPlane(EnbMultiplexer &multiplexer, int batchLimit)
+{
+    int drained = 0;
+    for (int i = 0; i < batchLimit; ++i)
+    {
+        if (!multiplexer.poll(16, 16))
+            break;
+        ++drained;
+    }
+    return drained;
 }
 
 void EnbMultiplexer::setRadioFrameObserver(RadioFrameObserver observer)
