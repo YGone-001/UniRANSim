@@ -883,6 +883,25 @@ authenticated, EPS-registered LTE UEs). Neither is achieved.
 - Measurements that need real EPC interaction, new subscribers or sustained
   load are `NOT_MEASURED` or `BLOCKED_AUTHORIZATION`, never a fabricated zero.
 
+## LTE 512-UE capacity
+
+The production `maxUes` bound is now `1..512`. That is a configuration bound,
+not a scalability claim: what establishes capacity is the isolated runtime
+evidence in `docs/lte-512-ue-capacity-foundation.md`.
+
+- A synthetic registry entry is `ISOLATED_CONTEXT_CAPACITY`, never a simulated
+  Attach and never a real EPS registration. The nine classifications are
+  reported as structured evidence states (`PASS`, `FAIL`, `NOT_MEASURED`,
+  `NOT_APPLICABLE`, `BLOCKED_AUTHORIZATION`), and an unmeasured value is never
+  reported as a failure.
+- Each simulated radio endpoint is its own UDP socket: the registry keys a UE
+  on its peer address, so one shared socket cannot present many UEs.
+- This kernel drops excess UDP datagrams when a burst is queued before any
+  receive (222 of 300 in a raw probe). Interleave sends with polling; that is
+  also how independent radios behave.
+- A full registry refuses new contexts deterministically and still accepts
+  releases and cleanup. Nothing leaks a slot.
+
 ## What must never be committed
 
 - `config/*.local.yaml` — private laboratory configurations, including

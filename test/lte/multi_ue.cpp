@@ -363,8 +363,10 @@ mme:
     auto enb = lte::enb::ParseConfig(enbYaml);
     CHECK(enb.maxUes == 16);
 
+    // Phase 19-B raised the supported bound to 512 for the PERF-P2 capacity
+    // work; the refusal is now for anything above that bound.
     std::string beyond = enbYaml;
-    beyond.replace(beyond.find("16"), 2, "65");
+    beyond.replace(beyond.find("16"), 2, "513");
     CHECK_THROWS(lte::enb::ParseConfig(beyond));
 
     const char *ueYaml = R"(

@@ -85,7 +85,11 @@ EnbConfig ParseNode(const YAML::Node &root)
         throw std::runtime_error("Field 's1u.address' must be a concrete advertised IPv4 address");
 
     if (yaml::HasField(root, "maxUes"))
-        result.maxUes = yaml::GetInt32(root, "maxUes", 1, 64);
+        // Phase 19-B: the production bound is now 512, the target capacity of
+        // PERF-P2. It is not unbounded, and it is not a scalability claim: the
+        // isolated 512-context runtime evidence is what establishes that this
+        // many contexts can be held safely, not this line of code.
+        result.maxUes = yaml::GetInt32(root, "maxUes", 1, 512);
 
     if (yaml::HasField(root, "sctp"))
     {

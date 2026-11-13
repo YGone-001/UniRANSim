@@ -334,3 +334,17 @@ EPC address-pool limits, a traffic rate and a rollback plan. PERF-P1 needs an
 authorized real-EPC iperf3 session with distinct UE and server identities and
 corroborating packet counters. See `docs/lte-performance-benchmark-profiles.md`
 for the exact commands and classification rules.
+
+---
+
+## 7. Phase 19-B capacity foundation
+
+The 64-UE configuration ceiling is gone: `maxUes` accepts `1..512` and the
+production registry holds 512 independent contexts with exact-bound refusal,
+clean release and no stale index. Production radio ingress registers hundreds
+of independently identified peers, and the bounded poll budget shows no
+cross-UE starvation. See `docs/lte-512-ue-capacity-foundation.md`.
+
+PERF-P2 remains `REAL_512_UE_BLOCKED_AUTHORIZATION`: isolated context capacity
+is not EPS registration, and the laboratory's four authorized subscribers are
+untouched. PERF-P1 is unchanged and independent.
