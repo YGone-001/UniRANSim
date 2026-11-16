@@ -75,7 +75,9 @@ jobs:
         run: |
           report=cmake-build-coverage/report
           mkdir -p "$report"
-          gcovr --root . --filter src/ --exclude 'src/(asn|ext)/' --print-summary \
+          gcovr --root . --filter src/ --exclude 'src/(asn|ext)/' \
+                --gcov-ignore-parse-errors=negative_hits.warn \
+                --print-summary \
                 --html-details "$report/index.html" cmake-build-coverage | tee "$report/summary.txt"
           { echo '```'; cat "$report/summary.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v7
