@@ -281,14 +281,22 @@ The old 10.45.0.9 context is gone; no Open5GS restart was used.
 
 The 19-E-R campaign session usage record is 36,920,333,088 bytes. The balance
 `data_used` ended at 32,625,365,792 bytes, exactly 4,294,967,296 bytes (2^32)
-lower, while `data_available` moved by the full 36,920,333,088 bytes. A later
-UL4+DL4 diagnostic consumed 19,070,850,679 bytes and moved `data_used` and
-`data_available` by the same amount, without creating a second 4 GiB gap.
+lower, while `data_available` moved by the full 36,920,333,088 bytes.
 
-The arithmetic is a fixed one-time carry/ledger offset in `data_used`, not a
-loss of available credit. The balance invariant remains violated by exactly
-2^32 bytes. The external OCS code was not modified or restarted; the balance
-was not repaired. Raw ledger records remain local.
+The quantum is a 2^32 field-level carry/aliasing artefact, and it is not fixed
+to one field. After the 19-F-A diagnostic the balance read `used
+51,958,377,335, available 218,624,562,313`, which is `total - used - 2^32`: the
+quantum had moved into `available` while `used` had become the exact sum of the
+post-provisioning sessions. The current record reads `used 51,958,377,335,
+available 222,919,529,609`, which is `total - used` with no quantum at all.
+So the balance satisfies `total = used + available + reserved` at some
+observation instants and not at others.
+
+The external OCS code was not modified or restarted; the balance was not
+repaired, and no balance write was made. Raw ledger records remain local.
+
+The diagnostic's own usage is fully accounted for by the retained records and
+does not reproduce the report's 19,070,850,679 figure. See section 13.2.
 
 ### 12.2 Per-second wire evidence
 
@@ -337,12 +345,16 @@ application gap is headers/retransmissions, not missing packets.
 
 DL4 reached 662.9 Mbps with PGW-U at 75.4%, SGW-U 64.9%, eNB 50.9% and UE
 44.1%; **no process was saturated**. The downlink root cause is
-`BOTTLENECK_NOT_ESTABLISHED`. The strongest source-level candidate is the UE
-radio receive loop processing one frame per iteration (the uplink TUN path is
-batched up to 16); the UE radio socket recorded only 157 drops, so buffer loss
-alone does not explain the 663 Mbps plateau. A focused next experiment should
-batch the UE downlink receive or capture TCP window/RTT and UE TUN write
-latency; do not rewrite the loop without that evidence.
+`BOTTLENECK_NOT_ESTABLISHED`. The UE radio socket recorded only 157 drops and
+no TUN write failure, so buffer loss alone does not explain the 663 Mbps
+plateau.
+
+The one-frame-per-turn receive loop was the strongest source-level candidate at
+the time. Section 13 records the controlled measurement that tested it: the loop
+sustains 245,000-287,000 frames per second on one core against the 62,000 the
+DL4 profile actually offers, so the receive path is excluded with at least 4.0x
+headroom.
+The remaining candidates are EPC-side.
 
 The UDP anomaly remains a separate environment limit at the 212,992 B eNB
 radio receive buffer. It is not used as the TCP explanation.
@@ -358,3 +370,50 @@ was not available from the retained logs and is `NOT_MEASURED`.
 The campaign ended with the owner's six sessions, two eNB-UEs and one eNB
 untouched; no campaign UE, TUN or process remained. The fixed 4 GiB balance
 offset remains for the EPC owner to reconcile; no write was made.
+
+## 13. Downlink receive path: controlled measurement
+
+### 13.1 The one-frame hypothesis
+
+The production UE takes one simulated-radio datagram per main-loop turn. The
+controlled experiment in `docs/lte-downlink-receive-performance.md` runs that
+loop (Variant A) against a bounded drain (Variant B) over real loopback UDP with
+the production codec, validator and TUN writer.
+
+| Load | Variant A | Variant B (8) |
+|---|---:|---:|
+| 62,000 pps, 10 s | 60,794-61,895 fps, 28.2-32.0% CPU | 61,373-61,904 fps, 21.1-25.2% CPU |
+| 200,000 pps, 5 s | 160,553-161,815 fps, 57.8-60.4% | 190,796-193,664 fps, 54.4-56.4% |
+| ceiling, one core | 244,814-287,274 fps | 338,272-398,063 fps |
+
+The accepted DL4 profile offers 59,133-62,263 pps. Variant A therefore has
+**at least 4.0x headroom** at the operating point and delivers every offered
+datagram at about 30% of one core. The hypothesis is rejected as a throughput
+limit. The bounded drain lowers receive CPU by 22% and raises the ceiling 1.38x,
+which is a per-turn cost being amortised, not a bottleneck being removed.
+
+No production receive-loop change was made: the isolated experiment did not
+establish a scheduling restriction, which is the condition the work order sets.
+The applied-effect measurement is retained in
+`docs/lte-downlink-receive-performance.md` for a later phase.
+
+### 13.2 Diagnostic usage reconciliation
+
+Session `;130` (the 19-F-A diagnostic) recorded `used_total 15,038,044,247`,
+which its 1,435 usage records reproduce exactly. The ledger's `data_used` moved
+by 19,333,011,543 = 15,038,044,247 + 2^32, so the account-level movement is the
+session plus the deferred quantum. The current `data_used 51,958,377,335` is
+exactly the sum of the four post-provisioning sessions.
+
+The report's 19,070,850,679 figure is not reproducible from the retained
+records; the difference from the session record is 4,032,806,432. The
+work order's 262,160,864 residual follows from that figure, not from the ledger.
+Status: `OCS_DIAGNOSTIC_USAGE_DELTA_UNRESOLVED`. No record was modified.
+
+### 13.3 Verdict
+
+- Downlink bottleneck: `DOWNLINK_BOTTLENECK_NOT_ESTABLISHED`; the UE receive
+  path is excluded, and the remaining candidates are EPC-side.
+- PERF-P1 peak and sustained remain below target in both directions.
+- PERF-P2 remains `REAL_512_UE_ACCEPTED`.
+- No live throughput run was executed in this phase.

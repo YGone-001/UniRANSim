@@ -1,6 +1,6 @@
 # LTE Performance and Scalability Roadmap
 
-**Document status: `PERF-P2 ACCEPTED — PERF-P1 UL 929 MBPS — PGW-U CPU CONFIRMED — DL ROOT CAUSE OPEN`**
+**Document status: `PERF-P2 ACCEPTED — PERF-P1 UL 929 MBPS — PGW-U CPU CONFIRMED — DL UE RECEIVE PATH EXCLUDED`**
 
 Phase 19-A audited the architecture, established the current hard limits,
 implemented the reproducible isolated capacity harness and the opt-in
@@ -114,14 +114,26 @@ measure EPC throughput:
 > as a simulator-to-simulator number. Both endpoints must be distinct network
 > identities and the traffic must be observed inside GTP-U.
 
-### 2.4 Future P1 engineering analysis
+### 2.4 P1 engineering analysis
 
-Likely areas to investigate when — and only when — P1 is authorised. **None of
-these is implemented in the current phase, and none may be changed merely
-because it appears in this list.**
+Areas to investigate when — and only when — P1 is authorised. **None of these is
+implemented in the current phase, and none may be changed merely because it
+appears in this list.**
+
+The first item has now been measured rather than assumed. Phase 19-F-B measured
+the real UE downlink receive loop at the rate the accepted DL4 profile offers:
+about 61,400 frames per second at a median 30.3% of one core for the
+one-frame-per-turn loop, against a single-core ceiling of 244,814-287,274 frames
+per second. Bounded receive batches of 8 raise the ceiling to 338,272-398,063
+and lower receive CPU by 22%, and they change no deliverable at the operating
+point. The receive path is therefore excluded as the downlink limit with at
+least 4.0x measured headroom; the remaining downlink candidates are EPC-side.
+The record is `docs/lte-downlink-receive-performance.md`.
 
 - Number of packets processed per event-loop iteration, and the latency cost of
-  the current one-packet-at-a-time model.
+  the current one-packet-at-a-time model. **Measured (19-F-B): 4.9 us per frame
+  at 62,000 pps, 1.8 us of it in decode, validation and the TUN write; not the
+  downlink limit.**
 - UDP radio-link packet handling, including per-datagram syscalls.
 - Copying and buffer allocation: how many times one datagram is copied between
   the TUN, the radio link and the GTP-U socket.

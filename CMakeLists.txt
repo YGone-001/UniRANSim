@@ -113,6 +113,18 @@ if (BUILD_TESTS)
     doctest_discover_tests(nr-tests PROPERTIES TIMEOUT 60)
 endif ()
 
+#################### OFFLINE EXPERIMENTS ####################
+# Measurement tools that must never run inside the CI matrix. They are off by
+# default so a normal build and every CI job stay exactly as they were; a
+# measurement run configures with -DBUILD_EXPERIMENTS=ON.
+option(BUILD_EXPERIMENTS "Build the offline measurement tools in tools/" OFF)
+
+if (BUILD_EXPERIMENTS)
+    add_executable(lte-downlink-experiment tools/lte-downlink-receive-experiment.cpp)
+    target_compile_options(lte-downlink-experiment PRIVATE -Wall -Wextra -pedantic)
+    target_link_libraries(lte-downlink-experiment pthread common-lib lte-ue-lib)
+endif ()
+
 #################### COVERAGE ####################
 # Only the first-party libraries are instrumented. The generated ASN.1 code and the vendored libraries would dominate
 # the report and slow the build down, and they are not what the tests are written for.

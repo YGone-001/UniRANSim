@@ -146,6 +146,27 @@ control reaches 42.9 Gbps, so the endpoint is not the limiter. Four-stream
 downlink has PGW-U 75.4%, SGW-U 64.9%, eNB 50.9%, UE 44.1%: no process is
 saturated and the downlink cause remains `BOTTLENECK_NOT_ESTABLISHED`.
 
-The OCS 4 GiB offset is a fixed one-time carry in `data_used`; `data_available`
-moved by the full session usage and the later 19.07 GB diagnostic did not grow
-the gap. The external OCS was not modified.
+## 7. Downlink receive envelope
+
+Phase 19-F-B measured the UE receive path against the rate this profile matrix
+actually offers. A DL4 second carries 59,133-62,263 S1-U downlink datagrams; the
+table below is the measured capacity of one UE process at that frame size, on
+one core, with the production codec, validator and TUN writer.
+
+| Load | One frame per turn | Bounded 8 per turn |
+|---|---:|---:|
+| 62,000 pps (the DL4 rate) | 30.3% of one core, p99 0.25 ms | 23.6%, p99 0.19 ms |
+| ceiling on one core | 245,000-287,000 frames/s | 338,000-398,000 frames/s |
+
+A downlink profile may be offered up to at least 244,000 datagrams per second
+before the UE receive loop itself becomes the limiter, which is four times the
+DL4 rate. The production loop was deliberately left unchanged; the experiment
+and its invariants are in `docs/lte-downlink-receive-performance.md`.
+
+The OCS 4 GiB quantum is a field-level carry/aliasing artefact: it appeared in
+`data_used` in one snapshot and in `data_available` in another, and the current
+record satisfies `total = used + available` with no quantum. The diagnostic's
+usage is fully accounted for by its session record; the report's separate
+19,070,850,679 figure is not reproducible from the retained records and is
+recorded as `OCS_DIAGNOSTIC_USAGE_DELTA_UNRESOLVED`. The external OCS was not
+modified.

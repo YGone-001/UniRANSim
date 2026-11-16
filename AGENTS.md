@@ -869,8 +869,18 @@ TCP uplink four-stream sustained 929–941 Mbps and the best one-second interval
 was 999.71 Mbps, so both targets remain below 1 Gbps. Per-thread evidence
 confirms one PGW-U thread at 89.8% of one core on the uplink plateau; the
 host endpoint control reaches 42.9 Gbps. Downlink is 663 Mbps with no process
-saturated; its root cause is not established. The operational record is
+saturated. The operational record is
 `docs/lte-single-ue-1gbps-benchmark.md`.
+
+The UE downlink receive path has been measured, not assumed. It sustains
+245,000-287,000 frames per second on one core against the 62,000 a four-stream
+downlink second actually offers, so it is excluded as the downlink limit with at
+least 4.0x headroom; the remaining candidates are EPC-side and need their own
+authorization. The measurement, the bounded-drain alternative and the invariants
+any future batch must keep are in `docs/lte-downlink-receive-performance.md`.
+The raw evidence tool is `tools/lte-downlink-receive-experiment.cpp`, built only
+with `-DBUILD_EXPERIMENTS=ON`; it is a measurement tool and must never join the
+CI matrix.
 
 - An isolated registry holding 512 synthetic contexts is `ISOLATED_CONTEXT_CAPACITY`
   and never a real EPS Attach. The structured checkpoint classifications in
@@ -907,6 +917,19 @@ saturated; its root cause is not established. The operational record is
   torn down and report `BLOCKED_EPC_CONFIGURATION`.
 - UDP loss, jitter and retransmissions are results. Do not retry until a
   favorable sample appears or discard earlier samples.
+- A single simulated-radio receive per main-loop turn is the production UE
+  behaviour. Do not treat it as a bottleneck without a measurement: it was
+  measured at about 30% of one core at the DL4 rate, with a ceiling at least
+  four times higher. A bounded
+  drain is a per-turn cost saving, not a throughput fix, and it must stay
+  bounded, keep arrival order, use a zero timeout after the first frame, and
+  return to the TUN uplink read between turns. The contract is pinned in
+  `test/lte/downlink_receive.cpp`; do not weaken it to make a batch convenient.
+- The OCS ledger can differ from its own conservation equation by exactly 2^32
+  bytes, in `data_used` in one snapshot and in `data_available` in another. That
+  is a field-level carry artefact outside this repository, not lost credit, and
+  it is never repaired here. Reconcile from the session and usage records, quote
+  which observation window each number came from, and never write a balance.
 
 ## LTE 512-UE capacity
 
