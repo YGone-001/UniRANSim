@@ -114,11 +114,13 @@ the eNB waited 20 ms on SCTP before one 16-packet drain, and the UE waited
 | UDP uplink, 100 Mbps | 3.44 Mbps, 97% loss | 35 Mbps, 65.1% loss |
 
 The best one-second interval (999.71 Mbps) is below 1,000 Mbps, so the peak
-verdict is `PERF_P1_PEAK_BELOW_TARGET`. The 60 s window is
-`PERF_P1_SUSTAINED_NOT_MEASURED`: the subscriber's OCS balance is 6.44 GB
-total, 6.44 GB used, 0 available, and a 60 s 1 Gbps run needs about 7.5 GB.
-The SMF removed the session on Gy final-unit action; a later Attach received
-Gy 4012 credit-limit-reached. No subscriber or balance was modified.
+verdict is `PERF_P1_PEAK_BELOW_TARGET`. The first 60 s attempt was blocked by
+a 6.44 GB OCS balance. After the owner restored 256 GiB, the complete 65 s
+matrix ran: TCP uplink four-stream sustained 930.5 Mbps (repeat 941.35 Mbps),
+downlink four-stream 655.6 Mbps, single-stream 771.5/562.5 Mbps. The sustained
+verdict is `PERF_P1_SUSTAINED_BELOW_TARGET`; EPC PGW-U/UPF reached 89–91% of
+one core, which is the measured bottleneck. No subscriber or balance was
+modified.
 
 UDP at 50–100 Mbps still drops at the eNB radio socket, whose 212,992 B buffer
 holds about 230 packets; that is a `SOCKET_BUFFER_LIMIT` for bursty UDP, not

@@ -864,10 +864,12 @@ encoded. `src/lte/enb/handover_runtime_provenance.{hpp,cpp}` owns that.
 Two goals drive the current workstream: PERF-P1 (single UE sustained 1 Gbps
 user-plane goodput over a real EPC path) and PERF-P2 (512 concurrent
 authenticated, EPS-registered LTE UEs). PERF-P2 is accepted by the 512-subscriber
-campaign. PERF-P1 is measured below the strict sustained target and is currently
-blocked by the EPC's per-session online-charging quota; the data-path limits
-that were measured and fixed are recorded in
-`docs/lte-single-ue-1gbps-benchmark.md`.
+campaign. PERF-P1 completed the four 60 s TCP profiles and a repeat of the best
+profile: TCP uplink four-stream sustained 930.5 Mbps (repeat 941.35 Mbps) and
+the best one-second interval was 999.71 Mbps, so both targets remain below
+1 Gbps. The measured bottleneck at that point is the EPC PGW-U/UPF process,
+which reached 89–91% of one core; the UE and eNB loops are no longer the cap.
+The operational record is `docs/lte-single-ue-1gbps-benchmark.md`.
 
 - An isolated registry holding 512 synthetic contexts is `ISOLATED_CONTEXT_CAPACITY`
   and never a real EPS Attach. The structured checkpoint classifications in

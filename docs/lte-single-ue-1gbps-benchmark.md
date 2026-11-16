@@ -128,7 +128,10 @@ A 60 s 1 Gbps application-goodput window needs about 7.5 GB. The 6.44 GB balance
 cannot carry it even from an empty session. This is an EPC configuration limit,
 not a UniRANSim data-path limit. No subscriber, balance or tariff was modified.
 
-## 7. Peak and sustained verdicts
+## 7. Peak and sustained verdicts (quota-blocked run)
+
+> The 256 GiB recovery run supersedes the quota-blocked verdicts in this
+> section; its complete 60-second matrix is in section 11.
 
 - **Peak:** `PERF_P1_PEAK_BELOW_TARGET`. The best measured one-second interval
   was 999.71 Mbps, just below the 1,000 Mbps boundary; the 10 s aggregate was
@@ -179,3 +182,95 @@ local and are not committed.
 3. If UDP at 50–100 Mbps matters, measure a controlled per-socket receive-buffer
    test or a paced UDP profile; do not change global sysctls by default.
 4. Keep the 512-UE registration acceptance unchanged.
+
+## 11. 256 GiB recovery and complete 60-second matrix
+
+The owner replenished the subscriber's data allowance. The effective OCS state
+was verified before load:
+
+```text
+data_total      274,877,906,944 bytes (256 GiB)
+data_used        32,625,365,792 bytes after the campaign
+data_available  237,957,573,856 bytes after the campaign
+data_reserved                0 bytes
+```
+
+A new Gy reservation returned result code 2001 with granted units and no final
+unit. The old residual SMF context (IPv4 10.45.0.9) was released by the
+supported production Attach for the same IMSI; the new session used
+10.45.0.27. No subscriber, tariff or balance was modified.
+
+### 11.1 Four primary TCP profiles
+
+Each profile was 65 s total with the first 5 s omitted; the 60 measured
+one-second intervals are retained locally.
+
+| Profile | Receiver goodput | Best 1 s | Worst 1 s | Retransmits |
+|---|---:|---:|---:|---:|
+| TCP uplink, 1 stream | 771.5 Mbps | 830.5 | 704.6 | 6,915 |
+| TCP downlink, 1 stream | 562.5 Mbps | 606.1 | 530.6 | 2,803 |
+| TCP uplink, 4 streams | **930.5 Mbps** | 962.6 | 757.1 | 34,903 |
+| TCP downlink, 4 streams | 655.6 Mbps | 686.8 | 574.6 | 36,665 |
+| TCP uplink, 4 streams, repeat | **941.4 Mbps** | 965.7 | 882.9 | 34,829 |
+
+The sustained target is not met in any direction. The repeated uplink
+four-stream mean is 940.6 Mbps; the two runs span 930.5–941.4 Mbps.
+
+### 11.2 CPU and wire evidence
+
+The EPC is the limiting subsystem at the four-stream uplink rate:
+
+| Process | Average / maximum (% of one core) |
+|---|---:|
+| PGW-U / `upfd` | 89.2 / 91.0 |
+| SGW-U / `sgwud` | ~80 / 85 |
+| eNB | 77.0 / 79.0 |
+| UE | 66.7 / 68.0 |
+| iperf3 server | 33 |
+| MME / SMF | 1 / 2 |
+
+The eNB per-UE counters for the session measured 24,887,382,062 bytes and
+20,986,849 packets uplink, and 12,032,868,778 bytes and 16,304,838 packets
+downlink on S1-U. The UE TUN counters measured 16,209,207,664 bytes uplink and
+11,880,146,183 bytes downlink. The S1-U/application ratio is therefore about
+1.54 uplink and 1.01 downlink; uplink includes TCP retransmissions and GTP-U/
+IP/UDP overhead, so it is not an application-goodput number. No eNB S1-U drop
+was recorded.
+
+### 11.3 Bounded UDP validation
+
+| Offered | Delivered | Loss |
+|---:|---:|---:|
+| 10 Mbps uplink | 10.0 Mbps | 0% |
+| 50 Mbps uplink | 30.36 Mbps | 39.28% |
+| 10 Mbps downlink | 10.0 Mbps | 0% |
+| 50 Mbps downlink | 50.0 Mbps | 0% |
+
+The uplink 50 Mbps step exceeds the 10% loss limit, so no higher UDP rate was
+attempted. The asymmetry is consistent with the eNB radio receive buffer on
+the uplink path; downlink at 50 Mbps was loss-free.
+
+### 11.4 Cleanup
+
+The final state is the owner's pre-existing baseline:
+
+```text
+MME eNB-UEs            1
+MME sessions           2
+SMF GTPv2 / PFCP       2 / 2
+eNB connections        1
+campaign UE processes  0
+campaign TUNs          0
+```
+
+The old 10.45.0.9 context is gone; no Open5GS restart was used.
+
+### 11.5 Verdicts
+
+- Peak: `PERF_P1_PEAK_BELOW_TARGET` — best observed 999.71 Mbps (earlier 10 s
+  diagnostic); best in the 60 s repeat 965.73 Mbps.
+- Sustained: `PERF_P1_SUSTAINED_BELOW_TARGET` — complete 60 s matrix, best
+  four-stream uplink 941.35 Mbps.
+- The remaining primary bottleneck is EPC PGW-U CPU, not the UE/eNB loop.
+- Engineering acceptance is tied to the final report's cleanup and CI gates;
+  the throughput objective itself remains below target.

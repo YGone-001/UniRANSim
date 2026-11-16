@@ -1,6 +1,6 @@
 # LTE Performance and Scalability Roadmap
 
-**Document status: `PERF-P2 ACCEPTED — PERF-P1 983.8 MBPS PEAK — SUSTAINED BLOCKED BY EPC QUOTA`**
+**Document status: `PERF-P2 ACCEPTED — PERF-P1 SUSTAINED 930.5 MBPS — EPC PGW-U CPU LIMIT`**
 
 Phase 19-A audited the architecture, established the current hard limits,
 implemented the reproducible isolated capacity harness and the opt-in
@@ -508,3 +508,30 @@ also left one residual PDN context after the failed charging attempt; the MME,
 eNB and TUNs were clean.
 
 The full record is `docs/lte-single-ue-1gbps-benchmark.md`.
+
+### 10.4 Recovery run: complete 60-second matrix
+
+The owner restored the OCS data allowance to 256 GiB (274,877,906,944 bytes);
+the effective balance was verified and a new Gy reservation returned result
+code 2001 with granted units. The stale 10.45.0.9 SMF context was released by
+the supported production Attach for the same IMSI, which created 10.45.0.27.
+
+| Profile (65 s, 5 s warm-up) | Receiver goodput | Best 1 s | Worst 1 s |
+|---|---:|---:|---:|
+| TCP uplink, 1 stream | 771.5 Mbps | 830.5 | 704.6 |
+| TCP downlink, 1 stream | 562.5 Mbps | 606.1 | 530.6 |
+| TCP uplink, 4 streams | **930.5 Mbps** | 962.6 | 757.1 |
+| TCP downlink, 4 streams | 655.6 Mbps | 686.8 | 574.6 |
+| TCP uplink, 4 streams, repeat | **941.4 Mbps** | 965.7 | 882.9 |
+
+The 60-second rows are complete measured windows, not extrapolations. The
+sustained target is `PERF_P1_SUSTAINED_BELOW_TARGET`; the best peak remains
+`PERF_P1_PEAK_BELOW_TARGET` (999.71 Mbps in the earlier 10 s diagnostic and
+965.73 Mbps in the 60 s repeat).
+
+The measured bottleneck is the EPC PGW-U/UPF process: 89–91% of one core at
+the four-stream uplink rate, with SGW-U at 85%, eNB at 79%, and UE at 68% at
+their maxima. UDP remained bounded: 10 Mbps had 0% loss in both directions;
+50 Mbps delivered 30.36 Mbps uplink (39.28% loss) and 50 Mbps downlink (0%
+loss). Cleanup restored the owner baseline: 2 MME sessions, 2 SMF/PFCP
+sessions, 1 eNB and 1 eNB-UE, with no campaign TUN or UE process.
