@@ -1,6 +1,6 @@
 # LTE Performance and Scalability Roadmap
 
-**Document status: `PERF-P2 ACCEPTED — PERF-P1 SUSTAINED 930.5 MBPS — EPC PGW-U CPU LIMIT`**
+**Document status: `PERF-P2 ACCEPTED — PERF-P1 UL 929 MBPS — PGW-U CPU CONFIRMED — DL ROOT CAUSE OPEN`**
 
 Phase 19-A audited the architecture, established the current hard limits,
 implemented the reproducible isolated capacity harness and the opt-in
@@ -535,3 +535,27 @@ their maxima. UDP remained bounded: 10 Mbps had 0% loss in both directions;
 50 Mbps delivered 30.36 Mbps uplink (39.28% loss) and 50 Mbps downlink (0%
 loss). Cleanup restored the owner baseline: 2 MME sessions, 2 SMF/PFCP
 sessions, 1 eNB and 1 eNB-UE, with no campaign TUN or UE process.
+
+### 10.5 Root-cause diagnostic
+
+The 4 GiB OCS offset is a fixed one-time carry in `data_used`: the campaign
+session usage is 36,920,333,088 bytes, `data_used` is exactly 2^32 lower, and
+`data_available` moved by the full amount. A later 19.07 GB diagnostic moved
+both fields together and did not grow the gap. The external OCS code and
+balance were not modified.
+
+Time-aligned S1-U captures give the missing per-second wire rates: UL4 uplink
+972–993 Mbps (84.6–86.5k pps), DL4 downlink 679–715 Mbps (59.1–62.3k pps).
+The application/wire ratio is about 1.05 per direction; the old 1.54 session
+ratio was a counter-window artifact.
+
+`pidstat -t` confirms one PGW-U thread at 89.8% average (90% max), system-
+heavy, at the 929 Mbps uplink plateau. SGW-U 83.7%, eNB 76.0%, UE 67.0%, while
+the host endpoint control reached 42.9 Gbps. The uplink classification is
+`PGWU_CPU_LIMIT_CONFIRMED`.
+
+Downlink DL4 was 662.9 Mbps with PGW-U 75.4%, SGW-U 64.9%, eNB 50.9%, UE 44.1%;
+no process was saturated. Its root cause is `BOTTLENECK_NOT_ESTABLISHED`; the
+strongest source-level candidate is the UE one-frame-per-turn radio receive
+path, not yet confirmed. The next experiment is a bounded UE receive batch or
+TCP-window/TUN-latency capture, not a data-plane rewrite.

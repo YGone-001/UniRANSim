@@ -274,3 +274,87 @@ The old 10.45.0.9 context is gone; no Open5GS restart was used.
 - The remaining primary bottleneck is EPC PGW-U CPU, not the UE/eNB loop.
 - Engineering acceptance is tied to the final report's cleanup and CI gates;
   the throughput objective itself remains below target.
+
+## 12. Root-cause diagnostic and OCS reconciliation
+
+### 12.1 The 4 GiB OCS offset
+
+The 19-E-R campaign session usage record is 36,920,333,088 bytes. The balance
+`data_used` ended at 32,625,365,792 bytes, exactly 4,294,967,296 bytes (2^32)
+lower, while `data_available` moved by the full 36,920,333,088 bytes. A later
+UL4+DL4 diagnostic consumed 19,070,850,679 bytes and moved `data_used` and
+`data_available` by the same amount, without creating a second 4 GiB gap.
+
+The arithmetic is a fixed one-time carry/ledger offset in `data_used`, not a
+loss of available credit. The balance invariant remains violated by exactly
+2^32 bytes. The external OCS code was not modified or restarted; the balance
+was not repaired. Raw ledger records remain local.
+
+### 12.2 Per-second wire evidence
+
+A bounded 8 s S1-U capture during each 60 s profile gives the missing
+time-resolved series (GTP-U payload plus IPv4/UDP headers; link header excluded):
+
+| Profile | Direction | Packet rate | S1-U wire rate | Application goodput |
+|---|---:|---:|---:|---:|
+| UL4 | uplink | 84,597–86,482 pps | 971.9–993.5 Mbps | 928.7 Mbps |
+| UL4 | downlink ACKs | 39,001–40,244 pps | 27.6–28.4 Mbps | — |
+| DL4 | downlink | 59,133–62,263 pps | 679.3–715.3 Mbps | 662.9 Mbps |
+| DL4 | uplink ACKs | 24,205–25,534 pps | 17.1–18.1 Mbps | — |
+
+The per-second S1-U/application ratio is about 1.05, not the 1.54 implied by
+the older session totals. The 1.54 was a counter-boundary artifact: the eNB
+session counter and the UE TUN counter did not cover the same interval. The
+corrected evidence is the time-aligned capture.
+
+### 12.3 Per-thread CPU
+
+`pidstat -t` during the 60 s profiles:
+
+| Process / thread | UL4 average / max | DL4 average / max |
+|---|---:|---:|
+| PGW-U thread 4040 | **89.8 / 90.0%** | 75.4 / — |
+| SGW-U thread 3959 | 83.7 / — | 64.9 / — |
+| LTE eNB | 76.0 / — | 50.9 / — |
+| LTE UE | 67.0 / — | 44.1 / — |
+| iperf3 client | 2.1 / — | 21 (earlier) |
+| OCS / SMF | below 1–2% | below 1–2% |
+
+PGW-U thread 4040 is system-heavy: 24.1% user, 65.7% system. The process is
+not merely "busy"; one thread is at the one-core ceiling at the 929 Mbps
+uplink plateau. The host endpoint control (4-stream iperf3 on loopback, no EPC)
+reached 42.9 Gbps, so iperf3 and the host stack are not the endpoint limit.
+
+### 12.4 Uplink conclusion
+
+`PGWU_CPU_LIMIT_CONFIRMED` for the four-stream uplink path: one PGW-U thread
+saturates at ~90% while the application plateaus at 929 Mbps; SGW-U/eNB/UE are
+lower; the endpoint control and host CPU have headroom; retransmissions are
+present (34,099 in the 60 s run). The S1-U wire is 972–993 Mbps, so the
+application gap is headers/retransmissions, not missing packets.
+
+### 12.5 Downlink conclusion
+
+DL4 reached 662.9 Mbps with PGW-U at 75.4%, SGW-U 64.9%, eNB 50.9% and UE
+44.1%; **no process was saturated**. The downlink root cause is
+`BOTTLENECK_NOT_ESTABLISHED`. The strongest source-level candidate is the UE
+radio receive loop processing one frame per iteration (the uplink TUN path is
+batched up to 16); the UE radio socket recorded only 157 drops, so buffer loss
+alone does not explain the 663 Mbps plateau. A focused next experiment should
+batch the UE downlink receive or capture TCP window/RTT and UE TUN write
+latency; do not rewrite the loop without that evidence.
+
+The UDP anomaly remains a separate environment limit at the 212,992 B eNB
+radio receive buffer. It is not used as the TCP explanation.
+
+### 12.6 OCS/Gy behavior
+
+The new 65 s UL4 profile added 819 usage records; DL4 added 590. With 10 MiB
+grants this is about 12.6 CCR-Update events per second at 929 Mbps. OCS and SMF
+CPU stayed below 1–2% in the same samples; the 10 MiB grant size is a protocol
+design cost, not the measured packet-path bottleneck. Per-request CCA latency
+was not available from the retained logs and is `NOT_MEASURED`.
+
+The campaign ended with the owner's six sessions, two eNB-UEs and one eNB
+untouched; no campaign UE, TUN or process remained. The fixed 4 GiB balance
+offset remains for the EPC owner to reconcile; no write was made.

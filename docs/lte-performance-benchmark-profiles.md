@@ -127,3 +127,25 @@ holds about 230 packets; that is a `SOCKET_BUFFER_LIMIT` for bursty UDP, not
 the event-loop ceiling that was fixed. TCP is flow-controlled and reached
 983.8 Mbps. The full operational record is
 `docs/lte-single-ue-1gbps-benchmark.md`.
+
+## 6. Per-second wire and CPU diagnostic
+
+A time-aligned S1-U capture during the 60 s profiles gives:
+
+| Profile | Direction | Wire rate | Application |
+|---|---:|---:|---:|
+| TCP UL4 | uplink | 972–993 Mbps | 928.7 Mbps |
+| TCP DL4 | downlink | 679–715 Mbps | 662.9 Mbps |
+
+The per-direction wire/application ratio is about 1.05; the old 1.54 session
+total was a counter-window artifact, not protocol overhead.
+
+`pidstat -t` shows one PGW-U thread at 89.8% average (90% max), system-heavy,
+on the uplink plateau; SGW-U 83.7%, eNB 76.0%, UE 67.0%. The host endpoint
+control reaches 42.9 Gbps, so the endpoint is not the limiter. Four-stream
+downlink has PGW-U 75.4%, SGW-U 64.9%, eNB 50.9%, UE 44.1%: no process is
+saturated and the downlink cause remains `BOTTLENECK_NOT_ESTABLISHED`.
+
+The OCS 4 GiB offset is a fixed one-time carry in `data_used`; `data_available`
+moved by the full session usage and the later 19.07 GB diagnostic did not grow
+the gap. The external OCS was not modified.
