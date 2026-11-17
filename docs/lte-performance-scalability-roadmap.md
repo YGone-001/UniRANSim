@@ -1,6 +1,6 @@
 # LTE Performance and Scalability Roadmap
 
-**Document status: `PERF-P2 ACCEPTED - PERF-P1 DL 872 MBPS - DL LOSS CHAIN RESOLVED, PGW-U CPU NEXT`**
+**Document status: `PERF-P2 ACCEPTED - PERF-P1 DL 947 MBPS - PGW-U ONE-CORE CEILING`**
 
 Phase 19-A audited the architecture, established the current hard limits,
 implemented the reproducible isolated capacity harness and the opt-in
@@ -204,6 +204,13 @@ The next limit is PGW-U CPU: 92.3% average and 98-99% peak of one thread at
 872 Mbps, with SGW-U at 79.7%, the eNB at 67.2% and the UE at 57.8%. The
 sender held a 108-segment window at a 6.1 ms RTT and was receive-window
 limited for 5-12 ms out of 39 s.
+
+A follow-up run rebuilt the EPC from the same source in release mode (the
+installed build was `buildtype=debug`, `-O0`) and repeated the profile: 947.24
+Mbps sustained, 985.66 Mbps best second, still zero drops, PGW-U still 92.2%
+average and 99% peak. The rebuild is worth +8.6% and does not move the wall:
+the same 92% of a core now carries more packets. 1 Gbps needs more PGW-U
+capacity, not a cheaper packet path alone.
 
 PERF-P1 downlink is therefore `PERF_P1_DL_SUSTAINED_BELOW_TARGET` at 871.95
 Mbps, and the remaining 1-Gbps gap is a PGW-U per-thread question, not a

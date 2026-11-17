@@ -573,3 +573,28 @@ their sockets report `rb212992`. No sysctl was persisted.
 The downlink result is therefore `PERF_P1_DL_SUSTAINED_BELOW_TARGET` at 871.95 Mbps
 on a tuned host, with no buffer loss left to recover. What remains is the PGW-U
 per-thread cost, which is the same external workstream as the uplink.
+
+### 16.1 Release-build EPC
+
+The installed Open5GS was configured with `buildtype=debug` and
+`optimization=0`, so every user-plane packet was processed by `-O0` code. It was
+rebuilt from the same source with `-Dbuildtype=release` (verified: `-O3`, no `-g`)
+and all daemons were restarted. The same DL4 profile was then run under the
+same host buffers:
+
+| EPC build | Receiver goodput | Best 1 s | Retransmits | PGW-U CPU | UDP drops |
+|---|---:|---:|---:|---:|---:|
+| debug, `-O0` | 871.95 Mbps | 907.24 | 3,473 | 92.3% / 99% | 0 |
+| release, `-O3` | **947.24 Mbps** | **985.66** | 3,309 | 92.2% / 99% | 0 |
+
+The rebuild is worth **+75 Mbps (+8.6%)** and nothing else changed: still zero
+drops at all four hops, still four streams, same 60 s window, sender `cwnd` 105
+segments at a 5.37 ms RTT and receive-window limited for 2 ms out of 39 s.
+
+PGW-U stays at the one-core ceiling. The rebuild did not move the wall; it
+moved more packets through the same 92% of a core, which is what a cheaper
+per-packet path looks like when the process is the limit. The 1 Gbps target is
+therefore still `PERF_P1_DL_SUSTAINED_BELOW_TARGET` (947.24 Mbps sustained, 985.66
+Mbps best second) and the remaining gap is PGW-U capacity, not buffers, not
+the EPC build, and not UniRANSim.
+
