@@ -925,6 +925,12 @@ CI matrix.
   torn down and report `BLOCKED_EPC_CONFIGURATION`.
 - UDP loss, jitter and retransmissions are results. Do not retry until a
   favorable sample appears or discard earlier samples.
+- A receive-buffer experiment must state every hop effective budget. A run in
+  which all sockets inherit a raised `rmem_default` is not evidence for the
+  per-socket option, and a run in which one hop is larger than the others is
+  not a controlled A/B. Open5GS never requests a receive buffer, so its
+  sockets take `rmem_default` at creation and only a restart after the sysctl
+  change moves them; record that restart rather than assuming it.
 - A receive buffer is opt-in and verified. Absent means no system call and the
   historical socket; an explicit request is checked with getsockopt and a value
   the kernel capped is a configuration failure, never a success with a smaller

@@ -517,23 +517,59 @@ applied is 212,992 bytes of usable budget (reported as 425,984 by
 `getsockopt`). The 4 MiB budget the 19-F-C counterfactual used is not attainable
 here without a host change that this phase is not authorized to make.
 
-## 15. Real-EPC re-acceptance status
+## 15. Real-EPC re-acceptance
 
-`BLOCKED_LIVE_AUTHORIZATION`. No new high-rate workload was run in this phase. The
-reason is not only authorization: with the host cap at 212,992 the tuning can at
-most reproduce the 19-F-C counterfactual, which already measured 762.64 Mbps and
-`LOSS_STAGE_RELOCATED` rather than a resolved chain.
+Authorized in Phase 19-F-E as three separate approvals: a temporary host sysctl
+change, an Open5GS restart, and one bounded DL4 A/B. The results are in
+section 16.
 
-A future authorized run should be:
+## 16. Coordinated receive-buffer DL4 campaign
 
-1. raise `net.core.rmem_max` on the laboratory host (an operator action, with
-   rollback), so a 4 MiB request is applied rather than capped;
-2. restart Open5GS if the SGW-U socket is to inherit the larger default,
-   which needs its own approval and a maintenance window;
-3. run one DL4 baseline (production defaults) and one DL4 with both opt-in
-   values, 65 s each, 5 s warm-up, 60 s measured, four streams;
-4. record per-socket drops at all three hops, TCP state on both ends, CPU,
-   softirq, wire rate and OCS usage for each run.
+Setup: the host was temporarily given `net.core.rmem_max=8388608` and
+`net.core.rmem_default=4194304`, and `sgwud` and `upfd` were restarted so their
+GTP-U sockets were created with the new default. Both EPC sockets then
+reported `rb4194304`. The UE and the eNB were started twice: once with no
+receive-buffer field (run A) and once with `receiveBufferBytes: 4194304` on
+both (run B), which reads back as `rb8388608` on those two sockets.
 
-Until that exists, the downlink has no 1 Gbps evidence and PERF-P1 stays
-`PERF_P1_SUSTAINED_BELOW_TARGET`.
+| Run | eNB S1-U | UE radio | SGW-U | PGW-U | DL4 goodput | Retransmits | UDP drops (any hop) |
+|---|---|---|---|---|---:|---:|---:|
+| 19-F-C baseline | 212,992 | 212,992 | 212,992 | 212,992 | 298.56 / 537.86 Mbps | 18,908 / 29,894 | 27,963 / 3,345 / 1,071 |
+| A: host default | 4,194,304 | 4,194,304 | 4,194,304 | 4,194,304 | **871.95 Mbps** | 3,473 | **0** |
+| B: A + explicit 4 MiB | 8,388,608 | 8,388,608 | 4,194,304 | 4,194,304 | **865.35 Mbps** | 3,449 | **0** |
+
+Both runs used four TCP streams, 65 s total and a 60 s measured window, the
+same device path and the same endpoint. Each run created its own EPS session
+and was detached afterwards; the EPC returned to zero sessions both times.
+
+**What moved the number was the host default, not the per-socket option.** Run
+A had no buffer field at all and still reached 872 Mbps, because every socket
+it created inherited 4 MiB from `rmem_default`. Run B doubled the two
+UniRANSim sockets to 8 MiB and changed nothing measurable (865 Mbps, inside the
+run-to-run spread). The option is verified and correct; it simply was not the
+remaining constraint once the whole chain had 4 MiB.
+
+**The loss chain is resolved at the socket level.** With 4 MiB everywhere no
+socket dropped a single datagram in either run (`UdpRcvbufErrors` +0,
+per-socket `d` counters unchanged at the eNB S1-U, the UE radio, the SGW-U and
+the PGW-U), and TCP retransmissions fell from 18,908-29,894 to about 3,450.
+
+**The next limit is PGW-U CPU.** Per-thread averages over the 60 s window:
+PGW-U 92.3% (A) / 91.1% (B), maximum 98-99%; SGW-U 79.7 / 77.3%; eNB 67.2 /
+65.3%; UE 57.8 / 55.6%; iperf3 server 2.1. The sender held `cwnd` 108 (A) and
+104 (B) segments at a 6.1 ms RTT, and was `rwnd_limited` for 5-12 ms out of 39 s,
+so the receiver window was not the brake. S1-U wire samples were 780-838 Mbps
+in one direction against 870 Mbps of application goodput, a ratio of about
+1.04.
+
+Verdicts: `SOCKET_BUFFER_CONFIGURATION_ACCEPTED`, `LOSS_CHAIN_RESOLVED`,
+`PERF_P1_DL_SUSTAINED_BELOW_TARGET` (871.95 Mbps best sustained, 907.24 Mbps best one
+second). The 1 Gbps target now needs the PGW-U thread, not a buffer.
+
+The host change was rolled back after the campaign: `rmem_max` and
+`rmem_default` are 212,992 again, and `sgwud`/`upfd` were restarted once more so
+their sockets report `rb212992`. No sysctl was persisted.
+
+The downlink result is therefore `PERF_P1_DL_SUSTAINED_BELOW_TARGET` at 871.95 Mbps
+on a tuned host, with no buffer loss left to recover. What remains is the PGW-U
+per-thread cost, which is the same external workstream as the uplink.

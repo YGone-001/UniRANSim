@@ -1,6 +1,6 @@
 # LTE Performance and Scalability Roadmap
 
-**Document status: `PERF-P2 ACCEPTED - PERF-P1 BELOW TARGET - DL LOSS CHAIN KNOWN, BUFFERS OPT-IN`**
+**Document status: `PERF-P2 ACCEPTED - PERF-P1 DL 872 MBPS - DL LOSS CHAIN RESOLVED, PGW-U CPU NEXT`**
 
 Phase 19-A audited the architecture, established the current hard limits,
 implemented the reproducible isolated capacity harness and the opt-in
@@ -183,12 +183,31 @@ explicit receive buffer: `s1u.receiveBufferBytes` for the shared eNB S1-U socket
 the historical behaviour. A request the kernel caps is refused with the
 requested and effective values, never reported as applied.
 
-This is capability, not a performance result. On this host the cap is 212,992
-bytes, so the largest applicable request reproduces the Phase 19-F-C
-counterfactual (762.64 Mbps, `LOSS_STAGE_RELOCATED`) rather than resolving the chain.
-Reaching the intended 4 MiB needs a host `net.core.rmem_max` change and an Open5GS
-restart, both separately authorized. The record is
-`docs/lte-udp-receive-buffer-tuning.md`.
+This is capability, and Phase 19-F-E later measured it under a separate host
+authorization. The record is `docs/lte-udp-receive-buffer-tuning.md`.
+
+### 2.7 Downlink after the receive-buffer campaign
+
+Under a temporary host authorization (`rmem_max=8388608`,
+`rmem_default=4194304`, SGW-U and PGW-U restarted so their sockets inherited
+it) the downlink loss chain was resolved: four-stream DL4 reached **871.95
+Mbps** with **zero UDP drops at the eNB S1-U, the UE radio, the SGW-U and the
+PGW-U**, and TCP retransmissions fell from 18,908-29,894 to about 3,450.
+
+The explicit per-socket option added nothing on top of that default: with 4
+MiB inherited everywhere, the run without any buffer field already reached
+872 Mbps, and doubling the two UniRANSim sockets to 8 MiB measured 865 Mbps.
+The host default, not the option, was the lever, which is why the option is
+described as capability and the host change as the experiment.
+
+The next limit is PGW-U CPU: 92.3% average and 98-99% peak of one thread at
+872 Mbps, with SGW-U at 79.7%, the eNB at 67.2% and the UE at 57.8%. The
+sender held a 108-segment window at a 6.1 ms RTT and was receive-window
+limited for 5-12 ms out of 39 s.
+
+PERF-P1 downlink is therefore `PERF_P1_DL_SUSTAINED_BELOW_TARGET` at 871.95
+Mbps, and the remaining 1-Gbps gap is a PGW-U per-thread question, not a
+buffer one.
 
 ---
 

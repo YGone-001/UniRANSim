@@ -123,16 +123,20 @@ int main(int argc, char **argv)
 {
     uint64_t count = 2000;
     size_t payload = 1400;
+    int explicitRequest = 4194304;
     if (argc > 1)
         count = static_cast<uint64_t>(std::strtoull(argv[1], nullptr, 10));
     if (argc > 2)
         payload = static_cast<size_t>(std::strtoul(argv[2], nullptr, 10));
+    if (argc > 3)
+        explicitRequest = std::atoi(argv[3]);
 
     const int cap = KernelRmemMax();
     std::printf("HOST net.core.rmem_max=%d\n", cap);
 
     Print(RunBurst("default", 0, count, payload, false));
     Print(RunBurst("at-cap", cap, count, payload, true));
+    Print(RunBurst("explicit", explicitRequest, count, payload, true));
     Print(RunBurst("above-cap", std::min(2 * cap, udp::MaxConfiguredReceiveBufferBytes), count, payload, true));
     return 0;
 }

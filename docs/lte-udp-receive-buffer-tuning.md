@@ -78,13 +78,21 @@ the parser cannot make an unbounded request either.
 `net.core.rmem_max`, and doubles it for accounting; `getsockopt` returns
 **the doubled value**. Therefore:
 
-- a request that was applied reads back as twice the request;
+- a socket that was never configured reads back `rmem_default`, not twice it:
+  the default is stored as the accounting value directly;
+- an applied request reads back as twice the request;
 - a request that the kernel capped reads back as twice `rmem_max`, which is
   less than twice the request.
 
+`usableBytes` is therefore the *nominal requested budget*, not a capacity for
+that many payload bytes. Linux charges each queued datagram its skb truesize,
+which for a 1,408-byte datagram is about 2,290 bytes on this kernel, so a
+212,992-byte budget holds about 93 datagrams, not 151. The isolated experiment
+below shows exactly that ratio.
+
 `ConfigureReceiveBuffer` classifies the readback against the request and
-reports ```requestedBytes```, ```effectiveBytes``` (the readback),
-```usableBytes``` (the readback halved) and an error string. A capped request is
+reports `requestedBytes`, `effectiveBytes` (the readback),
+`usableBytes` (the readback halved) and an error string. A capped request is
 **not** applied:
 
 ```text
@@ -149,22 +157,38 @@ not "N MiB resident".
 | PGW-U GTP-U | Open5GS | no |
 | NR/gNB sockets | this repository | no (unchanged class, untouched by default) |
 
-A unix `rmem_max` raise is a **host** action and is not performed by this
-code or by this phase. Open5GS does not request a larger buffer either: on this
-host its GTP-U sockets report `rb212992`, the value they inherit from the
-kernel default, and no buffer setting exists in `/etc/open5gs/*.yaml`. Raising
-`rmem_max` alone would therefore not enlarge an existing Open5GS socket; the
-socket has to be created after the change, which means restarting the process
-and is a separately authorized operational action.
+Raising `rmem_max` is a **host** action and is not performed by this code or by
+this phase.
+
+Open5GS 2.8.0 does not request a receive buffer at all. Its socket helper
+(`lib/core/ogs-sockopt.c`) sets only `SO_REUSEADDR`, `TCP_NODELAY`,
+`SO_LINGER` and `SO_BINDTODEVICE`; the only `SO_RCVBUF`/`SO_SNDBUF`
+references in the tree belong to the bundled freeDiameter SCTP code; and no
+buffer key exists in the YAML schema. A GTP-U socket therefore takes
+**`net.core.rmem_default` at creation time** and keeps it for its lifetime.
+
+Two consequences follow, and neither can be assumed away:
+
+1. raising `rmem_max` does nothing for Open5GS, because it never asks for more
+   than the default it was given;
+2. the only lever is `net.core.rmem_default`, and it only applies to sockets
+   created **after** the change, so the SGW-U (and PGW-U) process has to be
+   recreated. That is a service lifecycle action with its own approval.
+
+On this host all three GTP-U sockets report `rb212992`, which is exactly
+`rmem_default`, and their cumulative drop counters (59,525 for the PGW-U,
+60,547 for the SGW-U) are the residue of the 19-F-C campaign.
 
 ## 9. Status
 
 - Implementation: complete and opt-in.
 - Default behaviour: unchanged, verified by a test that asserts two unconfigured
   sockets report the same buffer.
-- Real-EPC re-acceptance: **not performed in this phase**; the live workload was
-  not separately authorized, and the host cap could not have provided the 4 MiB
-  budget the tuning exists to reach. See
-  `docs/lte-single-ue-1gbps-benchmark.md` section 15.
+- Real-EPC re-acceptance: **performed under separate authorization**. With the
+  host temporarily at `rmem_default=4194304` and `rmem_max=8388608`, DL4
+  reached 871.95 Mbps with zero UDP drops at every hop; the explicit
+  per-socket request added nothing on top of that default. The results are in
+  `docs/lte-single-ue-1gbps-benchmark.md` section 16, and the host change was
+  rolled back afterwards.
 - PERF-P1: still below target in both directions.
 - PERF-P2: `REAL_512_UE_ACCEPTED`, untouched.
