@@ -410,10 +410,93 @@ records; the difference from the session record is 4,032,806,432. The
 work order's 262,160,864 residual follows from that figure, not from the ledger.
 Status: `OCS_DIAGNOSTIC_USAGE_DELTA_UNRESOLVED`. No record was modified.
 
-### 13.3 Verdict
+### 13.3 Verdict at the end of 19-F-B
 
 - Downlink bottleneck: `DOWNLINK_BOTTLENECK_NOT_ESTABLISHED`; the UE receive
   path is excluded, and the remaining candidates are EPC-side.
 - PERF-P1 peak and sustained remain below target in both directions.
 - PERF-P2 remains `REAL_512_UE_ACCEPTED`.
 - No live throughput run was executed in this phase.
+
+Section 13.4 records the later real-EPC diagnostic that supersedes this
+provisional classification.
+
+### 13.4 EPC downlink diagnostic and the real limit
+
+Phase 19-F-C measured the real EPC downlink path with per-flow TCP state on both
+ends and per-socket UDP accounting. The path under test:
+
+```text
+iperf3 server 10.45.0.1 (host namespace, ogstun)
+  -> PGW-U (upfd, 127.0.0.7:2152)
+  -> SGW-U (sgwud, 10.10.0.139:2152)
+  -> LTE eNB S1-U (127.0.0.5:2152)
+  -> simulated radio (127.0.0.1:32000)
+  -> LTE UE TUN p19fc0 (moved into netns p19fc, 10.45.0.x/32)
+  -> iperf3 client -R in that namespace
+```
+
+The client ran inside the UE's network namespace, so its only route is the TUN,
+and a bounded `tcpdump` on `udp port 2152` confirmed the GTP-U exchange on the
+S1-U at the same time. No host-local shortcut was used.
+
+Four 65 s / 60 s DL4 profiles were run. The first three used the production
+socket buffers; the fourth is a counterfactual that raised the two
+UniRANSim-owned receive buffers. Nothing was committed from the counterfactual.
+
+| Run | S1-U / UE radio SO_RCVBUF | Receiver goodput | Retransmits | UDP drops eNB / UE / SGW-U |
+|---|---|---:|---:|---|
+| 1 | default 212,992 | 298.56 Mbps | 18,908 | not per-socket sampled |
+| 2 | default 212,992 | 537.86 Mbps | 29,894 | +27,963 / +3,345 / +1,071 |
+| 3 | 425,984 / 212,992 | 411.12 Mbps | 29,971 | +51 / +27,262 / +7,096 |
+| 4 | 425,984 / 425,984 | **762.64 Mbps** | 40,924 | +1,392 / +2,185 / +41,364 |
+
+Reference from 19-F-A: 662.93 Mbps. It was not reproduced by runs 1-3: the same
+production configuration produced 298-538 Mbps in this session. The plateau is
+not a stable property of the configuration; it is the result of where the first
+UDP receive buffer overflows.
+
+**What the TCP state shows.** At the 538 Mbps plateau the sender's per-flow
+`cwnd` was 15-23 segments (20-31 KB) with `ssthresh` 14-23, `rwnd_limited`
+0.0-7.7%, and `snd_wnd` 350-700 KB. Throughput per flow equals
+`cwnd x 1348 / rtt` to within a few percent. The receiver's window is at least
+ten times the in-flight requirement, so the flow is **congestion-window
+limited, not receive-window limited**.
+
+**What the loss is.** `TcpRetransSegs` in each run matched the sum of the
+per-socket UDP drops within a few percent, and every drop the kernel counted was
+a `UdpRcvbufErrors` on a forwarding socket, not an interface error and not an IP
+drop. The first and largest loss point in the production configuration is the
+eNB S1-U socket. When that buffer is doubled, the loss moves to the UE radio
+socket and goodput does not improve (411 Mbps). When both are doubled, the loss
+moves to the SGW-U socket and goodput rises to 762.64 Mbps, the best downlink
+result measured in this project.
+
+**The counterfactual boundary.** `net.core.rmem_max` is 212,992 on this host, so
+a 4 MiB request is capped at 425,984 bytes (2x). A larger buffer needs
+`rmem_max` raised, which is a host setting, not a UniRANSim one, and Open5GS's
+own sockets are capped by the same value. That is why the loss relocates
+instead of disappearing.
+
+**The BDP.** Per-flow requirement at 1 Gbps with the observed 2.3-3.4 ms RTT is
+`125e6/4 x 0.0027 = 84 KB` (62 segments). At 763 Mbps the sender held 46-62
+segments per flow, which is exactly the requirement for that rate, and the
+receiver advertised 523-547 KB. To reach 1 Gbps the sender needs about 62
+segments per flow with **no loss events**, which a 1% loss rate does not allow.
+
+**CPU as throughput rises.** At 538 Mbps: SGW-U 23-29%, PGW-U 28-39%, eNB
+18-26%, UE 15-22%. At 763 Mbps: SGW-U 65-74%, PGW-U 77-87%. The PGW-U thread
+approaches the same one-core ceiling that the uplink already shows, so once the
+loss is removed the PGW-U per-packet cost becomes the next wall.
+
+### 13.5 Verdict
+
+- Downlink root cause: `TCP_CWND_LIMIT_CONFIRMED`, driven by UDP receive-buffer
+  loss at the chain's narrowest socket.
+- Receive window: `TCP_WINDOW_NOT_LIMITING`.
+- First loss point in the production configuration: the eNB S1-U socket; with
+  UniRANSim's buffers enlarged, the SGW-U socket.
+- The 19-F-B UE receive-loop conclusion is unchanged and is not contradicted:
+  the loop is not the limit, the buffers ahead of it are.
+- PERF-P1 peak and sustained remain below target in both directions.
+- PERF-P2 remains `REAL_512_UE_ACCEPTED`.

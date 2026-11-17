@@ -917,6 +917,16 @@ CI matrix.
   torn down and report `BLOCKED_EPC_CONFIGURATION`.
 - UDP loss, jitter and retransmissions are results. Do not retry until a
   favorable sample appears or discard earlier samples.
+- A downlink TCP plateau is a loss question before it is a processing question.
+  Attribute it with per-socket UDP accounting (`/proc/net/udp` drops and
+  receive queue per local port) and with both ends' TCP state (`ss -tinm` in
+  the sender's and the receiver's own network namespace) before proposing any
+  code change. In this laboratory the first loss point moves between the eNB
+  S1-U socket, the UE radio socket and the SGW-U socket as their buffers change,
+  so a single-buffer fix relocates the loss instead of removing it. Quote a
+  goodput number only together with its loss number, and never classify a flow
+  as receive-window limited from `rcv_space` alone: check `rwnd_limited` and
+  the advertised window against the measured bandwidth-delay product.
 - A single simulated-radio receive per main-loop turn is the production UE
   behaviour. Do not treat it as a bottleneck without a measurement: it was
   measured at about 30% of one core at the DL4 rate, with a ceiling at least

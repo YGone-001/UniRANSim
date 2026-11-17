@@ -337,3 +337,47 @@ own authorization. In order of expected value:
    per-packet cost of any process in the chain);
 3. only after 1 and 2, revisit any UniRANSim-side change, and then with the
    bounded drain in section 7 rather than a rewrite.
+
+## 12. Measurement semantics corrected
+
+The tool originally reported one "latency" that was, in fact, the interval from
+the sender's embedded timestamp to the moment `UdpServer::Receive` returned
+the frame. It was never a receive-to-TUN-write time, and a later reader could
+easily take it for one. Phase 19-F-C corrected that without changing any
+previously recorded raw data:
+
+- five intervals are now measured at their own boundaries and named for them:
+  send->radio, radio->decode, decode->validate, validate->tun-write and
+  send->tun-write;
+- the sink is reported explicitly as `REAL_TUN_MEASUREMENT` or
+  `PIPE_PROXY_MEASUREMENT`, so a proxy run can never be read as a real TUN run;
+- `sched_setaffinity`'s result and the CPU the thread actually ran on are
+  printed for both the receiver and the sender, so an unpinned run is visible
+  instead of being taken as controlled;
+- the stage clocks are taken only when the timed variant runs, so the untimed
+  control really is a control.
+
+A corrected ten-second reference at 62,000 offered datagrams per second, real
+TUN, receiver pinned to CPU 2 and sender to CPU 4 (both verified):
+
+| Interval | p50 | p95 | p99 |
+|---|---:|---:|---:|
+| send->radio | 0.115 ms | 0.192 ms | 0.229 ms |
+| radio->decode | 0.0001 ms | 0.0001 ms | 0.0003 ms |
+| decode->validate | 0.0000 ms | 0.0000 ms | 0.0001 ms |
+| validate->tun-write | 0.0014 ms | 0.0018 ms | 0.0058 ms |
+| send->tun-write | 0.117 ms | 0.194 ms | 0.231 ms |
+
+The frame's own processing is therefore about 1.6 us of a 117 us end-to-end
+figure; almost all of it is time spent before the receiver is handed the
+datagram. That is consistent with the 19-F-B conclusion and it sharpens it: the
+loop is not where the time goes, and it is not where the loss is either.
+
+The earlier 19-F-B runs were all real-TUN runs: every recorded line carried
+`sink=tun` and no run printed the tool's TUN-unavailable fallback. The
+`REAL_TUN_MEASUREMENT` classification is retrospective only in the sense that the
+label did not exist then; the sink did.
+
+The downlink loss that actually limits the real EPC path is described in
+`docs/lte-single-ue-1gbps-benchmark.md` section 13.4. It is UDP receive-buffer
+overflow in the forwarding chain, not a property of this loop.

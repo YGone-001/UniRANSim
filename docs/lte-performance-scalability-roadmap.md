@@ -1,6 +1,6 @@
 # LTE Performance and Scalability Roadmap
 
-**Document status: `PERF-P2 ACCEPTED — PERF-P1 UL 929 MBPS — PGW-U CPU CONFIRMED — DL UE RECEIVE PATH EXCLUDED`**
+**Document status: `PERF-P2 ACCEPTED - PERF-P1 UL 929 MBPS - PGW-U CPU CONFIRMED - DL LOSS-LIMITED, BUFFERS FIRST`**
 
 Phase 19-A audited the architecture, established the current hard limits,
 implemented the reproducible isolated capacity harness and the opt-in
@@ -150,6 +150,30 @@ The record is `docs/lte-downlink-receive-performance.md`.
 - Multicore scaling of the per-UE data path.
 - Per-packet logging overhead, which is often the dominant cost in a
   debug-instrumented simulator.
+
+### 2.5 Downlink: what the real EPC actually limits
+
+Phase 19-F-C measured four 60 s DL4 profiles against the real EPC with per-flow
+TCP state on both ends and per-socket UDP accounting:
+
+| S1-U / UE radio receive buffer | Receiver goodput | Loss point |
+|---|---:|---|
+| 212,992 / 212,992 (default) | 298.56 Mbps | not per-socket sampled |
+| 212,992 / 212,992 (repeat) | 537.86 Mbps | eNB +27,963, UE +3,345, SGW-U +1,071 |
+| 425,984 / 212,992 | 411.12 Mbps | eNB +51, UE +27,262, SGW-U +7,096 |
+| 425,984 / 425,984 | **762.64 Mbps** | eNB +1,392, UE +2,185, SGW-U +41,364 |
+
+The sender is congestion-window limited (`cwnd` 15-23 segments at 538 Mbps,
+46-62 at 763 Mbps) and never receive-window limited (`rwnd_limited` 0.0-7.7%,
+advertised window 350-700 KB). Throughput per flow equals `cwnd x MSS / rtt`.
+The cwnd ceiling is set by UDP receive-buffer loss at whichever forwarding socket
+is currently narrowest, not by a processing limit in the UE or the eNB.
+
+So the remaining 1-Gbps gap has two components, in order: the UDP receive
+budget of the forwarding chain, and then the PGW-U per-thread cost that the
+uplink already shows. Neither is a UniRANSim receive-loop problem.
+
+The record is `docs/lte-single-ue-1gbps-benchmark.md` section 13.4.
 
 ---
 

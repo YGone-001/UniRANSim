@@ -32,6 +32,27 @@
 // monotonic clock read, one non-blocking TUN uplink read that finds nothing,
 // and the receive-timeout policy call. Everything the frame itself costs is
 // the production code.
+//
+// Latency is reported at five separate boundaries, and each one is named by the
+// two points it joins:
+//
+//   send->radio        sender wrote the datagram to Receive() returning it
+//   radio->decode      Receive() to link::Decode returning
+//   decode->validate   link::Decode to ip::Validate returning
+//   validate->tun-write  ip::Validate to the TUN write returning
+//   send->tun-write    the whole path
+//
+// The earlier version of this tool reported a single "latency" that was in fact
+// send->radio, and a reader could take it for a receive-to-TUN-write time. It is
+// not one, and it is no longer reported as one.
+//
+// The sink is reported explicitly: REAL_TUN_MEASUREMENT when the frame really
+// went through a kernel TUN, PIPE_PROXY_MEASUREMENT when the tool had to fall
+// back to a non-blocking pipe. The two are never mixed in one conclusion.
+//
+// Affinity is verified, not assumed: sched_setaffinity's result and the CPU the
+// thread actually ran on are both printed, for the receiver and for the sender,
+// so a run that failed to pin is visible instead of being taken as controlled.
 
 #include <algorithm>
 #include <array>
@@ -94,6 +115,12 @@ struct RunResult
 {
     std::string variant;
     bool realTun{false};
+    int requestedCpu{-1};
+    int actualCpu{-1};
+    bool affinityApplied{false};
+    int senderRequestedCpu{-1};
+    int senderActualCpu{-1};
+    bool senderAffinityApplied{false};
     int batch{0};
     int pps{0};
     bool timed{true};
@@ -123,7 +150,15 @@ struct RunResult
     long involuntarySwitches{0};
 
     StageTimes stage{};
-    std::vector<double> latencyMillis;
+    // Five separate intervals, each measured at its own boundary. The old
+    // single "latency" value was sender-timestamp to completed radio receive
+    // and was never a receive-to-TUN-write number; it is kept under its real
+    // name here.
+    std::vector<double> sendToRadioMillis;
+    std::vector<double> radioToDecodeMillis;
+    std::vector<double> decodeToValidateMillis;
+    std::vector<double> validateToTunMillis;
+    std::vector<double> sendToTunMillis;
 
     double FramesPerSecond() const { return wallSeconds > 0 ? static_cast<double>(frames) / wallSeconds : 0; }
     double BytesPerSecond() const { return wallSeconds > 0 ? static_cast<double>(bytes) / wallSeconds : 0; }
@@ -134,6 +169,10 @@ struct RunResult
     double MeanStageNanos(uint64_t total, uint64_t count) const
     {
         return count == 0 ? 0 : static_cast<double>(total) / static_cast<double>(count);
+    }
+    const char *MeasurementClass() const
+    {
+        return realTun ? "REAL_TUN_MEASUREMENT" : "PIPE_PROXY_MEASUREMENT";
     }
 };
 
@@ -186,14 +225,19 @@ std::vector<uint8_t> BuildFrame(const std::array<uint8_t, 4> &destination, size_
     return packet;
 }
 
-void PinToCpu(int cpu)
+// Pins the calling thread and reports whether the kernel accepted it. A
+// measurement that claims an isolated core must prove it got one: a failed
+// sched_setaffinity leaves the thread free to migrate, and the CPU percentage
+// then describes a moving target. On failure the run is still executed, but it
+// is reported as unpinned instead of being silently treated as controlled.
+bool PinToCpu(int cpu)
 {
     if (cpu < 0)
-        return;
+        return false;
     cpu_set_t set;
     CPU_ZERO(&set);
     CPU_SET(cpu, &set);
-    (void)sched_setaffinity(0, sizeof(set), &set);
+    return sched_setaffinity(0, sizeof(set), &set) == 0;
 }
 
 // The timeout policy Variant B proposes: the first frame of a turn keeps the
@@ -210,13 +254,33 @@ uint64_t NowNanos()
         std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count());
 }
 
-double Percentile(std::vector<double> values, double fraction)
+struct LatencySummary
 {
+    size_t samples{0};
+    double p50{0};
+    double p95{0};
+    double p99{0};
+    double maximum{0};
+};
+
+// Nearest-rank percentiles over the observed samples, so a reported tail is an
+// observation and not an interpolation between two observations.
+LatencySummary Summarize(std::vector<double> &values)
+{
+    LatencySummary summary;
+    summary.samples = values.size();
     if (values.empty())
-        return 0;
+        return summary;
     std::sort(values.begin(), values.end());
-    const double rank = fraction * static_cast<double>(values.size() - 1);
-    return values[static_cast<size_t>(std::llround(rank))];
+    const auto at = [&values](double fraction) {
+        const double rank = fraction * static_cast<double>(values.size() - 1);
+        return values[static_cast<size_t>(std::llround(rank))];
+    };
+    summary.p50 = at(0.50);
+    summary.p95 = at(0.95);
+    summary.p99 = at(0.99);
+    summary.maximum = values.back();
+    return summary;
 }
 
 // The sender. It owns its own UDP socket, so the frames the receiver sees left
@@ -230,9 +294,13 @@ class Sender
     {
     }
 
+    [[nodiscard]] bool AffinityApplied() const { return m_affinityApplied; }
+    [[nodiscard]] int ActualCpu() const { return m_actualCpu.load(); }
+
     void Run(std::atomic_bool &stop, std::atomic<uint64_t> &sent, std::atomic<uint64_t> &blocked)
     {
-        PinToCpu(m_pinnedCpu);
+        m_affinityApplied = PinToCpu(m_pinnedCpu);
+        m_actualCpu = sched_getcpu();
         if (m_pps <= 0)
         {
             while (!stop.load(std::memory_order_relaxed))
@@ -282,6 +350,8 @@ class Sender
     std::vector<uint8_t> m_frame;
     int m_pps{0};
     int m_pinnedCpu{4};
+    std::atomic<bool> m_affinityApplied{false};
+    std::atomic<int> m_actualCpu{-1};
     udp::UdpServer m_socket;
 };
 
@@ -341,7 +411,9 @@ RunResult RunVariant(const Options &options, const std::string &variant, int bat
     std::atomic<uint64_t> blocked{0};
     std::thread senderThread([&] { sender.Run(stop, sent, blocked); });
 
-    PinToCpu(options.receiverCpu);
+    result.requestedCpu = options.receiverCpu;
+    result.affinityApplied = PinToCpu(options.receiverCpu);
+    result.actualCpu = sched_getcpu();
 
     const auto dropsBefore = lte::enb::ReadUdpSocketAccounting(receiverPort).drops;
     // The receiver thread's own cost: the sender runs on its own thread and
@@ -355,7 +427,13 @@ RunResult RunVariant(const Options &options, const std::string &variant, int bat
     const int firstTimeoutMs = lte::ue::RadioReceiveTimeoutMs(true, false);
     uint8_t buffer[link::MaxDataPduSize + link::HeaderSize];
     std::vector<uint8_t> probe;
-    result.latencyMillis.reserve(1u << 20);
+    // Bounded sample storage: five vectors of one million doubles, pre-reserved
+    // so a run never grows them mid-measurement and never samples unboundedly.
+    result.sendToRadioMillis.reserve(1u << 20);
+    result.radioToDecodeMillis.reserve(1u << 20);
+    result.decodeToValidateMillis.reserve(1u << 20);
+    result.validateToTunMillis.reserve(1u << 20);
+    result.sendToTunMillis.reserve(1u << 20);
 
     const auto started = Clock::now();
     const auto deadline = started + std::chrono::seconds(options.seconds);
@@ -397,12 +475,18 @@ RunResult RunVariant(const Options &options, const std::string &variant, int bat
             // The stage clocks exist only in a timed run. An untimed run is the
             // control for the instrumentation cost, so it must not pay for a
             // clock read it never uses.
-            const uint64_t receivedAt = timing ? NowNanos() : 0;
-            const auto stageStart = timing ? Clock::now() : Clock::time_point{};
+            //
+            // Five boundaries, each measured where it actually happens:
+            //   sentAt              sender wrote the datagram
+            //   radioReceivedAt     Receive() returned the frame
+            //   decodedAt           link::Decode returned
+            //   validatedAt         ip::Validate returned
+            //   writtenAt           the TUN write returned
+            const uint64_t radioReceivedAt = timing ? NowNanos() : 0;
             try
             {
                 auto message = link::Decode(buffer, static_cast<size_t>(received));
-                const auto decodedAt = timing ? Clock::now() : Clock::time_point{};
+                const uint64_t decodedAt = timing ? NowNanos() : 0;
                 if (!link::IsDownlink(message.type) || message.ueId != kUeId)
                 {
                     ++result.identityRejects;
@@ -410,7 +494,7 @@ RunResult RunVariant(const Options &options, const std::string &variant, int bat
                 }
                 const auto ipv4 = lte::ip::Validate(message.payload.data(), message.payload.size(),
                                                     static_cast<size_t>(options.payloadBytes));
-                const auto validatedAt = timing ? Clock::now() : Clock::time_point{};
+                const uint64_t validatedAt = timing ? NowNanos() : 0;
                 if (ipv4.destination != tunAddress)
                     throw lte::ip::ValidationError("Downlink destination does not match the assigned UE IPv4 address");
                 bool wrote = false;
@@ -419,16 +503,7 @@ RunResult RunVariant(const Options &options, const std::string &variant, int bat
                 else
                     wrote = ::write(pipeFds[1], message.payload.data(), message.payload.size()) ==
                             static_cast<ssize_t>(message.payload.size());
-                const auto writtenAt = timing ? Clock::now() : Clock::time_point{};
-                if (timing)
-                {
-                    result.stage.decodeNanos +=
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(decodedAt - stageStart).count();
-                    result.stage.validateNanos +=
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(validatedAt - decodedAt).count();
-                    result.stage.writeNanos +=
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(writtenAt - validatedAt).count();
-                }
+                const uint64_t writtenAt = timing ? NowNanos() : 0;
                 if (!wrote)
                 {
                     ++result.tunWriteErrors;
@@ -438,13 +513,27 @@ RunResult RunVariant(const Options &options, const std::string &variant, int bat
                 ++result.frames;
                 result.bytes += message.payload.size();
                 ++framesThisTurn;
-                if (timing && result.latencyMillis.size() < result.latencyMillis.capacity() &&
-                    message.payload.size() >= 28 + kTimestampOffset + sizeof(uint64_t))
+                if (timing)
                 {
-                    uint64_t sentAt = 0;
-                    std::memcpy(&sentAt, message.payload.data() + 28 + kTimestampOffset, sizeof(sentAt));
-                    if (sentAt != 0 && receivedAt > sentAt)
-                        result.latencyMillis.push_back(static_cast<double>(receivedAt - sentAt) / 1e6);
+                    result.stage.decodeNanos += decodedAt - radioReceivedAt;
+                    result.stage.validateNanos += validatedAt - decodedAt;
+                    result.stage.writeNanos += writtenAt - validatedAt;
+                    if (result.sendToTunMillis.size() < result.sendToTunMillis.capacity() &&
+                        message.payload.size() >= 28 + kTimestampOffset + sizeof(uint64_t))
+                    {
+                        uint64_t sentAt = 0;
+                        std::memcpy(&sentAt, message.payload.data() + 28 + kTimestampOffset, sizeof(sentAt));
+                        if (sentAt != 0 && writtenAt > sentAt && writtenAt > radioReceivedAt &&
+                            radioReceivedAt > sentAt)
+                        {
+                            result.sendToRadioMillis.push_back(static_cast<double>(radioReceivedAt - sentAt) / 1e6);
+                            result.radioToDecodeMillis.push_back(static_cast<double>(decodedAt - radioReceivedAt) / 1e6);
+                            result.decodeToValidateMillis.push_back(
+                                static_cast<double>(validatedAt - decodedAt) / 1e6);
+                            result.validateToTunMillis.push_back(static_cast<double>(writtenAt - validatedAt) / 1e6);
+                            result.sendToTunMillis.push_back(static_cast<double>(writtenAt - sentAt) / 1e6);
+                        }
+                    }
                 }
             }
             catch (const std::exception &)
@@ -459,6 +548,9 @@ RunResult RunVariant(const Options &options, const std::string &variant, int bat
     }
     stop.store(true);
     senderThread.join();
+    result.senderRequestedCpu = options.senderCpu;
+    result.senderAffinityApplied = sender.AffinityApplied();
+    result.senderActualCpu = sender.ActualCpu();
 
     const auto finished = Clock::now();
     rusage usageAfter{};
@@ -483,10 +575,20 @@ RunResult RunVariant(const Options &options, const std::string &variant, int bat
     return result;
 }
 
-void Print(const RunResult &r, bool realTun)
+void PrintLatency(const char *name, std::vector<double> &values)
 {
-    std::printf("RESULT variant=%s batch=%d offered-pps=%d timed=%d sink=%s\n", r.variant.c_str(), r.batch, r.pps,
-                r.timed ? 1 : 0, realTun ? "tun" : "pipe");
+    const auto summary = Summarize(values);
+    std::printf("  lat %-20s p50=%.4f p95=%.4f p99=%.4f max=%.4f ms n=%zu\n", name, summary.p50, summary.p95,
+                summary.p99, summary.maximum, summary.samples);
+}
+
+void Print(RunResult &r)
+{
+    std::printf("RESULT variant=%s batch=%d offered-pps=%d timed=%d sink=%s measurement=%s\n", r.variant.c_str(),
+                r.batch, r.pps, r.timed ? 1 : 0, r.realTun ? "real-tun" : "pipe-proxy", r.MeasurementClass());
+    std::printf("  affinity receiver=requested:%d applied:%d actual:%d sender=requested:%d applied:%d actual:%d\n",
+                r.requestedCpu, r.affinityApplied ? 1 : 0, r.actualCpu, r.senderRequestedCpu,
+                r.senderAffinityApplied ? 1 : 0, r.senderActualCpu);
     std::printf("  wall=%.3fs turns=%llu receive-attempts=%llu frames=%llu sent=%llu\n", r.wallSeconds,
                 static_cast<unsigned long long>(r.turns), static_cast<unsigned long long>(r.receiveAttempts),
                 static_cast<unsigned long long>(r.frames), static_cast<unsigned long long>(r.sent));
@@ -502,15 +604,20 @@ void Print(const RunResult &r, bool realTun)
                 static_cast<unsigned long long>(r.kernelDrops), static_cast<unsigned long long>(r.sendBlocked));
     std::printf("  cpu=%.1f%% user=%.3fs sys=%.3fs vcsw=%ld ivcsw=%ld\n", r.CpuPercent(), r.cpuUserSeconds,
                 r.cpuSystemSeconds, r.voluntarySwitches, r.involuntarySwitches);
-    std::printf("  latency-ms p50=%.3f p95=%.3f p99=%.3f max=%.3f samples=%zu\n", Percentile(r.latencyMillis, 0.50),
-                Percentile(r.latencyMillis, 0.95), Percentile(r.latencyMillis, 0.99),
-                r.latencyMillis.empty() ? 0.0 : *std::max_element(r.latencyMillis.begin(), r.latencyMillis.end()),
-                r.latencyMillis.size());
-    std::printf("  stage-ns decode=%.0f validate=%.0f tun-write=%.0f\n", r.MeanStageNanos(r.stage.decodeNanos, r.frames),
-                r.MeanStageNanos(r.stage.validateNanos, r.frames),
+    // Each interval is named by its two boundaries. "send-to-radio" is what the
+    // earlier single latency figure actually measured; it is not a
+    // receive-to-TUN-write time and is no longer reported as one.
+    PrintLatency("send->radio", r.sendToRadioMillis);
+    PrintLatency("radio->decode", r.radioToDecodeMillis);
+    PrintLatency("decode->validate", r.decodeToValidateMillis);
+    PrintLatency("validate->tun-write", r.validateToTunMillis);
+    PrintLatency("send->tun-write", r.sendToTunMillis);
+    std::printf("  stage-mean-ns decode=%.0f validate=%.0f tun-write=%.0f\n",
+                r.MeanStageNanos(r.stage.decodeNanos, r.frames), r.MeanStageNanos(r.stage.validateNanos, r.frames),
                 r.MeanStageNanos(r.stage.writeNanos, r.frames));
-    std::printf("  summary fps=%.0f cpu=%.1f%% p99=%.3fms drops=%llu\n", r.FramesPerSecond(), r.CpuPercent(),
-                Percentile(r.latencyMillis, 0.99), static_cast<unsigned long long>(r.kernelDrops));
+    const auto endToEnd = Summarize(r.sendToTunMillis);
+    std::printf("  summary fps=%.0f cpu=%.1f%% send-to-tun-p99=%.4fms drops=%llu\n", r.FramesPerSecond(),
+                r.CpuPercent(), endToEnd.p99, static_cast<unsigned long long>(r.kernelDrops));
 }
 
 Options ParseOptions(int argc, char **argv)
@@ -575,9 +682,9 @@ int main(int argc, char **argv)
         results.push_back(RunVariant(options, "B-batch", options.batch, false));
     }
 
-    for (const auto &r : results)
+    for (auto &r : results)
     {
-        Print(r, r.realTun);
+        Print(r);
         std::printf("\n");
     }
     return 0;
