@@ -71,6 +71,9 @@ struct EnbConfig
     std::string s1uAddress;
     uint16_t s1uPort{2152};
     bool allowLoopbackS1u{false};
+    // Optional SO_RCVBUF for the shared S1-U socket. Zero means the setting is
+    // absent and the socket is created exactly as the kernel creates it.
+    int s1uReceiveBufferBytes{0};
     // Bound on concurrently served simulated radio UEs in the registry.
     int maxUes{8};
     RetryConfig retry;

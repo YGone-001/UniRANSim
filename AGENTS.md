@@ -925,6 +925,14 @@ CI matrix.
   torn down and report `BLOCKED_EPC_CONFIGURATION`.
 - UDP loss, jitter and retransmissions are results. Do not retry until a
   favorable sample appears or discard earlier samples.
+- A receive buffer is opt-in and verified. Absent means no system call and the
+  historical socket; an explicit request is checked with getsockopt and a value
+  the kernel capped is a configuration failure, never a success with a smaller
+  number. Linux returns twice the applied request, so a readback of 2x is the
+  applied value and anything lower is a cap. Never use SO_RCVBUFFORCE, never
+  write a sysctl, and never enable a large per-UE buffer by default: one eNB
+  S1-U socket is shared, one UE radio socket exists per process, and 512 tuned
+  UEs is a deliberate memory decision rather than a default.
 - A downlink TCP plateau is a loss question before it is a processing question.
   Attribute it with per-socket UDP accounting (`/proc/net/udp` drops and
   receive queue per local port) and with both ends' TCP state (`ss -tinm` in

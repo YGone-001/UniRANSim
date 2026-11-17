@@ -73,8 +73,9 @@ class NotifyingS1apSender final : public IS1apSender
 
 EnbMultiplexer::EnbMultiplexer(const EnbConfig &config, IS1apSender &sender)
     : m_config(config), m_ueLink(config.ueLinkAddress, config.ueLinkPort),
-      m_registry(static_cast<size_t>(config.maxUes)), m_s1u(config.s1uAddress, config.s1uPort, config.allowLoopbackS1u,
-                                                           m_registry, m_ueLink)
+      m_registry(static_cast<size_t>(config.maxUes)),
+      m_s1u(config.s1uAddress, config.s1uPort, config.allowLoopbackS1u, m_registry, m_ueLink,
+            config.s1uReceiveBufferBytes)
 {
     m_registry.setPerfCounters(&m_perf);
     bindAssociation(sender, 1);
@@ -82,8 +83,9 @@ EnbMultiplexer::EnbMultiplexer(const EnbConfig &config, IS1apSender &sender)
 
 EnbMultiplexer::EnbMultiplexer(const EnbConfig &config)
     : m_config(config), m_ueLink(config.ueLinkAddress, config.ueLinkPort),
-      m_registry(static_cast<size_t>(config.maxUes)), m_s1u(config.s1uAddress, config.s1uPort, config.allowLoopbackS1u,
-                                                           m_registry, m_ueLink)
+      m_registry(static_cast<size_t>(config.maxUes)),
+      m_s1u(config.s1uAddress, config.s1uPort, config.allowLoopbackS1u, m_registry, m_ueLink,
+            config.s1uReceiveBufferBytes)
 {
     m_registry.setPerfCounters(&m_perf);
 }

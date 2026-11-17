@@ -500,3 +500,40 @@ loss is removed the PGW-U per-packet cost becomes the next wall.
   the loop is not the limit, the buffers ahead of it are.
 - PERF-P1 peak and sustained remain below target in both directions.
 - PERF-P2 remains `REAL_512_UE_ACCEPTED`.
+
+## 14. Opt-in receive buffers
+
+The two UniRANSim-owned sockets that lose downlink packets now accept an explicit
+receive-buffer setting: `s1u.receiveBufferBytes` on the eNB and
+`enbLink.receiveBufferBytes` on the UE. Both are optional; absent means no
+system call and the historical socket. A request that the kernel caps is refused
+with the requested and effective values instead of being reported as applied.
+
+The design, the readback rules, the memory scaling and the isolated socket
+measurement are in `docs/lte-udp-receive-buffer-tuning.md`.
+
+On this host `net.core.rmem_max` is 212,992, so the largest request that can be
+applied is 212,992 bytes of usable budget (reported as 425,984 by
+`getsockopt`). The 4 MiB budget the 19-F-C counterfactual used is not attainable
+here without a host change that this phase is not authorized to make.
+
+## 15. Real-EPC re-acceptance status
+
+`BLOCKED_LIVE_AUTHORIZATION`. No new high-rate workload was run in this phase. The
+reason is not only authorization: with the host cap at 212,992 the tuning can at
+most reproduce the 19-F-C counterfactual, which already measured 762.64 Mbps and
+`LOSS_STAGE_RELOCATED` rather than a resolved chain.
+
+A future authorized run should be:
+
+1. raise `net.core.rmem_max` on the laboratory host (an operator action, with
+   rollback), so a 4 MiB request is applied rather than capped;
+2. restart Open5GS if the SGW-U socket is to inherit the larger default,
+   which needs its own approval and a maintenance window;
+3. run one DL4 baseline (production defaults) and one DL4 with both opt-in
+   values, 65 s each, 5 s warm-up, 60 s measured, four streams;
+4. record per-socket drops at all three hops, TCP state on both ends, CPU,
+   softirq, wire rate and OCS usage for each run.
+
+Until that exists, the downlink has no 1 Gbps evidence and PERF-P1 stays
+`PERF_P1_SUSTAINED_BELOW_TARGET`.

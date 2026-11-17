@@ -40,7 +40,7 @@ std::string Hex(uint32_t value, int width)
 } // namespace
 
 S1uEndpoint::S1uEndpoint(const std::string &address, uint16_t port, bool allowLoopback, UeRegistry &registry,
-                         udp::UdpServer &ueLink)
+                         udp::UdpServer &ueLink, int receiveBufferBytes)
     : m_registry(registry), m_ueLink(ueLink)
 {
     if (address.empty() || address == "0.0.0.0")
@@ -49,6 +49,18 @@ S1uEndpoint::S1uEndpoint(const std::string &address, uint16_t port, bool allowLo
         throw std::runtime_error(
             "Loopback S1-U requires s1u.allowLoopback=true after verifying a shared network namespace");
     m_socket = std::make_unique<udp::UdpServer>(address, port);
+    if (receiveBufferBytes > 0)
+    {
+        // A request the kernel capped is refused here rather than reported as
+        // applied: the operator asked for a budget this host cannot give.
+        const auto status = m_socket->ConfigureReceiveBuffer(receiveBufferBytes);
+        if (!status.applied)
+            throw std::runtime_error("S1-U receive buffer was not applied: " + status.error);
+        m_receiveBufferBytes = status.effectiveBytes;
+        Log("INFO", "S1-U receive buffer: requested=" + std::to_string(status.requestedBytes) +
+                        " effective=" + std::to_string(status.effectiveBytes) +
+                        " usable=" + std::to_string(status.usableBytes));
+    }
 }
 
 void S1uEndpoint::handleDatagram(const uint8_t *data, size_t size, const InetAddress &peer)
@@ -277,6 +289,11 @@ void S1uEndpoint::forwardUplink(EnbUeEntry &entry, BearerContext &bearer, const 
 InetAddress S1uEndpoint::localAddress() const
 {
     return m_socket->LocalAddress();
+}
+
+int S1uEndpoint::receiveBufferBytes() const
+{
+    return m_receiveBufferBytes;
 }
 
 const S1uEndpointCounters &S1uEndpoint::counters() const

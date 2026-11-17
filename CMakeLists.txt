@@ -123,6 +123,10 @@ if (BUILD_EXPERIMENTS)
     add_executable(lte-downlink-experiment tools/lte-downlink-receive-experiment.cpp)
     target_compile_options(lte-downlink-experiment PRIVATE -Wall -Wextra -pedantic)
     target_link_libraries(lte-downlink-experiment pthread common-lib lte-ue-lib)
+
+    add_executable(lte-socket-buffer-experiment tools/lte-socket-buffer-experiment.cpp)
+    target_compile_options(lte-socket-buffer-experiment PRIVATE -Wall -Wextra -pedantic)
+    target_link_libraries(lte-socket-buffer-experiment pthread common-lib lte-enb-lib)
 endif ()
 
 #################### COVERAGE ####################

@@ -8,6 +8,8 @@
 
 #include "config.hpp"
 
+#include <lib/udp/server.hpp>
+
 #include <algorithm>
 #include <cctype>
 #include <stdexcept>
@@ -80,6 +82,11 @@ EnbConfig ParseNode(const YAML::Node &root)
         result.s1uPort = static_cast<uint16_t>(yaml::GetInt32(s1u, "port", 1, 65535));
         if (yaml::HasField(s1u, "allowLoopback"))
             result.allowLoopbackS1u = s1u["allowLoopback"].as<bool>();
+        // Opt-in only. Absent means the historical behaviour: no setsockopt at
+        // all, so the socket keeps whatever the kernel gave it.
+        if (yaml::HasField(s1u, "receiveBufferBytes"))
+            result.s1uReceiveBufferBytes =
+                yaml::GetInt32(s1u, "receiveBufferBytes", 1, udp::MaxConfiguredReceiveBufferBytes);
     }
     if (result.s1uAddress == "0.0.0.0")
         throw std::runtime_error("Field 's1u.address' must be a concrete advertised IPv4 address");

@@ -197,8 +197,12 @@ class FakeNetwork
     bool waitForTauCompletes(int expected, std::chrono::milliseconds timeout)
     {
         std::unique_lock<std::mutex> lock(m_observation);
-        return m_observationReady.wait_for(lock, timeout,
-                                           [&] { return tauCompletes >= expected || m_finished; });
+        m_observationReady.wait_for(lock, timeout, [&] { return tauCompletes >= expected || m_finished; });
+        // Waking up is not the same as observing. The predicate also fires when
+        // the worker stops consuming, so the result is the completion count and
+        // nothing else: a worker that died before the expected TAU Complete must
+        // read as a failed observation, never as a success.
+        return tauCompletes >= expected;
     }
 
     // Observations the tests assert on. They are written on the network thread
@@ -862,6 +866,28 @@ TEST_CASE("lte/mobility/context: a Tracking Area Update on an established S1 con
     REQUIRE(session.network->tauRequests.size() == 1);
     CHECK(session.network->tauRequests[0].first == link::MessageType::NAS_UPLINK);
     CHECK(session.network->failures.empty());
+}
+
+// ---------------------------------------------------------------------------
+// A waiter that was only released is not a waiter that observed anything
+// ---------------------------------------------------------------------------
+
+TEST_CASE("lte/mobility/context: a network that stopped before the TAU Complete is not an observation")
+{
+    // The waiter's predicate also fires when the worker stops consuming, so a
+    // wake-up alone could be mistaken for the expected completion. Stopping the
+    // worker before any frame can arrive makes this deterministic instead of
+    // timing dependent, and it pins two things at once: the result is false,
+    // and it is false promptly rather than after the full timeout.
+    auto config = ParseConfig(UeConfig(47391, 47392, "tau-normal", std::nullopt));
+    FakeNetwork network("127.0.0.1", 47392, 47393);
+    network.start(config, TauAction::AcceptWithNewGuti, {}, {}, kDefaultEbi);
+    network.stop();
+
+    const auto started = Clock::now();
+    CHECK_FALSE(network.waitForTauCompletes(1, std::chrono::milliseconds(10000)));
+    CHECK(Clock::now() - started < std::chrono::seconds(5));
+    CHECK(network.tauCompletes == 0);
 }
 
 // ---------------------------------------------------------------------------

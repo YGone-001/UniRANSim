@@ -8,7 +8,10 @@
 
 #include "server.hpp"
 
+#include <cerrno>
 #include <cstring>
+#include <sys/socket.h>
+
 #include <utils/common.hpp>
 
 namespace udp
@@ -45,6 +48,64 @@ int UdpServer::Receive(uint8_t *buffer, size_t bufferSize, int timeoutMs, InetAd
     if (!socket.hasFd())
         return 0;
     return socket.receive(buffer, bufferSize, timeoutMs, outPeerAddress);
+}
+
+ReceiveBufferStatus UdpServer::ConfigureReceiveBuffer(int requestedBytes)
+{
+    ReceiveBufferStatus status;
+    status.requestedBytes = requestedBytes;
+    if (requestedBytes <= 0)
+    {
+        status.error = "a receive buffer request must be positive";
+        return status;
+    }
+    if (requestedBytes > MaxConfiguredReceiveBufferBytes)
+    {
+        status.error = "a receive buffer request of " + std::to_string(requestedBytes) +
+                       " bytes exceeds the supported maximum of " +
+                       std::to_string(MaxConfiguredReceiveBufferBytes) + " bytes";
+        return status;
+    }
+
+    bool configured = false;
+    for (const auto &socket : sockets)
+    {
+        if (!socket.hasFd())
+            continue;
+        configured = true;
+        const int fd = socket.getFd();
+        if (::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &requestedBytes, sizeof(requestedBytes)) != 0)
+        {
+            status.error = "setsockopt(SO_RCVBUF, " + std::to_string(requestedBytes) +
+                           ") failed: " + std::strerror(errno);
+            return status;
+        }
+        int effective = 0;
+        socklen_t length = sizeof(effective);
+        if (::getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &effective, &length) != 0)
+        {
+            status.error = std::string("getsockopt(SO_RCVBUF) failed: ") + std::strerror(errno);
+            return status;
+        }
+        status.effectiveBytes = effective;
+        // Linux stores the requested value capped at net.core.rmem_max and
+        // returns twice that, which is where the factor two comes from.
+        status.usableBytes = effective / 2;
+        status.applied = static_cast<long long>(effective) >= 2LL * requestedBytes;
+        if (!status.applied)
+        {
+            status.error = "SO_RCVBUF request of " + std::to_string(requestedBytes) + " bytes was capped: effective " +
+                           std::to_string(effective) + " bytes (" + std::to_string(status.usableBytes) +
+                           " bytes usable) means net.core.rmem_max is lower than the request";
+            return status;
+        }
+    }
+    if (!configured)
+    {
+        status.error = "the socket has no open descriptor to configure";
+        return status;
+    }
+    return status;
 }
 
 void UdpServer::Send(const InetAddress &address, const uint8_t *buffer, size_t bufferSize) const

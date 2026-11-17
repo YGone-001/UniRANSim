@@ -58,8 +58,11 @@ struct S1uEndpointCounters
 class S1uEndpoint
 {
   public:
+    // receiveBufferBytes is the opt-in SO_RCVBUF for this one socket. Zero means
+    // the configuration stated no size: the socket is then created exactly as
+    // the kernel creates it, with no system call at all.
     S1uEndpoint(const std::string &address, uint16_t port, bool allowLoopback, UeRegistry &registry,
-                udp::UdpServer &ueLink);
+                udp::UdpServer &ueLink, int receiveBufferBytes = 0);
 
     // Consumes one datagram received at the shared endpoint.
     void handleDatagram(const uint8_t *data, size_t size, const InetAddress &peer);
@@ -77,6 +80,12 @@ class S1uEndpoint
     [[nodiscard]] InetAddress localAddress() const;
     [[nodiscard]] const S1uEndpointCounters &counters() const;
 
+    // The effective receive buffer of the shared socket as getsockopt reports
+    // it, or 0 when no explicit size was configured. A configured request that
+    // the kernel capped is refused at construction, so a live endpoint always
+    // carries the value it was told to use.
+    [[nodiscard]] int receiveBufferBytes() const;
+
   private:
     // The three dispatch targets of handleDatagram, kept separate so that no
     // control message can fall through into G-PDU forwarding.
@@ -88,6 +97,9 @@ class S1uEndpoint
     udp::UdpServer &m_ueLink;
     std::unique_ptr<udp::UdpServer> m_socket;
     S1uEndpointCounters m_counters{};
+    // Effective SO_RCVBUF reported by the kernel, or 0 when the configuration
+    // stated no size. It is never the requested value: it is the observed one.
+    int m_receiveBufferBytes{};
 };
 
 } // namespace lte::enb

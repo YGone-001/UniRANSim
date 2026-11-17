@@ -188,6 +188,17 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
     uint64_t pagingRestorations = 0;
     uint64_t pagingRestorationFailures = 0;
     udp::UdpServer socket(config.link.localAddress, config.link.localPort);
+    if (config.link.receiveBufferBytes > 0)
+    {
+        // A request the kernel capped is refused here rather than reported as
+        // applied: the operator asked for a budget this host cannot give.
+        const auto status = socket.ConfigureReceiveBuffer(config.link.receiveBufferBytes);
+        if (!status.applied)
+            throw std::runtime_error("UE radio receive buffer was not applied: " + status.error);
+        Log("INFO", "UE radio receive buffer: requested=" + std::to_string(status.requestedBytes) +
+                        " effective=" + std::to_string(status.effectiveBytes) +
+                        " usable=" + std::to_string(status.usableBytes));
+    }
     InetAddress enb(config.link.enbAddress, config.link.enbPort);
     const uint32_t ueId = config.ueId;
     mobility.ecm = EcmState::CONNECTED;

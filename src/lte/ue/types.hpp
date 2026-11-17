@@ -126,6 +126,11 @@ struct LinkConfig
     uint16_t servingTac{};
     std::optional<RemoteCell> targetCell;
     int timeoutMs{15000};
+    // Optional SO_RCVBUF for this UE's radio socket. Zero means the setting is
+    // absent and the socket is created exactly as the kernel creates it. It is
+    // per process by construction, so a large value here is a large value for
+    // every UE that is started with this configuration.
+    int receiveBufferBytes{0};
 };
 
 struct TunConfig

@@ -1,6 +1,6 @@
 # LTE Performance and Scalability Roadmap
 
-**Document status: `PERF-P2 ACCEPTED - PERF-P1 UL 929 MBPS - PGW-U CPU CONFIRMED - DL LOSS-LIMITED, BUFFERS FIRST`**
+**Document status: `PERF-P2 ACCEPTED - PERF-P1 BELOW TARGET - DL LOSS CHAIN KNOWN, BUFFERS OPT-IN`**
 
 Phase 19-A audited the architecture, established the current hard limits,
 implemented the reproducible isolated capacity harness and the opt-in
@@ -174,6 +174,21 @@ budget of the forwarding chain, and then the PGW-U per-thread cost that the
 uplink already shows. Neither is a UniRANSim receive-loop problem.
 
 The record is `docs/lte-single-ue-1gbps-benchmark.md` section 13.4.
+
+### 2.6 Opt-in receive buffers
+
+The two UniRANSim-owned sockets that lose downlink packets now have an optional
+explicit receive buffer: `s1u.receiveBufferBytes` for the shared eNB S1-U socket and
+`enbLink.receiveBufferBytes` for a UE radio socket. Absent means no system call and
+the historical behaviour. A request the kernel caps is refused with the
+requested and effective values, never reported as applied.
+
+This is capability, not a performance result. On this host the cap is 212,992
+bytes, so the largest applicable request reproduces the Phase 19-F-C
+counterfactual (762.64 Mbps, `LOSS_STAGE_RELOCATED`) rather than resolving the chain.
+Reaching the intended 4 MiB needs a host `net.core.rmem_max` change and an Open5GS
+restart, both separately authorized. The record is
+`docs/lte-udp-receive-buffer-tuning.md`.
 
 ---
 

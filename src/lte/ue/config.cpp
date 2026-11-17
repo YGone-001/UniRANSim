@@ -8,6 +8,8 @@
 
 #include "config.hpp"
 
+#include <lib/udp/server.hpp>
+
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
@@ -234,6 +236,10 @@ Config ParseNode(const YAML::Node &root)
         config.link.targetCell = cell;
     }
     if (yaml::HasField(link, "timeoutMs")) config.link.timeoutMs = yaml::GetInt32(link, "timeoutMs", 100, 60000);
+    // Opt-in only. Absent means the historical behaviour: no setsockopt at all.
+    if (yaml::HasField(link, "receiveBufferBytes"))
+        config.link.receiveBufferBytes =
+            yaml::GetInt32(link, "receiveBufferBytes", 1, udp::MaxConfiguredReceiveBufferBytes);
     return config;
 }
 } // namespace
