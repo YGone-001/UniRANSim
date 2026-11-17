@@ -598,3 +598,46 @@ therefore still `PERF_P1_DL_SUSTAINED_BELOW_TARGET` (947.24 Mbps sustained, 985.
 Mbps best second) and the remaining gap is PGW-U capacity, not buffers, not
 the EPC build, and not UniRANSim.
 
+### 16.2 Where the PGW-U thread actually spends its time
+
+A bounded profile of the running `upfd` under the same DL4 load (perf record,
+999 Hz, about 940 Mbps, 4,815 samples; perf stat over 8 s) attributes the thread
+almost entirely to the kernel side of two system calls per packet:
+
+| Path | Share of samples |
+|---|---:|
+| `sendto` (GTP-U toward the SGW-U) | 44.7% |
+| `write` (TUN, uplink toward the data network) | 17.8% |
+| `read` (TUN, downlink from the data network) | 7.2% |
+| `epoll_wait` | 3.4% |
+| `recvfrom` (GTP-U from the SGW-U) | 1.9% |
+| **syscall path total** | **~75%** |
+| `inet_ntop` from the per-packet log arguments | ~2-3% |
+| libogscore (allocator, talloc) | 4.9% |
+| libogspfcp + libogsgtp + upfd logic | ~4% |
+
+`perf stat` over the same window: 26.5 G instructions in 8 s at IPC 1.06,
+59.3 M cache misses (2.77%), 53.6 M branch misses (1.12%), 3,739 context
+switches. That is roughly 30,000 instructions per forwarded packet, of which the
+GTP header parse, the UE-IP hash lookup and the PDR rule match are a small
+minority.
+
+Three consequences:
+
+- **Batching is the only change with a large expected effect.** The user-space
+  forwarding logic is ~4% of the thread; syscall entry/exit and the kernel's own
+  UDP, route and netfilter work per packet are ~75%. Reading or sending more than
+  one datagram per syscall attacks the part that actually costs.
+- **The GTP parser is not the problem**, and neither is the session lookup: both
+  are fractions of a percent, which matches the static reading of the code.
+- **Two small, safe items exist.** The per-packet log arguments call `inet_ntop`
+  even when the trace level is filtered (~2-3%), and the kernel spends ~1.9% in
+  `ipt_do_table`, i.e. a netfilter rule on this path; both are removable without
+  touching protocol behaviour.
+
+The packet-buffer allocator is not the hot spot it looked like statically: talloc
+itself is 0.5%, and the zeroing it performs shows up as `memset` at 3.9%, second
+only to the syscall path. Multi-worker scaling would multiply syscall capacity
+across cores but needs TEID partitioning, per-worker sockets and a shared-TUN
+design, so it is an architecture phase rather than a tuning step.
+

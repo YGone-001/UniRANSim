@@ -209,8 +209,17 @@ A follow-up run rebuilt the EPC from the same source in release mode (the
 installed build was `buildtype=debug`, `-O0`) and repeated the profile: 947.24
 Mbps sustained, 985.66 Mbps best second, still zero drops, PGW-U still 92.2%
 average and 99% peak. The rebuild is worth +8.6% and does not move the wall:
-the same 92% of a core now carries more packets. 1 Gbps needs more PGW-U
-capacity, not a cheaper packet path alone.
+the same 92% of a core now carries more packets.
+
+A profile of that thread (Phase 19-F-F) shows where the time goes: 75% of the
+samples are the kernel side of one `read`/`write` and one `sendto` per packet
+(`sendto` 44.7%, TUN `write` 17.8%, TUN `read` 7.2%, `epoll_wait` 3.4%,
+`recvfrom` 1.9%), while libogspfcp, libogsgtp and the upfd logic together are
+about 4%. The GTP parser, the TEID lookup and the locks are each below 1%.
+Per-packet `inet_ntop` from the log arguments costs another 2-3%.
+
+So the remaining 52.76 Mbps is a syscall-per-packet cost, and the only
+candidate with the right mechanism is batching the receive and send path.
 
 PERF-P1 downlink is therefore `PERF_P1_DL_SUSTAINED_BELOW_TARGET` at 871.95
 Mbps, and the remaining 1-Gbps gap is a PGW-U per-thread question, not a
