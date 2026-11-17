@@ -641,3 +641,44 @@ only to the syscall path. Multi-worker scaling would multiply syscall capacity
 across cores but needs TEID partitioning, per-worker sockets and a shared-TUN
 design, so it is an architecture phase rather than a tuning step.
 
+### 16.3 What batching can and cannot remove
+
+The 75% syscall share is not 75% of removable overhead. Splitting each syscall
+subtree into its entry/exit part and its kernel work gives a much smaller
+addressable fraction:
+
+| Syscall | Total | Kernel work | Entry/exit only |
+|---|---:|---:|---:|
+| `sendto` | 44.73% | 42.52% (`udp_sendmsg` -> `ip_output` -> `dev_queue_xmit` -> softirq) | **2.21%** |
+| TUN `write` | 17.84% | ~17.7% | ~0.1% |
+| TUN `read` | 7.24% | 7.17% | **0.07%** |
+| `epoll_wait` | 3.38% | 2.98% | **0.40%** |
+| `recvfrom` | 1.93% | ~1.85% | ~0.1% |
+
+So `sendmmsg` can remove about **2.2%**, and the whole batching family about
+**2.8%** of the PGW-U thread. The kernel still has to parse, route and deliver
+every packet; only the per-call boundary goes away. That is an honest ceiling of
+roughly 25-30 Mbps at the 947 Mbps operating point, which is why the phase did
+not implement it: the cost was a change in a shared library (`libogspfcp`,
+also linked by the SGW-U) for an effect inside the run-to-run variance of the
+measurement.
+
+`recvmmsg` was ruled out for the same reason plus a structural one: the
+downlink path reads the **TUN**, not a socket, and `recvmmsg` cannot be applied
+to a TUN character device. Only the uplink GTP-U receive is a socket (1.93%
+total, ~0.1% entry/exit). A bounded TUN drain loop would reduce epoll wakeups,
+not `read` syscalls, and the whole `epoll_wait` share is 3.38%.
+
+**Implemented instead, and not yet deployed:** the per-packet trace in
+`_gtpv1_u_recv_cb` formats the peer address with `OGS_ADDR()`, which runs
+`inet_ntop` on every GTP-U packet even when the trace level is filtered, because
+C evaluates the arguments before the call. The change guards that one call with
+a level test (`ogs_log_get_domain_level(OGS_LOG_DOMAIN) >= OGS_LOG_TRACE`), in
+`src/upf/gtp-path.c` only. It is UPF-local: no shared library changes, so a
+future deployment would restart `upfd` alone. Its expected effect is the
+2-3% that the profile attributed to `__printf_buffer`, and it is unmeasured
+because four protected EPS sessions blocked the restart.
+
+Open5GS source at the time of the change: `7df8ada9dcc0e232e63103f7f87186d37a472c1f`,
+release build, `-O3`, GCC 13.3.0.
+

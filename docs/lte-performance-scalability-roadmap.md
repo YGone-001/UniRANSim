@@ -218,10 +218,23 @@ samples are the kernel side of one `read`/`write` and one `sendto` per packet
 about 4%. The GTP parser, the TEID lookup and the locks are each below 1%.
 Per-packet `inet_ntop` from the log arguments costs another 2-3%.
 
-So the remaining 52.76 Mbps is a syscall-per-packet cost, and the only
-candidate with the right mechanism is batching the receive and send path.
+Splitting each syscall into its entry/exit part and its kernel work shrinks the
+addressable share: only about 2.2% of the thread is `sendto` entry/exit, and
+the whole batching family about 2.8%. The kernel still parses, routes and
+delivers every packet. `recvmmsg` cannot help the downlink at all, because that
+path reads the TUN and not a socket.
 
-PERF-P1 downlink is therefore `PERF_P1_DL_SUSTAINED_BELOW_TARGET` at 871.95
+So the remaining 52.76 Mbps is not something socket batching can remove. What
+was implemented instead is the one item that is both safe and measurable: the
+per-packet `OGS_ADDR()` trace argument in `_gtpv1_u_recv_cb` now sits behind a
+level test, so `inet_ntop` no longer runs when trace is filtered (~2-3% of the
+thread). It is UPF-local, it changes no library, and it is **not deployed**:
+four protected EPS sessions blocked the restart, so its effect is unmeasured.
+
+The remaining gap needs a different lever altogether - TUN or kernel packet
+processing, or a multi-worker UPF - and belongs to a separate phase.
+
+PERF-P1 downlink is therefore `PERF_P1_DL_SUSTAINED_BELOW_TARGET` at 947.24
 Mbps, and the remaining 1-Gbps gap is a PGW-U per-thread question, not a
 buffer one.
 
