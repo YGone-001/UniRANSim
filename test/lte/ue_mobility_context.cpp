@@ -41,8 +41,10 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -183,6 +185,22 @@ class FakeNetwork
             m_thread.join();
     }
 
+    // Waits, with a bound, until the network has consumed the expected number of
+    // protected Tracking Area Update Completes. The worker publishes that
+    // observation under this object mutex, so a test may wait for it while the
+    // worker is still running; every other member here is still read only after
+    // stop() has joined the thread.
+    //
+    // A false return means the completion never arrived, or the worker stopped
+    // consuming before it did. The caller must treat that as a failure: the
+    // absence of an event is not evidence that one happened.
+    bool waitForTauCompletes(int expected, std::chrono::milliseconds timeout)
+    {
+        std::unique_lock<std::mutex> lock(m_observation);
+        return m_observationReady.wait_for(lock, timeout,
+                                           [&] { return tauCompletes >= expected || m_finished; });
+    }
+
     // Observations the tests assert on. They are written on the network thread
     // and read only after stop() has joined it.
     std::vector<std::string> failures;
@@ -216,15 +234,22 @@ class FakeNetwork
             while (!m_stop)
             {
                 if (!pump(m_source))
-                    return;
+                    break;
                 if (!pump(m_target))
-                    return;
+                    break;
             }
         }
         catch (const std::exception &e)
         {
             fail(e.what());
         }
+        // A worker that stopped is a failed observation, not a slow one: say so
+        // and release the waiter now instead of leaving it to its timeout.
+        {
+            std::lock_guard<std::mutex> lock(m_observation);
+            m_finished = true;
+        }
+        m_observationReady.notify_all();
     }
 
     // Every reply goes back out of the endpoint the uplink arrived on, so a
@@ -397,7 +422,11 @@ class FakeNetwork
         }
         if (plain.size() >= 2 && plain[0] == 0x07 && plain[1] == 0x4A)
         {
-            ++tauCompletes;
+            {
+                std::lock_guard<std::mutex> lock(m_observation);
+                ++tauCompletes;
+            }
+            m_observationReady.notify_all();
             return true;
         }
         return true;
@@ -563,6 +592,11 @@ class FakeNetwork
     std::vector<uint8_t> m_lastUplinkPlain;
     std::thread m_thread;
     std::atomic_bool m_stop{false};
+    // Guards tauCompletes, the one observation a test may wait for while the
+    // worker is still consuming. m_finished is guarded by it too.
+    std::mutex m_observation;
+    std::condition_variable m_observationReady;
+    bool m_finished{};
 };
 
 // ---------------------------------------------------------------------------
@@ -585,6 +619,8 @@ struct Session
     std::unique_ptr<FakeNetwork> network;
     std::atomic_bool shutdown{false};
     int exitCode{-1};
+    // Whether the network consumed the TAU Complete the log reported sending.
+    bool tauCompleteObserved{false};
     std::string log;
     Clock::duration elapsed{};
 
@@ -617,6 +653,19 @@ struct Session
     void stopAfter(const std::string &needle, int timeoutMs = 8000)
     {
         capture->waitFor(needle, timeoutMs);
+        shutdown = true;
+        finish();
+    }
+
+    // Stops the UE once it reports the outcome under test and the fake network
+    // has actually consumed the TAU Complete that outcome implies. The log line
+    // alone is not the observation: the datagram may still be queued when
+    // shutdown begins, and the worker stops consuming at that point.
+    void stopAfterTauComplete(const std::string &needle, int expectedCompletes, int timeoutMs = 8000)
+    {
+        capture->waitFor(needle, timeoutMs);
+        tauCompleteObserved =
+            network->waitForTauCompletes(expectedCompletes, std::chrono::milliseconds(timeoutMs));
         shutdown = true;
         finish();
     }
@@ -664,7 +713,7 @@ TEST_CASE("lte/mobility/context: the production UE declares its bearer inventory
     Session session;
     session.start(UeConfig(47301, 47302, "idle-reselection", 47303), Plan{}, TauAction::AcceptWithNewGuti, 47302,
                   47303);
-    session.stopAfter("Tracking Area Update accepted");
+    session.stopAfterTauComplete("Tracking Area Update accepted", 1);
 
     CHECK(session.exitCode == 0);
     CHECK(Contains(session.log, "ECM-IDLE cell reselection 460/02/1 -> 460/02/2"));
@@ -692,6 +741,7 @@ TEST_CASE("lte/mobility/context: the production UE declares its bearer inventory
     // Update Request. The TAU Complete follows the Accept.
     CHECK(session.network->protectedUplinks == 4);
     CHECK(session.network->lastUplinkCount == 3);
+    CHECK(session.tauCompleteObserved);
     CHECK(session.network->tauCompletes == 1);
     CHECK(session.network->attachComplete);
     CHECK(session.network->failures.empty());
@@ -798,11 +848,12 @@ TEST_CASE("lte/mobility/context: a Tracking Area Update on an established S1 con
     session.start(UeConfig(47313, 47314, "tau-normal", std::nullopt, /*triggerAfterMs=*/100,
                            /*procedureTimeoutMs=*/30000, /*maxRetries=*/2),
                   Plan{{6}, {}}, TauAction::AcceptWithNewGuti, 47314, 47316);
-    session.stopAfter("Tracking Area Update accepted");
+    session.stopAfterTauComplete("Tracking Area Update accepted", 1);
 
     CHECK(session.exitCode == 0);
     CHECK(Contains(session.log, "Protected normal Tracking Area Update Request sent"));
     CHECK(session.network->attachComplete);
+    CHECK(session.tauCompleteObserved);
     CHECK(session.network->tauCompletes == 1);
     // No mobility uplink of either form was ever produced, and the reselected
     // endpoint was never addressed at all.

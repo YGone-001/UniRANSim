@@ -88,6 +88,14 @@ namespace that has a real `/dev/net/tun` and root capability.
   two flows, and the dedicated flow must travel the dedicated bearer's TEID.
   A control-plane-only pass is not a restoration pass, and a loopback packet
   that never left a socket pair is not user-plane evidence.
+- A test that asserts what a fake peer observed must wait for the peer's own
+  synchronised event, not for the log line that says a message was sent. The log
+  line is written after the datagram leaves, but the peer's worker may still be
+  holding it when shutdown begins, and a worker stops consuming at that point.
+  `test/lte/ue_mobility_context.cpp` publishes the received TAU Complete
+  under a mutex and waits for it through a bounded condition variable for
+  exactly this reason. A wait that times out is a failed observation and must
+  fail the test; it is never a slow success.
 
 ## GTP-U message handling
 
