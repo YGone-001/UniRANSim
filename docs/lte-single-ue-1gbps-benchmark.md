@@ -864,9 +864,19 @@ verify `test_start` (`omit`, `duration`, `target_bitrate`) from the JSON; abort 
 the 5 s pre-test boundary if any drop counter moved; then 60 s measured with 1 Hz
 drop sampling and a hard stop on the first new drop.
 
-Even with that, a 1 Gbps run against a 4 MiB socket may still abort, so the
-smallest justified next action is a **larger PGW-U ingress buffer** (8-16 MiB,
-a host sysctl plus an `upfd` restart), not a data-plane change. The budget is the
-second constraint: one 65 s profile at 1 Gbps needs 8.68 GB charged against
-15.51 GB of headroom above the 120 GB reserve, so **one direction fits and the
-two-direction matrix does not** (17.36 GB needed, 1.85 GB short).
+That procedure was executed once, on 2026-11-18, with a **16 MiB PGW-U ingress**.
+The PGW-U no longer dropped at all, which confirms the queue-overflow mechanism,
+but the **SGW-U** - still at the 4 MiB it was created with, because restarting
+`sgwud` is outside the authorized scope - dropped **9 packets one second after
+the client connected**. The run was killed at that moment, before any measured
+interval, and charged 136 MB. Host swap stood at 3.76 of 4.10 GB, so a page-in
+stall on the idle SGW-U thread is a plausible co-factor; no fault counters were
+sampled to prove it.
+
+So the first drop point moves down the chain as each link is widened: PGW-U at
+4 MiB, then SGW-U at 4 MiB. A compliant 1 Gbps run needs the same treatment on
+the SGW-U - a socket-budget change plus a restart the current authorization
+forbids - or a host without memory pressure. The budget is the second
+constraint: one 65 s profile at 1 Gbps needs 8.68 GB charged against 15.51 GB of
+headroom above the 120 GB reserve, so **one direction fits and the two-direction
+matrix does not** (17.36 GB needed, 1.85 GB short).

@@ -272,11 +272,14 @@ has been accepted**: uplink sustained remains 928.69 Mbps and downlink
 The mechanism is now known. `upfd` was only 74% busy while the 4 MiB ingress
 socket filled to its limit, because `iperf3 -b` overshoots its target by 12.5%
 on this path and the queue then cycles through fill, CUBIC back-off, drain and
-overflow. Attach readiness is not the cause and neither is CPU. The smallest
-justified next action is a larger PGW-U ingress buffer (8-16 MiB, a host sysctl
-and an `upfd` restart), not a data-plane change - and the two-direction
-acceptance matrix also needs 1.85 GB more OCS quota than the 120 GB reserve
-leaves free.
+overflow. Attach readiness is not the cause and neither is CPU.
+
+Widening the PGW-U to 16 MiB on 2026-11-18 confirmed it: the PGW-U stopped
+dropping, and the failure moved to the **SGW-U**, still at 4 MiB because
+restarting `sgwud` is outside the authorized scope, which dropped 9 packets one
+second into the run. The 60-second acceptance was therefore stopped before its
+first measured interval. The two-direction matrix also needs 1.85 GB more OCS
+quota than the 120 GB reserve leaves free.
 
 ---
 
