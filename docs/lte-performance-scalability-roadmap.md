@@ -231,9 +231,10 @@ level test, so `inet_ntop` no longer runs when trace is filtered (~2-3% of the
 thread). It is UPF-local and changes no library, so it needs only an `upfd`
 restart.
 
-That restart happened in a maintenance window on 2026-11-17, once the four
-protected sessions had drained. Three interleaved runs of the guarded binary
-against three of the original found **no resolvable effect**: goodput median
+That restart happened in a maintenance window on 2026-11-17, under explicit
+authorization; the owner sessions were not awaited, and the UPF session count
+was back within seconds of every restart. Three interleaved runs of the guarded
+binary against three of the original found **no resolvable effect**: goodput median
 919.51 Mbps against 917.72, while two runs of the *same* binary differed by 2.9%,
 and goodput per cycle was 289.8 bits against 294.6. A 1-2% instruction saving
 does not reach goodput on a thread that is already at 95% of a core and spends

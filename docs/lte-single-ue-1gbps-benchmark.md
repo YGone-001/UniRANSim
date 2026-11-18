@@ -685,8 +685,8 @@ release build, `-O3`, GCC 13.3.0.
 ### 16.4 Lazy logging: deployed A/B
 
 The one change left open by 19-F-G was deployed in a maintenance window on
-2026-11-17, once the four owner sessions had drained, and measured against the
-original binary in an **interleaved** sequence `old / new / old / new / old /
+2026-11-17, under explicit authorization and without waiting for the owner
+sessions, and measured against the original binary in an **interleaved** sequence `old / new / old / new / old /
 new`, so that any drift on the host is shared by both arms instead of landing
 on one of them.
 
