@@ -260,6 +260,24 @@ PERF-P1 downlink is therefore `PERF_P1_DL_SUSTAINED_BELOW_TARGET` at 947.24
 Mbps, and the remaining 1-Gbps gap is a PGW-U per-thread question, not a
 buffer one.
 
+### 2.8 Acceptance state after the uplink attempts
+
+The uplink reached **1,160.78 Mbps** over a 20 s window on 2026-11-18, above
+1 Gbps for the first time, but with 471 PGW-U ingress drops; a paced re-run at
+1,000 Mbps offered reached 914.63 Mbps with 412 drops, all in the measured
+phase. Both were stopped under the zero-drop rule, so **no 60-second direction
+has been accepted**: uplink sustained remains 928.69 Mbps and downlink
+947.24 Mbps, both below target.
+
+The mechanism is now known. `upfd` was only 74% busy while the 4 MiB ingress
+socket filled to its limit, because `iperf3 -b` overshoots its target by 12.5%
+on this path and the queue then cycles through fill, CUBIC back-off, drain and
+overflow. Attach readiness is not the cause and neither is CPU. The smallest
+justified next action is a larger PGW-U ingress buffer (8-16 MiB, a host sysctl
+and an `upfd` restart), not a data-plane change - and the two-direction
+acceptance matrix also needs 1.85 GB more OCS quota than the 120 GB reserve
+leaves free.
+
 ---
 
 ## 3. Performance P2 — 512 simultaneous LTE UEs

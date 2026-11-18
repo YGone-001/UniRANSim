@@ -817,3 +817,56 @@ campaign's own bookings (so it predates them), there is no repair record, and th
 current OCS code uses `int64_t` throughout for octets. The cause is
 `OCS_EVIDENCE_INSUFFICIENT`; it was deliberately not "fixed" by adding 4 GiB,
 because `data_available` is what grants are made from and it closes exactly.
+
+### 16.7 Short-window 1 Gbps and the queue-overflow mechanism
+
+On 2026-11-18 an unpaced uplink run reached **1,160.78 Mbps** over a 20 s
+measurement window - the first observation above 1 Gbps on this path - with
+**471 PGW-U ingress drops**; a paced re-run (`-P 4 -b 250M`) reached 914.63 Mbps
+with **412 drops**. Both were stopped under the zero-drop rule. The 1.16 Gbps
+number is short-window evidence, not a 60-second acceptance: it was measured
+while the socket was losing packets.
+
+The paced run explains the mechanism. Against the iperf3 clock (client connect
+at 16:02:03 local, 5 s pre-test, 20 s measured):
+
+| Time | Event |
+|---|---|
+| 16:02:02.889 | MME "Attach complete" |
+| 16:02:03 | client connects, 4 x 250 Mbit/s |
+| 16:02:03-08 | pre-test, per-second aggregate 1017 / 960 / 1125 / 974 / 925 Mbps |
+| 16:02:09 | PGW-U receive queue sampled at 2.11 MB of the 4 MiB budget |
+| 16:02:13-17 | CUBIC back-off: 731 -> 357 -> 381 -> 115 Mbps |
+| 16:02:17-25 | drops 63 -> 290 -> 394 -> 412, queue between samples at the limit |
+| 16:02:26-28 | drops flat, throughput recovers to ~1,140 Mbps |
+
+Three facts follow. Attach readiness is **not** the cause - the bearer was up
+0.1 s before the client connected and the first ten seconds carried no drops.
+The CPU is **not** the limit - `upfd` used 74.0% of one core at 914 Mbps, against
+91-96% at ~918 Mbps downlink, because the uplink path does not encapsulate GTP on
+egress. The limit is the **4 MiB ingress socket** meeting a pacer that overshoots
+its target by 12.5% (1,125 vs 1,000 Mbps): the queue fills, delay grows, CUBIC
+backs off, the queue drains, the sender bursts again, and eventually the socket
+drops - each drop buying another back-off.
+
+`iperf3 -b` is a token bucket, not a shaper. On a lossless loopback the same
+command keeps +0.25% overshoot, so the 12.5% seen here is path-induced (ACK
+clocking against a draining queue), not a harness defect. `--fq-rate` exists in
+iperf3 3.16 and measured identically to `-b` on loopback; it has not been tried
+on the EPC.
+
+### 16.8 Acceptance state and what a 60-second run needs
+
+A controlled startup procedure removes the attach overlap but not the overflow
+cycle: wait for user-plane-active, TUN and route, one ping and 5 s with no new
+drops; require >= 10 s between "Attach complete" and the first bulk packet;
+verify `test_start` (`omit`, `duration`, `target_bitrate`) from the JSON; abort at
+the 5 s pre-test boundary if any drop counter moved; then 60 s measured with 1 Hz
+drop sampling and a hard stop on the first new drop.
+
+Even with that, a 1 Gbps run against a 4 MiB socket may still abort, so the
+smallest justified next action is a **larger PGW-U ingress buffer** (8-16 MiB,
+a host sysctl plus an `upfd` restart), not a data-plane change. The budget is the
+second constraint: one 65 s profile at 1 Gbps needs 8.68 GB charged against
+15.51 GB of headroom above the 120 GB reserve, so **one direction fits and the
+two-direction matrix does not** (17.36 GB needed, 1.85 GB short).
