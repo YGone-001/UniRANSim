@@ -754,3 +754,66 @@ buys nothing measurable is a maintenance cost, not an optimization. The host
 sysctls were returned to their baseline (`rmem_max = rmem_default = 212992`);
 the running GTP-U sockets keep the 4 MiB they were created with, which is the
 documented consequence in `docs/lte-udp-receive-buffer-tuning.md` section 8.
+
+### 16.5 Uplink: the direction the change is actually on
+
+`_gtpv1_u_recv_cb` is the **uplink** handler: GTP-U from the access side,
+PDR/FAR, then `ogs_tun_write`. The downlink handler is a different function,
+`_gtpv1_tun_recv_common_cb`, which reads the TUN and calls
+`ogs_pfcp_send_gtpu`. The guard at `src/upf/gtp-path.c:358` therefore runs once
+per **uplink** G-PDU.
+
+A DL4 test only runs it on the UE's TCP ACKs: 44-50 MB and roughly 0.6 M packets
+against 2.1 M downlink packets, i.e. 23-29% of the packet stream and the cheapest
+packets in it. That is why the DL4 A/B above is a regression check, not a test of
+the optimization.
+
+Two uplink campaigns were run on 2026-11-18 to close that gap:
+
+| Attempt | Offer | Achieved | PGW-U ingress drops | Outcome |
+|---|---|---:|---:|---|
+| unbounded | 4 streams, no cap | 1,160.78 Mbps | 471 | stopped |
+| paced | `-b 250M` x 4 = 1.00 Gbps | 914.63 Mbps | 412 (first ~9 s only) | stopped |
+
+Both were stopped under the zero-drop rule before the guarded binary was ever
+deployed, so **there is no UL4 A/B result**: the question stays
+`UL4_VALIDATION_NOT_ESTABLISHED`. What the attempts did establish:
+
+- the uplink really does traverse the modified function (1.6-2.0 M G-PDUs per run
+  reached the PGW-U socket and were written to the TUN);
+- uplink is the cheaper direction per byte - `upfd` used **74.0%** of a core at
+  914 Mbps uplink against 91-96% at ~918 Mbps downlink, because the uplink path
+  does not encapsulate GTP on egress;
+- the PGW-U **ingress** socket is the loss point in uplink: at 1.16 Gbps the loss
+  is sustained, at 914 Mbps it is confined to the start-up burst (four TCP
+  streams entering slow start together) and stops after about 9 s.
+
+Making the comparison possible would need either a two-phase ramp (iperf3 cannot
+express it in one run) or a larger ingress budget on the PGW-U (8-16 MiB, a host
+and socket-lifecycle change). Neither belongs to this phase and neither was
+attempted.
+
+### 16.6 What the DL4 campaign consumed
+
+The six DL4 runs were real traffic and were charged:
+
+| | Bytes |
+|---|---:|
+| Application payload, pre-test + measured | 17,002,528,768 |
+| OCS `input_octets` + `output_octets` (six sessions) | 18,164,232,265 |
+| `data_available` movement | 18,174,718,025 = 18,164,232,265 + 10,485,760 (live reservation) |
+
+The +6.8% over payload is GTP-U encapsulation (inner 1400 B -> 1436 B on the
+wire), the 5 s pre-test of each run, and attach-time traffic. Per session the
+sum of `ocs_usage_records` equals `used_total` exactly, and the balance movement
+equals the six `used_total` values plus the outstanding reservation, to the byte.
+An earlier statement that the campaign produced "no traffic, no consumption" was
+wrong and is withdrawn.
+
+Separately, this subscriber's balance violates `data_total = data_used +
+data_reserved + data_available` by exactly **4,294,967,296 B (1 x 2^32)**. It is
+the only one of 1000 balances with a non-zero gap, it is invariant under the
+campaign's own bookings (so it predates them), there is no repair record, and the
+current OCS code uses `int64_t` throughout for octets. The cause is
+`OCS_EVIDENCE_INSUFFICIENT`; it was deliberately not "fixed" by adding 4 GiB,
+because `data_available` is what grants are made from and it closes exactly.

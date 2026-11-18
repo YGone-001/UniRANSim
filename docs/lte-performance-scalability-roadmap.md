@@ -244,6 +244,15 @@ installed binary was restored to the original; the measurement is in
 **this campaign cannot resolve an effect below about 3%**, which is the number
 any future micro-optimization on this path has to beat.
 
+The uplink, where the guard actually runs on every packet rather than on the
+UE's ACKs, is still open. Two uplink campaigns on 2026-11-18 stopped on PGW-U
+ingress drops - 471 at 1.16 Gbps unbounded, 412 confined to the start-up burst
+at a paced 914 Mbps - so the guarded binary was never deployed in an uplink
+test and the question is recorded as `UL4_VALIDATION_NOT_ESTABLISHED`, not
+answered by the DL4 result. Uplink is the cheaper direction per byte (74.0% of
+a core at 914 Mbps against 91-96% at ~918 Mbps downlink), and its first limit is
+the GTP-U ingress socket, not the log line.
+
 The remaining gap needs a different lever altogether - TUN or kernel packet
 processing, or a multi-worker UPF - and belongs to a separate phase.
 
