@@ -175,9 +175,12 @@ Two consequences follow, and neither can be assumed away:
    created **after** the change, so the SGW-U (and PGW-U) process has to be
    recreated. That is a service lifecycle action with its own approval.
 
-On this host all three GTP-U sockets report `rb212992`, which is exactly
-`rmem_default`, and their cumulative drop counters (59,525 for the PGW-U,
-60,547 for the SGW-U) are the residue of the 19-F-C campaign.
+At the time of the 19-F-C audit all three GTP-U sockets reported `rb212992`,
+which is exactly `rmem_default`, and their cumulative drop counters (59,525 for
+the PGW-U, 60,547 for the SGW-U) were the residue of that campaign. The host
+default is back at 212,992, but the SGW-U socket and the running PGW-U socket
+still hold the 4 MiB they inherited when they were created, which is the
+behaviour described above: the socket keeps what it was given.
 
 ## 9. Status
 

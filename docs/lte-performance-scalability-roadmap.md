@@ -225,11 +225,23 @@ delivers every packet. `recvmmsg` cannot help the downlink at all, because that
 path reads the TUN and not a socket.
 
 So the remaining 52.76 Mbps is not something socket batching can remove. What
-was implemented instead is the one item that is both safe and measurable: the
+was implemented instead is the one item that is both safe and testable: the
 per-packet `OGS_ADDR()` trace argument in `_gtpv1_u_recv_cb` now sits behind a
 level test, so `inet_ntop` no longer runs when trace is filtered (~2-3% of the
-thread). It is UPF-local, it changes no library, and it is **not deployed**:
-four protected EPS sessions blocked the restart, so its effect is unmeasured.
+thread). It is UPF-local and changes no library, so it needs only an `upfd`
+restart.
+
+That restart happened in a maintenance window on 2026-11-17, once the four
+protected sessions had drained. Three interleaved runs of the guarded binary
+against three of the original found **no resolvable effect**: goodput median
+919.51 Mbps against 917.72, while two runs of the *same* binary differed by 2.9%,
+and goodput per cycle was 289.8 bits against 294.6. A 1-2% instruction saving
+does not reach goodput on a thread that is already at 95% of a core and spends
+75% of its time in the kernel. The patch is kept as a vetted artifact and the
+installed binary was restored to the original; the measurement is in
+`docs/lte-single-ue-1gbps-benchmark.md` section 16.4. What remains is that
+**this campaign cannot resolve an effect below about 3%**, which is the number
+any future micro-optimization on this path has to beat.
 
 The remaining gap needs a different lever altogether - TUN or kernel packet
 processing, or a multi-worker UPF - and belongs to a separate phase.

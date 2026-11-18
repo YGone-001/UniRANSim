@@ -682,3 +682,75 @@ because four protected EPS sessions blocked the restart.
 Open5GS source at the time of the change: `7df8ada9dcc0e232e63103f7f87186d37a472c1f`,
 release build, `-O3`, GCC 13.3.0.
 
+### 16.4 Lazy logging: deployed A/B
+
+The one change left open by 19-F-G was deployed in a maintenance window on
+2026-11-17, once the four owner sessions had drained, and measured against the
+original binary in an **interleaved** sequence `old / new / old / new / old /
+new`, so that any drift on the host is shared by both arms instead of landing
+on one of them.
+
+Method, identical for all six runs: `iperf3` 3.16, four TCP streams downlink,
+`-t 20 -O 5 -R -P 4`, and the same campaign UE configuration. The receive
+budget was held constant: `net.core.rmem_default` was temporarily 4,194,304, so
+every restart - original or guarded - recreated its GTP-U socket at 4 MiB, and
+`ss` at the start of each run confirms `rb4194304` on the eNB S1-U, UE radio,
+SGW-U and PGW-U sockets. Without that, a restart would have changed the buffer
+budget and the A/B would have measured the buffer rather than the patch.
+`perf stat` sampled the `upfd` thread for 8 s inside the steady-state window,
+`pidstat -t` recorded per-thread CPU, and a 1 Hz reader sampled
+`/proc/net/udp` for those sockets. The swap was a
+`kill -TERM` / `cp` / restart of `upfd` alone, and `/proc/<pid>/exe` was
+hashed after every restart, so each run is tied to the binary it actually ran:
+
+| Binary | sha256 (first 16) |
+|---|---|
+| original `upfd` (as installed) | `94b4347913122ceb` |
+| `upfd` with the trace guard | `ae0849829b7cf8de` |
+
+| Run | Binary | Goodput | Interval mean | Worst second | Retransmits | Cycles/s | Instr/s | IPC | bits/cycle | upfd CPU |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `base` | original | 917.72 | 907.80 | 728.42 | 1,165 | 3.055 G | 3.239 G | 1.060 | 300.4 | 91.2% |
+| `post` | guarded | 919.86 | 919.52 | 885.73 | 1,113 | 3.123 G | 3.213 G | 1.029 | 294.6 | 94.6% |
+| `base2` | original | 922.01 | 913.06 | 524.26 | 1,375 | 3.130 G | 3.272 G | 1.045 | 294.6 | 95.5% |
+| `post2` | guarded | 919.51 | 921.68 | 911.22 | 861 | 3.183 G | 3.275 G | 1.029 | 288.9 | 96.1% |
+| `base3` | original | 895.69 | 885.45 | 388.28 | 972 | 3.143 G | 3.348 G | 1.065 | 285.0 | 94.2% |
+| `post3` | guarded | 913.57 | 911.86 | 858.79 | 1,006 | 3.153 G | 3.258 G | 1.034 | 289.8 | 95.8% |
+
+Goodput is the `end` summary of the measured window; `perf stat` counters are
+divided by the elapsed time of that sample. The sampler recorded **zero UDP
+drops at all five sampled sockets in all six runs** (26 samples each), so no arm lost
+traffic and the comparison is not biased by a buffer event.
+
+**Result: no resolvable effect.** The two arms differ by less than the spread of
+one arm:
+
+- goodput median 917.72 (original, range 895.69-922.01) against 919.51
+  (guarded, range 913.57-919.86). The patched arm's median is 1.8 Mbps higher,
+  while two runs of the *same* original binary differ by 26.3 Mbps, i.e. 2.9%;
+- the same holds for the per-second series: the worst second in the original
+  arm (388.28) is far below anything in the guarded arm, but the original arm
+  also produced the best overall run;
+- the thread is saturated (91-96% of a core), so cycles per second is set by
+  the CPU rather than by the work: it stayed at 3.05-3.18 G in both arms, and
+  the useful ratio, goodput per cycle, is 294.6 bits/cycle (original median)
+  against 289.8 (guarded median) - lower, not higher;
+- instructions per second moved from 3.272 G to 3.258 G (-0.4%), inside the
+  3.3% spread between the two identical-binary runs, and its only stable
+  correlate is the IPC drop (1.060 -> 1.029), which is a property of the code
+  layout, not of the amount of work.
+
+The profile's 2-3% estimate for `__printf_buffer` therefore does **not** survive
+into end-to-end throughput at this operating point: the estimate was of samples
+in a gated-off path, and the arithmetic cost per packet is smaller than the
+campaign's 2.9% resolution. With the thread already at 95% of a core, a 1-2%
+instruction reduction would not translate into goodput without a matching
+reduction in the kernel share, which this change does not touch.
+
+Consequence: the guard stays in `artifacts/phase-19-f-g/` as a vetted patch, and
+the installed binary was restored to the original `94b4347913122ceb` after the
+campaign (`/proc/<pid>/exe` re-hashed). A local fork of a third-party daemon that
+buys nothing measurable is a maintenance cost, not an optimization. The host
+sysctls were returned to their baseline (`rmem_max = rmem_default = 212992`);
+the running GTP-U sockets keep the 4 MiB they were created with, which is the
+documented consequence in `docs/lte-udp-receive-buffer-tuning.md` section 8.
