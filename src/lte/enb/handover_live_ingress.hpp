@@ -80,6 +80,11 @@ enum class HandoverCapability : uint8_t
     // components that own them. This is simulator runtime evidence, not
     // real-RF evidence.
     RRC_RUNTIME_INPUT_AVAILABLE,
+    // The TS 33.401 Annex A hierarchy exists and is independently verified:
+    // initial KeNB, the NH chain, horizontal and vertical KeNB*, and the
+    // Annex A.7 RRC/UP algorithm keys (lte::security). This says the derivation
+    // is correct, not that a UE can apply it to a live handover.
+    AS_KEY_DERIVATION_READY,
     // The UE runtime can derive and apply AS handover security (KeNB, NH, and
     // the RRC/UP keys) from the SecurityContext the MME sends.
     HANDOVER_SECURITY_READY,

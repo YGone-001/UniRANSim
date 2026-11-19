@@ -80,8 +80,10 @@ behaviour.
   `intralte` are refused at decode and at encode. A `targetRNC-ID` or a `cGI`
   TargetID is refused as an invalid context identity rather than decoded.
 * **No RRC reconfiguration.** The transparent containers are opaque. §9.
-* **No security derivation.** The `SecurityContext` is carried, never
-  generated, never defaulted and never logged. §10.
+* **No security derivation on the S1 path.** The `SecurityContext` is carried,
+  never generated, never defaulted and never logged. The AS key hierarchy itself
+  exists outside this slice in `lte::security` (Phase 18-F-B4); no function in
+  the S1 ingress or the handover orchestration enters it. §10.
 * **No live EPC handover.** Nothing in this phase contacted Open5GS.
 
 ## 3. Normative protocol references
@@ -904,7 +906,7 @@ MME. Specifically not implemented, and not claimed:
 * no source context release, no source TEID retirement, no bearer path update;
 * no data forwarding, direct or indirect;
 * no RRC handover command, no Target-ToSource container of the target's own,
-  and no security key derivation;
+  and no security key derivation on the handover path;
 * no X2 handover, no Path Switch Request, no inter-RAT or inter-MME handover;
 * no live Open5GS handover and no PCC policy change.
 
@@ -1145,6 +1147,12 @@ The arrival binding is not a cryptographic authentication key and proves nothing
 on its own. No NAS or AS security key is derived or fabricated anywhere in this
 slice: `nextHopParameter` and `nextHopChainingCount` are carried from
 signalling, never generated, defaulted, derived or logged.
+
+Phase 18-F-B4 adds the TS 33.401 Annex A key hierarchy in `lte::security` and
+verifies it against independent vectors, but this slice still does not enter it:
+the target has no verified PCI or EARFCN-DL to derive a KeNB* from, and no RRC
+security procedure exists to select AS algorithms. `AS_KEY_DERIVATION_READY` is
+therefore true while `HANDOVER_SECURITY_READY` remains false.
 
 The source-to-target command is a simulator control exchange. It is not
 authenticated, it is not confidential, and its binding is only as good as the
@@ -1836,7 +1844,8 @@ because the code they would need does not; the tenth is derived.
 | `SOURCE_PROVENANCE_READY` | false | no standards-compliant source identity reaches a target |
 | `TARGET_CONTEXT_READY` | false | a provisional context needs a `SourceSession` from the source's registry |
 | `RRC_CONTAINER_READY` | false | no TS 36.331 codec exists |
-| `HANDOVER_SECURITY_READY` | false | the UE has KASME and NAS keys only |
+| `AS_KEY_DERIVATION_READY` | true | `lte::security` implements Annex A.3-A.7 and `test/lte/as_security.cpp` pins it to an independent reference |
+| `HANDOVER_SECURITY_READY` | false | the hierarchy exists, but no AS algorithm is selected, no RRC/PDCP protection is active and the UE cannot execute the radio move |
 | `UE_RADIO_EXECUTION_READY` | false | the UE executes a simulator frame, not an RRC reconfiguration |
 | `MME_PATH_UPDATE_OBSERVABLE` | false | the eNB cannot see the SGW's map |
 | `LIVE_HANDOVER_EXECUTION_READY` | false | derived: the conjunction of the nine above |

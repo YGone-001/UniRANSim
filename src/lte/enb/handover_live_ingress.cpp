@@ -130,6 +130,7 @@ const char *ToString(HandoverCapability capability)
     case HandoverCapability::S1AP_TRANSPARENT_CONTAINER_CODEC_READY: return "S1AP_TRANSPARENT_CONTAINER_CODEC_READY";
     case HandoverCapability::RRC_CONFIGURATION_COMPLETE: return "RRC_CONFIGURATION_COMPLETE";
     case HandoverCapability::RRC_RUNTIME_INPUT_AVAILABLE: return "RRC_RUNTIME_INPUT_AVAILABLE";
+    case HandoverCapability::AS_KEY_DERIVATION_READY: return "AS_KEY_DERIVATION_READY";
     case HandoverCapability::HANDOVER_SECURITY_READY: return "HANDOVER_SECURITY_READY";
     case HandoverCapability::UE_RADIO_EXECUTION_READY: return "UE_RADIO_EXECUTION_READY";
     case HandoverCapability::MME_PATH_UPDATE_OBSERVABLE: return "MME_PATH_UPDATE_OBSERVABLE";
@@ -270,9 +271,15 @@ LiveHandoverReadiness AssessLiveHandoverCapabilities()
         Assess(HandoverCapability::TARGET_CONTEXT_READY, false,
                "a provisional target context is created only from a SourceSession that ExtractSourceSession read "
                "out of the source's own live registry, which a target eNB does not hold"),
+        Assess(HandoverCapability::AS_KEY_DERIVATION_READY, true,
+               "lte::security implements the TS 33.401 Annex A hierarchy - initial KeNB from KASME and the "
+               "uplink NAS COUNT of the Security Mode Complete, the NH chain, horizontal and vertical KeNB*, and "
+               "the Annex A.7 RRC/UP keys - and test/lte/as_security.cpp pins every value to an independent "
+               "Python HMAC-SHA-256 reference implementation"),
         Assess(HandoverCapability::HANDOVER_SECURITY_READY, false,
-               "lte::ue::SecurityContext holds KASME, CK, IK and the NAS keys only: there is no KeNB, no NH "
-               "handling and no RRC/UP key derivation, so the nextHopParameter the MME sends cannot be applied"),
+               "the key hierarchy exists and is verified, but the runtime has no RRC security mode procedure: no "
+               "AS algorithm is selected, no RRC or PDCP protection is activated, and the UE cannot move its "
+               "radio to the target cell, so the nextHopParameter the MME sends still cannot be applied"),
         Assess(HandoverCapability::UE_RADIO_EXECUTION_READY, false,
                "the UE runtime executes the SIMULATED_HANDOVER_COMMAND control frame, not an "
                "RRCConnectionReconfiguration carrying a mobilityControlInfo"),

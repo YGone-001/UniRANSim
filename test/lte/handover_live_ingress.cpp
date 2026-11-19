@@ -215,6 +215,10 @@ TEST_CASE("lte/handover/live: the capability model names every missing live prer
     CHECK(readiness.available(HandoverCapability::LTE_RRC_UPER_CODEC_READY));
     CHECK(readiness.available(HandoverCapability::S1AP_TRANSPARENT_CONTAINER_CODEC_READY));
     CHECK(readiness.available(HandoverCapability::RRC_RUNTIME_INPUT_AVAILABLE));
+    // Phase 18-F-B4 adds the verified TS 33.401 key hierarchy. It is a
+    // derivation capability only: the execution prerequisite below stays
+    // false because no RRC security procedure or radio execution exists.
+    CHECK(readiness.available(HandoverCapability::AS_KEY_DERIVATION_READY));
 
     // What does not exist is named, not hidden behind a switch.
     CHECK_FALSE(readiness.available(HandoverCapability::RRC_CONFIGURATION_COMPLETE));
@@ -244,7 +248,7 @@ TEST_CASE("lte/handover/live: the capability model names every missing live prer
     CHECK_FALSE(readiness.available(HandoverCapability::MME_PATH_UPDATE_OBSERVABLE));
 
     // Every assessment carries the fact it rests on.
-    REQUIRE(readiness.assessments.size() == 13);
+    REQUIRE(readiness.assessments.size() == 14);
     for (const auto &assessment : readiness.assessments)
     {
         CHECK_FALSE(assessment.evidence.empty());

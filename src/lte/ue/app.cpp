@@ -24,10 +24,12 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <sstream>
 
 #include <lte/enb/codec.hpp>
 #include <lte/ip_packet.hpp>
+#include <lte/security/as_security.hpp>
 #include <lte/tft.hpp>
 
 #include <lib/udp/server.hpp>
@@ -129,6 +131,12 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
 {
     State state = State::DISCONNECTED;
     SecurityContext security{};
+    // Phase 18-F-B4: the UE-owned EPS AS security context (KeNB/NH/NCC). It is
+    // created when NAS security activates, replaced when a fresh EPS AKA
+    // replaces KASME, and destroyed on deregistration. It is never copied and
+    // its key material never reaches a log or a provenance record.
+    std::optional<lte::security::AsSecurityContext> asSecurity;
+    uint64_t nasSecurityGeneration = 1;
     MobilityContext mobility{};
     bool attachAcceptSeen = false;
     bool defaultBearerAccepted = false;
@@ -1028,6 +1036,10 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                             Log("ERROR", "Authentication Request processing failed");
                         return 1;
                     }
+                    // A fresh EPS AKA replaces KASME, so the AS context that
+                    // was derived from the old one is worthless.
+                    asSecurity.reset();
+                    nasSecurityGeneration++;
                     security = result.context;
                     // Record the exact UE security capability octets that went
                     // out in the Attach Request so the SMC replay check can use
@@ -1066,8 +1078,25 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 state = State::NAS_SECURITY_ACTIVE;
                 LogState(state);
 
+                // TS 33.401 7.2.1: the uplink NAS COUNT that activates AS
+                // security is the one the Security Mode Complete travels with.
+                // It is read before SendProtected advances the COUNT.
+                const uint32_t securityModeCompleteCount = security.ulNasCount;
                 SendProtected(socket, enb, ueId, security, true,
                               nas::EncodeSecurityModeComplete(config, command.imeisvRequested));
+                {
+                    // No RRC security mode procedure exists in this simulator,
+                    // so no AS algorithm has been selected. The context is built
+                    // with that stated, and it refuses to derive RRC/UP keys
+                    // rather than reusing the NAS selection in a role the
+                    // standard gives to a different procedure.
+                    lte::security::AsAlgorithmSet algorithms;
+                    algorithms.negotiated = false;
+                    asSecurity.emplace(lte::security::AsSecurityContext::Create(
+                        static_cast<uint32_t>(ueId), security.kasme, securityModeCompleteCount,
+                        nasSecurityGeneration, algorithms));
+                    Log("INFO", "EPS AS security context established: " + asSecurity->Describe());
+                }
                 state = State::SECURITY_MODE_COMPLETE_SENT;
                 LogState(state);
                 continue;
@@ -1224,6 +1253,11 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                     link::EncodeBearerRestoration(activeEbi, mobility.accessGeneration)});
                 socket.Send(enb, deleted.data(), deleted.size());
                 mobility.onDetachAccepted();
+                if (asSecurity)
+                {
+                    asSecurity->Reset();
+                    asSecurity.reset();
+                }
                 security = SecurityContext{};
                 pendingWire.clear();
                 tun.reset();

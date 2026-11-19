@@ -867,6 +867,52 @@ encoded. `src/lte/enb/handover_runtime_provenance.{hpp,cpp}` owns that.
   may emit. The `...Legacy` pair exists for its historical pinned vectors and
   is refused by the conformant decoder.
 
+## LTE AS security context
+
+`src/lte/security/` owns the TS 33.401 Annex A key hierarchy. It is a separate
+library because the UE and the target eNB both consume it and neither may depend
+on the other. `docs/lte-as-security-context.md` is the design record.
+
+- **Keys are owned, never shared.** `AsSecurityContext` is move-only and bound to
+  one UE id and one NAS generation. Using it for another UE is
+  `CROSS_UE_CONTEXT`; using it with an older NAS generation is
+  `STALE_NAS_GENERATION`. There is no global security context and no copy in
+  `SourceHandoverSnapshot`, `SourceSession`, `ServingCellHistory`,
+  `TargetInventory` or a provenance manifest.
+- **UL NAS COUNT provenance is explicit.** `KeNB = KDF(KASME, 0x11, count)` takes
+  the COUNT of the Security Mode Complete, read at the call site *before*
+  `SendProtected` advances the counter. Never use whichever `count` field is
+  easiest to reach, never reconstruct it from another message, never reset it
+  implicitly.
+- **NCC labels a chain position; it is not an input to the NH KDF.** Keep an
+  absolute chain index beside the three-bit value, so a wrap is a later position
+  with a different key. A request that would land behind the current position is
+  `STALE_NH`, never realised by walking backwards.
+- **Handover keys are staged.** `PrepareHandover` never touches the active key;
+  only `CommitHandover` installs the candidate, and `DiscardHandover` leaves the
+  active key, NCC and NH chain unchanged. A failed handover must never replace
+  the active KeNB.
+- **No algorithm is guessed.** A runtime context is created with
+  `negotiated == false` because this simulator has no RRC security mode
+  procedure; `DeriveAccessKeys()` refuses rather than copying the NAS selection
+  into the AS role. K_UPint is derived only for a profile that has a UP integrity
+  algorithm, which the LTE UE here does not.
+- **No fabricated radio parameters.** `DeriveTargetKenbStar` needs a verified
+  `TargetRadioConfig`; `TargetContext` has no PCI or EARFCN-DL today, so the
+  target refuses with `MISSING_TARGET_RADIO_CONFIG`. Never invent a PCI or an
+  EARFCN-DL to make a derivation succeed, and never infer one from a CGI.
+- **Every refusal is typed.** `AsSecurityError` names the reason, the operation
+  throws, and a rejected derivation leaves no partial state. Do not add a silent
+  default or an all-zero key path.
+- **Secrets stay in memory and die there.** No key material in logs, metrics,
+  JSON diagnostics or packet-capture notes; destruction uses a volatile store
+  loop; `Describe()` is the only string a context produces and it carries no key
+  bytes.
+- **Derivation is not activation.** `AS_KEY_DERIVATION_READY` may be true while
+  `HANDOVER_SECURITY_READY`, `UE_RADIO_EXECUTION_READY` and
+  `LIVE_HANDOVER_EXECUTION_READY` stay false. Do not enable live handover
+  because the KDF tests pass.
+
 ## LTE performance and capacity
 
 Two goals drive the current workstream: PERF-P1 (single UE sustained 1 Gbps

@@ -26,10 +26,19 @@ target_compile_options(lte-rrc PRIVATE -Wall -Wextra -pedantic)
 target_include_directories(lte-rrc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../asn/lte-rrc)
 target_link_libraries(lte-rrc PUBLIC asn-lte-rrc asn-asn1c)
 
+# Phase 18-F-B4: the LTE Access Stratum key hierarchy. It is its own library
+# because both the UE and the target eNB consume it and neither may depend on
+# the other.
+file(GLOB_RECURSE LTE_SECURITY_HDR_FILES security/*.hpp)
+file(GLOB_RECURSE LTE_SECURITY_SRC_FILES security/*.cpp)
+add_library(lte-security ${LTE_SECURITY_HDR_FILES} ${LTE_SECURITY_SRC_FILES})
+target_compile_options(lte-security PRIVATE -Wall -Wextra -pedantic)
+target_link_libraries(lte-security PUBLIC common-lib)
+
 add_library(lte-enb-lib ${LTE_ENB_HDR_FILES} ${LTE_ENB_SRC_FILES})
 target_compile_options(lte-enb-lib PRIVATE -Wall -Wextra -pedantic)
-target_link_libraries(lte-enb-lib PUBLIC common-lib lte-radio-link lte-user-plane-common lte-tft)
+target_link_libraries(lte-enb-lib PUBLIC common-lib lte-security lte-radio-link lte-user-plane-common lte-tft)
 
 add_library(lte-ue-lib ${LTE_UE_HDR_FILES} ${LTE_UE_SRC_FILES})
 target_compile_options(lte-ue-lib PRIVATE -Wall -Wextra -pedantic)
-target_link_libraries(lte-ue-lib PUBLIC common-lib lte-enb-lib lte-radio-link ue lte-tft)
+target_link_libraries(lte-ue-lib PUBLIC common-lib lte-security lte-enb-lib lte-radio-link ue lte-tft)
