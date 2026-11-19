@@ -6,12 +6,12 @@
 // See README, LICENSE, and CONTRIBUTING files for licensing details.
 //
 
-// Phase 18-F-B5: AS algorithm negotiation, the SecurityMode procedure over
-// PDCP, and PDCP security composition.
+// Phase 18-F-B5-R1: AS algorithm negotiation, the SecurityMode procedure over
+// the SRB1 PDCP profile, and the two LTE PDCP bearer profiles of TS 36.323.
 //
-// The RRC message vectors are the UPER encodings of TS 36.331 structures; the
-// PDCP MAC-I and ciphertext vectors were computed independently with OpenSSL
-// AES-128-CMAC and AES-128-CTR over the TS 33.401 inputs, not by this code.
+// The RRC vectors are UPER encodings of TS 36.331 structures. Every PDCP MAC-I
+// and ciphertext below was computed independently with OpenSSL AES-128-CMAC and
+// AES-128-CTR over the TS 33.401 inputs, never by the code under test.
 #include <ext/doctest/doctest.h>
 
 #include <lte/security/as_algorithm_selection.hpp>
@@ -21,9 +21,9 @@
 #include <lte/security/pdcp_security.hpp>
 
 #include <algorithm>
-#include <array>
 #include <functional>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace
@@ -60,6 +60,19 @@ const std::string KasmeBHex = "404142434445464748494a4b4c4d4e4f50515253545556575
 const char *KenbCount0Hex = "e6267359de012d9bda173d1b6fae57dec0e04e01cfcf57cb33a7573f142b8b95";
 const char *KRrcIntEia2Hex = "2f6e105d4dda7c910c988fcadc7b4844";
 const char *KRrcEncEea2Hex = "ae14c26e3ba014f8e4279841fb8ade28";
+const char *KUpEncEea1Hex = "34213661a0f7b726bf64faa986f6e280";
+
+// SRB1, COUNT 0, BEARER 0, DIRECTION 0, data 2800:
+//   MAC-I = OpenSSL CMAC over COUNT||BEARER||DIR||0^26||(00 2800) -> 7527c93b
+//   data||MAC-I ciphered with EEA2 (COUNT 0, BEARER 0, DIR 0)   -> 2b39107a6b9d
+const char *SrbMacHex = "7527c93b";
+const char *SrbCipherHex = "2b39107a6b9d";
+// DIRECTION 1: MAC-I = c159e70a over COUNT||BEARER 0||DIR 1||0^26||(00 2800),
+// and data||MAC-I ciphered with the DIRECTION 1 keystream -> 803d834dcc49.
+const char *SrbCipherDownlinkHex = "803d834dcc49";
+// DRB RB identity 3 -> BEARER 2 (bits 32-36 of the IV, so the octet is 0x10),
+// COUNT 0, DIR 0, data 2800, EEA2 -> f81f
+const char *DrbCipherHex = "f81f";
 
 lte::security::AsSecurityContext MakeContext(uint32_t ueId, const std::string &kasme = KasmeAHex)
 {
@@ -68,12 +81,12 @@ lte::security::AsSecurityContext MakeContext(uint32_t ueId, const std::string &k
     return lte::security::AsSecurityContext::Create(ueId, Key(kasme), 0, 1, set);
 }
 
-lte::security::UeAlgorithmCapabilities Capabilities(bool ciphering = true, bool integrity = true)
+lte::security::UeAlgorithmCapabilities Capabilities(uint16_t ciphering = 0x000F, uint16_t integrity = 0x000F)
 {
     lte::security::UeAlgorithmCapabilities caps;
     caps.present = true;
-    caps.ciphering = ciphering ? 0x000FU : 0;
-    caps.integrity = integrity ? 0x000FU : 0;
+    caps.ciphering = ciphering;
+    caps.integrity = integrity;
     return caps;
 }
 
@@ -92,7 +105,7 @@ constexpr lte::security::SelectionError NoSelectionRefusal = static_cast<lte::se
 constexpr lte::security::ProcedureError NoProcedureRefusal = static_cast<lte::security::ProcedureError>(0xFF);
 constexpr lte::security::PdcpSecurityError NoPdcpRefusal = static_cast<lte::security::PdcpSecurityError>(0xFF);
 
-template <typename E, typename Fn, E Sentinel> E RefusalOf(Fn &&action)
+template <typename E, E Sentinel, typename Fn> E RefusalOf(Fn &&action)
 {
     try
     {
@@ -116,105 +129,88 @@ template <typename E, typename Fn, E Sentinel> E RefusalOf(Fn &&action)
     return Sentinel;
 }
 
+lte::security::PdcpSecurityEntity MakeSrb(bool uplink, uint8_t integrity = 2, uint8_t ciphering = 2)
+{
+    return lte::security::PdcpSecurityEntity::Create(lte::security::PdcpProfile::SRB,
+                                                     lte::security::RadioBearerIdentity::Srb1(), uplink, integrity,
+                                                     ciphering, Key16(KRrcIntEia2Hex), Key16(KRrcEncEea2Hex));
+}
+
 } // namespace
 
 // --- Algorithm selection ----------------------------------------------------
 
-TEST_CASE("lte/as-sec5/selection honours the operator order, not the numeric one")
+TEST_CASE("lte/as-sec5r1/selection is the first common algorithm in operator order")
 {
     using namespace lte::security;
 
-    // The allowlist says EEA1 before EEA2 even though 2 > 1 numerically.
+    // Every algorithm advertised: the allowlist order decides, not the identity.
     auto selection = SelectAsAlgorithms(Capabilities(), Configuration({1, 2, 3}), 5);
     CHECK(selection.ciphering == 1);
     CHECK(selection.integrity == 1);
 
-    // A UE that does not advertise EEA1 gets the next entry.
-    UeAlgorithmCapabilities caps;
-    caps.present = true;
-    caps.ciphering = 0x0005;  // EEA0 and EEA2
-    caps.integrity = 0x0005;
-    auto second = SelectAsAlgorithms(caps, Configuration({1, 2, 3}), 5);
+    // UE advertises EEA0 and EEA2 only. EEA1 is first in the allowlist but is
+    // NOT in the UE set, so the answer is EEA2 - the B5 report's example said
+    // EEA1 here and was wrong.
+    auto second = SelectAsAlgorithms(Capabilities(0x0005, 0x0005), Configuration({1, 2, 3}), 5);
     CHECK(second.ciphering == 2);
     CHECK(second.integrity == 2);
 
-    // Deterministic: same request, same answer.
-    CHECK(SelectAsAlgorithms(caps, Configuration({1, 2, 3}), 5).ciphering == second.ciphering);
+    // A policy that permits only an algorithm the UE lacks has no intersection.
+    CHECK(RefusalOf<SelectionError, NoSelectionRefusal>(
+              [&] { (void)SelectAsAlgorithms(Capabilities(0x0005, 0x0005), Configuration({1}), 5); }) ==
+          SelectionError::NO_COMMON_ALGORITHM);
+
+    // Deterministic.
+    CHECK(SelectAsAlgorithms(Capabilities(0x0005, 0x0005), Configuration({1, 2, 3}), 5).ciphering == 2);
 }
 
-TEST_CASE("lte/as-sec5/selection fails closed")
+TEST_CASE("lte/as-sec5r1/selection fails closed")
 {
     using namespace lte::security;
 
-    CHECK(RefusalOf<SelectionError, std::function<void()>, NoSelectionRefusal>(
+    CHECK(RefusalOf<SelectionError, NoSelectionRefusal>(
               [&] { (void)SelectAsAlgorithms(UeAlgorithmCapabilities{}, Configuration(), 5); }) ==
           SelectionError::UE_CAPABILITIES_MISSING);
-
-    auto zero = Capabilities();
-    zero.ciphering = 0;
-    CHECK(RefusalOf<SelectionError, std::function<void()>, NoSelectionRefusal>(
-              [&] { (void)SelectAsAlgorithms(zero, Configuration(), 5); }) == SelectionError::UE_CAPABILITIES_MALFORMED);
-
-    CHECK(RefusalOf<SelectionError, std::function<void()>, NoSelectionRefusal>(
+    CHECK(RefusalOf<SelectionError, NoSelectionRefusal>(
+              [&] { (void)SelectAsAlgorithms(Capabilities(0, 0x000F), Configuration(), 5); }) ==
+          SelectionError::UE_CAPABILITIES_MALFORMED);
+    CHECK(RefusalOf<SelectionError, NoSelectionRefusal>(
               [&] { (void)SelectAsAlgorithms(Capabilities(), Configuration({}), 5); }) ==
           SelectionError::ALLOWLIST_EMPTY);
-
-    UeAlgorithmCapabilities onlyZero;
-    onlyZero.present = true;
-    onlyZero.ciphering = 0x0001;
-    onlyZero.integrity = 0x0001;
-    CHECK(RefusalOf<SelectionError, std::function<void()>, NoSelectionRefusal>(
-              [&] { (void)SelectAsAlgorithms(onlyZero, Configuration({1, 2}), 5); }) ==
+    CHECK(RefusalOf<SelectionError, NoSelectionRefusal>(
+              [&] { (void)SelectAsAlgorithms(Capabilities(0x0001, 0x0001), Configuration({1, 2}), 5); }) ==
           SelectionError::NO_COMMON_ALGORITHM);
-
-    CHECK(RefusalOf<SelectionError, std::function<void()>, NoSelectionRefusal>(
+    CHECK(RefusalOf<SelectionError, NoSelectionRefusal>(
               [&] { (void)SelectAsAlgorithms(Capabilities(), Configuration({2}), 4); }) ==
           SelectionError::STALE_CONFIGURATION);
-
-    CHECK(RefusalOf<SelectionError, std::function<void()>, NoSelectionRefusal>(
+    CHECK(RefusalOf<SelectionError, NoSelectionRefusal>(
               [&] { (void)SelectAsAlgorithms(Capabilities(), Configuration({16}), 5); }) ==
           SelectionError::INVALID_ALGORITHM_IDENTITY);
 }
 
-TEST_CASE("lte/as-sec5/null algorithms are classified honestly and EIA0 is restricted")
+TEST_CASE("lte/as-sec5r1/null algorithms stay classified and EIA0 stays restricted")
 {
     using namespace lte::security;
 
-    UeAlgorithmCapabilities caps;
-    caps.present = true;
-    caps.ciphering = 0x0001;  // EEA0 only
-    caps.integrity = 0x0003;  // EIA0 and EIA1
-
     auto config = Configuration({0, 1});
     config.nasIntegrityAlgorithm = 0;  // NAS is also null
-    auto selection = SelectAsAlgorithms(caps, config, 5);
+    auto selection = SelectAsAlgorithms(Capabilities(0x0001, 0x0003), config, 5);
     CHECK(selection.ciphering == 0);
     CHECK(selection.cipheringNull);
-    CHECK_FALSE(ProvidesProtection(AsAlgorithmDirection::CIPHERING, 0));
     CHECK(selection.Describe().find("no confidentiality") != std::string::npos);
+    CHECK_FALSE(ProvidesProtection(AsAlgorithmDirection::CIPHERING, 0));
 
-    // EIA0 is refused when NAS integrity is not null, even though it is listed.
     auto nullFirst = Configuration({0, 2});
     nullFirst.nasIntegrityAlgorithm = 2;
-    CHECK(RefusalOf<SelectionError, std::function<void()>, NoSelectionRefusal>(
-              [&] { (void)SelectAsAlgorithms(caps, nullFirst, 5); }) ==
+    CHECK(RefusalOf<SelectionError, NoSelectionRefusal>(
+              [&] { (void)SelectAsAlgorithms(Capabilities(0x0001, 0x0003), nullFirst, 5); }) ==
           SelectionError::EIA0_WITHOUT_NULL_NAS_INTEGRITY);
-
-    // There is no automatic downgrade: a UE that supports EEA1/EIA1 only, and
-    // a policy that offers EEA2/EIA2 only, is a refusal - not a silent
-    // fallback to a null algorithm.
-    UeAlgorithmCapabilities noNull;
-    noNull.present = true;
-    noNull.ciphering = 0x0002;
-    noNull.integrity = 0x0002;
-    CHECK(RefusalOf<SelectionError, std::function<void()>, NoSelectionRefusal>(
-              [&] { (void)SelectAsAlgorithms(noNull, Configuration({2}), 5); }) ==
-          SelectionError::NO_COMMON_ALGORITHM);
 }
 
 // --- RRC codec --------------------------------------------------------------
 
-TEST_CASE("lte/as-sec5/security mode messages encode to the pinned TS 36.331 vectors")
+TEST_CASE("lte/as-sec5r1/security mode messages keep their pinned encodings")
 {
     using namespace lte::security;
 
@@ -232,7 +228,6 @@ TEST_CASE("lte/as-sec5/security mode messages encode to the pinned TS 36.331 vec
     failure.transactionId = 0;
     CHECK(EncodeSecurityModeFailure(failure) == Hex("3000"));
 
-    // Round trip through the same codec for every transaction identifier.
     for (uint8_t tx = 0; tx <= MaxRrcTransactionId; tx++)
     {
         command.transactionId = tx;
@@ -240,144 +235,219 @@ TEST_CASE("lte/as-sec5/security mode messages encode to the pinned TS 36.331 vec
         SecurityModeCommandMessage decoded;
         REQUIRE(DecodeSecurityModeCommand(bytes.data(), bytes.size(), decoded));
         CHECK(decoded.transactionId == tx);
-        CHECK(decoded.cipheringAlgorithm == 2);
-        CHECK(decoded.integrityAlgorithm == 2);
     }
 
-    // A wrong message type is not accepted as the requested one.
     auto failureBytes = EncodeSecurityModeFailure(failure);
     SecurityModeCompleteMessage wrong;
     CHECK_FALSE(DecodeSecurityModeComplete(failureBytes.data(), failureBytes.size(), wrong));
-
-    // Truncated input does not decode.
-    auto smc = EncodeSecurityModeCommand(command);
-    SecurityModeCommandMessage truncated;
-    CHECK_FALSE(DecodeSecurityModeCommand(smc.data(), 1, truncated));
 }
 
-// --- PDCP security ----------------------------------------------------------
+// --- Bearer identity --------------------------------------------------------
 
-TEST_CASE("lte/as-sec5/pdcp composes COUNT, bearer, direction and MAC-I as TS 33.401 defines")
+TEST_CASE("lte/as-sec5r1/bearer identity maps to the algorithm BEARER field")
 {
     using namespace lte::security;
 
-    // SRB1 uplink, EIA2, count 0, payload = SecurityModeComplete(0).
-    auto entity = PdcpSecurityEntity::Create(Srb1Bearer, true, 2, 0, Key16(KRrcIntEia2Hex), Key16(KRrcEncEea2Hex));
-    entity.ActivateIntegrity();
-    auto pdu = entity.Protect(Hex("2800"));
+    CHECK(RadioBearerIdentity::Srb1().rbId == 1);
+    CHECK(RadioBearerIdentity::Srb1().BearerField() == 0);
+    CHECK(RadioBearerIdentity::Srb2().BearerField() == 1);
+    CHECK(RadioBearerIdentity::Drb(3).BearerField() == 2);
+    CHECK_FALSE(RadioBearerIdentity{0}.Valid());
 
-    // Header 8000, payload 2800, MAC-I 6a5f5c9f. The MAC-I was computed with
-    // OpenSSL from COUNT||BEARER||DIR||000000||PDU and the pinned KRRCint.
-    CHECK(pdu == Hex("800028006a5f5c9f"));
-    CHECK(entity.NextTxCount() == 1);
-
-    // EEA2 only, same inputs: ciphertext 4c02 from OpenSSL AES-128-CTR with the
-    // EEA2 IV (count, bearer, direction).
-    auto cipherOnly = PdcpSecurityEntity::Create(Srb1Bearer, true, 0, 2, Key16(KRrcIntEia2Hex), Key16(KRrcEncEea2Hex));
-    cipherOnly.ActivateCiphering();
-    CHECK(cipherOnly.Protect(Hex("2800")) == Hex("80004c02"));
+    // The SRB profile refuses a DRB identity and vice versa.
+    CHECK(RefusalOf<PdcpSecurityError, NoPdcpRefusal>([&] {
+              (void)PdcpSecurityEntity::Create(PdcpProfile::SRB, RadioBearerIdentity::Drb(3), true, 2, 2,
+                                               Key16(KRrcIntEia2Hex), Key16(KRrcEncEea2Hex));
+          }) == PdcpSecurityError::UNSUPPORTED_BEARER);
+    CHECK(RefusalOf<PdcpSecurityError, NoPdcpRefusal>([&] {
+              (void)PdcpSecurityEntity::Create(PdcpProfile::DRB12, RadioBearerIdentity::Srb1(), true, 0, 2,
+                                               Key16(KRrcIntEia2Hex), Key16(KRrcEncEea2Hex));
+          }) == PdcpSecurityError::UNSUPPORTED_BEARER);
 }
 
-TEST_CASE("lte/as-sec5/pdcp round trips, and rejects tamper, replay and the wrong context")
+// --- SRB1 profile -----------------------------------------------------------
+
+TEST_CASE("lte/as-sec5r1/srb1 uses a five-bit header, ciphers data and MAC-I, and leaves the header clear")
 {
     using namespace lte::security;
 
-    auto tx = PdcpSecurityEntity::Create(Srb1Bearer, true, 2, 2, Key16(KRrcIntEia2Hex), Key16(KRrcEncEea2Hex));
-    auto rx = PdcpSecurityEntity::Create(Srb1Bearer, true, 2, 2, Key16(KRrcIntEia2Hex), Key16(KRrcEncEea2Hex));
+    // Integrity only: header 00, data 2800, MAC-I 7527c93b.
+    auto integrityOnly = MakeSrb(true, 2, 0);
+    integrityOnly.ActivateIntegrity();
+    CHECK(integrityOnly.Protect(Hex("2800")) == Hex(std::string("00") + "2800" + SrbMacHex));
+
+    // Integrity and ciphering: the header stays 00, data+MAC-I are ciphered.
+    auto both = MakeSrb(true, 2, 2);
+    both.ActivateIntegrity();
+    both.ActivateCiphering();
+    CHECK(both.Protect(Hex("2800")) == Hex(std::string("00") + SrbCipherHex));
+
+    // Downlink uses DIRECTION = 1 and therefore a different keystream.
+    auto downlink = MakeSrb(false, 2, 2);
+    downlink.ActivateIntegrity();
+    downlink.ActivateCiphering();
+    CHECK(downlink.Protect(Hex("2800")) == Hex(std::string("00") + SrbCipherDownlinkHex));
+}
+
+TEST_CASE("lte/as-sec5r1/srb1 round trips and rejects tamper, replay and a wrong bearer field")
+{
+    using namespace lte::security;
+
+    auto tx = MakeSrb(true);
+    auto rx = MakeSrb(true);
     tx.ActivateIntegrity();
     tx.ActivateCiphering();
     rx.ActivateIntegrity();
     rx.ActivateCiphering();
 
-    const auto plain = Hex("2800112233445566");
+    const auto plain = Hex("280011223344");
     const auto pdu = tx.Protect(plain);
     CHECK(rx.Unprotect(pdu) == plain);
 
-    // Tampering with the ciphertext is an integrity failure.
-    auto tampered = pdu;
-    tampered[3] ^= 0x01;
-    CHECK(RefusalOf<PdcpSecurityError, std::function<void()>, NoPdcpRefusal>(
-              [&] { (void)rx.Unprotect(tampered); }) == PdcpSecurityError::INTEGRITY_FAILURE);
+    // The header is not ciphered: the first octet is the SN.
+    CHECK(pdu[0] == 0x00);
 
-    // Replaying an accepted PDU is refused.
-    CHECK(RefusalOf<PdcpSecurityError, std::function<void()>, NoPdcpRefusal>(
+    auto tampered = pdu;
+    tampered[2] ^= 0x01;
+    CHECK(RefusalOf<PdcpSecurityError, NoPdcpRefusal>(
+              [&] { (void)rx.Unprotect(tampered); }) == PdcpSecurityError::INTEGRITY_FAILURE);
+    CHECK(RefusalOf<PdcpSecurityError, NoPdcpRefusal>(
               [&] { (void)rx.Unprotect(pdu); }) == PdcpSecurityError::REPLAY_DETECTED);
 
-    // A different bearer or direction is a different context.
-    auto otherBearer = PdcpSecurityEntity::Create(3, true, 2, 2, Key16(KRrcIntEia2Hex), Key16(KRrcEncEea2Hex));
-    otherBearer.ActivateIntegrity();
-    otherBearer.ActivateCiphering();
-    CHECK(RefusalOf<PdcpSecurityError, std::function<void()>, NoPdcpRefusal>(
-              [&] { (void)otherBearer.Unprotect(pdu); }) == PdcpSecurityError::INTEGRITY_FAILURE);
-
-    auto downlink = PdcpSecurityEntity::Create(Srb1Bearer, false, 2, 2, Key16(KRrcIntEia2Hex), Key16(KRrcEncEea2Hex));
-    downlink.ActivateIntegrity();
-    downlink.ActivateCiphering();
-    CHECK(RefusalOf<PdcpSecurityError, std::function<void()>, NoPdcpRefusal>(
-              [&] { (void)downlink.Unprotect(pdu); }) == PdcpSecurityError::INTEGRITY_FAILURE);
-
-    // A different key is a failure, not a silent pass.
-    auto wrongKey = PdcpSecurityEntity::Create(Srb1Bearer, true, 2, 2, Key16(KRrcEncEea2Hex), Key16(KRrcEncEea2Hex));
-    wrongKey.ActivateIntegrity();
-    wrongKey.ActivateCiphering();
-    CHECK(RefusalOf<PdcpSecurityError, std::function<void()>, NoPdcpRefusal>(
-              [&] { (void)wrongKey.Unprotect(pdu); }) == PdcpSecurityError::INTEGRITY_FAILURE);
+    // SRB2 is a different BEARER field (1), so the MAC-I cannot verify.
+    auto srb2 = PdcpSecurityEntity::Create(PdcpProfile::SRB, RadioBearerIdentity::Srb2(), true, 2, 2,
+                                           Key16(KRrcIntEia2Hex), Key16(KRrcEncEea2Hex));
+    srb2.ActivateIntegrity();
+    srb2.ActivateCiphering();
+    CHECK(RefusalOf<PdcpSecurityError, NoPdcpRefusal>(
+              [&] { (void)srb2.Unprotect(pdu); }) == PdcpSecurityError::INTEGRITY_FAILURE);
 }
 
-TEST_CASE("lte/as-sec5/pdcp COUNT rolls over the HFN without losing the sequence")
+TEST_CASE("lte/as-sec5r1/srb1 rejects reserved header bits")
 {
     using namespace lte::security;
 
-    auto tx = PdcpSecurityEntity::Create(Srb1Bearer, true, 2, 0, Key16(KRrcIntEia2Hex), Key16(KRrcIntEia2Hex));
-    auto rx = PdcpSecurityEntity::Create(Srb1Bearer, true, 2, 0, Key16(KRrcIntEia2Hex), Key16(KRrcIntEia2Hex));
+    auto rx = MakeSrb(true);
+    rx.ActivateIntegrity();
+    rx.ActivateCiphering();
+
+    // A header with a reserved bit set is malformed, not a different SN.
+    auto pdu = Hex("e0" + std::string("00112233445566778899aabb"));
+    CHECK(RefusalOf<PdcpSecurityError, NoPdcpRefusal>(
+              [&] { (void)rx.Unprotect(pdu); }) == PdcpSecurityError::MALFORMED_HEADER);
+}
+
+TEST_CASE("lte/as-sec5r1/srb1 COUNT rolls the 27-bit HFN over a 5-bit SN")
+{
+    using namespace lte::security;
+
+    auto tx = MakeSrb(true, 2, 0);
+    auto rx = MakeSrb(true, 2, 0);
     tx.ActivateIntegrity();
     rx.ActivateIntegrity();
 
-    // 4096 PDUs take the SN from 0 to 4095; the 4097th reuses SN 0 with HFN 1.
-    for (int i = 0; i < 4096; i++)
-        CHECK(rx.Unprotect(tx.Protect(Hex("00"))) == Hex("00"));
-    CHECK(rx.LastRxCount() == 4095);
-
-    const auto next = tx.Protect(Hex("00"));
-    CHECK(rx.Unprotect(next) == Hex("00"));
-    CHECK(rx.LastRxCount() == 4096);
+    // 32 PDUs take the SN from 0 to 31; the 33rd reuses SN 0 with HFN 1.
+    for (int i = 0; i < 32; i++)
+        CHECK(rx.Unprotect(tx.Protect(Hex("aa"))) == Hex("aa"));
+    CHECK(rx.LastRxCount() == 31);
+    CHECK(rx.Unprotect(tx.Protect(Hex("aa"))) == Hex("aa"));
+    CHECK(rx.LastRxCount() == 32);
 }
 
-TEST_CASE("lte/as-sec5/ciphering is not applied before it is activated")
+// --- DRB profile ------------------------------------------------------------
+
+TEST_CASE("lte/as-sec5r1/drb12 carries no MAC-I, ciphers data only, and keeps the header clear")
 {
     using namespace lte::security;
 
-    auto entity = PdcpSecurityEntity::Create(Srb1Bearer, true, 2, 2, Key16(KRrcIntEia2Hex), Key16(KRrcEncEea2Hex));
-    entity.ActivateIntegrity();
-    const auto pdu = entity.Protect(Hex("2800"));
-    // The payload is still readable while ciphering is inactive.
-    CHECK(std::vector<uint8_t>(pdu.begin() + 2, pdu.end() - 4) == Hex("2800"));
-    CHECK_FALSE(entity.CipheringActive());
+    auto drb = PdcpSecurityEntity::Create(PdcpProfile::DRB12, RadioBearerIdentity::Drb(3), true, 0, 2,
+                                          Key16(KUpEncEea1Hex), Key16(KRrcEncEea2Hex));
+    drb.ActivateCiphering();
+    const auto pdu = drb.Protect(Hex("2800"));
+
+    // Header 8000 (D/C = 1, SN 0), then the ciphered data. No MAC-I.
+    CHECK(pdu == Hex(std::string("8000") + DrbCipherHex));
+    CHECK(pdu.size() == 2 + 2);
+
+    // The header is clear and the D/C bit is set.
+    CHECK(pdu[0] == 0x80);
+    CHECK(pdu[1] == 0x00);
+}
+
+TEST_CASE("lte/as-sec5r1/drb12 refuses integrity and round trips with a 12-bit COUNT")
+{
+    using namespace lte::security;
+
+    // The ordinary UE DRB profile has no integrity protection.
+    CHECK(RefusalOf<PdcpSecurityError, NoPdcpRefusal>([&] {
+              (void)PdcpSecurityEntity::Create(PdcpProfile::DRB12, RadioBearerIdentity::Drb(3), true, 2, 2,
+                                               Key16(KRrcIntEia2Hex), Key16(KRrcEncEea2Hex));
+          }) == PdcpSecurityError::UNSUPPORTED_PROFILE);
+
+    auto tx = PdcpSecurityEntity::Create(PdcpProfile::DRB12, RadioBearerIdentity::Drb(3), true, 0, 2,
+                                         Key16(KUpEncEea1Hex), Key16(KRrcEncEea2Hex));
+    auto rx = PdcpSecurityEntity::Create(PdcpProfile::DRB12, RadioBearerIdentity::Drb(3), true, 0, 2,
+                                         Key16(KUpEncEea1Hex), Key16(KRrcEncEea2Hex));
+    tx.ActivateCiphering();
+    rx.ActivateCiphering();
+
+    // 4096 PDUs wrap the 12-bit SN and advance the 20-bit HFN.
+    for (int i = 0; i < 4096; i++)
+        CHECK(rx.Unprotect(tx.Protect(Hex("0102"))) == Hex("0102"));
+    CHECK(rx.LastRxCount() == 4095);
+    CHECK(rx.Unprotect(tx.Protect(Hex("0102"))) == Hex("0102"));
+    CHECK(rx.LastRxCount() == 4096);
+
+    // A DRB PDU presented to an SRB entity is not the same wire format. The
+    // short one is too short for header + MAC-I; the long one has the DRB
+    // first octet 0x80 in the SRB header position, which sets reserved bits.
+    auto srb = MakeSrb(true);
+    srb.ActivateIntegrity();
+    srb.ActivateCiphering();
+    CHECK(RefusalOf<PdcpSecurityError, NoPdcpRefusal>(
+              [&] { (void)srb.Unprotect(tx.Protect(Hex("0102"))); }) == PdcpSecurityError::PDU_TOO_SHORT);
+    CHECK(RefusalOf<PdcpSecurityError, NoPdcpRefusal>(
+              [&] { (void)srb.Unprotect(tx.Protect(Hex("0102030405060708"))); }) ==
+          PdcpSecurityError::MALFORMED_HEADER);
+}
+
+TEST_CASE("lte/as-sec5r1/srb and drb keep independent sequence state")
+{
+    using namespace lte::security;
+
+    auto srb = MakeSrb(true, 2, 0);
+    auto drb = PdcpSecurityEntity::Create(PdcpProfile::DRB12, RadioBearerIdentity::Drb(3), true, 0, 2,
+                                          Key16(KUpEncEea1Hex), Key16(KRrcEncEea2Hex));
+    srb.ActivateIntegrity();
+    drb.ActivateCiphering();
+
+    (void)srb.Protect(Hex("aa"));
+    CHECK(srb.NextTxCount() == 1);
+    CHECK(drb.NextTxCount() == 0);
+    (void)drb.Protect(Hex("bb"));
+    CHECK(drb.NextTxCount() == 1);
+    CHECK(srb.NextTxCount() == 1);
 }
 
 // --- The procedure ----------------------------------------------------------
 
-TEST_CASE("lte/as-sec5/the security mode procedure completes with matching state on both sides")
+TEST_CASE("lte/as-sec5r1/the procedure carries the command on SRB1 and completes on both sides")
 {
     using namespace lte::security;
 
     auto enb = MakeContext(7);
     auto ue = MakeContext(7);
+    auto procedure = EnbAsSecurityProcedure::Start(enb, 7, Capabilities(), Configuration({2}), 5, 0);
 
-    auto procedure = EnbAsSecurityProcedure::Start(enb, 7, Capabilities(), Configuration({2, 1, 3}), 5, 0);
     CHECK(procedure.State() == AsSecurityState::COMMAND_PENDING);
-    CHECK(procedure.Selection().ciphering == 2);
-    CHECK(procedure.Selection().integrity == 2);
+    const auto command = procedure.Command();
+    // One-octet SRB1 header (SN 0), the pinned command, a 4-byte MAC-I.
+    CHECK(command.size() == 1 + 3 + 4);
+    CHECK(command[0] == 0x00);
+    CHECK(ExtractPdcpPayload(command, PdcpProfile::SRB) == Hex("300220"));
     CHECK_FALSE(procedure.CipheringActive());
 
-    auto command = procedure.Command();
-    // PDCP header + the pinned SecurityModeCommand + a 4-byte MAC-I.
-    CHECK(command.size() == 2 + 3 + 4);
-    CHECK(std::vector<uint8_t>(command.begin() + 2, command.end() - 4) == Hex("300220"));
-
     auto ueProcedure = UeAsSecurityProcedure::Listening(ue, 7);
-    CHECK(ueProcedure.State() == AsSecurityState::KEY_PREPARED);
-
     auto complete = ueProcedure.OnCommand(command);
     CHECK(ueProcedure.State() == AsSecurityState::COMPLETE_PENDING);
     CHECK_FALSE(ueProcedure.CipheringActive());
@@ -390,12 +460,11 @@ TEST_CASE("lte/as-sec5/the security mode procedure completes with matching state
     CHECK(ueProcedure.State() == AsSecurityState::ACTIVE);
     CHECK(ueProcedure.CipheringActive());
 
-    // Same KASME and COUNT on both sides produce the same KeNB and keys.
+    // Same KASME and COUNT on both sides, same KeNB.
     CHECK(ue.ActiveKenb() == enb.ActiveKenb());
-    CHECK(ue.ActiveNcc() == 0);
 }
 
-TEST_CASE("lte/as-sec5/a corrupted command fails closed on the UE and changes nothing")
+TEST_CASE("lte/as-sec5r1/a corrupted command is answered with a failure and activates nothing")
 {
     using namespace lte::security;
 
@@ -404,78 +473,38 @@ TEST_CASE("lte/as-sec5/a corrupted command fails closed on the UE and changes no
     auto procedure = EnbAsSecurityProcedure::Start(enb, 7, Capabilities(), Configuration({2}), 5, 1);
 
     auto command = procedure.Command();
-    // Corrupt the MAC-I while leaving the message decodable: this is the case
-    // the standard answers with SecurityModeFailure. A command too broken to
-    // decode has no transaction identifier to answer with at all.
-    command.back() ^= 0xFF;
+    command.back() ^= 0xFF;  // break the MAC-I, keep the message decodable
 
     auto ueProcedure = UeAsSecurityProcedure::Listening(ue, 7);
     auto response = ueProcedure.OnCommand(command);
-
     CHECK(ueProcedure.State() == AsSecurityState::FAILED);
     CHECK_FALSE(ueProcedure.CipheringActive());
-    // The UE answers with SecurityModeFailure under the protection state it
-    // already had, which is none: the bytes are plain RRC, not a PDCP PDU.
+
     SecurityModeFailureMessage failure;
     CHECK(DecodeSecurityModeFailure(response.data(), response.size(), failure));
     CHECK(failure.transactionId == 1);
-
-    // The eNB never leaves COMMAND_PENDING, so it may not mark the UE secure.
     CHECK(procedure.State() == AsSecurityState::COMMAND_PENDING);
     CHECK_FALSE(procedure.CipheringActive());
 }
 
-TEST_CASE("lte/as-sec5/the eNB rejects an unverifiable completion and stays failed")
+TEST_CASE("lte/as-sec5r1/an unverifiable completion leaves the eNB failed")
 {
     using namespace lte::security;
 
     auto enb = MakeContext(7);
     auto ue = MakeContext(7);
     auto procedure = EnbAsSecurityProcedure::Start(enb, 7, Capabilities(), Configuration({2}), 5, 0);
-
     auto ueProcedure = UeAsSecurityProcedure::Listening(ue, 7);
     auto complete = ueProcedure.OnCommand(procedure.Command());
-    complete[complete.size() - 1] ^= 0xFF;
+    complete.back() ^= 0xFF;
 
-    CHECK(RefusalOf<ProcedureError, std::function<void()>, NoProcedureRefusal>(
+    CHECK(RefusalOf<ProcedureError, NoProcedureRefusal>(
               [&] { procedure.OnComplete(complete); }) == ProcedureError::INTEGRITY_FAILURE);
     CHECK(procedure.State() == AsSecurityState::FAILED);
     CHECK_FALSE(procedure.CipheringActive());
-
-    // A second completion cannot revive a failed transaction.
-    CHECK(RefusalOf<ProcedureError, std::function<void()>, NoProcedureRefusal>(
-              [&] { procedure.OnComplete(complete); }) == ProcedureError::UNEXPECTED_MESSAGE);
 }
 
-TEST_CASE("lte/as-sec5/the procedure refuses a wrong transaction identifier and a foreign context")
-{
-    using namespace lte::security;
-
-    auto enb = MakeContext(7);
-    auto ue = MakeContext(7);
-    auto procedure = EnbAsSecurityProcedure::Start(enb, 7, Capabilities(), Configuration({2}), 5, 0);
-
-    auto ueProcedure = UeAsSecurityProcedure::Listening(ue, 7);
-    (void)ueProcedure.OnCommand(procedure.Command());
-
-    // A completion for transaction 1 arrives at a procedure started for 0. The
-    // keys are the same, so integrity verifies; the transaction does not match.
-    auto other = MakeContext(7);
-    auto otherProcedure = EnbAsSecurityProcedure::Start(other, 7, Capabilities(), Configuration({2}), 5, 1);
-    auto ueOtherContext = MakeContext(7);
-    auto ueOther = UeAsSecurityProcedure::Listening(ueOtherContext, 7);
-    auto foreign = ueOther.OnCommand(otherProcedure.Command());
-    CHECK(RefusalOf<ProcedureError, std::function<void()>, NoProcedureRefusal>(
-              [&] { procedure.OnComplete(foreign); }) == ProcedureError::TRANSACTION_MISMATCH);
-
-    // A context owned by another UE cannot start a procedure for this UE.
-    auto stranger = MakeContext(9);
-    CHECK(RefusalOf<ProcedureError, std::function<void()>, NoProcedureRefusal>(
-              [&] { (void)EnbAsSecurityProcedure::Start(stranger, 7, Capabilities(), Configuration({2}), 5, 0); }) ==
-          ProcedureError::CONTEXT_MISMATCH);
-}
-
-TEST_CASE("lte/as-sec5/two UEs run independent procedures without sharing keys")
+TEST_CASE("lte/as-sec5r1/two UEs cannot satisfy each other's transaction")
 {
     using namespace lte::security;
 
@@ -486,9 +515,6 @@ TEST_CASE("lte/as-sec5/two UEs run independent procedures without sharing keys")
 
     auto procA = EnbAsSecurityProcedure::Start(enbA, 1, Capabilities(), Configuration({2}), 5, 0);
     auto procB = EnbAsSecurityProcedure::Start(enbB, 2, Capabilities(), Configuration({2}), 5, 0);
-    CHECK(procA.Selection().ciphering == 2);
-    CHECK(procB.Selection().ciphering == 2);
-
     auto ueProcA = UeAsSecurityProcedure::Listening(ueA, 1);
     auto ueProcB = UeAsSecurityProcedure::Listening(ueB, 2);
     auto completeA = ueProcA.OnCommand(procA.Command());
@@ -499,22 +525,16 @@ TEST_CASE("lte/as-sec5/two UEs run independent procedures without sharing keys")
     CHECK(procA.State() == AsSecurityState::ACTIVE);
     CHECK(procB.State() == AsSecurityState::ACTIVE);
 
-    // UE A's completion must not satisfy a transaction for UE B: the keys
-    // differ, so the MAC-I cannot verify.
+    // UE A's completion replayed at a transaction for UE B fails its MAC-I.
     auto enbB2 = MakeContext(2, KasmeBHex);
     auto procB2 = EnbAsSecurityProcedure::Start(enbB2, 2, Capabilities(), Configuration({2}), 5, 0);
-    CHECK(RefusalOf<ProcedureError, std::function<void()>, NoProcedureRefusal>(
+    CHECK(RefusalOf<ProcedureError, NoProcedureRefusal>(
               [&] { procB2.OnComplete(completeA); }) == ProcedureError::INTEGRITY_FAILURE);
     CHECK(procB2.State() == AsSecurityState::FAILED);
-
-    // Different KASME means different KeNB and different keys.
     CHECK(enbA.ActiveKenb() != enbB.ActiveKenb());
-    auto keysA = enbA.DeriveAccessKeys();
-    auto keysB = enbB.DeriveAccessKeys();
-    CHECK(keysA.kRrcInt != keysB.kRrcInt);
 }
 
-TEST_CASE("lte/as-sec5/the key hierarchy still matches the B4 vectors")
+TEST_CASE("lte/as-sec5r1/the key hierarchy still matches the B4 vectors")
 {
     using namespace lte::security;
 

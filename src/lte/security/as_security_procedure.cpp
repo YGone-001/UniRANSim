@@ -110,10 +110,13 @@ EnbAsSecurityProcedure EnbAsSecurityProcedure::Start(AsSecurityContext &context,
     context.ApplyAsAlgorithms(AlgorithmSetFor(procedure.selection_));
     const AsKeys keys = context.DeriveAccessKeys();
 
-    procedure.tx_.emplace(PdcpSecurityEntity::Create(Srb1Bearer, false, procedure.selection_.integrity,
-                                                     procedure.selection_.ciphering, keys.kRrcInt, keys.kRrcEnc));
-    procedure.rx_.emplace(PdcpSecurityEntity::Create(Srb1Bearer, true, procedure.selection_.integrity,
-                                                     procedure.selection_.ciphering, keys.kRrcInt, keys.kRrcEnc));
+    // SRB1 on the control-plane profile: RB identity 1, BEARER field 0.
+    procedure.tx_.emplace(PdcpSecurityEntity::Create(PdcpProfile::SRB, RadioBearerIdentity::Srb1(), false,
+                                                     procedure.selection_.integrity, procedure.selection_.ciphering,
+                                                     keys.kRrcInt, keys.kRrcEnc));
+    procedure.rx_.emplace(PdcpSecurityEntity::Create(PdcpProfile::SRB, RadioBearerIdentity::Srb1(), true,
+                                                     procedure.selection_.integrity, procedure.selection_.ciphering,
+                                                     keys.kRrcInt, keys.kRrcEnc));
     // The initial SecurityModeCommand is integrity protected and never ciphered:
     // only integrity is active on the SRB1 downlink at this point.
     procedure.tx_->ActivateIntegrity();
@@ -233,7 +236,7 @@ std::vector<uint8_t> UeAsSecurityProcedure::OnCommand(const std::vector<uint8_t>
     std::vector<uint8_t> payload;
     try
     {
-        payload = ExtractPdcpPayload(downlinkPdu, true);
+        payload = ExtractPdcpPayload(downlinkPdu, PdcpProfile::SRB);
     }
     catch (const PdcpSecurityException &error)
     {
@@ -259,8 +262,8 @@ std::vector<uint8_t> UeAsSecurityProcedure::OnCommand(const std::vector<uint8_t>
     context_->ApplyAsAlgorithms(AlgorithmSetFor(selection_));
     const AsKeys keys = context_->DeriveAccessKeys();
 
-    rx_.emplace(PdcpSecurityEntity::Create(Srb1Bearer, false, selection_.integrity, selection_.ciphering, keys.kRrcInt,
-                                           keys.kRrcEnc));
+    rx_.emplace(PdcpSecurityEntity::Create(PdcpProfile::SRB, RadioBearerIdentity::Srb1(), false, selection_.integrity,
+                                           selection_.ciphering, keys.kRrcInt, keys.kRrcEnc));
     rx_->ActivateIntegrity();
 
     try
@@ -278,8 +281,8 @@ std::vector<uint8_t> UeAsSecurityProcedure::OnCommand(const std::vector<uint8_t>
     }
     state_ = AsSecurityState::UE_VERIFIED;
 
-    tx_.emplace(PdcpSecurityEntity::Create(Srb1Bearer, true, selection_.integrity, selection_.ciphering, keys.kRrcInt,
-                                           keys.kRrcEnc));
+    tx_.emplace(PdcpSecurityEntity::Create(PdcpProfile::SRB, RadioBearerIdentity::Srb1(), true, selection_.integrity,
+                                           selection_.ciphering, keys.kRrcInt, keys.kRrcEnc));
     tx_->ActivateIntegrity();
 
     SecurityModeCompleteMessage complete;

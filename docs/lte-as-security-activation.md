@@ -53,23 +53,66 @@ Encoded and decoded with the accepted asn1c LTE RRC UPER codec
 (`asn_DEF_DL_DCCH_Message`, `asn_DEF_UL_DCCH_Message`). A wrong message type,
 a truncated PDU, or an algorithm identity above 3 does not decode.
 
-## 3. PDCP security
+## 3. PDCP security: two bearer profiles
 
-`lte::security::PdcpSecurityEntity` is one direction of one bearer and owns that
-direction's COUNT, HFN, keys and activation state.
+Phase 18-F-B5-R1 corrected this section. The B5 text below the heading used one
+PDU shape for every bearer and stated that the MAC-I is never ciphered; both are
+wrong for LTE. `PdcpSecurityEntity` now has two explicit profiles.
+
+### 3.1 Control plane, SRB (TS 36.323 6.2.2)
 
 ```text
-PDU   = [D/C=1 | SN(12)] || data(possibly ciphered) || [MAC-I(32)]
-MAC-I = EIA(K, COUNT(32) || BEARER(5) || DIRECTION(1) || 0^26 || PDCP-PDU)
+header = [3 reserved bits = 0][PDCP SN: 5 bits]      1 octet, NO D/C bit
+PDU    = header || data || MAC-I(32)
+MAC-I  = EIA(K, COUNT || BEARER || DIRECTION || 0^26 || header||data)
 ```
 
-Order follows TS 36.323 5.5: the MAC-I is computed over the **unciphered** PDU,
-then the data part is ciphered; the MAC-I itself is never ciphered. The receiver
-deciphers first and verifies the MAC-I over the reassembled PDU.
+* SN 5 bits, HFN 27 bits, `COUNT = HFN || SN`.
+* The MAC-I field is **always present**; when integrity is not configured it is
+  zero and is still ciphered with the data.
+* Ciphering covers **data || MAC-I**. The header is never ciphered.
+* Receiver: parse the clear header, rebuild the COUNT, decipher data and MAC-I,
+  recompute the MAC-I over the clear header and the recovered data, compare, and
+  deliver only on success.
 
-COUNT reconstruction: `COUNT = HFN || SN`, with the HFN advanced when a 12-bit
-SN wraps below the last accepted value. A PDU whose COUNT is not greater than
-the last accepted one is `REPLAY_DETECTED`.
+### 3.2 User plane, DRB 12-bit (TS 36.323 6.2.3)
+
+```text
+header = [D/C = 1][3 reserved bits = 0][PDCP SN: 12 bits]   2 octets
+PDU    = header || data
+```
+
+* SN 12 bits, HFN 20 bits.
+* **No MAC-I field** for the ordinary UE profile; a DRB entity refuses to be
+  created with an integrity algorithm (`UNSUPPORTED_PROFILE`).
+* Ciphering covers the data field only; the header is clear.
+
+### 3.3 Bearer identity
+
+The value handed to EEA/EIA is the **radio bearer identity minus one**
+(TS 36.323 6.3.5, TS 33.401 5.1.3.2): SRB1 → BEARER 0, SRB2 → 1, DRB 3 → 2.
+`RadioBearerIdentity` holds the RB identity and `BearerField()` produces the
+algorithm input, so the two numbers cannot drift apart. B5 passed `1` for SRB1
+and its pinned MAC-I was therefore for the wrong bearer; it has been
+recalculated (section 3.4).
+
+### 3.4 Independent evidence
+
+| Vector | Value | Reproduced with |
+|---|---|---|
+| SRB1 UL MAC-I (BEARER 0, DIR 0, COUNT 0, PDU `00 2800`) | `7527c93b` | OpenSSL CMAC over `00000000 00 000000 002800` |
+| SRB1 UL PDU (data + MAC-I ciphered) | `00 2b39107a6b9d` | OpenSSL AES-128-CTR, IV octet `00` |
+| SRB1 DL MAC-I (DIR 1) | `c159e70a` | OpenSSL CMAC over `00000000 04 000000 002800` |
+| SRB1 DL PDU | `00 803d834dcc49` | OpenSSL AES-128-CTR, IV octet `04` |
+| DRB (RB 3 → BEARER 2, DIR 0) ciphertext of `2800` | `f81f` | OpenSSL AES-128-CTR, IV octet `10` |
+
+The IV octet is `(BEARER << 3) | (DIRECTION << 2)`; getting that shift wrong was
+the first error this independent check caught, and using the uplink MAC-I for the
+downlink vector was the second. Both are corrected here.
+
+COUNT reconstruction: `COUNT = HFN || SN` per profile, with the HFN advanced
+when the SN wraps below the last accepted value. A PDU whose COUNT is not
+greater than the last accepted one is `REPLAY_DETECTED`.
 
 INDEPENDENT EVIDENCE. The SRB1 test vector
 
@@ -127,6 +170,28 @@ destruction. `ApplyAsAlgorithms` adds the negotiated algorithm set; it does not
 make the context "active" in any protocol sense - that is the state machine's
 job.
 
+## 5.1 UP integrity capability audit (Phase F)
+
+The B5 report justified having no K_UPint by "this profile is not a Relay Node".
+That is not sufficient: TS 36.331 Release 18 also carries a UE capability for
+user-plane integrity protection.
+
+Audit result: **the simulator has no such capability information at all.** The
+UE's `networkCapability` is a two-octet *NAS* algorithm bitmap
+(`EPS encryption/integrity algorithm`), it is not a `UE-EUTRA-Capability`
+message, and nothing in `src/lte` carries a user-plane integrity indication or a
+relay-node indication. The profile therefore falls into case (3) - no capability
+information - and cannot claim UP integrity in either direction.
+
+Consequences, which are the honest ones:
+
+* `AsAlgorithmSet::upIntegrity` stays empty and no K_UPint is derived at runtime;
+* `PDCP_UP_INTEGRITY_READY` is **false** and no DRB entity accepts an integrity
+  algorithm;
+* the exact missing input is a `UE-EUTRA-Capability`-derived user-plane
+  integrity indication (plus relay-node operation) that this simulator does not
+  model.
+
 ## 6. What is missing
 
 - **No RRC connection and no SRB1.** The bytes the procedure produces have no
@@ -147,7 +212,8 @@ job.
 | `AS_SMC_CODEC_READY` | true | pinned UPER encodings |
 | `PDCP_RRC_INTEGRITY_READY` | true | OpenSSL-reproduced MAC-I |
 | `PDCP_RRC_CIPHERING_READY` | true | OpenSSL-reproduced ciphertext |
-| `PDCP_UP_CIPHERING_READY` | true | same construction, DRB bearer id |
+| `PDCP_UP_CIPHERING_READY` | true | DRB12 profile, K_UPenc, BEARER = RB-1 |
+| `PDCP_UP_INTEGRITY_READY` | **false** | no UE capability to support or refuse it |
 | `AS_SMC_RUNTIME_READY` | **false** | no SRB1 transport |
 | `AS_INITIAL_SECURITY_ACTIVATION_READY` | **false** | depends on the above |
 | `HANDOVER_SECURITY_READY` | false | target KeNB* runtime and RRC execution absent |

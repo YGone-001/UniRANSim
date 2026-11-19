@@ -931,9 +931,20 @@ design record.
   quiet fallback to a null one.
 - **Null security is named.** EEA0/EIA0 protect nothing and the selection says
   so; do not describe them as confidentiality or integrity.
-- **The MAC-I is computed before ciphering** over
-  `COUNT||BEARER||DIRECTION||0^26||PDU`, and the MAC-I itself is never
-  ciphered (TS 36.323 5.5). A receiver deciphers first, then verifies.
+- **Two bearer profiles, never one.** SRB: one-octet header, 5-bit SN, no
+  D/C bit, 32-bit MAC-I always present, and the MAC-I is **ciphered with the
+  data** (TS 36.323 6.2.2). DRB 12-bit: two-octet header with D/C = 1, no MAC-I
+  (TS 36.323 6.2.3). Never give an ordinary UE DRB a MAC-I field, and never
+  leave an SRB MAC-I in the clear when ciphering is active.
+- **The MAC-I covers COUNT||BEARER||DIRECTION||0^26||header||data** and is
+  computed before ciphering. A receiver parses the clear header, deciphers data
+  and MAC-I, then verifies. B5's "the MAC-I is never ciphered" was wrong.
+- **BEARER is the RB identity minus one.** SRB1 is 0, SRB2 is 1, DRB 3 is 2. Use
+  `RadioBearerIdentity` and its `BearerField()`; never pass an RB identity where
+  the algorithm expects the bearer field.
+- **UP integrity is not claimed.** The simulator has no `UE-EUTRA-Capability`
+  user-plane integrity indication, so `PDCP_UP_INTEGRITY_READY` is false and no
+  DRB accepts an integrity algorithm. "Not a relay node" is not a reason.
 - **Activation is a protocol event.** The SecurityModeCommand is integrity
   protected and never ciphered; the SecurityModeComplete is integrity protected
   and not ciphered; ciphering starts only after the completion is verified. A

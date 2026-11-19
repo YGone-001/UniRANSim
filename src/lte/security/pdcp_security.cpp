@@ -19,10 +19,8 @@ namespace lte::security
 namespace
 {
 
-constexpr uint32_t SnMask = 0x0FFFU;
-constexpr uint32_t HfnStep = 0x1000U;
-constexpr size_t HeaderSize = 2;
 constexpr size_t MacSize = 4;
+constexpr uint8_t MaxRbIdentity = 32;
 
 void SecureZero(uint8_t *data, size_t length) noexcept
 {
@@ -51,6 +49,35 @@ bool AllZero(const Key128 &value)
 
 } // namespace
 
+const char *ToString(PdcpProfile profile)
+{
+    switch (profile)
+    {
+    case PdcpProfile::SRB: return "SRB";
+    case PdcpProfile::DRB12: return "DRB12";
+    }
+    return "UNKNOWN_PROFILE";
+}
+
+uint8_t PdcpSnBits(PdcpProfile profile)
+{
+    // TS 36.323 6.3.2: SRBs use 5 bits, the DRB profile implemented here 12.
+    return profile == PdcpProfile::SRB ? 5 : 12;
+}
+
+uint8_t PdcpHeaderLength(PdcpProfile profile)
+{
+    // TS 36.323 6.2.2: one octet for SRB; 6.2.3: two octets for the 12-bit DRB.
+    return profile == PdcpProfile::SRB ? 1 : 2;
+}
+
+bool PdcpHasMacI(PdcpProfile profile)
+{
+    // TS 36.323 6.2.2: the SRB data PDU carries a 32-bit MAC-I. The ordinary UE
+    // DRB profile has no integrity protection and no MAC-I field.
+    return profile == PdcpProfile::SRB;
+}
+
 const char *ToString(PdcpSecurityError error)
 {
     switch (error)
@@ -58,7 +85,10 @@ const char *ToString(PdcpSecurityError error)
     case PdcpSecurityError::NOT_CONFIGURED: return "NOT_CONFIGURED";
     case PdcpSecurityError::ALGORITHM_UNSUPPORTED: return "ALGORITHM_UNSUPPORTED";
     case PdcpSecurityError::KEY_MISSING: return "KEY_MISSING";
+    case PdcpSecurityError::UNSUPPORTED_PROFILE: return "UNSUPPORTED_PROFILE";
+    case PdcpSecurityError::UNSUPPORTED_BEARER: return "UNSUPPORTED_BEARER";
     case PdcpSecurityError::PDU_TOO_SHORT: return "PDU_TOO_SHORT";
+    case PdcpSecurityError::MALFORMED_HEADER: return "MALFORMED_HEADER";
     case PdcpSecurityError::NOT_A_DATA_PDU: return "NOT_A_DATA_PDU";
     case PdcpSecurityError::INTEGRITY_FAILURE: return "INTEGRITY_FAILURE";
     case PdcpSecurityError::REPLAY_DETECTED: return "REPLAY_DETECTED";
@@ -72,12 +102,24 @@ PdcpSecurityException::PdcpSecurityException(PdcpSecurityError reason)
 {
 }
 
-std::vector<uint8_t> ExtractPdcpPayload(const std::vector<uint8_t> &pdu, bool hasMac)
+bool RadioBearerIdentity::Valid() const
 {
-    const size_t trailer = hasMac ? MacSize : 0;
-    if (pdu.size() < HeaderSize + trailer)
+    return rbId >= 1 && rbId <= MaxRbIdentity;
+}
+
+uint8_t RadioBearerIdentity::BearerField() const
+{
+    // TS 36.323 6.3.5 / TS 33.401 5.1.3.2: BEARER = RB identity - 1, so SRB1 is 0.
+    return static_cast<uint8_t>(rbId - 1);
+}
+
+std::vector<uint8_t> ExtractPdcpPayload(const std::vector<uint8_t> &pdu, PdcpProfile profile)
+{
+    const size_t header = PdcpHeaderLength(profile);
+    const size_t trailer = PdcpHasMacI(profile) ? MacSize : 0;
+    if (pdu.size() < header + trailer)
         Fail(PdcpSecurityError::PDU_TOO_SHORT);
-    return std::vector<uint8_t>(pdu.begin() + HeaderSize, pdu.end() - trailer);
+    return std::vector<uint8_t>(pdu.begin() + header, pdu.end() - trailer);
 }
 
 PdcpSecurityEntity::~PdcpSecurityEntity()
@@ -86,20 +128,63 @@ PdcpSecurityEntity::~PdcpSecurityEntity()
     SecureZero(kCiphering_);
 }
 
-PdcpSecurityEntity PdcpSecurityEntity::Create(uint8_t bearer, bool uplink, uint8_t integrityAlgorithm,
-                                              uint8_t cipheringAlgorithm, const Key128 &kIntegrity,
-                                              const Key128 &kCiphering)
+PdcpSecurityEntity::PdcpSecurityEntity(PdcpSecurityEntity &&other) noexcept
 {
-    if (bearer == 0)
-        Fail(PdcpSecurityError::NOT_CONFIGURED);
+    *this = std::move(other);
+}
+
+PdcpSecurityEntity &PdcpSecurityEntity::operator=(PdcpSecurityEntity &&other) noexcept
+{
+    if (this == &other)
+        return *this;
+    SecureZero(kIntegrity_);
+    SecureZero(kCiphering_);
+
+    profile_ = other.profile_;
+    bearer_ = other.bearer_;
+    uplink_ = other.uplink_;
+    integrityAlgorithm_ = other.integrityAlgorithm_;
+    cipheringAlgorithm_ = other.cipheringAlgorithm_;
+    kIntegrity_ = other.kIntegrity_;
+    kCiphering_ = other.kCiphering_;
+    integrityActive_ = other.integrityActive_;
+    cipheringActive_ = other.cipheringActive_;
+    txCount_ = other.txCount_;
+    rxCount_ = other.rxCount_;
+    rxAny_ = other.rxAny_;
+
+    SecureZero(other.kIntegrity_);
+    SecureZero(other.kCiphering_);
+    other.integrityActive_ = false;
+    other.cipheringActive_ = false;
+    return *this;
+}
+
+PdcpSecurityEntity PdcpSecurityEntity::Create(PdcpProfile profile, RadioBearerIdentity bearer, bool uplink,
+                                              uint8_t integrityAlgorithm, uint8_t cipheringAlgorithm,
+                                              const Key128 &kIntegrity, const Key128 &kCiphering)
+{
+    if (!bearer.Valid())
+        Fail(PdcpSecurityError::UNSUPPORTED_BEARER);
+    if (profile == PdcpProfile::DRB12 && bearer.rbId < 3)
+        Fail(PdcpSecurityError::UNSUPPORTED_BEARER);
+    if (profile == PdcpProfile::SRB && bearer.rbId > 2)
+        Fail(PdcpSecurityError::UNSUPPORTED_BEARER);
     if (integrityAlgorithm > 3 || cipheringAlgorithm > 3)
         Fail(PdcpSecurityError::ALGORITHM_UNSUPPORTED);
+    if (profile == PdcpProfile::DRB12 && integrityAlgorithm != 0)
+    {
+        // The ordinary UE DRB profile implemented here has no integrity and no
+        // MAC-I field; activating one would be a PDU the peer cannot parse.
+        Fail(PdcpSecurityError::UNSUPPORTED_PROFILE);
+    }
     if (integrityAlgorithm != 0 && AllZero(kIntegrity))
         Fail(PdcpSecurityError::KEY_MISSING);
     if (cipheringAlgorithm != 0 && AllZero(kCiphering))
         Fail(PdcpSecurityError::KEY_MISSING);
 
     PdcpSecurityEntity entity;
+    entity.profile_ = profile;
     entity.bearer_ = bearer;
     entity.uplink_ = uplink;
     entity.integrityAlgorithm_ = integrityAlgorithm;
@@ -121,7 +206,7 @@ bool PdcpSecurityEntity::CipheringProtects() const
 
 void PdcpSecurityEntity::ActivateIntegrity()
 {
-    if (bearer_ == 0)
+    if (bearer_.rbId == 0)
         Fail(PdcpSecurityError::NOT_CONFIGURED);
     if (integrityAlgorithm_ != 0 && AllZero(kIntegrity_))
         Fail(PdcpSecurityError::KEY_MISSING);
@@ -130,7 +215,7 @@ void PdcpSecurityEntity::ActivateIntegrity()
 
 void PdcpSecurityEntity::ActivateCiphering()
 {
-    if (bearer_ == 0)
+    if (bearer_.rbId == 0)
         Fail(PdcpSecurityError::NOT_CONFIGURED);
     if (cipheringAlgorithm_ != 0 && AllZero(kCiphering_))
         Fail(PdcpSecurityError::KEY_MISSING);
@@ -143,72 +228,100 @@ void PdcpSecurityEntity::DeactivateAll() noexcept
     cipheringActive_ = false;
 }
 
+void PdcpSecurityEntity::Cipher(uint32_t count, uint8_t *data, size_t length, bool encipher) const
+{
+    if (length == 0)
+        return;
+    const int direction = uplink_ ? 0 : 1;
+    const int bearerField = bearer_.BearerField();
+    OctetString key = OctetString::FromArray(kCiphering_.data(), kCiphering_.size());
+    OctetString body = OctetString::FromArray(data, length);
+    switch (cipheringAlgorithm_)
+    {
+    case 1: encipher ? crypto::EncryptEea1(count, bearerField, direction, body, key)
+                     : crypto::DecryptEea1(count, bearerField, direction, body, key); break;
+    case 2: encipher ? crypto::EncryptEea2(count, bearerField, direction, body, key)
+                     : crypto::DecryptEea2(count, bearerField, direction, body, key); break;
+    case 3: encipher ? crypto::EncryptEea3(count, bearerField, direction, body, key)
+                     : crypto::DecryptEea3(count, bearerField, direction, body, key); break;
+    default: Fail(PdcpSecurityError::ALGORITHM_UNSUPPORTED);
+    }
+    std::copy(body.data(), body.data() + body.length(), data);
+}
+
 uint32_t PdcpSecurityEntity::BuildCount(uint32_t sn) const
 {
-    // TS 36.323 5.5: COUNT = HFN || SN. The receiver reconstructs the HFN from
-    // the SN it already accepted, so a 12-bit wrap becomes the next HFN.
-    uint32_t count = (rxAny_ ? (rxCount_ & ~SnMask) : 0U) | (sn & SnMask);
+    const uint8_t bits = PdcpSnBits(profile_);
+    const uint32_t snMask = (1U << bits) - 1U;
+    uint32_t count = (rxAny_ ? (rxCount_ & ~snMask) : 0U) | (sn & snMask);
     if (rxAny_ && count < rxCount_)
-        count += HfnStep;
+        count += (1U << bits);
     return count;
 }
 
 uint32_t PdcpSecurityEntity::MacFor(uint32_t count, const uint8_t *data, size_t length) const
 {
     const int direction = uplink_ ? 0 : 1;
+    const int bearerField = bearer_.BearerField();
     OctetString message = OctetString::FromArray(data, length);
     OctetString key = OctetString::FromArray(kIntegrity_.data(), kIntegrity_.size());
     switch (integrityAlgorithm_)
     {
-    case 1: return crypto::ComputeMacEia1(count, bearer_, direction, message, key);
-    case 2: return crypto::ComputeMacEia2(count, bearer_, direction, message, key);
-    case 3: return crypto::ComputeMacEia3(count, bearer_, direction, message, key);
+    case 1: return crypto::ComputeMacEia1(count, bearerField, direction, message, key);
+    case 2: return crypto::ComputeMacEia2(count, bearerField, direction, message, key);
+    case 3: return crypto::ComputeMacEia3(count, bearerField, direction, message, key);
     default: Fail(PdcpSecurityError::ALGORITHM_UNSUPPORTED);
     }
 }
 
 std::vector<uint8_t> PdcpSecurityEntity::Protect(const std::vector<uint8_t> &plain)
 {
-    if (bearer_ == 0 || (!integrityActive_ && !cipheringActive_))
+    if (bearer_.rbId == 0 || (!integrityActive_ && !cipheringActive_))
         Fail(PdcpSecurityError::NOT_CONFIGURED);
-    if (txCount_ > 0xFFFFFFFFU - 1U)
+    if (txCount_ > 0xFFFFFFFEU)
         Fail(PdcpSecurityError::COUNT_EXHAUSTED);
 
+    const uint8_t bits = PdcpSnBits(profile_);
+    const uint32_t snMask = (1U << bits) - 1U;
     const uint32_t count = txCount_;
-    const uint16_t header = static_cast<uint16_t>(0x8000U | (count & SnMask));
+    const uint32_t sn = count & snMask;
 
     std::vector<uint8_t> pdu;
-    pdu.reserve(HeaderSize + plain.size() + (integrityActive_ ? MacSize : 0));
-    pdu.push_back(static_cast<uint8_t>((header >> 8U) & 0xFFU));
-    pdu.push_back(static_cast<uint8_t>(header & 0xFFU));
-    pdu.insert(pdu.end(), plain.begin(), plain.end());
+    pdu.reserve(PdcpHeaderLength(profile_) + plain.size() + (PdcpHasMacI(profile_) ? MacSize : 0));
 
-    uint32_t mac = 0;
-    if (integrityActive_)
-        mac = MacFor(count, pdu.data(), pdu.size());
-
-    if (cipheringActive_ && !plain.empty())
+    if (profile_ == PdcpProfile::SRB)
     {
-        const int direction = uplink_ ? 0 : 1;
-        std::vector<uint8_t> data(plain.begin(), plain.end());
-        OctetString body{std::move(data)};
-        OctetString key = OctetString::FromArray(kCiphering_.data(), kCiphering_.size());
-        switch (cipheringAlgorithm_)
-        {
-        case 1: crypto::EncryptEea1(count, bearer_, direction, body, key); break;
-        case 2: crypto::EncryptEea2(count, bearer_, direction, body, key); break;
-        case 3: crypto::EncryptEea3(count, bearer_, direction, body, key); break;
-        default: Fail(PdcpSecurityError::ALGORITHM_UNSUPPORTED);
-        }
-        std::copy(body.data(), body.data() + body.length(), pdu.begin() + HeaderSize);
+        // One octet: three reserved bits (zero) then the 5-bit SN. No D/C bit.
+        pdu.push_back(static_cast<uint8_t>(sn & 0x1FU));
+    }
+    else
+    {
+        // Two octets: D/C = 1, three reserved bits, 12-bit SN.
+        const uint16_t header = static_cast<uint16_t>(0x8000U | (sn & 0x0FFFU));
+        pdu.push_back(static_cast<uint8_t>((header >> 8U) & 0xFFU));
+        pdu.push_back(static_cast<uint8_t>(header & 0xFFU));
     }
 
-    if (integrityActive_)
+    const size_t headerLength = pdu.size();
+    pdu.insert(pdu.end(), plain.begin(), plain.end());
+
+    if (PdcpHasMacI(profile_))
     {
+        uint32_t mac = 0;
+        if (integrityActive_)
+            mac = MacFor(count, pdu.data(), pdu.size());
         pdu.push_back(static_cast<uint8_t>((mac >> 24U) & 0xFFU));
         pdu.push_back(static_cast<uint8_t>((mac >> 16U) & 0xFFU));
         pdu.push_back(static_cast<uint8_t>((mac >> 8U) & 0xFFU));
         pdu.push_back(static_cast<uint8_t>(mac & 0xFFU));
+    }
+
+    if (cipheringActive_)
+    {
+        // TS 36.323 6.2.2: for SRB the MAC-I is ciphered with the data; the
+        // header is never ciphered. TS 36.323 6.2.3: the DRB ciphers the data
+        // field, and has no MAC-I to consider.
+        Cipher(count, pdu.data() + headerLength, pdu.size() - headerLength, true);
     }
 
     txCount_++;
@@ -217,49 +330,54 @@ std::vector<uint8_t> PdcpSecurityEntity::Protect(const std::vector<uint8_t> &pla
 
 std::vector<uint8_t> PdcpSecurityEntity::Unprotect(const std::vector<uint8_t> &pdu)
 {
-    if (bearer_ == 0)
+    if (bearer_.rbId == 0)
         Fail(PdcpSecurityError::NOT_CONFIGURED);
 
-    const size_t minimum = HeaderSize + (integrityActive_ ? MacSize : 0);
-    if (pdu.size() < minimum)
+    const size_t headerLength = PdcpHeaderLength(profile_);
+    const size_t trailer = PdcpHasMacI(profile_) ? MacSize : 0;
+    if (pdu.size() < headerLength + trailer)
         Fail(PdcpSecurityError::PDU_TOO_SHORT);
 
-    const uint16_t header = static_cast<uint16_t>((pdu[0] << 8U) | pdu[1]);
-    if ((header & 0x8000U) == 0)
-        Fail(PdcpSecurityError::NOT_A_DATA_PDU);
+    const uint8_t bits = PdcpSnBits(profile_);
+    const uint32_t snMask = (1U << bits) - 1U;
+    uint32_t sn = 0;
 
-    const uint32_t sn = header & SnMask;
-    const uint32_t count = BuildCount(sn);
-
-    std::vector<uint8_t> body(pdu.begin() + HeaderSize, pdu.end() - (integrityActive_ ? MacSize : 0));
-
-    if (cipheringActive_ && !body.empty())
+    if (profile_ == PdcpProfile::SRB)
     {
-        const int direction = uplink_ ? 0 : 1;
-        OctetString data{std::move(body)};
-        OctetString key = OctetString::FromArray(kCiphering_.data(), kCiphering_.size());
-        switch (cipheringAlgorithm_)
-        {
-        case 1: crypto::DecryptEea1(count, bearer_, direction, data, key); break;
-        case 2: crypto::DecryptEea2(count, bearer_, direction, data, key); break;
-        case 3: crypto::DecryptEea3(count, bearer_, direction, data, key); break;
-        default: Fail(PdcpSecurityError::ALGORITHM_UNSUPPORTED);
-        }
-        body.assign(data.data(), data.data() + data.length());
+        if ((pdu[0] & 0xE0U) != 0)
+            Fail(PdcpSecurityError::MALFORMED_HEADER);
+        sn = pdu[0] & 0x1FU;
+    }
+    else
+    {
+        const uint16_t header = static_cast<uint16_t>((pdu[0] << 8U) | pdu[1]);
+        if ((header & 0x8000U) == 0)
+            Fail(PdcpSecurityError::NOT_A_DATA_PDU);
+        if ((header & 0x7000U) != 0)
+            Fail(PdcpSecurityError::MALFORMED_HEADER);
+        sn = header & snMask;
     }
 
-    if (integrityActive_)
+    const uint32_t count = BuildCount(sn);
+
+    std::vector<uint8_t> field(pdu.begin() + headerLength, pdu.end());
+    if (cipheringActive_)
+        Cipher(count, field.data(), field.size(), false);
+
+    const size_t dataLength = field.size() - trailer;
+    std::vector<uint8_t> data(field.begin(), field.begin() + dataLength);
+
+    if (PdcpHasMacI(profile_) && integrityActive_)
     {
         std::vector<uint8_t> macInput;
-        macInput.reserve(HeaderSize + body.size());
-        macInput.push_back(static_cast<uint8_t>((header >> 8U) & 0xFFU));
-        macInput.push_back(static_cast<uint8_t>(header & 0xFFU));
-        macInput.insert(macInput.end(), body.begin(), body.end());
+        macInput.reserve(headerLength + dataLength);
+        macInput.insert(macInput.end(), pdu.begin(), pdu.begin() + headerLength);
+        macInput.insert(macInput.end(), data.begin(), data.end());
         const uint32_t expected = MacFor(count, macInput.data(), macInput.size());
-        const uint32_t received = (static_cast<uint32_t>(pdu[pdu.size() - 4]) << 24U) |
-                                  (static_cast<uint32_t>(pdu[pdu.size() - 3]) << 16U) |
-                                  (static_cast<uint32_t>(pdu[pdu.size() - 2]) << 8U) |
-                                  static_cast<uint32_t>(pdu[pdu.size() - 1]);
+        const uint32_t received = (static_cast<uint32_t>(field[dataLength]) << 24U) |
+                                  (static_cast<uint32_t>(field[dataLength + 1]) << 16U) |
+                                  (static_cast<uint32_t>(field[dataLength + 2]) << 8U) |
+                                  static_cast<uint32_t>(field[dataLength + 3]);
         if (expected != received)
             Fail(PdcpSecurityError::INTEGRITY_FAILURE);
     }
@@ -269,7 +387,7 @@ std::vector<uint8_t> PdcpSecurityEntity::Unprotect(const std::vector<uint8_t> &p
 
     rxCount_ = count;
     rxAny_ = true;
-    return body;
+    return data;
 }
 
 } // namespace lte::security
