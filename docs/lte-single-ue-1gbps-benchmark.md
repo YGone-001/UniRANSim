@@ -880,3 +880,105 @@ forbids - or a host without memory pressure. The budget is the second
 constraint: one 65 s profile at 1 Gbps needs 8.68 GB charged against 15.51 GB of
 headroom above the 120 GB reserve, so **one direction fits and the two-direction
 matrix does not** (17.36 GB needed, 1.85 GB short).
+
+### 16.9 The nine SGW-U drops: what the surviving evidence supports
+
+The 2026-11-18 acceptance run stopped one second after the client connected, when
+the SGW-U socket counter moved from 0 to 9. That measurement stands. What it
+does **not** establish is the mechanism, and the record has to be read at exactly
+that resolution.
+
+Surviving observations for the run (UTC, iperf3 client clock and the 1 Hz
+sampler in `/tmp/phase19-fh/ul60-udp.log`):
+
+| Time | Event |
+|---|---|
+| 10:03:17Z | SGW-U session added, "Attach complete" (F-SEID UP:0x171) |
+| 10:03:18Z | readiness gate passed, 10 s settle begins |
+| 10:03:28Z | iperf3 connects, 4 x 250 Mbit/s, `-O 5 -t 60` |
+| 10:03:29Z | SGW-U rxq 244,608 B, drops 0; PGW-U rxq 656,640 B; UE radio rxq 167,040 B |
+| 10:03:29Z | 0.5 s watcher fires, SIGINT to the client |
+| 10:03:30Z | SGW-U rxq 0, drops 9; every other socket delta 0 |
+
+Facts and gaps, kept apart:
+
+- **The drop is real and attributable to this UE.** The socket had carried zero
+  drops since it was created on 2026-11-17, and the counter moved in the first
+  second of this UE's uplink.
+- **The queue peak was not measured.** One sample inside the burst caught
+  244,608 B of the 4,194,304 B budget; the drop itself happened between two 1 Hz
+  samples. `INITIAL_QUEUE_PEAK_NOT_MEASURED`.
+- **No fault or swap-in sample exists for the interval.** `pidstat -t` covered
+  `upfd` and `iperf3` only, and no `/proc/<pid>/stat` fault counters were
+  taken. `PAGE_IN_STALL_NOT_ESTABLISHED`.
+- **No sender-side rate evidence survived.** The aborted client wrote two
+  pre-test intervals and no measured window, so the offered rate at the instant
+  of the drop is not recorded; only the eNB totals (101,530 uplink packets,
+  142,069,796 B for the whole run) survive.
+- **The 16 MiB PGW-U observation is one second long.** Zero PGW-U drops during
+  that second supports the receive-buffer hypothesis; it does not prove the
+  16 MiB socket would stay drop-free for 65 s. `PGWU_LOSS_CHAIN_RESOLVED` is not
+  marked on it.
+
+The SGW-U receive path explains why an unmeasured gap matters. `sgwu_main()`
+(`src/sgwu/init.c:116`) runs one `epoll_wait` loop; the GTP-U socket is
+registered level-triggered at `src/sgwu/gtp-path.c:336` with
+`_gtpv1_u_recv_cb`, and that callback issues **exactly one** `ogs_recvfrom`
+(`src/sgwu/gtp-path.c:52`) before parsing, the PDR/forwarding lookup and one
+`sendto`. A burst is therefore drained one datagram per wakeup, and any
+multi-millisecond gap in that loop accumulates directly in the socket queue.
+
+The 4 MiB budget is not configured anywhere in Open5GS: `sgwu_gtp_open()` calls
+`ogs_gtp_server()` -> `ogs_sock_socket()` and never calls `setsockopt`, so the
+socket inherits `net.core.rmem_default` at creation. The live socket still
+reads `rb4194304` because it was created on 2026-11-17 when that sysctl was
+4 MiB; `rmem_default` is now `212992`, so a freshly restarted `sgwud` would
+come back with a **20x smaller** buffer unless the sysctl is raised first. A
+`setsockopt` of 4 MiB under today's `rmem_max=212992` is capped at 425,984 B.
+
+### 16.10 What a 4 MiB single-packet receiver can actually absorb
+
+An isolated experiment (private network namespace, veth pair, test-owned ports
+5201/5202, no EPC, no production socket, no host sysctl change) reproduced the
+SGW-U receive shape: level-triggered epoll, one `recvfrom` per wakeup, one
+forwarding `send`, 1,436-byte datagrams, effective `SO_RCVBUF` 4,194,304 B.
+
+| Offered | Pattern | Delivered | Queue peak | Drops |
+|---|---|---:|---:|---:|
+| 919 Mbps (80k pps) | paced 1 s | 80,000 | 829 KB | 0 |
+| 1,149 Mbps (100k pps) | paced 1 s | 100,000 | 1,032 KB | 0 |
+| 1,379 Mbps (120k pps) | paced 1 s | 120,000 | 189 KB | 0 |
+| 1,609 Mbps (140k pps) | paced 1 s | 140,000 | 958 KB | 0 |
+| 5.7 Gbps (495k pps) | unpaced burst 100 ms | 402k pps | 3.40 MB | 7,795 |
+| 5.7 Gbps (495k pps) | unpaced burst 500 ms | 400k pps | 4.20 MB | 45,703 |
+
+Against a fixed 919 Mbps offer, a deliberate receiver stall scales the damage
+predictably:
+
+| Stall | Queue peak | Drops |
+|---:|---:|---:|
+| 5 ms | 938 KB | 0 |
+| 20 ms | 3.71 MB | 0 |
+| 21 ms | 3.89 MB | 0 |
+| 22 ms | 4.08 MB | 41 |
+| 23 ms | 4.19 MB | 129 |
+| 30 ms | 4.19 MB | 673 |
+
+And the buffer itself is decisive in the same test: with a 512 KB budget the
+same 20 ms stall drops 2,194 packets, while the 4 MiB socket drops none.
+
+Two conclusions follow, and neither is a statement about what the EPC did:
+
+1. **Steady 1 Gbps cannot overflow this receiver.** The same shape sustains
+   1.6 Gbps with zero drops and 42% of one core. Saturation needs roughly
+   400k pps, which would have cost thousands of drops, not nine.
+2. **Nine drops needs a brief stall, not a sustained one.** At this offer rate a
+   4 MiB queue buys about 21 ms, and the first losses appear just past that
+   edge. The SGW-U process currently holds **23,772 kB of anonymous heap in
+   swap** (VmRSS 9,428 kB against VmData 265,896 kB) and has taken 1,027 major
+   faults since it started, which is the only host-side mechanism found that
+   can produce a stall of that length on this process - but no time-aligned
+   sample exists, so `SGWU_ROOT_CAUSE_NOT_ESTABLISHED` is the honest verdict.
+
+The isolated result is not EPC evidence: it shows which burst and stall patterns
+are *sufficient*, not which one occurred.

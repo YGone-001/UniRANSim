@@ -281,6 +281,51 @@ second into the run. The 60-second acceptance was therefore stopped before its
 first measured interval. The two-direction matrix also needs 1.85 GB more OCS
 quota than the 120 GB reserve leaves free.
 
+### 2.9 Phase 19-F-H-R: first-burst attribution of the nine SGW-U drops
+
+The nine SGW-U drops that stopped the 2026-11-18 run are confirmed as a real,
+attributable loss event (`SGWU_FIRST_BURST_DROPS_OBSERVED`). The mechanism behind
+them is **not** established.
+
+Three things were settled read-only:
+
+- **The packet path drains one datagram per wakeup.** `_gtpv1_u_recv_cb`
+  (`src/sgwu/gtp-path.c:52`) issues a single `ogs_recvfrom` per socket event and
+  the loop is level-triggered, so a burst queues in the kernel socket.
+- **The 4 MiB budget is inherited, not configured.** Open5GS never calls
+  `setsockopt(SO_RCVBUF)`; the socket takes `net.core.rmem_default` at creation.
+  Today that sysctl is 212,992 B, so a restarted `sgwud` would come back with a
+  20x smaller buffer than the one that dropped, unless the sysctl is raised
+  first. That is a hazard for any future "just restart it with a bigger buffer"
+  plan.
+- **A 4 MiB buffer is far more than 1 Gbps needs.** In an isolated
+  single-packet-per-wakeup receiver of the same shape, 1.6 Gbps runs drop-free
+  and the queue stays below 1 MB. Nine drops only appear when the receiver
+  stalls for about 21 ms, or when the offered rate reaches hundreds of thousands
+  of packets per second - either of which would normally cost thousands of
+  packets, not nine.
+
+So the remaining candidates are a short receiver-side stall (the process holds
+23.8 MB of anonymous heap in swap and has taken 1,027 major faults) or a sender
+burst that the surviving evidence cannot show, because the aborted run's
+`iperf3` JSON has no measured interval and no fault or run-delay counter was
+sampled for `sgwud` at all. `PAGE_IN_STALL_NOT_ESTABLISHED` and
+`INITIAL_QUEUE_PEAK_NOT_MEASURED` are the two gaps.
+
+The single next experiment is therefore a **measurement**, not an optimization:
+one short bounded uplink run at 0.9 Gbps with 200 Hz read-only sampling of the
+SGW-U thread (major/minor faults, run-queue delay, context switches) alongside
+the socket queue and drop counters and the eNB's offered packet rate. A drop
+that coincides with a >= 20 ms run-queue delay or a major-fault burst confirms
+the stall; a drop that coincides with an offered-rate spike above 300k pps
+confirms the burst. It needs fresh approval for live traffic and for profiling
+the running EPC, and it does not need a restart, a socket change or an Open5GS
+patch.
+
+Host state at the time of this review: swap occupancy 1.90 GiB of 4.09 GiB but
+**zero** swap-in and swap-out over a 10 s sample, memory PSI `some avg300=0.01`,
+load 0.38 on 6 cores. Used swap is not active swapping.
+
 ---
 
 ## 3. Performance P2 — 512 simultaneous LTE UEs
