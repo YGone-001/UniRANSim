@@ -300,10 +300,10 @@ Three things were settled read-only:
   plan.
 - **A 4 MiB buffer is far more than 1 Gbps needs.** In an isolated
   single-packet-per-wakeup receiver of the same shape, 1.6 Gbps runs drop-free
-  and the queue stays below 1 MB. Nine drops only appear when the receiver
-  stalls for about 21 ms, or when the offered rate reaches hundreds of thousands
-  of packets per second - either of which would normally cost thousands of
-  packets, not nine.
+  and   the queue stays below 1 MB. Nine drops appear only at the edge where a
+  ~21 ms receiver stall carries the queue just past its limit; sustained
+  overload at hundreds of thousands of packets per second costs thousands of
+  drops, not nine.
 
 So the remaining candidates are a short receiver-side stall (the process holds
 23.8 MB of anonymous heap in swap and has taken 1,027 major faults) or a sender
