@@ -131,6 +131,13 @@ const char *ToString(HandoverCapability capability)
     case HandoverCapability::RRC_CONFIGURATION_COMPLETE: return "RRC_CONFIGURATION_COMPLETE";
     case HandoverCapability::RRC_RUNTIME_INPUT_AVAILABLE: return "RRC_RUNTIME_INPUT_AVAILABLE";
     case HandoverCapability::AS_KEY_DERIVATION_READY: return "AS_KEY_DERIVATION_READY";
+    case HandoverCapability::AS_ALGORITHM_SELECTION_READY: return "AS_ALGORITHM_SELECTION_READY";
+    case HandoverCapability::AS_SMC_CODEC_READY: return "AS_SMC_CODEC_READY";
+    case HandoverCapability::PDCP_RRC_INTEGRITY_READY: return "PDCP_RRC_INTEGRITY_READY";
+    case HandoverCapability::PDCP_RRC_CIPHERING_READY: return "PDCP_RRC_CIPHERING_READY";
+    case HandoverCapability::PDCP_UP_CIPHERING_READY: return "PDCP_UP_CIPHERING_READY";
+    case HandoverCapability::AS_SMC_RUNTIME_READY: return "AS_SMC_RUNTIME_READY";
+    case HandoverCapability::AS_INITIAL_SECURITY_ACTIVATION_READY: return "AS_INITIAL_SECURITY_ACTIVATION_READY";
     case HandoverCapability::HANDOVER_SECURITY_READY: return "HANDOVER_SECURITY_READY";
     case HandoverCapability::UE_RADIO_EXECUTION_READY: return "UE_RADIO_EXECUTION_READY";
     case HandoverCapability::MME_PATH_UPDATE_OBSERVABLE: return "MME_PATH_UPDATE_OBSERVABLE";
@@ -276,6 +283,29 @@ LiveHandoverReadiness AssessLiveHandoverCapabilities()
                "uplink NAS COUNT of the Security Mode Complete, the NH chain, horizontal and vertical KeNB*, and "
                "the Annex A.7 RRC/UP keys - and test/lte/as_security.cpp pins every value to an independent "
                "Python HMAC-SHA-256 reference implementation"),
+        Assess(HandoverCapability::AS_ALGORITHM_SELECTION_READY, true,
+               "lte::security::SelectAsAlgorithms intersects the UE EPS security capability bitmaps with the "
+               "operator's ordered allowlists, honours the configured priority rather than the numeric order, "
+               "records the configuration generation and refuses every empty, stale, unsupported or EIA0-without-null-NAS "
+               "case; test/lte/as_security_activation.cpp pins each refusal"),
+        Assess(HandoverCapability::AS_SMC_CODEC_READY, true,
+               "SecurityModeCommand, SecurityModeComplete and SecurityModeFailure encode and decode through the accepted "
+               "asn1c LTE RRC UPER codec; the command encoding 30 02 20 and the two uplink encodings are pinned"),
+        Assess(HandoverCapability::PDCP_RRC_INTEGRITY_READY, true,
+               "lte::security::PdcpSecurityEntity computes the 32-bit MAC-I over COUNT||BEARER||DIRECTION||0^26||PDU with "
+               "EIA1/EIA2/EIA3; the pinned SRB1 PDU's MAC-I was reproduced independently with OpenSSL AES-128-CMAC"),
+        Assess(HandoverCapability::PDCP_RRC_CIPHERING_READY, true,
+               "the same entity ciphers the data part with EEA1/EEA2/EEA3 and leaves the MAC-I in the clear, in the "
+               "TS 36.323 order; the pinned ciphertext was reproduced independently with OpenSSL AES-128-CTR and the EEA2 IV"),
+        Assess(HandoverCapability::PDCP_UP_CIPHERING_READY, true,
+               "UP ciphering uses the same construction with K_UPenc and a DRB bearer identity; it is the same code path "
+               "that the SRB1 tests exercise, and no separate DRB implementation is claimed"),
+        Assess(HandoverCapability::AS_SMC_RUNTIME_READY, false,
+               "the UE and eNB state machines run end to end in-process over real RRC and PDCP bytes, but this simulator "
+               "has no RRC connection and no SRB1 transport: there is no peer to carry a SecurityModeCommand to"),
+        Assess(HandoverCapability::AS_INITIAL_SECURITY_ACTIVATION_READY, false,
+               "activation depends on AS_SMC_RUNTIME_READY; the transitions and the PDCP activation points are implemented "
+               "and tested, but nothing in the running LTE stack drives them"),
         Assess(HandoverCapability::HANDOVER_SECURITY_READY, false,
                "the key hierarchy exists and is verified, but the runtime has no RRC security mode procedure: no "
                "AS algorithm is selected, no RRC or PDCP protection is activated, and the UE cannot move its "

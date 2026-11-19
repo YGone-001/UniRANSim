@@ -1845,6 +1845,9 @@ because the code they would need does not; the tenth is derived.
 | `TARGET_CONTEXT_READY` | false | a provisional context needs a `SourceSession` from the source's registry |
 | `RRC_CONTAINER_READY` | false | no TS 36.331 codec exists |
 | `AS_KEY_DERIVATION_READY` | true | `lte::security` implements Annex A.3-A.7 and `test/lte/as_security.cpp` pins it to an independent reference |
+| `AS_ALGORITHM_SELECTION_READY` / `AS_SMC_CODEC_READY` | true | Phase 18-F-B5 selection and the pinned TS 36.331 encodings |
+| `PDCP_RRC_*_READY` | true | Phase 18-F-B5 PDCP entity, reproduced independently with OpenSSL |
+| `AS_SMC_RUNTIME_READY` | false | no RRC connection or SRB1 carries the messages in this simulator |
 | `HANDOVER_SECURITY_READY` | false | the hierarchy exists, but no AS algorithm is selected, no RRC/PDCP protection is active and the UE cannot execute the radio move |
 | `UE_RADIO_EXECUTION_READY` | false | the UE executes a simulator frame, not an RRC reconfiguration |
 | `MME_PATH_UPDATE_OBSERVABLE` | false | the eNB cannot see the SGW's map |

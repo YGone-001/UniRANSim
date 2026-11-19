@@ -85,6 +85,24 @@ enum class HandoverCapability : uint8_t
     // Annex A.7 RRC/UP algorithm keys (lte::security). This says the derivation
     // is correct, not that a UE can apply it to a live handover.
     AS_KEY_DERIVATION_READY,
+    // Phase 18-F-B5: algorithm negotiation over the UE's EPS security
+    // capabilities and the operator's ordered allowlists.
+    AS_ALGORITHM_SELECTION_READY,
+    // The three TS 36.331 SecurityMode messages encode and decode through the
+    // accepted LTE RRC UPER codec, byte-pinned in the tests.
+    AS_SMC_CODEC_READY,
+    // The PDCP security entity composes COUNT, bearer, direction, MAC-I and
+    // ciphering as TS 33.401 5.1.3.2 requires, for RRC (SRB1) integrity and
+    // ciphering and for UP ciphering.
+    PDCP_RRC_INTEGRITY_READY,
+    PDCP_RRC_CIPHERING_READY,
+    PDCP_UP_CIPHERING_READY,
+    // The procedure exists and is exercised end to end in-process, but this
+    // simulator has no SRB1 transport and no RRC connection, so no runtime
+    // message is carried: the bytes go to a test, not to a peer.
+    AS_SMC_RUNTIME_READY,
+    // Activation at runtime follows from the two above and is therefore false.
+    AS_INITIAL_SECURITY_ACTIVATION_READY,
     // The UE runtime can derive and apply AS handover security (KeNB, NH, and
     // the RRC/UP keys) from the SecurityContext the MME sends.
     HANDOVER_SECURITY_READY,

@@ -342,6 +342,20 @@ uint64_t AsSecurityContext::NhChainIndex() const
     return nhIndex_;
 }
 
+void AsSecurityContext::ApplyAsAlgorithms(const AsAlgorithmSet &algorithms)
+{
+    if (!active_)
+        Fail(AsSecurityError::NO_ACTIVE_CONTEXT);
+    if (!algorithms.negotiated)
+        Fail(AsSecurityError::UNSUPPORTED_ALGORITHM);
+    ValidateAlgorithmIdentity(algorithms.rrcIntegrity);
+    ValidateAlgorithmIdentity(algorithms.rrcCiphering);
+    ValidateAlgorithmIdentity(algorithms.upCiphering);
+    if (algorithms.upIntegrity)
+        ValidateAlgorithmIdentity(*algorithms.upIntegrity);
+    algorithms_ = algorithms;
+}
+
 Key256 AsSecurityContext::ActiveKenb() const
 {
     if (!active_)

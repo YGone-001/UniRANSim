@@ -205,6 +205,13 @@ is `CROSS_UE_CONTEXT`; using it with an older NAS generation is
   KASME nor the KeNB hex appears in it.
 * Nothing is persisted to disk and nothing reaches a log.
 
+## 11.1 Continuation: initial AS security mode (Phase 18-F-B5)
+
+Phase 18-F-B5 adds algorithm negotiation, the TS 36.331 SecurityMode messages
+and PDCP protection on top of this hierarchy. See
+`docs/lte-as-security-activation.md`; this document remains the record of the key
+hierarchy itself.
+
 ## 12. Capability boundary
 
 | Capability | State |

@@ -913,6 +913,41 @@ on the other. `docs/lte-as-security-context.md` is the design record.
   `LIVE_HANDOVER_EXECUTION_READY` stay false. Do not enable live handover
   because the KDF tests pass.
 
+### Initial AS security mode procedure
+
+`src/lte/security/as_algorithm_selection.{hpp,cpp}`,
+`as_security_codec.{hpp,cpp}`, `pdcp_security.{hpp,cpp}` and
+`as_security_procedure.{hpp,cpp}` implement the initial AS security mode of
+TS 33.401 7.2.4 and TS 36.331 5.3.4. `docs/lte-as-security-activation.md` is the
+design record.
+
+- **Priority is the operator's order.** `SelectAsAlgorithms` takes the first
+  allowlist entry the UE advertises and this build implements. Never sort by
+  algorithm identity, never derive the choice from the UE bitmap, and never let
+  the UE bitmap select on its own.
+- **Fail closed, never downgrade.** Empty allowlist, empty UE bitmap, no
+  intersection, unsupported identity, stale configuration generation and
+  EIA0-without-null-NAS are refusals. A missing strong algorithm is never a
+  quiet fallback to a null one.
+- **Null security is named.** EEA0/EIA0 protect nothing and the selection says
+  so; do not describe them as confidentiality or integrity.
+- **The MAC-I is computed before ciphering** over
+  `COUNT||BEARER||DIRECTION||0^26||PDU`, and the MAC-I itself is never
+  ciphered (TS 36.323 5.5). A receiver deciphers first, then verifies.
+- **Activation is a protocol event.** The SecurityModeCommand is integrity
+  protected and never ciphered; the SecurityModeComplete is integrity protected
+  and not ciphered; ciphering starts only after the completion is verified. A
+  selected algorithm is not activation, and a sent command is not completion.
+- **Failure changes nothing.** A rejected command or completion leaves the
+  context, the keys and the ciphering state exactly as they were, and a failed
+  transaction cannot be revived by a second message.
+- **Secrets stay owned.** The PDCP entity wipes its keys on destruction; no key
+  material reaches a log, a metric or a diagnostic string.
+- **The procedure has no carrier.** This simulator has no RRC connection and no
+  SRB1, so `AS_SMC_RUNTIME_READY` and
+  `AS_INITIAL_SECURITY_ACTIVATION_READY` stay false. Do not wire a flag to make
+  them true without an actual bearer to carry the messages.
+
 ## LTE performance and capacity
 
 Two goals drive the current workstream: PERF-P1 (single UE sustained 1 Gbps

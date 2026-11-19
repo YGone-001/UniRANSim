@@ -210,6 +210,12 @@ class AsSecurityContext
         return pending_.has_value();
     }
 
+    // Applies the AS algorithms an RRC SecurityModeCommand selected. Before this
+    // the context owns the key hierarchy but no AS algorithm, and refuses to
+    // derive RRC/UP keys; after it the keys exist for a procedure that has not
+    // necessarily completed yet. Derivation is still not activation.
+    void ApplyAsAlgorithms(const AsAlgorithmSet &algorithms);
+
     // The active KeNB. Returned by value because the context must stay the only
     // owner of the stored key.
     [[nodiscard]] Key256 ActiveKenb() const;
