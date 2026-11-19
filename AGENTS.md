@@ -959,6 +959,32 @@ design record.
   `AS_INITIAL_SECURITY_ACTIVATION_READY` stay false. Do not wire a flag to make
   them true without an actual bearer to carry the messages.
 
+## LTE simulated Uu transport and SRB0
+
+Phase 18-F-B6-A starts the runtime carrier under the AS security work.
+`src/lte/rrc-runtime/` owns it; the design records are
+`docs/lte-simulated-uu-transport.md`, `docs/lte-srb0-rlc-tm.md`,
+`docs/lte-rrc-initial-access.md` and `docs/lte-rrc-connection-runtime.md`.
+
+- **RRC must travel through RLC.** A message may not go from RRC to UDP to RRC.
+  The transport envelope carries an association, a direction, a logical channel
+  and opaque bytes; it never names an RRC message type.
+- **The transport is not reliable by accident.** No hidden ACK, retransmission,
+  sequence number, reordering or deduplication. Loss stays observable so the
+  state machine, not the transport, decides what a loss means.
+- **RLC TM adds nothing.** No header, no SN, no STATUS, no segmentation. An SDU
+  above 1024 bytes is refused, never truncated or segmented.
+- **SRB0 has no PDCP.** No SN, no MAC-I, no ciphering, no integrity. Nothing in
+  the SRB0 path instantiates a security entity.
+- **Do not claim RRC_CONNECTED without SetupComplete.** In B6-A the UE stops at
+  `RRC_SRB1_CONFIGURING` with the staged SRB1 configuration. Only a validated
+  RRCConnectionSetupComplete on SRB1, in B6-B, may complete the connection.
+- **The association is not a C-RNTI.** There is no PRACH, contention resolution
+  or MAC scheduling; the association is a simulator routing identifier and must
+  stay unique and validated per UE.
+- **Never duplicate NAS.** The legacy NAS_UPLINK path is untouched in B6-A. When
+  B6-C moves NAS into RRCConnectionSetupComplete, the old path must not also run.
+
 ## LTE performance and capacity
 
 Two goals drive the current workstream: PERF-P1 (single UE sustained 1 Gbps

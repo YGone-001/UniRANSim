@@ -97,6 +97,11 @@ enum class HandoverCapability : uint8_t
     PDCP_RRC_INTEGRITY_READY,
     PDCP_RRC_CIPHERING_READY,
     PDCP_UP_CIPHERING_READY,
+    // Phase 18-F-B6-A: a simulated Uu transport carries opaque RLC PDUs between
+    // independent UE and eNB processes, and SRB0 initial access runs over it.
+    // This is a simulator bearer, not physical radio.
+    SIMULATED_UU_TRANSPORT_READY,
+    SRB0_INITIAL_ACCESS_READY,
     // The procedure exists and is exercised end to end in-process, but this
     // simulator has no SRB1 transport and no RRC connection, so no runtime
     // message is carried: the bytes go to a test, not to a peer.

@@ -219,6 +219,8 @@ TEST_CASE("lte/handover/live: the capability model names every missing live prer
     // derivation capability only: the execution prerequisite below stays
     // false because no RRC security procedure or radio execution exists.
     CHECK(readiness.available(HandoverCapability::AS_KEY_DERIVATION_READY));
+    CHECK(readiness.available(HandoverCapability::SIMULATED_UU_TRANSPORT_READY));
+    CHECK(readiness.available(HandoverCapability::SRB0_INITIAL_ACCESS_READY));
     CHECK(readiness.available(HandoverCapability::AS_ALGORITHM_SELECTION_READY));
     CHECK(readiness.available(HandoverCapability::AS_SMC_CODEC_READY));
     CHECK(readiness.available(HandoverCapability::PDCP_RRC_INTEGRITY_READY));
@@ -258,7 +260,7 @@ TEST_CASE("lte/handover/live: the capability model names every missing live prer
     CHECK_FALSE(readiness.available(HandoverCapability::MME_PATH_UPDATE_OBSERVABLE));
 
     // Every assessment carries the fact it rests on.
-    REQUIRE(readiness.assessments.size() == 21);
+    REQUIRE(readiness.assessments.size() == 23);
     for (const auto &assessment : readiness.assessments)
     {
         CHECK_FALSE(assessment.evidence.empty());

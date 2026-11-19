@@ -136,6 +136,8 @@ const char *ToString(HandoverCapability capability)
     case HandoverCapability::PDCP_RRC_INTEGRITY_READY: return "PDCP_RRC_INTEGRITY_READY";
     case HandoverCapability::PDCP_RRC_CIPHERING_READY: return "PDCP_RRC_CIPHERING_READY";
     case HandoverCapability::PDCP_UP_CIPHERING_READY: return "PDCP_UP_CIPHERING_READY";
+    case HandoverCapability::SIMULATED_UU_TRANSPORT_READY: return "SIMULATED_UU_TRANSPORT_READY";
+    case HandoverCapability::SRB0_INITIAL_ACCESS_READY: return "SRB0_INITIAL_ACCESS_READY";
     case HandoverCapability::AS_SMC_RUNTIME_READY: return "AS_SMC_RUNTIME_READY";
     case HandoverCapability::AS_INITIAL_SECURITY_ACTIVATION_READY: return "AS_INITIAL_SECURITY_ACTIVATION_READY";
     case HandoverCapability::HANDOVER_SECURITY_READY: return "HANDOVER_SECURITY_READY";
@@ -300,6 +302,14 @@ LiveHandoverReadiness AssessLiveHandoverCapabilities()
         Assess(HandoverCapability::PDCP_UP_CIPHERING_READY, true,
                "UP ciphering uses the same construction with K_UPenc and a DRB bearer identity; it is the same code path "
                "that the SRB1 tests exercise, and no separate DRB implementation is claimed"),
+        Assess(HandoverCapability::SIMULATED_UU_TRANSPORT_READY, true,
+               "lte::uu carries opaque RLC PDUs between an independently running UE process and eNB process over a "
+               "loopback UDP envelope with per-association routing, deterministic loss/duplication/reordering and "
+               "malformed-frame rejection; it is a simulator bearer, not physical radio"),
+        Assess(HandoverCapability::SRB0_INITIAL_ACCESS_READY, true,
+               "SRB0 runs RLC TM (no header, no SN, no PDCP) over that transport and exchanges real TS 36.331 "
+               "RRCConnectionRequest / RRCConnectionSetup / RRCConnectionReject; a separate-process test completes the "
+               "exchange and the UE stops at SRB1 configuration"),
         Assess(HandoverCapability::AS_SMC_RUNTIME_READY, false,
                "the UE and eNB state machines run end to end in-process over real RRC and PDCP bytes, but this simulator "
                "has no RRC connection and no SRB1 transport: there is no peer to carry a SecurityModeCommand to"),
