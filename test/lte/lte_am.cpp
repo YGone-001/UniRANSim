@@ -7,13 +7,22 @@
 #include <ext/doctest/doctest.h>
 
 #include <lte/rrc-runtime/lte_am.hpp>
+#include <lte/rrc-runtime/lte_am_bearer.hpp>
+#include <lte/rrc-runtime/uu_transport.hpp>
 
 #include <functional>
 #include <memory>
 #include <string>
+
+#include <sys/wait.h>
+#include <unistd.h>
 #include <vector>
 
 using namespace lte::rlc::am;
+using namespace lte;
+
+using namespace lte::rlc::am;
+using namespace lte;
 
 namespace
 {
@@ -367,4 +376,45 @@ TEST_CASE("lte/rlc-am-entity/concatenated sdus carry an li chain and are split o
     AmdPdu plain;
     REQUIRE(DecodeAmd(single->wire[0].data(), single->wire[0].size(), plain, &why));
     CHECK(plain.li.empty());
+}
+TEST_CASE("lte/rlc-am-bearer/an independent process receives over the uu transport")
+{
+    auto a = uu::Socket::BindLoopback(0, nullptr);
+    auto b = uu::Socket::BindLoopback(0, nullptr);
+    REQUIRE(a.has_value());
+    REQUIRE(b.has_value());
+    const uint16_t portA = a->Port();
+    const uint16_t portB = b->Port();
+
+    const pid_t child = ::fork();
+    REQUIRE(child >= 0);
+
+    if (child == 0)
+    {
+        // The transmitter runs in its own process with its own entity.
+        LteAmBearer tx(std::move(*a), portB, 0x77, AmConfig{}, nullptr);
+        tx.SubmitSdu({0xAA, 0xBB});
+        tx.SubmitSdu({0xCC});
+        for (int i = 0; i < 60; i++)
+        {
+            tx.Pump(1);
+            tx.Tick();
+        }
+        ::_exit(tx.VtA() == 2 ? 0 : 7);
+    }
+
+    std::vector<std::vector<uint8_t>> delivered;
+    LteAmBearer rx(std::move(*b), portA, 0x77, AmConfig{},
+                   [&delivered](std::vector<uint8_t> sdu) { delivered.push_back(std::move(sdu)); });
+    for (int i = 0; i < 200 && delivered.size() < 2; i++)
+    {
+        rx.Pump(1);
+        rx.Tick();
+    }
+    CHECK(delivered.size() == 2);
+
+    int status = 0;
+    ::waitpid(child, &status, 0);
+    CHECK(WIFEXITED(status));
+    CHECK(WEXITSTATUS(status) == 0);
 }
