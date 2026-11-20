@@ -57,13 +57,14 @@ void LteAmEntity::Fail()
 }
 
 void LteAmEntity::SendPdu(uint16_t sn, bool poll, FramingInfo fi, const std::vector<uint8_t> &data,
-                          std::optional<std::pair<uint16_t, uint16_t>> soRange)
+                          std::optional<std::pair<uint16_t, uint16_t>> soRange, const std::vector<uint16_t> &li)
 {
     AmdPdu pdu;
     pdu.sn = sn;
     pdu.poll = poll;
     pdu.fi = fi;
     pdu.data = data;
+    pdu.li = li;
     if (soRange)
     {
         pdu.segment = true;
@@ -117,6 +118,51 @@ void LteAmEntity::SubmitSdu(const std::vector<uint8_t> &sdu)
     }
 }
 
+void LteAmEntity::SubmitSdus(const std::vector<std::vector<uint8_t>> &sdus)
+{
+    if (state_ != AmState::ACTIVE)
+        throw std::logic_error("LTE AM entity is not active");
+    if (sdus.empty())
+        return;
+    if (sdus.size() == 1)
+    {
+        SubmitSdu(sdus[0]);
+        return;
+    }
+
+    std::vector<uint16_t> li;
+    std::vector<uint8_t> data;
+    size_t total = 0;
+    for (const auto &sdu : sdus)
+    {
+        if (sdu.empty())
+            throw std::logic_error("an empty SDU cannot be concatenated");
+        total += sdu.size();
+        data.insert(data.end(), sdu.begin(), sdu.end());
+    }
+    // Every element but the last carries an LI.
+    for (size_t i = 0; i + 1 < sdus.size(); i++)
+        li.push_back(static_cast<uint16_t>(sdus[i].size()));
+
+    // Two-octet header, plus the E/LI chain including its padding when the LI
+    // count is odd.
+    const size_t liBytes = li.size() % 2 == 0 ? (li.size() * 12) / 8 : (li.size() * 12 + 4) / 8;
+    if (2 + liBytes + total > config_.maxPduBytes)
+        throw std::logic_error("concatenated SDUs do not fit in one PDU");
+    if (Distance(vtA_, vtS_) >= Window)
+        throw std::logic_error("transmission window is full");
+
+    StoredSdu stored;
+    stored.sn = vtS_;
+    stored.fi = FramingInfo::COMPLETE;
+    stored.data = data;
+    stored.li = li;
+    stored.transmissions = 1;
+    transmissions_[vtS_] = stored;
+    SendPdu(vtS_, false, FramingInfo::COMPLETE, data, std::nullopt, li);
+    vtS_ = static_cast<uint16_t>((vtS_ + 1) % SnModulus);
+}
+
 void LteAmEntity::TransmitStored(StoredSdu &stored, bool poll)
 {
     if (stored.transmissions >= config_.maxRetx)
@@ -126,7 +172,7 @@ void LteAmEntity::TransmitStored(StoredSdu &stored, bool poll)
     }
     stored.transmissions++;
     retransmissions_++;
-    SendPdu(stored.sn, poll, stored.fi, stored.data, std::nullopt);
+    SendPdu(stored.sn, poll, stored.fi, stored.data, std::nullopt, stored.li);
 }
 
 void LteAmEntity::OnStatusPdu(const std::vector<uint8_t> &pdu)
@@ -210,6 +256,9 @@ void LteAmEntity::OnPdu(const std::vector<uint8_t> &pdu)
         entry.firstFi = decoded.fi;
         entry.lastFi = decoded.fi;
     }
+    if (!decoded.li.empty())
+        entry.li = decoded.li;
+
     RxSegment segment;
     segment.so = decoded.segment ? decoded.so : 0;
     segment.lsf = decoded.segment ? decoded.lsf : true;
@@ -273,8 +322,28 @@ void LteAmEntity::TryDeliverInOrder()
         const FramingInfo last = it->second.lastFi;
         if (first == FramingInfo::COMPLETE && last == FramingInfo::COMPLETE)
         {
-            deliverer_(data);
-            delivered_++;
+            // Several SDUs may share one PDU: the LI chain says where each
+            // element ends, and the last element has no LI.
+            const auto &li = it->second.li;
+            if (li.empty())
+            {
+                deliverer_(data);
+                delivered_++;
+            }
+            else
+            {
+                size_t offset = 0;
+                for (size_t i = 0; i <= li.size(); i++)
+                {
+                    const size_t length = i < li.size() ? li[i] : data.size() - offset;
+                    if (offset + length > data.size())
+                        break;
+                    deliverer_(std::vector<uint8_t>(data.begin() + static_cast<long>(offset),
+                                                    data.begin() + static_cast<long>(offset + length)));
+                    delivered_++;
+                    offset += length;
+                }
+            }
             assembly_.clear();
         }
         else if (first == FramingInfo::FIRST_SEGMENT)

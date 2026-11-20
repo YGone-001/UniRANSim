@@ -341,3 +341,30 @@ TEST_CASE("lte/rlc-am-entity/a whole missing pdu stays a whole-pdu nack")
     CHECK(status.nacks[0].sn == 0);
     CHECK_FALSE(status.nacks[0].soRange.has_value());
 }
+TEST_CASE("lte/rlc-am-entity/concatenated sdus carry an li chain and are split on delivery")
+{
+    auto pair = MakePair();
+    pair->tx.SubmitSdus({std::vector<uint8_t>{0x01}, std::vector<uint8_t>{0x02, 0x03}, std::vector<uint8_t>{0x04}});
+
+    REQUIRE(pair->wire.size() == 1);
+    AmdPdu pdu;
+    std::string why;
+    REQUIRE(DecodeAmd(pair->wire[0].data(), pair->wire[0].size(), pdu, &why));
+    // Three elements: two LIs (1 and 2), the last element carries none.
+    REQUIRE(pdu.li.size() == 2);
+    CHECK(pdu.li[0] == 1);
+    CHECK(pdu.li[1] == 2);
+    CHECK(pdu.fi == FramingInfo::COMPLETE);
+
+    REQUIRE(pair->delivered.size() == 3);
+    CHECK(pair->delivered[0] == std::vector<uint8_t>({0x01}));
+    CHECK(pair->delivered[1] == std::vector<uint8_t>({0x02, 0x03}));
+    CHECK(pair->delivered[2] == std::vector<uint8_t>({0x04}));
+
+    // A single SDU still travels without any LI.
+    auto single = MakePair();
+    single->tx.SubmitSdus({std::vector<uint8_t>{0xAA}});
+    AmdPdu plain;
+    REQUIRE(DecodeAmd(single->wire[0].data(), single->wire[0].size(), plain, &why));
+    CHECK(plain.li.empty());
+}

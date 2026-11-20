@@ -50,6 +50,8 @@ struct StoredSdu
     uint16_t sn{0};
     FramingInfo fi{FramingInfo::COMPLETE};
     std::vector<uint8_t> data{};
+    // SDU elements inside this PDU: every element but the last carries an LI.
+    std::vector<uint16_t> li{};
     uint8_t transmissions{0};
     bool acked{false};
 };
@@ -64,6 +66,9 @@ class LteAmEntity
     LteAmEntity(AmConfig config, Sender sender, Deliverer deliverer);
 
     void SubmitSdu(const std::vector<uint8_t> &sdu);
+    // Packs several whole SDUs into one AMD PDU with an E/LI chain. Refused if
+    // they do not fit in one PDU; they are never silently split without LI.
+    void SubmitSdus(const std::vector<std::vector<uint8_t>> &sdus);
     void OnPdu(const std::vector<uint8_t> &pdu);
     void OnStatusPdu(const std::vector<uint8_t> &pdu);
     void OnTick();
@@ -123,10 +128,11 @@ class LteAmEntity
         std::vector<RxSegment> segments{};
         bool complete{false};
         size_t totalSize{0};
+        std::vector<uint16_t> li{};
     };
 
     void SendPdu(uint16_t sn, bool poll, FramingInfo fi, const std::vector<uint8_t> &data,
-                 std::optional<std::pair<uint16_t, uint16_t>> soRange);
+                 std::optional<std::pair<uint16_t, uint16_t>> soRange, const std::vector<uint16_t> &li = {});
     void TransmitStored(StoredSdu &stored, bool poll);
     void TryDeliverInOrder();
     void SendStatus();
