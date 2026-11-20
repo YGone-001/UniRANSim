@@ -228,3 +228,116 @@ TEST_CASE("lte/rlc-am-entity/entity release stops all processing")
     CHECK(pair->tx.State() == AmState::RELEASED);
     CHECK_THROWS(pair->tx.SubmitSdu({2}));
 }
+namespace
+{
+
+struct RxHarness
+{
+    LteAmEntity entity;
+    std::vector<std::vector<uint8_t>> statuses;
+    std::vector<std::vector<uint8_t>> delivered;
+
+    RxHarness()
+    {
+        entity = LteAmEntity(
+            AmConfig{},
+            [this](std::vector<uint8_t> pdu) { statuses.push_back(std::move(pdu)); },
+            [this](std::vector<uint8_t> sdu) { delivered.push_back(std::move(sdu)); });
+    }
+};
+
+std::vector<uint8_t> Segment(uint16_t sn, uint16_t so, bool lsf, const std::vector<uint8_t> &data)
+{
+    AmdPdu pdu;
+    pdu.sn = sn;
+    pdu.segment = true;
+    pdu.so = so;
+    pdu.lsf = lsf;
+    // FI describes the SDU boundary inside this segment, not the segmentation
+    // itself: a first segment starts an SDU, a last one ends it.
+    if (so == 0 && lsf)
+        pdu.fi = FramingInfo::COMPLETE;
+    else if (so == 0)
+        pdu.fi = FramingInfo::FIRST_SEGMENT;
+    else if (lsf)
+        pdu.fi = FramingInfo::LAST_SEGMENT;
+    else
+        pdu.fi = FramingInfo::MIDDLE_SEGMENT;
+    pdu.data = data;
+    return EncodeAmd(pdu);
+}
+
+StatusPdu LastStatus(const RxHarness &harness)
+{
+    StatusPdu status;
+    std::string why;
+    REQUIRE_FALSE(harness.statuses.empty());
+    const auto &pdu = harness.statuses.back();
+    REQUIRE(DecodeStatus(pdu.data(), pdu.size(), status, &why));
+    return status;
+}
+
+} // namespace
+
+TEST_CASE("lte/rlc-am-entity/a partial pdu produces a segment-specific nack with soend 0x7fff")
+{
+    RxHarness harness;
+    harness.entity.OnPdu(Segment(0, 0, false, {1, 2, 3, 4}));
+    harness.entity.OnTick();
+
+    const auto status = LastStatus(harness);
+    CHECK(status.ackSn == 0);
+    REQUIRE(status.nacks.size() == 1);
+    CHECK(status.nacks[0].sn == 0);
+    REQUIRE(status.nacks[0].soRange.has_value());
+    CHECK(status.nacks[0].soRange->first == 4);
+    CHECK(status.nacks[0].soRange->second == SoMax);
+}
+
+TEST_CASE("lte/rlc-am-entity/a missing middle range is reported and never acknowledged")
+{
+    RxHarness harness;
+    harness.entity.OnPdu(Segment(0, 0, false, {1, 2, 3, 4}));
+    harness.entity.OnPdu(Segment(0, 8, true, {9, 10, 11, 12}));
+    harness.entity.OnTick();
+
+    const auto status = LastStatus(harness);
+    CHECK(status.ackSn == 0);
+    REQUIRE(status.nacks.size() == 1);
+    REQUIRE(status.nacks[0].soRange.has_value());
+    CHECK(status.nacks[0].soRange->first == 4);
+    CHECK(status.nacks[0].soRange->second == 7);
+    CHECK(harness.delivered.empty());
+
+    // The missing middle arrives: the PDU completes and the SDU is delivered in
+    // order, with the gaps filled.
+    harness.entity.OnPdu(Segment(0, 4, false, {5, 6, 7, 8}));
+    REQUIRE(harness.delivered.size() == 1);
+    CHECK(harness.delivered[0] == std::vector<uint8_t>({1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}));
+    CHECK(harness.entity.VrR() == 1);
+
+    // A completed PDU is acknowledged, not nacked.
+    harness.entity.OnTick();
+    harness.entity.OnTick();
+    const auto after = LastStatus(harness);
+    CHECK(after.ackSn == 1);
+    CHECK(after.nacks.empty());
+}
+
+TEST_CASE("lte/rlc-am-entity/a whole missing pdu stays a whole-pdu nack")
+{
+    RxHarness harness;
+    harness.entity.OnPdu(EncodeAmd([] {
+        AmdPdu pdu;
+        pdu.sn = 1;
+        pdu.data = {0x42};
+        return pdu;
+    }()));
+    harness.entity.OnTick();
+
+    const auto status = LastStatus(harness);
+    CHECK(status.ackSn == 0);
+    REQUIRE(status.nacks.size() == 1);
+    CHECK(status.nacks[0].sn == 0);
+    CHECK_FALSE(status.nacks[0].soRange.has_value());
+}

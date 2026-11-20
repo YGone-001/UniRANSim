@@ -116,7 +116,10 @@ class LteAmEntity
     };
     struct RxEntry
     {
-        FramingInfo fi{FramingInfo::COMPLETE};
+        // SDU boundaries belong to the first and the last segment of the
+        // original PDU, not to whichever segment arrived last.
+        FramingInfo firstFi{FramingInfo::COMPLETE};
+        FramingInfo lastFi{FramingInfo::COMPLETE};
         std::vector<RxSegment> segments{};
         bool complete{false};
         size_t totalSize{0};

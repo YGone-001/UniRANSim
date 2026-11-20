@@ -198,7 +198,18 @@ void LteAmEntity::OnPdu(const std::vector<uint8_t> &pdu)
     if (existing != receive_.end())
         entry = existing->second;
 
-    entry.fi = decoded.fi;
+    if (decoded.segment)
+    {
+        if (decoded.so == 0)
+            entry.firstFi = decoded.fi;
+        if (decoded.lsf)
+            entry.lastFi = decoded.fi;
+    }
+    else
+    {
+        entry.firstFi = decoded.fi;
+        entry.lastFi = decoded.fi;
+    }
     RxSegment segment;
     segment.so = decoded.segment ? decoded.so : 0;
     segment.lsf = decoded.segment ? decoded.lsf : true;
@@ -223,6 +234,13 @@ void LteAmEntity::OnPdu(const std::vector<uint8_t> &pdu)
     }
     entry.complete = complete;
     receive_[decoded.sn] = entry;
+    // Anything received may change what is missing, so a report is due. The
+    // highest received SN takes the partially received PDU itself into account:
+    // a half-received PDU at VR(R) still has to be reported.
+    statusPending_ = true;
+    const int receivedDistance = Distance(vrR_, decoded.sn);
+    if (receivedDistance + 1 > Distance(vrR_, vrH_))
+        vrH_ = static_cast<uint16_t>((vrR_ + receivedDistance + 1) % SnModulus);
 
     if (decoded.sn == vrR_)
         TryDeliverInOrder();
@@ -251,27 +269,33 @@ void LteAmEntity::TryDeliverInOrder()
 
         // Reassemble the SDU across PDUs: FI marks where one SDU starts and
         // ends, so a segmented SDU must not be delivered piece by piece.
-        const FramingInfo fi = it->second.fi;
-        if (fi == FramingInfo::COMPLETE)
+        const FramingInfo first = it->second.firstFi;
+        const FramingInfo last = it->second.lastFi;
+        if (first == FramingInfo::COMPLETE && last == FramingInfo::COMPLETE)
         {
             deliverer_(data);
             delivered_++;
             assembly_.clear();
         }
-        else if (fi == FramingInfo::FIRST_SEGMENT)
+        else if (first == FramingInfo::FIRST_SEGMENT)
         {
             assembly_ = data;
-        }
-        else if (fi == FramingInfo::MIDDLE_SEGMENT)
-        {
-            assembly_.insert(assembly_.end(), data.begin(), data.end());
+            if (last == FramingInfo::LAST_SEGMENT || last == FramingInfo::COMPLETE)
+            {
+                deliverer_(assembly_);
+                delivered_++;
+                assembly_.clear();
+            }
         }
         else
         {
             assembly_.insert(assembly_.end(), data.begin(), data.end());
-            deliverer_(assembly_);
-            delivered_++;
-            assembly_.clear();
+            if (last == FramingInfo::LAST_SEGMENT || last == FramingInfo::COMPLETE)
+            {
+                deliverer_(assembly_);
+                delivered_++;
+                assembly_.clear();
+            }
         }
         receive_.erase(it);
         vrR_ = static_cast<uint16_t>((vrR_ + 1) % SnModulus);
@@ -286,16 +310,69 @@ void LteAmEntity::SendStatus()
 {
     StatusPdu status;
     status.ackSn = vrR_;
+
     for (int offset = 0; offset < Distance(vrR_, vrH_); offset++)
     {
         const uint16_t sn = static_cast<uint16_t>((vrR_ + offset) % SnModulus);
-        if (receive_.find(sn) == receive_.end())
+        const auto it = receive_.find(sn);
+        if (it == receive_.end())
         {
+            // Nothing at all arrived for this SN: a whole-PDU NACK.
             StatusNack nack;
             nack.sn = sn;
             status.nacks.push_back(nack);
+            continue;
+        }
+        if (it->second.complete)
+            continue;  // Never nack a fully reconstructed PDU.
+
+        // Partially received: report every byte range that is still missing.
+        // The segments are kept sorted on insertion, but sort defensively.
+        auto segments = it->second.segments;
+        std::sort(segments.begin(), segments.end(),
+                  [](const RxSegment &a, const RxSegment &b) { return a.so < b.so; });
+
+        size_t covered = 0;
+        bool sawEnd = false;
+        for (const auto &segment : segments)
+        {
+            if (segment.so > covered)
+            {
+                StatusNack gap;
+                gap.sn = sn;
+                gap.soRange = std::make_pair(static_cast<uint16_t>(covered), static_cast<uint16_t>(segment.so - 1));
+                status.nacks.push_back(gap);
+            }
+            covered = std::max(covered, static_cast<size_t>(segment.so) + segment.data.size());
+            if (segment.lsf)
+            {
+                sawEnd = true;
+                break;
+            }
+        }
+
+        if (sawEnd)
+        {
+            if (covered < it->second.totalSize)
+            {
+                StatusNack gap;
+                gap.sn = sn;
+                gap.soRange = std::make_pair(static_cast<uint16_t>(covered),
+                                              static_cast<uint16_t>(it->second.totalSize - 1));
+                status.nacks.push_back(gap);
+            }
+        }
+        else if (covered > 0 && covered <= SoMax)
+        {
+            // The last byte of the original PDU has not arrived, so the
+            // missing range runs to its end: SOend = 0x7FFF.
+            StatusNack gap;
+            gap.sn = sn;
+            gap.soRange = std::make_pair(static_cast<uint16_t>(covered), static_cast<uint16_t>(SoMax));
+            status.nacks.push_back(gap);
         }
     }
+
     sender_(EncodeStatus(status));
     statusPending_ = false;
     prohibitTimer_ = config_.prohibitTicks;
