@@ -985,6 +985,26 @@ Phase 18-F-B6-A starts the runtime carrier under the AS security work.
 - **Never duplicate NAS.** The legacy NAS_UPLINK path is untouched in B6-A. When
   B6-C moves NAS into RRCConnectionSetupComplete, the old path must not also run.
 
+## LTE RLC AM entity
+
+`src/lte/rrc-runtime/lte_am.{hpp,cpp}` is the LTE AM entity; the wire codec is
+`rlc_am.{hpp,cpp}`; `docs/lte-rlc-am-entity.md` is the design record.
+
+- **Do not reuse the NR engine.** `src/lib/rlc/entity_am` is NR-typed (segment
+  info enum, NR PDU objects); adapting it would fabricate NR headers from LTE
+  fields. Keep the two wire formats and the two entities separate.
+- **One SN arithmetic path.** Modulus 1024 and a single `Distance()` helper; never
+  compare SNs with `<` and never open-code the modulo.
+- **The window is a correctness boundary.** 512 outstanding PDUs; a submission
+  beyond it is refused rather than sent out of window.
+- **Per-SN state, not per-PDU-arrival.** A duplicate is rejected by SN, an
+  out-of-order PDU is buffered, and an SDU spanning several PDUs is reassembled
+  by FI before delivery - a segmented SDU must never be delivered piece by piece.
+- **Timers are tick-driven.** The entity has no clock; the caller owns the tick.
+  Reaching `maxRetx` fails the entity instead of retrying forever.
+- **No SRB1 claim.** This entity is not wired to SRB1, PDCP or the RRC connection;
+  `SRB1_RLC_AM_READY` stays false until B6-B2.
+
 ## LTE performance and capacity
 
 Two goals drive the current workstream: PERF-P1 (single UE sustained 1 Gbps
