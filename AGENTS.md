@@ -1337,3 +1337,30 @@ The LTE path can be driven against a real Open5GS EPC. When it is:
 `docs/` holds one design record per LTE slice rather than a single manual. When
 behaviour is verified, update the relevant record to describe what was actually
 observed, and correct a record only for a demonstrated inconsistency.
+## LTE NAS over SRB1 and S1AP (B6-C)
+
+`enb_rrc_bridge.{hpp,cpp}` joins the SRB1 runtime to the S1AP codec;
+`docs/lte-nas-s1ap-runtime.md` is the design record.
+
+- **NAS stays opaque to the eNB.** Encode and decode S1AP containers only. Do not
+  read, decrypt or rewrite a NAS PDU, and do not move NAS security into the eNB.
+- **No fabricated identities.** The eNB-UE-S1AP-ID is allocated by the eNB and
+  the MME-UE-S1AP-ID is learned from the first downlink NAS. Never invent either,
+  and never answer a transaction whose identity pair does not match.
+- **KASME belongs to the UE and the MME.** The eNB context starts at the KeNB in
+  `securityKey`. `EnbAsSecurityContext` must keep having no KASME input, and the
+  AS procedure must keep taking `AsKeySource` so it cannot ask for one.
+- **Read the capability string most significant bit first.** TS 36.413
+  UESecurityCapabilities has EEA0/EIA0 in its first bit. Use
+  `MapUeSecurityCapabilities`; a raw cast reads EEA0 as EEA15.
+- **One PDCP entity per direction carries the whole procedure.** The command is
+  downlink COUNT 0 and the completion uplink COUNT 0; afterwards the same
+  entities continue. Never recreate them after activation.
+- **A failed or unverified completion activates nothing.** Do not report an
+  Initial Context Setup outcome before the radio procedure reached ACTIVE.
+- **The legacy link remains for idle and mobility.** Do not send the same NAS PDU
+  over both the legacy link and SRB1, and do not create a second NAS delivery
+  path.
+- **No live claim.** `LTE_OPEN5GS_ATTACH_ACCEPTED` and
+  `LTE_EPS_ATTACH_OVER_SRB1_READY` stay false until the production UE NAS path is
+  wired and a live Attach is accepted.

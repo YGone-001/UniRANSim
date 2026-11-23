@@ -80,7 +80,7 @@ ProcedureException::ProcedureException(ProcedureError reason)
 
 // --- eNB --------------------------------------------------------------------
 
-EnbAsSecurityProcedure EnbAsSecurityProcedure::Start(AsSecurityContext &context, uint32_t ueId,
+EnbAsSecurityProcedure EnbAsSecurityProcedure::Start(AsKeySource &context, uint32_t ueId,
                                                      const UeAlgorithmCapabilities &capabilities,
                                                      const AsAlgorithmConfiguration &configuration,
                                                      uint64_t expectedConfigurationGeneration,
@@ -197,6 +197,24 @@ void EnbAsSecurityProcedure::OnComplete(const std::vector<uint8_t> &uplinkPdu)
     state_ = AsSecurityState::ACTIVE;
 }
 
+std::optional<PdcpSecurityEntity> EnbAsSecurityProcedure::TakeTx()
+{
+    if (state_ != AsSecurityState::ACTIVE || !tx_.has_value())
+        Fail(ProcedureError::NOT_PREPARED);
+    std::optional<PdcpSecurityEntity> out = std::move(tx_);
+    tx_.reset();
+    return out;
+}
+
+std::optional<PdcpSecurityEntity> EnbAsSecurityProcedure::TakeRx()
+{
+    if (state_ != AsSecurityState::ACTIVE || !rx_.has_value())
+        Fail(ProcedureError::NOT_PREPARED);
+    std::optional<PdcpSecurityEntity> out = std::move(rx_);
+    rx_.reset();
+    return out;
+}
+
 void EnbAsSecurityProcedure::OnFailure(const std::vector<uint8_t> &uplinkPdu)
 {
     (void)uplinkPdu;
@@ -298,6 +316,24 @@ std::vector<uint8_t> UeAsSecurityProcedure::OnCommand(const std::vector<uint8_t>
     auto protectedComplete = tx_->Protect(encoded);
     state_ = AsSecurityState::COMPLETE_PENDING;
     return protectedComplete;
+}
+
+std::optional<PdcpSecurityEntity> UeAsSecurityProcedure::TakeTx()
+{
+    if (state_ != AsSecurityState::ACTIVE || !tx_.has_value())
+        Fail(ProcedureError::NOT_PREPARED);
+    std::optional<PdcpSecurityEntity> out = std::move(tx_);
+    tx_.reset();
+    return out;
+}
+
+std::optional<PdcpSecurityEntity> UeAsSecurityProcedure::TakeRx()
+{
+    if (state_ != AsSecurityState::ACTIVE || !rx_.has_value())
+        Fail(ProcedureError::NOT_PREPARED);
+    std::optional<PdcpSecurityEntity> out = std::move(rx_);
+    rx_.reset();
+    return out;
 }
 
 void UeAsSecurityProcedure::ConfirmCompleteSent()

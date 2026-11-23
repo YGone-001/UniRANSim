@@ -80,7 +80,10 @@ class EnbAsSecurityProcedure
   public:
     EnbAsSecurityProcedure() = default;
 
-    static EnbAsSecurityProcedure Start(AsSecurityContext &context, uint32_t ueId,
+    // The context is any key source that owns a KeNB: a UE context on the UE
+    // side of a test, an EnbAsSecurityContext on the eNB side. The procedure
+    // never needs KASME.
+    static EnbAsSecurityProcedure Start(AsKeySource &context, uint32_t ueId,
                                         const UeAlgorithmCapabilities &capabilities,
                                         const AsAlgorithmConfiguration &configuration,
                                         uint64_t expectedConfigurationGeneration, uint8_t transactionId);
@@ -101,8 +104,15 @@ class EnbAsSecurityProcedure
     // A SecurityModeFailure ends the transaction without activating anything.
     void OnFailure(const std::vector<uint8_t> &uplinkPdu);
 
+    // Hands the activated PDCP entities to the steady-state SRB1 bearer. The
+    // procedure must be ACTIVE; afterwards it holds none. Moving them, rather
+    // than recreating them, is what keeps the COUNT that the command and the
+    // completion consumed.
+    std::optional<PdcpSecurityEntity> TakeTx();
+    std::optional<PdcpSecurityEntity> TakeRx();
+
   private:
-    AsSecurityContext *context_{nullptr};
+    AsKeySource *context_{nullptr};
     AlgorithmSelection selection_{};
     uint8_t transactionId_{0};
     AsSecurityState state_{AsSecurityState::UNINITIALIZED};
@@ -130,6 +140,9 @@ class UeAsSecurityProcedure
     // The UE activates RRC/UP ciphering once the SecurityModeComplete has been
     // sent; this is that step, and it is the only path to ACTIVE.
     void ConfirmCompleteSent();
+
+    std::optional<PdcpSecurityEntity> TakeTx();
+    std::optional<PdcpSecurityEntity> TakeRx();
 
     [[nodiscard]] AsSecurityState State() const noexcept
     {

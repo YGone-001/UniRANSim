@@ -141,6 +141,11 @@ const char *ToString(HandoverCapability capability)
     case HandoverCapability::SRB1_RLC_AM_READY: return "SRB1_RLC_AM_READY";
     case HandoverCapability::SRB1_PDCP_RUNTIME_READY: return "SRB1_PDCP_RUNTIME_READY";
     case HandoverCapability::RRC_CONNECTION_RUNTIME_READY: return "RRC_CONNECTION_RUNTIME_READY";
+    case HandoverCapability::RRC_INFORMATION_TRANSFER_READY: return "RRC_INFORMATION_TRANSFER_READY";
+    case HandoverCapability::NAS_S1AP_OVER_SRB1_READY: return "NAS_S1AP_OVER_SRB1_READY";
+    case HandoverCapability::ENB_KE_NB_SECURITY_CONTEXT_READY: return "ENB_KE_NB_SECURITY_CONTEXT_READY";
+    case HandoverCapability::LTE_EPS_ATTACH_OVER_SRB1_READY: return "LTE_EPS_ATTACH_OVER_SRB1_READY";
+    case HandoverCapability::LTE_OPEN5GS_ATTACH_ACCEPTED: return "LTE_OPEN5GS_ATTACH_ACCEPTED";
     case HandoverCapability::AS_SMC_RUNTIME_READY: return "AS_SMC_RUNTIME_READY";
     case HandoverCapability::AS_INITIAL_SECURITY_ACTIVATION_READY: return "AS_INITIAL_SECURITY_ACTIVATION_READY";
     case HandoverCapability::HANDOVER_SECURITY_READY: return "HANDOVER_SECURITY_READY";
@@ -225,6 +230,10 @@ std::vector<HandoverCapability> LiveHandoverReadiness::missing() const
         // handover. It is reported separately and a future live campaign
         // obtains it from the core side.
         if (assessment.capability == HandoverCapability::MME_PATH_UPDATE_OBSERVABLE)
+            continue;
+        // A live Open5GS Attach is external acceptance evidence, not something
+        // this build can be made to satisfy by code.
+        if (assessment.capability == HandoverCapability::LTE_OPEN5GS_ATTACH_ACCEPTED)
             continue;
         if (!assessment.available)
             out.push_back(assessment.capability);
@@ -327,12 +336,30 @@ LiveHandoverReadiness AssessLiveHandoverCapabilities()
                "RRCConnectionSetupComplete -> eNB decode -> dedicatedInfoNAS delivery runs over the simulated Uu, in one "
                "process and across two, with the RLC acknowledgement deciding the UE's RRC_CONNECTED transition; "
                "test/lte/srb1_runtime.cpp executes the complete procedure"),
-        Assess(HandoverCapability::AS_SMC_RUNTIME_READY, false,
-               "the SMC state machines run end to end in-process over real RRC and PDCP bytes, and an SRB1 runtime now "
-               "exists, but the procedure is not carried over it yet: B6-C wires SecurityModeCommand to this bearer"),
-        Assess(HandoverCapability::AS_INITIAL_SECURITY_ACTIVATION_READY, false,
-               "activation depends on AS_SMC_RUNTIME_READY; the transitions and the PDCP activation points are implemented "
-               "and tested, but nothing in the running LTE stack drives them"),
+        Assess(HandoverCapability::RRC_INFORMATION_TRANSFER_READY, true,
+               "ULInformationTransfer and DLInformationTransfer encode and decode through the accepted asn1c LTE RRC "
+               "UPER codec and carry an opaque NAS PDU on SRB1; test/lte/lte_cp_runtime.cpp round trips both and "
+               "refuses an empty payload, the wrong message type and a different UL-DCCH message"),
+        Assess(HandoverCapability::NAS_S1AP_OVER_SRB1_READY, true,
+               "the eNB bridge encodes the SetupComplete NAS as a real S1AP Initial UE Message, a ULInformationTransfer "
+               "as an Uplink NAS Transport and a Downlink NAS Transport as a DLInformationTransfer, binding the S1AP "
+               "identity pair; the same NAS bytes reach the far end of the slice unchanged"),
+        Assess(HandoverCapability::ENB_KE_NB_SECURITY_CONTEXT_READY, true,
+               "lte::security::EnbAsSecurityContext accepts only the KeNB the MME sends, holds no KASME and no NAS "
+               "COUNT, and derives the same RRC keys as the UE context derives from KASME; the AS procedure takes an "
+               "AsKeySource, so it cannot ask for a KASME"),
+        Assess(HandoverCapability::LTE_EPS_ATTACH_OVER_SRB1_READY, false,
+               "the Attach ran over SRB1 and the S1AP codec with a deterministic MME fixture, but the production UE NAS "
+               "state machine is not wired into the UE application yet and no live MME was used"),
+        Assess(HandoverCapability::LTE_OPEN5GS_ATTACH_ACCEPTED, false,
+               "REAL_OPEN5GS_ATTACH_ACCEPTANCE = NOT_EXECUTED: no authorized live Open5GS Attach was run in this phase"),
+        Assess(HandoverCapability::AS_SMC_RUNTIME_READY, true,
+               "the RRC SecurityModeCommand and SecurityModeComplete are produced, protected and verified by the B5 "
+               "procedures over the actual socket-backed SRB1; the command is the first secure downlink COUNT and the "
+               "completion the first uplink one, and the entities that carried them continue afterwards"),
+        Assess(HandoverCapability::AS_INITIAL_SECURITY_ACTIVATION_READY, true,
+               "both sides reached ACTIVE over the SRB1 runtime, ciphering was switched on only after the verified "
+               "completion, and the next DLInformationTransfer and ULInformationTransfer crossed protected"),
         Assess(HandoverCapability::HANDOVER_SECURITY_READY, false,
                "the key hierarchy exists and is verified, but the runtime has no RRC security mode procedure: no "
                "AS algorithm is selected, no RRC or PDCP protection is activated, and the UE cannot move its "

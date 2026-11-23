@@ -223,3 +223,11 @@ hierarchy itself.
 
 Making key derivation correct does not make a handover executable, and this
 build does not pretend otherwise.
+
+## B6-C: the eNB context
+
+`EnbAsSecurityContext` is the eNB half: it starts at the KeNB the MME sends in
+the S1AP Initial Context Setup Request, holds no KASME and no NAS COUNT, and
+implements the same `AsKeySource` interface as the UE context. The AS security
+procedure takes that interface, so it cannot ask for a KASME, and a test proves
+both sides derive the same RRC keys.

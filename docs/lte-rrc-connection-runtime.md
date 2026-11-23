@@ -63,3 +63,12 @@ a commercial stack.
 `RRC_CONNECTION_RUNTIME_READY` are true. `AS_SMC_RUNTIME_READY`,
 `AS_INITIAL_SECURITY_ACTIVATION_READY`, `HANDOVER_SECURITY_READY`,
 `UE_RADIO_EXECUTION_READY` and `LIVE_HANDOVER_EXECUTION_READY` remain false.
+
+## B6-C: the NAS carrier
+
+SRB1 now also carries connected-mode NAS: `ULInformationTransfer` /
+`DLInformationTransfer` above PDCP, and the RRC AS Security Mode procedure
+between them. The eNB side is composed into `EnbRrcBridge`, which turns the
+SetupComplete NAS into an S1AP Initial UE Message and drives the AS security
+procedure from the KeNB the MME sends. See
+[lte-nas-s1ap-runtime.md](lte-nas-s1ap-runtime.md).

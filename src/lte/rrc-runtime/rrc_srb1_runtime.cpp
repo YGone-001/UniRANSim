@@ -16,6 +16,9 @@ const char *ToString(Srb1RuntimeError error)
     case Srb1RuntimeError::NO_SETUP_CONFIGURED: return "NO_SETUP_CONFIGURED";
     case Srb1RuntimeError::UNEXPECTED_STATE: return "UNEXPECTED_STATE";
     case Srb1RuntimeError::ENCODE_FAILED: return "ENCODE_FAILED";
+    case Srb1RuntimeError::SECURITY_NOT_PREPARED: return "SECURITY_NOT_PREPARED";
+    case Srb1RuntimeError::SECURITY_ALREADY_ACTIVE: return "SECURITY_ALREADY_ACTIVE";
+    case Srb1RuntimeError::SECURITY_REQUIRED: return "SECURITY_REQUIRED";
     }
     return "UNKNOWN_SRB1_RUNTIME_ERROR";
 }
@@ -39,8 +42,7 @@ const std::vector<uint8_t> &EmptyBytes()
 // --- UE ---------------------------------------------------------------------
 
 UeSrb1Runtime::UeSrb1Runtime(uu::Socket &socket, uint16_t enbPort, Config config)
-    : socket_(socket), enbPort_(enbPort), config_(config),
-      srb0_(rlc::TmEntity::Create(config.association)),
+    : socket_(socket), enbPort_(enbPort), config_(config), srb0_(rlc::TmEntity::Create(config.association)),
       access_(UeInitialAccess::Idle(config.association, config.mmec, config.mTmsi)),
       pdcp_(pdcp::SrbPdcpEntity::Create(true))
 {
@@ -92,7 +94,10 @@ void UeSrb1Runtime::Pump(int timeoutMs)
         return;
     }
     if (!bearer_->OnFrame(frame))
+    {
         refused_++;
+        return;
+    }
 }
 
 void UeSrb1Runtime::OnAccessAnswer(const uu::Frame &frame)
@@ -119,9 +124,80 @@ void UeSrb1Runtime::OnAccessAnswer(const uu::Frame &frame)
 void UeSrb1Runtime::EstablishSrb1(const RrcConnectionSetupMessage &setup)
 {
     resolved_ = MapSrb1Configuration(setup);
-    bearer_ = std::make_unique<LteAmBearer>(socket_, enbPort_, EndpointRole::UE, config_.association, resolved_.am,
-                                            nullptr);
+    bearer_ = std::make_unique<LteAmBearer>(
+        socket_, enbPort_, EndpointRole::UE, config_.association, resolved_.am,
+        [this](std::vector<uint8_t> pdu) { OnSrb1Pdu(std::move(pdu)); });
     state_ = RrcState::RRC_SRB1_CONFIGURING;
+}
+
+void UeSrb1Runtime::SetNasCallback(NasCallback callback)
+{
+    onNas_ = std::move(callback);
+}
+
+std::vector<uint8_t> UeSrb1Runtime::Protect(const std::vector<uint8_t> &rrc)
+{
+    if (secured_ && secureTx_.has_value())
+        return secureTx_->Protect(rrc);
+    return pdcp_.Protect(rrc);
+}
+
+std::vector<uint8_t> UeSrb1Runtime::Unprotect(const std::vector<uint8_t> &pdu)
+{
+    if (secured_ && secureRx_.has_value())
+        return secureRx_->Unprotect(pdu);
+    return pdcp_.Unprotect(pdu);
+}
+
+void UeSrb1Runtime::OnSrb1Pdu(std::vector<uint8_t> pdu)
+{
+    if (expectingCommand_ && asContext_.has_value())
+    {
+        // The NAS layer has completed NAS security, so the next SRB1 PDU may be
+        // the RRC SecurityModeCommand. The procedure verifies it against its own
+        // COUNT 0 and answers with the protected completion.
+        expectingCommand_ = false;
+        procedure_ = security::UeAsSecurityProcedure::Listening(*asContext_, config_.association);
+        const std::vector<uint8_t> response = procedure_->OnCommand(pdu);
+        if (procedure_->State() == security::AsSecurityState::COMPLETE_PENDING)
+        {
+            procedure_->ConfirmCompleteSent();
+            secureTx_ = procedure_->TakeTx();
+            secureRx_ = procedure_->TakeRx();
+            secured_ = true;
+        }
+        if (!response.empty() && bearer_ != nullptr)
+        {
+            bearer_->SubmitSdu(response);
+            evidence_.pdcpPdus++;
+        }
+        return;
+    }
+
+    std::vector<uint8_t> rrc;
+    try
+    {
+        rrc = Unprotect(pdu);
+    }
+    catch (const pdcp::SrbPdcpException &)
+    {
+        refused_++;
+        return;
+    }
+    OnRrc(rrc);
+}
+
+void UeSrb1Runtime::OnRrc(const std::vector<uint8_t> &rrc)
+{
+    InformationTransferMessage information;
+    if (DecodeDlInformationTransfer(rrc.data(), rrc.size(), information))
+    {
+        evidence_.downlinkNas++;
+        if (onNas_)
+            onNas_(information.dedicatedInfoNas);
+        return;
+    }
+    refused_++;
 }
 
 void UeSrb1Runtime::SubmitSetupComplete(const std::vector<uint8_t> &nas)
@@ -152,6 +228,40 @@ void UeSrb1Runtime::SubmitSetupComplete(const std::vector<uint8_t> &nas)
     state_ = RrcState::RRC_CONNECTION_COMPLETE_PENDING;
 }
 
+void UeSrb1Runtime::SubmitNas(const std::vector<uint8_t> &nas)
+{
+    if (bearer_ == nullptr)
+        throw Srb1RuntimeException(Srb1RuntimeError::NOT_ESTABLISHED);
+
+    InformationTransferMessage message;
+    message.dedicatedInfoNas = nas;
+    const std::vector<uint8_t> rrc = EncodeUlInformationTransfer(message);
+    if (rrc.empty())
+        throw Srb1RuntimeException(Srb1RuntimeError::ENCODE_FAILED);
+
+    const std::vector<uint8_t> pdu = Protect(rrc);
+    bearer_->SubmitSdu(pdu);
+    evidence_.uplinkNas++;
+    evidence_.rrcMessages++;
+}
+
+void UeSrb1Runtime::PrepareAsSecurity(const security::Key256 &kasme, uint32_t ulNasCount, uint64_t nasGeneration)
+{
+    if (bearer_ == nullptr)
+        throw Srb1RuntimeException(Srb1RuntimeError::NOT_ESTABLISHED);
+    if (secured_)
+        throw Srb1RuntimeException(Srb1RuntimeError::SECURITY_ALREADY_ACTIVE);
+
+    asContext_ = security::AsSecurityContext::Create(config_.association, kasme, ulNasCount, nasGeneration,
+                                                     security::AsAlgorithmSet{});
+    expectingCommand_ = true;
+}
+
+bool UeSrb1Runtime::AsSecurityActive() const
+{
+    return secured_ && secureTx_.has_value() && secureRx_.has_value();
+}
+
 void UeSrb1Runtime::Tick()
 {
     if (bearer_ != nullptr)
@@ -169,6 +279,11 @@ void UeSrb1Runtime::Release()
         bearer_.reset();
     }
     pdcp_.Release();
+    secureTx_.reset();
+    secureRx_.reset();
+    asContext_.reset();
+    procedure_.reset();
+    secured_ = false;
     state_ = RrcState::RRC_RELEASED;
 }
 
@@ -178,9 +293,12 @@ EnbSrb1Runtime::EnbSrb1Runtime(uu::Socket &socket, Config config, NasCallback on
     : socket_(socket), config_(config), onNas_(std::move(onNas)), srb0_(rlc::TmEntity::Create(0))
 {
     access_.SetSetup(config_.setup);
-    // The eNB instantiates exactly the configuration it offers. An unsupported
-    // enumeration is refused here, before any UE can be reached.
     (void)MapSrb1Configuration(config_.setup);
+}
+
+void EnbSrb1Runtime::SetUplinkNasCallback(UplinkNasCallback callback)
+{
+    onUplinkNas_ = std::move(callback);
 }
 
 void EnbSrb1Runtime::Pump(int timeoutMs)
@@ -223,8 +341,6 @@ void EnbSrb1Runtime::OnRequestFrame(uint32_t association, const uu::Frame &frame
     auto existing = contexts_.find(association);
     if (existing != contexts_.end())
     {
-        // One context per association. A repeat from the same endpoint gets the
-        // same answer; a different endpoint claiming the association is refused.
         if (existing->second.peerPort != sourcePort)
         {
             refused_++;
@@ -272,48 +388,160 @@ void EnbSrb1Runtime::OnSrb1Frame(uint32_t association, const uu::Frame &frame)
         refused_++;
 }
 
+std::vector<uint8_t> EnbSrb1Runtime::Protect(Context &context, const std::vector<uint8_t> &rrc)
+{
+    if (context.secured && context.secureTx.has_value())
+        return context.secureTx->Protect(rrc);
+    return context.pdcp.Protect(rrc);
+}
+
+std::vector<uint8_t> EnbSrb1Runtime::Unprotect(Context &context, const std::vector<uint8_t> &pdu)
+{
+    if (context.secured && context.secureRx.has_value())
+        return context.secureRx->Unprotect(pdu);
+    return context.pdcp.Unprotect(pdu);
+}
+
 void EnbSrb1Runtime::OnPdcpPdu(Context &context, uint32_t association, const std::vector<uint8_t> &pdu)
 {
     context.pdcpPdus.push_back(pdu);
 
-    std::vector<uint8_t> rrcPdu;
+    // The first uplink after the command is the SecurityModeComplete, which the
+    // procedure verifies with the entities it created. It is never handed to the
+    // steady-state receive path.
+    if (context.procedure.has_value() &&
+        context.procedure->State() == security::AsSecurityState::COMMAND_PENDING)
+    {
+        try
+        {
+            context.procedure->OnComplete(pdu);
+        }
+        catch (const security::ProcedureException &)
+        {
+            refusedRrc_++;
+            return;
+        }
+        context.secureTx = context.procedure->TakeTx();
+        context.secureRx = context.procedure->TakeRx();
+        context.secured = context.secureTx.has_value() && context.secureRx.has_value();
+        return;
+    }
+
+    if (context.state != RrcState::RRC_CONNECTED && context.state != RrcState::RRC_SETUP_PENDING)
+    {
+        refusedRrc_++;
+        return;
+    }
+
+    std::vector<uint8_t> rrc;
     try
     {
-        rrcPdu = context.pdcp.Unprotect(pdu);
+        rrc = Unprotect(context, pdu);
     }
     catch (const pdcp::SrbPdcpException &)
     {
-        refusedSetupComplete_++;
+        // Before the connection is up the only expected SRB1 PDU is the
+        // SetupComplete, so a malformed PDU is a refused SetupComplete.
+        if (context.state == RrcState::RRC_SETUP_PENDING)
+            refusedSetupComplete_++;
+        else
+            refusedRrc_++;
+        return;
+    }
+    catch (const security::PdcpSecurityException &)
+    {
+        // A bad MAC-I, a replayed COUNT or a malformed secure header: nothing is
+        // delivered and no state is replaced.
+        refusedRrc_++;
+        return;
+    }
+    OnRrc(context, association, rrc);
+}
+
+void EnbSrb1Runtime::OnRrc(Context &context, uint32_t association, const std::vector<uint8_t> &rrc)
+{
+    // Before the SetupComplete is accepted, the only RRC message on SRB1 is it.
+    if (context.state == RrcState::RRC_SETUP_PENDING)
+    {
+        RrcConnectionSetupCompleteMessage message;
+        if (!DecodeRrcConnectionSetupComplete(rrc.data(), rrc.size(), message))
+        {
+            refusedSetupComplete_++;
+            return;
+        }
+        if (message.transactionId != context.transactionId ||
+            message.selectedPlmnIdentity != config_.expectedPlmnIdentity)
+        {
+            refusedSetupComplete_++;
+            return;
+        }
+
+        context.received = message;
+        context.deliveredNas = message.dedicatedInfoNas;
+        context.deliveries++;
+        context.state = RrcState::RRC_CONNECTED;
+        if (onNas_)
+            onNas_(association, message);
         return;
     }
 
-    // One SetupComplete per context: once the context is connected, a second
-    // message is an unexpected RRC message, not a second NAS delivery.
-    if (context.state != RrcState::RRC_SETUP_PENDING)
+    InformationTransferMessage information;
+    if (DecodeUlInformationTransfer(rrc.data(), rrc.size(), information))
     {
-        refusedSetupComplete_++;
+        context.uplinkNas.push_back(information.dedicatedInfoNas);
+        if (onUplinkNas_)
+            onUplinkNas_(association, information.dedicatedInfoNas);
+        return;
+    }
+    refusedRrc_++;
+}
+
+void EnbSrb1Runtime::SendDownlinkNas(uint32_t association, const std::vector<uint8_t> &nas)
+{
+    const auto it = contexts_.find(association);
+    if (it == contexts_.end() || it->second.bearer == nullptr)
+    {
+        refused_++;
+        return;
+    }
+    Context &context = it->second;
+    if (context.state != RrcState::RRC_CONNECTED)
+    {
+        refusedRrc_++;
         return;
     }
 
-    RrcConnectionSetupCompleteMessage message;
-    if (!DecodeRrcConnectionSetupComplete(rrcPdu.data(), rrcPdu.size(), message))
+    InformationTransferMessage message;
+    message.dedicatedInfoNas = nas;
+    const std::vector<uint8_t> rrc = EncodeDlInformationTransfer(message);
+    if (rrc.empty())
     {
-        refusedSetupComplete_++;
+        refusedRrc_++;
         return;
     }
-    if (message.transactionId != context.transactionId ||
-        message.selectedPlmnIdentity != config_.expectedPlmnIdentity)
-    {
-        refusedSetupComplete_++;
-        return;
-    }
+    context.bearer->SubmitSdu(Protect(context, rrc));
+    context.downlinkNas++;
+}
 
-    context.received = message;
-    context.deliveredNas = message.dedicatedInfoNas;
-    context.deliveries++;
-    context.state = RrcState::RRC_CONNECTED;
-    if (onNas_)
-        onNas_(association, message);
+void EnbSrb1Runtime::StartAsSecurity(uint32_t association, const security::Key256 &kenb,
+                                     const security::UeAlgorithmCapabilities &capabilities,
+                                     const security::AsAlgorithmConfiguration &configuration,
+                                     uint64_t s1Generation, uint8_t transactionId)
+{
+    const auto it = contexts_.find(association);
+    if (it == contexts_.end() || it->second.bearer == nullptr)
+        throw Srb1RuntimeException(Srb1RuntimeError::NOT_ESTABLISHED);
+    Context &context = it->second;
+    if (context.secured)
+        throw Srb1RuntimeException(Srb1RuntimeError::SECURITY_ALREADY_ACTIVE);
+
+    context.asContext = security::EnbAsSecurityContext::Create(association, kenb, s1Generation);
+    context.procedure = security::EnbAsSecurityProcedure::Start(*context.asContext, association, capabilities,
+                                                               configuration, configuration.ciphering.generation,
+                                                               transactionId);
+    // The command is already an integrity-protected PDCP PDU: it bypasses the
+    // pre-security profile and is the first secure downlink COUNT.
+    context.bearer->SubmitSdu(context.procedure->Command());
 }
 
 void EnbSrb1Runtime::Tick()
@@ -373,6 +601,46 @@ const std::vector<std::vector<uint8_t>> &EnbSrb1Runtime::PdcpPdusOf(uint32_t ass
     static const std::vector<std::vector<uint8_t>> empty{};
     const auto it = contexts_.find(association);
     return it == contexts_.end() ? empty : it->second.pdcpPdus;
+}
+
+bool EnbSrb1Runtime::AsSecurityActive(uint32_t association) const
+{
+    const auto it = contexts_.find(association);
+    return it != contexts_.end() && it->second.secured && it->second.secureTx.has_value() &&
+           it->second.secureRx.has_value();
+}
+
+const security::EnbAsSecurityContext *EnbSrb1Runtime::SecurityContextOf(uint32_t association) const
+{
+    const auto it = contexts_.find(association);
+    return it == contexts_.end() || !it->second.asContext.has_value() ? nullptr : &*it->second.asContext;
+}
+
+security::AsSecurityState EnbSrb1Runtime::AsSecurityStateOf(uint32_t association) const
+{
+    const auto it = contexts_.find(association);
+    if (it == contexts_.end() || !it->second.procedure.has_value())
+        return security::AsSecurityState::UNINITIALIZED;
+    return it->second.procedure->State();
+}
+
+size_t EnbSrb1Runtime::UplinkNasCount(uint32_t association) const
+{
+    const auto it = contexts_.find(association);
+    return it == contexts_.end() ? 0 : it->second.uplinkNas.size();
+}
+
+size_t EnbSrb1Runtime::DownlinkNasCount(uint32_t association) const
+{
+    const auto it = contexts_.find(association);
+    return it == contexts_.end() ? 0 : it->second.downlinkNas;
+}
+
+const std::vector<std::vector<uint8_t>> &EnbSrb1Runtime::UplinkNasOf(uint32_t association) const
+{
+    static const std::vector<std::vector<uint8_t>> empty{};
+    const auto it = contexts_.find(association);
+    return it == contexts_.end() ? empty : it->second.uplinkNas;
 }
 
 void EnbSrb1Runtime::Release(uint32_t association) noexcept

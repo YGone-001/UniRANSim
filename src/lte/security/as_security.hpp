@@ -167,9 +167,27 @@ struct TargetDerivation
 [[nodiscard]] TargetDerivation DeriveTargetKenbStar(const ByteString &nextHopParameter, uint8_t nextHopChainingCount,
                                                     const TargetRadioConfig &radio);
 
+// --- The key source an AS security procedure needs ---------------------------
+//
+// The eNB and the UE reach the same KeNB by different routes: the UE derives it
+// from KASME, the eNB receives it from the MME. An AS security procedure only
+// needs the KeNB, the algorithm state and the access keys, so it takes this
+// interface and never a UE-only type. That is what keeps KASME out of the eNB.
+class AsKeySource
+{
+  public:
+    virtual ~AsKeySource() = default;
+
+    [[nodiscard]] virtual bool IsActive() const = 0;
+    [[nodiscard]] virtual uint32_t OwnerUeId() const = 0;
+    [[nodiscard]] virtual Key256 ActiveKenb() const = 0;
+    [[nodiscard]] virtual AsKeys DeriveAccessKeys() const = 0;
+    virtual void ApplyAsAlgorithms(const AsAlgorithmSet &algorithms) = 0;
+};
+
 // --- UE-owned AS security context ------------------------------------------
 
-class AsSecurityContext
+class AsSecurityContext : public AsKeySource
 {
   public:
     AsSecurityContext() = default;
@@ -187,11 +205,11 @@ class AsSecurityContext
     static AsSecurityContext Create(uint32_t ownerUeId, const Key256 &kasme, uint32_t ulNasCount,
                                     uint64_t nasGeneration, const AsAlgorithmSet &algorithms);
 
-    [[nodiscard]] bool IsActive() const noexcept
+    [[nodiscard]] bool IsActive() const noexcept override
     {
         return active_;
     }
-    [[nodiscard]] uint32_t OwnerUeId() const noexcept
+    [[nodiscard]] uint32_t OwnerUeId() const noexcept override
     {
         return ownerUeId_;
     }
@@ -214,12 +232,12 @@ class AsSecurityContext
     // the context owns the key hierarchy but no AS algorithm, and refuses to
     // derive RRC/UP keys; after it the keys exist for a procedure that has not
     // necessarily completed yet. Derivation is still not activation.
-    void ApplyAsAlgorithms(const AsAlgorithmSet &algorithms);
+    void ApplyAsAlgorithms(const AsAlgorithmSet &algorithms) override;
 
     // The active KeNB. Returned by value because the context must stay the only
     // owner of the stored key.
-    [[nodiscard]] Key256 ActiveKenb() const;
-    [[nodiscard]] AsKeys DeriveAccessKeys() const;
+    [[nodiscard]] Key256 ActiveKenb() const override;
+    [[nodiscard]] AsKeys DeriveAccessKeys() const override;
 
     // Stages a handover candidate. Horizontal when the received NCC equals the
     // NCC of the active KeNB, vertical otherwise; a vertical derivation walks

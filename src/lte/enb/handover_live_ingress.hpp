@@ -112,6 +112,23 @@ enum class HandoverCapability : uint8_t
     // RRCConnectionSetupComplete -> eNB decode -> NAS boundary, over the
     // simulated Uu, in one process and across two.
     RRC_CONNECTION_RUNTIME_READY,
+    // Phase 18-F-B6-C: UL/DLInformationTransfer carry an opaque NAS PDU on
+    // SRB1, through the same PDCP and RLC AM.
+    RRC_INFORMATION_TRANSFER_READY,
+    // The eNB bridge turns the SetupComplete NAS into an Initial UE Message and
+    // a ULInformationTransfer into an Uplink NAS Transport, and the reverse for
+    // Downlink NAS Transport, with the real S1AP codec and identity pair.
+    NAS_S1AP_OVER_SRB1_READY,
+    // The eNB owns a KeNB-only AS security context built from the S1AP
+    // securityKey, with no KASME and no NAS COUNT.
+    ENB_KE_NB_SECURITY_CONTEXT_READY,
+    // The whole Attach ran over SRB1 and S1AP with a deterministic MME fixture.
+    // The UE NAS state machine is not wired into the production UE application
+    // yet, so this stays false until it drives the messages itself.
+    LTE_EPS_ATTACH_OVER_SRB1_READY,
+    // External acceptance evidence: only an authorized live Open5GS Attach can
+    // make it true, and none was executed.
+    LTE_OPEN5GS_ATTACH_ACCEPTED,
     // The procedure exists and is exercised end to end in-process. The SRB1
     // runtime now exists, but the SecurityMode messages are not carried over it
     // yet: that is B6-C.
