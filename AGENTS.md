@@ -1005,6 +1005,33 @@ Phase 18-F-B6-A starts the runtime carrier under the AS security work.
 - **No SRB1 claim.** This entity is not wired to SRB1, PDCP or the RRC connection;
   `SRB1_RLC_AM_READY` stays false until B6-B2.
 
+`lte_am_bearer.{hpp,cpp}` puts one entity on one simulated Uu endpoint; the design
+records are `docs/lte-rlc-am-engine.md`, `docs/lte-rlc-am-state-machine.md`,
+`docs/lte-rlc-am-retransmission.md` and `docs/lte-rlc-am-pdu-format.md`.
+
+- **One bearer, one socket, one association.** The bearer moves a `uu::Socket`
+  in and binds the entity's sender and deliverer to it. A test never calls the
+  opposite endpoint's entity, and never shares a buffer between endpoints.
+- **The D/C bit routes the receive path.** AMD and STATUS are told apart by the
+  first octet the LTE header already carries; do not add a type field to the
+  envelope and do not add an RRC shortcut.
+- **Reassembly merges, it does not concatenate.** Reception keeps only the byte
+  ranges it does not already hold, so a duplicate or an overlapping
+  retransmission cannot double a delivered SDU. Keep that rule when touching
+  `OnPdu`.
+- **A reordering expiry must not acknowledge past a hole.** It makes the pending
+  STATUS due and leaves VR(R) at the missing SN; moving VR(R) to VR(H) silently
+  drops the SDU because the report is computed over `[VR(R), VR(H))`.
+- **Impairment is test-owned and deterministic.** `test/lte/lte_am_uu.cpp` puts
+  a node on the link that drops, duplicates, delays, reorders or re-segments a
+  frame - and nothing else. It never repairs loss, never fabricates an ACK, and
+  never enters production code. A partially delivered PDU is produced by
+  re-encoding it as AMD segments at the link, not by weakening the transport.
+- **Evidence comes from the frames.** A runtime test states direction, endpoint,
+  PDU type, SN, SO, length, poll bit and STATUS result from the decoded frames it
+  actually saw, plus the entity counters for transmission and retransmission; it
+  does not infer success from the absence of a crash.
+
 ## LTE performance and capacity
 
 Two goals drive the current workstream: PERF-P1 (single UE sustained 1 Gbps

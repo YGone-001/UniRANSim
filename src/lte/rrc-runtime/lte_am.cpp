@@ -218,7 +218,22 @@ void LteAmEntity::OnStatusPdu(const std::vector<uint8_t> &pdu)
         }
         stored.transmissions++;
         retransmissions_++;
-        SendPdu(stored.sn, false, stored.fi, piece, std::make_pair(start, coversEnd ? SoMax : static_cast<uint16_t>(last)));
+        // The LI chain lives at the very beginning of the PDU data, so a
+        // replacement segment that starts at offset zero carries it and one
+        // that starts later does not. The chain is only sent when the whole
+        // element prefix it describes fits in the piece; the receiver would
+        // otherwise refuse a chain longer than the data field.
+        std::vector<uint16_t> replacementLi;
+        if (start == 0)
+        {
+            size_t described = 0;
+            for (auto length : stored.li)
+                described += length;
+            if (described <= piece.size())
+                replacementLi = stored.li;
+        }
+        SendPdu(stored.sn, false, stored.fi, piece,
+                std::make_pair(start, coversEnd ? SoMax : static_cast<uint16_t>(last)), replacementLi);
     }
 }
 
@@ -259,11 +274,51 @@ void LteAmEntity::OnPdu(const std::vector<uint8_t> &pdu)
     if (!decoded.li.empty())
         entry.li = decoded.li;
 
-    RxSegment segment;
-    segment.so = decoded.segment ? decoded.so : 0;
-    segment.lsf = decoded.segment ? decoded.lsf : true;
-    segment.data = decoded.data;
-    entry.segments.push_back(segment);
+    // Bytes that have already arrived are not inserted a second time. A
+    // duplicated PDU would otherwise be concatenated twice when the SDU is
+    // reassembled, and a partially overlapping retransmission would append
+    // bytes the receiver already holds. Only the still-missing sub-ranges of
+    // this PDU are kept, and the LSF flag stays on the piece that reaches the
+    // original end of the data.
+    const size_t segmentStart = decoded.segment ? decoded.so : 0;
+    const bool segmentLsf = decoded.segment ? decoded.lsf : true;
+    const size_t segmentEnd = segmentStart + decoded.data.size();
+
+    std::sort(entry.segments.begin(), entry.segments.end(),
+              [](const RxSegment &a, const RxSegment &b) { return a.so < b.so; });
+
+    std::vector<RxSegment> missing;
+    size_t cursor = segmentStart;
+    for (const auto &part : entry.segments)
+    {
+        const size_t partEnd = static_cast<size_t>(part.so) + part.data.size();
+        if (partEnd <= cursor)
+            continue;
+        if (part.so >= segmentEnd)
+            break;
+        if (part.so > cursor)
+        {
+            RxSegment piece;
+            piece.so = static_cast<uint16_t>(cursor);
+            piece.lsf = false;
+            piece.data.assign(decoded.data.begin() + static_cast<long>(cursor - segmentStart),
+                              decoded.data.begin() + static_cast<long>(part.so - segmentStart));
+            missing.push_back(std::move(piece));
+        }
+        cursor = partEnd;
+        if (cursor >= segmentEnd)
+            break;
+    }
+    if (cursor < segmentEnd)
+    {
+        RxSegment piece;
+        piece.so = static_cast<uint16_t>(cursor);
+        piece.lsf = segmentLsf;
+        piece.data.assign(decoded.data.begin() + static_cast<long>(cursor - segmentStart), decoded.data.end());
+        missing.push_back(std::move(piece));
+    }
+    for (auto &piece : missing)
+        entry.segments.push_back(std::move(piece));
 
     std::sort(entry.segments.begin(), entry.segments.end(),
               [](const RxSegment &a, const RxSegment &b) { return a.so < b.so; });
@@ -462,10 +517,14 @@ void LteAmEntity::OnTick()
         if (++reorderTimer_ >= config_.reorderingTicks)
         {
             reorderTimer_ = 0;
+            // TS 36.322 5.2.2.4 updates RX_Highest_Status on t-Reordering
+            // expiry; it does not advance RX_Next. Moving VR(R) to VR(H) here
+            // would acknowledge past the hole, and because the STATUS report is
+            // computed over [VR(R), VR(H)) the missing SN would never be named
+            // again - the gap would be dropped silently. Keep VR(R) where it is
+            // so the report names the hole and the peer retransmits it.
             vrX_ = vrH_;
-            vrR_ = vrH_;
             reordering_ = false;
-            TryDeliverInOrder();
             statusPending_ = true;
         }
     }

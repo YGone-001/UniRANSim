@@ -47,6 +47,20 @@ class LteAmBearer
     {
         return sent_;
     }
+    // Entity counters, so a test can state the retransmission count it observed
+    // instead of inferring it from the frame stream.
+    [[nodiscard]] size_t Transmissions() const
+    {
+        return entity_.Transmissions();
+    }
+    [[nodiscard]] size_t Retransmissions() const
+    {
+        return entity_.Retransmissions();
+    }
+    [[nodiscard]] size_t DroppedOutOfWindow() const
+    {
+        return entity_.DroppedOutOfWindow();
+    }
     [[nodiscard]] const uu::Socket &Transport() const
     {
         return socket_;
