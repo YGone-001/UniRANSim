@@ -232,6 +232,8 @@ TEST_CASE("lte/handover/live: the capability model names every missing live prer
     CHECK(readiness.available(HandoverCapability::ENB_KE_NB_SECURITY_CONTEXT_READY));
     CHECK_FALSE(readiness.available(HandoverCapability::LTE_EPS_ATTACH_OVER_SRB1_READY));
     CHECK_FALSE(readiness.available(HandoverCapability::LTE_OPEN5GS_ATTACH_ACCEPTED));
+    CHECK(readiness.available(HandoverCapability::LTE_PRODUCTION_ENB_SRB1_READY));
+    CHECK(readiness.available(HandoverCapability::LTE_PRODUCTION_MULTIPLEXER_BRIDGE_READY));
     CHECK(readiness.available(HandoverCapability::AS_ALGORITHM_SELECTION_READY));
     CHECK(readiness.available(HandoverCapability::AS_SMC_CODEC_READY));
     CHECK(readiness.available(HandoverCapability::PDCP_RRC_INTEGRITY_READY));
@@ -270,7 +272,7 @@ TEST_CASE("lte/handover/live: the capability model names every missing live prer
     CHECK_FALSE(readiness.available(HandoverCapability::MME_PATH_UPDATE_OBSERVABLE));
 
     // Every assessment carries the fact it rests on.
-    REQUIRE(readiness.assessments.size() == 31);
+    REQUIRE(readiness.assessments.size() == 33);
     for (const auto &assessment : readiness.assessments)
     {
         CHECK_FALSE(assessment.evidence.empty());

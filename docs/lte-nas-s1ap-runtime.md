@@ -99,3 +99,48 @@ context, and two independent UE contexts on two eNBs.
 - The E-RAB setup items in the response come from the caller; the bridge does not
   allocate GTP-U endpoints.
 - No SRB2, no DRB PDCP, no re-establishment, no handover security change.
+
+## B6-D1: the production eNB owns the bridge
+
+`EnbMultiplexer` now constructs the bridge when the configuration states a Uu
+endpoint, and binds the two halves together:
+
+- the bridge takes the multiplexer's **UE registry allocator**, so the Initial UE
+  Message names an identifier the registry already owns;
+- every bridge message leaves through an **identified sink** that selects the
+  existing SCTP stream (`SctpStreamForUe`) and the existing sender binding;
+- the **setup callback** registers the pending `EnbUeEntry` (transport
+  `UuSrb1`, its Uu peer, the identifier, `CONTEXT_PENDING`) *before* the Initial
+  UE Message is emitted.
+
+`EnbUeEntry` carries an explicit `RadioTransportKind`. `sendRadio()` dispatches on
+it: a legacy UE keeps the software-radio link, a Uu/SRB1 UE never receives a
+legacy frame (they are counted in `bridgeDroppedLegacyFrames()` and are never
+re-sent down another path). Downlink NAS and Initial Context Setup for a Uu UE
+are routed to the bridge; uplink NAS comes back through it.
+
+## Deferred Initial Context Setup
+
+For a Uu/SRB1 UE the request is validated and its E-RAB TEIDs are reserved
+exactly as before, but the outcome is staged in a `PendingIcs` record instead of
+being committed:
+
+```text
+InitialContextSetupRequest -> validate -> reserve TEIDs -> StartAsSecurity
+        -> SecurityModeCommand/Complete over SRB1 -> AsSecurityActive
+        -> bind TEIDs, set MME id, send the response, commit the entry
+```
+
+`commitPendingIcs()` runs from every `poll()`, so the event loop never blocks. A
+transaction is abandoned after `kPendingIcsPolls` polls without security, and
+`unbindAssociation()` cancels every pending transaction of the association,
+releasing only the TEIDs it reserved. A response is therefore never sent before
+the radio-side security procedure succeeded, and a security failure cannot be
+reported as a successful E-RAB setup.
+
+## What is still missing
+
+- The S1AP codec decodes no message-level NAS-PDU for Initial Context Setup, so
+the optional NAS-PDU is still not delivered (the decoder carries none).
+- The production UE application still sends NAS over the legacy link (B6-D2).
+- There is no live Open5GS run: `REAL_OPEN5GS_ATTACH_ACCEPTANCE = NOT_EXECUTED`.

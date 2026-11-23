@@ -102,8 +102,7 @@ void EnbRrcBridge::OnUplinkNas(uint32_t association, const std::vector<uint8_t> 
     context.mmeUeS1apId = it->second.mmeUeS1apId;
     const auto pdu = EncodeUplinkNasTransport(config_.enb, context, nas);
     uplinkNasTransports_++;
-    if (sink_)
-        sink_(pdu);
+    Emit(it->second.enbUeS1apId, pdu);
 }
 
 void EnbRrcBridge::OnDownlinkNasTransport(const std::vector<uint8_t> &pdu)
@@ -200,6 +199,27 @@ void EnbRrcBridge::OnInitialContextSetupRequest(const std::vector<uint8_t> &pdu)
     }
 }
 
+void EnbRrcBridge::StartAsSecurity(uint32_t association, const InitialContextSetupRequest &request)
+{
+    const auto it = associations_.find(association);
+    if (it == associations_.end())
+        throw lte::rrc::Srb1RuntimeException(lte::rrc::Srb1RuntimeError::NOT_ESTABLISHED);
+    if (request.enbUeS1apId != it->second.enbUeS1apId)
+        throw s1ap::CodecError("Initial Context Setup Request names another eNB-UE-S1AP-ID");
+    if (it->second.mmeUeS1apId != 0 && it->second.mmeUeS1apId != request.mmeUeS1apId)
+        throw s1ap::CodecError("Initial Context Setup Request names another MME-UE-S1AP-ID");
+
+    it->second.mmeUeS1apId = request.mmeUeS1apId;
+    const auto capabilities = MapUeSecurityCapabilities(request.encryptionAlgorithms, request.integrityAlgorithms);
+    runtime_.StartAsSecurity(association, request.securityKey, capabilities, config_.algorithms,
+                             request.mmeUeS1apId, 0);
+}
+
+void EnbRrcBridge::SendDownlinkNas(uint32_t association, const std::vector<uint8_t> &nas)
+{
+    runtime_.SendDownlinkNas(association, nas);
+}
+
 void EnbRrcBridge::CompleteInitialContextSetup(uint32_t association, const std::vector<ErabSetupItem> &erabs)
 {
     const auto it = associations_.find(association);
@@ -220,8 +240,7 @@ void EnbRrcBridge::CompleteInitialContextSetup(uint32_t association, const std::
     it->second.icsPending = false;
     it->second.icsCompleted = true;
     setupResponses_++;
-    if (sink_)
-        sink_(pdu);
+    Emit(it->second.enbUeS1apId, pdu);
 }
 
 void EnbRrcBridge::OnS1AssociationLost()

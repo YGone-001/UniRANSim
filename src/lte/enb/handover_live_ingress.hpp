@@ -129,6 +129,11 @@ enum class HandoverCapability : uint8_t
     // External acceptance evidence: only an authorized live Open5GS Attach can
     // make it true, and none was executed.
     LTE_OPEN5GS_ATTACH_ACCEPTED,
+    // Phase 18-F-B6-D1: the production eNB multiplexer owns the SRB1 bridge,
+    // dispatches radio messages by an explicit per-UE transport kind, and
+    // defers the Initial Context Setup outcome until AS security is active.
+    LTE_PRODUCTION_ENB_SRB1_READY,
+    LTE_PRODUCTION_MULTIPLEXER_BRIDGE_READY,
     // The procedure exists and is exercised end to end in-process. The SRB1
     // runtime now exists, but the SecurityMode messages are not carried over it
     // yet: that is B6-C.

@@ -72,6 +72,14 @@ class EnbRrcBridge
     void OnDownlinkNasTransport(const std::vector<uint8_t> &pdu);
     void OnInitialContextSetupRequest(const std::vector<uint8_t> &pdu);
 
+    // Starts the radio AS security procedure from an Initial Context Setup
+    // Request the owner already decoded and validated. The command is emitted on
+    // SRB1; the owner must not answer the MME before AsSecurityActive().
+    void StartAsSecurity(uint32_t association, const InitialContextSetupRequest &request);
+
+    // DLInformationTransfer carrying opaque NAS on an established association.
+    void SendDownlinkNas(uint32_t association, const std::vector<uint8_t> &nas);
+
     // Called by the owner once the E-RABs of a pending Initial Context Setup are
     // established. Nothing is reported before this, and nothing is reported at
     // all if AS security did not activate.

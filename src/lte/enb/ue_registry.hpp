@@ -70,10 +70,21 @@ class RegistryError : public std::runtime_error
 // stable for the entry lifetime; the S1AP identifiers, the access transport and
 // the local S1-U TEID belong to one S1 connection and are invalidated when
 // that connection is released.
+// How this UE's radio control messages reach it. The kind is stated when the
+// entry is created and never inferred from an address, a port or the presence
+// of a pointer: a legacy UE and a Uu/SRB1 UE are served by different transports
+// and must never be routed through each other's.
+enum class RadioTransportKind : uint8_t
+{
+    LegacyLink,
+    UuSrb1,
+};
+
 struct EnbUeEntry
 {
     uint32_t radioUeId{};
     InetAddress peer{};
+    RadioTransportKind transport{RadioTransportKind::LegacyLink};
     UeS1State s1{UeS1State::NO_S1};
     // Zero while no S1 connection exists; allocated fresh for every context.
     uint32_t enbUeS1apId{};

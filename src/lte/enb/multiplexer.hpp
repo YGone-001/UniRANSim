@@ -9,6 +9,7 @@
 #pragma once
 
 #include "codec.hpp"
+#include "enb_rrc_bridge.hpp"
 #include "handover_live_ingress.hpp"
 #include "handover_preparation.hpp"
 #include "handover_source_release.hpp"
@@ -19,6 +20,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -319,7 +321,60 @@ class EnbMultiplexer
     // sockets remain owned by this object until it is destroyed.
     void shutdown();
 
+  public:
+    // B6-D1: the Uu/SRB1 side of this eNB. A configuration without a Uu
+    // endpoint leaves all of it absent, and every legacy path is unchanged.
+    [[nodiscard]] bool uuEnabled() const
+    {
+        return m_bridge != nullptr;
+    }
+    [[nodiscard]] size_t bridgeAssociationCount() const;
+    [[nodiscard]] bool bridgeHasAssociation(uint32_t association) const;
+    [[nodiscard]] bool asSecurityActive(uint32_t association) const;
+    [[nodiscard]] size_t bridgeDownlinkNas() const
+    {
+        return m_bridge == nullptr ? 0 : m_bridge->DownlinkNasTransports();
+    }
+    [[nodiscard]] size_t bridgeRefused() const
+    {
+        return m_bridge == nullptr ? 0 : m_bridge->Refused();
+    }
+    [[nodiscard]] size_t bridgeRefusedRrc() const
+    {
+        return m_bridge == nullptr ? 0 : m_bridge->Runtime().RefusedRrc();
+    }
+    [[nodiscard]] size_t bridgeUplinkNas(uint32_t association) const
+    {
+        return m_bridge == nullptr ? 0 : m_bridge->Runtime().UplinkNasCount(association);
+    }
+    [[nodiscard]] uint64_t bridgeDroppedLegacyFrames() const
+    {
+        return m_bridgeDroppedLegacyFrames;
+    }
+    [[nodiscard]] size_t pendingInitialContextSetups() const
+    {
+        return m_pendingIcs.size();
+    }
+
   private:
+    // B6-D1: the deferred Initial Context Setup transaction of one Uu UE. It
+    // holds everything the request carried and the outcome that must only be
+    // committed after the radio-side AS security procedure succeeded.
+    struct PendingIcs
+    {
+        uint32_t enbUeS1apId{0};
+        uint32_t mmeUeS1apId{0};
+        std::vector<uint8_t> response{};
+        std::vector<s1ap::ErabSetupItem> established{};
+        EnbUeEntry candidate{};
+        std::vector<uint8_t> nasPdu{};
+        bool deliverNas{false};
+        uint32_t ticksLeft{0};
+    };
+    void initUuTransport();
+    void pollUu();
+    void commitPendingIcs();
+    void cancelPendingIcs(uint32_t enbUeS1apId);
     void onInitialContextSetupRequest(const uint8_t *data, size_t size);
     void onDownlinkNasTransport(const uint8_t *data, size_t size);
     void onUeContextReleaseCommand(const uint8_t *data, size_t size);
@@ -386,6 +441,12 @@ class EnbMultiplexer
     uint64_t m_restorationLatencyMs{};
     std::chrono::steady_clock::time_point m_accessInvalidatedAt{};
     udp::UdpServer m_ueLink;
+    // B6-D1: the simulated Uu endpoint and the SRB1 bridge, present only when the
+    // configuration states a Uu endpoint.
+    std::unique_ptr<uu::Socket> m_uuSocket;
+    std::unique_ptr<s1ap::EnbRrcBridge> m_bridge;
+    uint64_t m_bridgeDroppedLegacyFrames{0};
+    std::map<uint32_t, PendingIcs> m_pendingIcs;
     RadioFrameObserver m_radioObserver;
     UeRegistry m_registry;
     S1uEndpoint m_s1u;

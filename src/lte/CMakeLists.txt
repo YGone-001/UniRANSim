@@ -43,7 +43,7 @@ file(GLOB_RECURSE LTE_RRC_RUNTIME_SRC_FILES rrc-runtime/*.cpp)
 add_library(lte-rrc-runtime ${LTE_RRC_RUNTIME_HDR_FILES} ${LTE_RRC_RUNTIME_SRC_FILES})
 target_compile_options(lte-rrc-runtime PRIVATE -Wall -Wextra -pedantic)
 target_include_directories(lte-rrc-runtime PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../asn/lte-rrc)
-target_link_libraries(lte-rrc-runtime PUBLIC common-lib asn-lte-rrc)
+target_link_libraries(lte-rrc-runtime PUBLIC common-lib asn-lte-rrc lte-security)
 
 add_library(lte-enb-lib ${LTE_ENB_HDR_FILES} ${LTE_ENB_SRC_FILES})
 target_compile_options(lte-enb-lib PRIVATE -Wall -Wextra -pedantic)

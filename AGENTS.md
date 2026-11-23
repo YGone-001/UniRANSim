@@ -1378,3 +1378,26 @@ the legacy `enbLink`/`ueLink` transport stays the only radio path.
 - **No configuration without a consumer.** A `uu` block that nothing reads is a
   promise, not a feature: until the UE application and the multiplexer bind it,
   do not describe the production path as integrated.
+
+## LTE eNB SRB1 multiplexer integration (B6-D1)
+
+`EnbMultiplexer` owns the Uu socket and the `EnbRrcBridge` when `uu.port` is
+configured. `docs/lte-nas-s1ap-runtime.md` is the record.
+
+- **Transport is a per-UE property.** `EnbUeEntry::transport` names it; never
+  infer it from an address or the presence of a pointer, and never send a legacy
+  software-radio frame to a Uu UE or fall back to the legacy link when Uu fails.
+- **One identity authority.** The bridge must allocate through
+  `UeRegistry::allocateEnbUeS1apId` and emit through the identified sink, so the
+  existing SCTP stream and sender binding stay authoritative. Never add a second
+  allocator or a second SCTP path.
+- **Register before you ask.** The setup callback creates the pending
+  `CONTEXT_PENDING` entry before the Initial UE Message leaves.
+- **Answer after security.** For a Uu UE the Initial Context Setup outcome is
+  committed only from `commitPendingIcs()`, once AS security is ACTIVE. Do not
+  send the response from the request handler and do not mark an E-RAB
+  established early.
+- **Cancel by association.** `unbindAssociation()` cancels pending transactions
+  and releases only their reservations; no callback may commit an old one.
+- **Keep the fixture honest.** A deterministic MME fixture is not Open5GS, and a
+  green eNB integration is not production UE or EPS Attach acceptance.

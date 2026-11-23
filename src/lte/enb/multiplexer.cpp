@@ -26,6 +26,11 @@ namespace lte::enb
 namespace
 {
 
+// A pending Initial Context Setup transaction is abandoned after this many
+// multiplexer polls without an active AS security procedure, so it cannot hold
+// E-RAB reservations forever.
+constexpr uint32_t kPendingIcsPolls = 2000;
+
 void Log(const char *level, const std::string &message)
 {
     std::cout << "[lte-enb] [" << level << "] " << message << std::endl;
@@ -78,6 +83,7 @@ EnbMultiplexer::EnbMultiplexer(const EnbConfig &config, IS1apSender &sender)
             config.s1uReceiveBufferBytes)
 {
     m_registry.setPerfCounters(&m_perf);
+    initUuTransport();
     bindAssociation(sender, 1);
 }
 
@@ -88,6 +94,7 @@ EnbMultiplexer::EnbMultiplexer(const EnbConfig &config)
             config.s1uReceiveBufferBytes)
 {
     m_registry.setPerfCounters(&m_perf);
+    initUuTransport();
 }
 
 void S1apSenderBinding::bind(IS1apSender &sender, uint32_t epoch)
@@ -145,6 +152,9 @@ uint32_t EnbMultiplexer::bindAssociation(IS1apSender &sender, int outboundStream
 
 void EnbMultiplexer::unbindAssociation()
 {
+    // Nothing pending under this association may be committed afterwards.
+    while (!m_pendingIcs.empty())
+        cancelPendingIcs(m_pendingIcs.begin()->first);
     // Destroyed first, while the registry it holds provisional contexts in is
     // still alive.
     m_preparations.reset();
@@ -336,6 +346,11 @@ void EnbMultiplexer::setOutboundStreams(int outboundStreams)
 
 bool EnbMultiplexer::poll(int radioBudget, int s1uBudget)
 {
+    // The Uu endpoint, when configured, is serviced on every poll: its bridge
+    // receives what the SRB1 peers sent and commits any Initial Context Setup
+    // transaction whose AS security has completed.
+    pollUu();
+
     const bool counting = m_perf.enabled.load(std::memory_order_relaxed);
     if (counting)
         m_perf.pollIterations.fetch_add(1, std::memory_order_relaxed);
@@ -806,6 +821,47 @@ void EnbMultiplexer::onInitialContextSetupRequest(const uint8_t *data, size_t si
     candidate.s1 = UeS1State::CONTEXT_ESTABLISHED;
     candidate.sgwPeer = InetAddress(Ipv4ToString(candidate.bearer.parameters().sgwAddress), 2152);
     const uint32_t previousMmeId = entry->mmeUeS1apId;
+
+    // A Uu/SRB1 UE may only be answered after the radio-side AS security
+    // procedure completed, so its transaction is staged and committed from
+    // commitPendingIcs() once the completion has been verified.
+    if (entry->transport == RadioTransportKind::UuSrb1)
+    {
+        auto rollbackReservations = [&] {
+            for (const auto &slot : establishedAt)
+                if (slot.has_value())
+                    m_registry.unbindLocalTeid(candidate, TeidFromBytes(slot->gtpTeid));
+        };
+        if (m_bridge == nullptr)
+        {
+            rollbackReservations();
+            fail("radioNetwork", 33);
+            return;
+        }
+        try
+        {
+            m_bridge->StartAsSecurity(entry->radioUeId, request);
+        }
+        catch (const std::exception &)
+        {
+            rollbackReservations();
+            fail("radioNetwork", 33);
+            return;
+        }
+        PendingIcs pending;
+        pending.enbUeS1apId = entry->enbUeS1apId;
+        pending.mmeUeS1apId = request.mmeUeS1apId;
+        pending.response = response;
+        pending.established = established;
+        pending.candidate = candidate;
+        // The S1AP codec in this repository decodes no message-level NAS-PDU for
+        // Initial Context Setup, so there is nothing to defer here yet.
+        pending.deliverNas = false;
+        pending.ticksLeft = kPendingIcsPolls;
+        m_pendingIcs[entry->enbUeS1apId] = std::move(pending);
+        return;
+    }
+
     try
     {
         for (const auto &item : established)
@@ -1098,6 +1154,20 @@ void EnbMultiplexer::onDownlinkNasTransport(const uint8_t *data, size_t size)
     if (!entry->s1Active())
         throw s1ap::CodecError("Downlink NAS Transport does not match an active S1 UE context");
     m_registry.setMmeUeS1apId(*entry, downlink.mmeUeS1apId);
+
+    // A Uu/SRB1 UE receives the NAS inside DLInformationTransfer on its own
+    // bearer; the legacy software-radio indication is not used for it at all.
+    if (entry->transport == RadioTransportKind::UuSrb1)
+    {
+        if (m_bridge == nullptr)
+            throw s1ap::CodecError("Downlink NAS Transport for a Uu UE without a bound bridge");
+        // The bridge owns the association's identity bookkeeping; handing it the
+        // original PDU keeps its MME-UE-S1AP-ID learning and validation in one
+        // place instead of duplicating them here.
+        m_bridge->OnDownlinkNasTransport(std::vector<uint8_t>(data, data + size));
+        Log("INFO", "Forwarded Downlink NAS Transport to SRB1 UE " + std::to_string(entry->radioUeId));
+        return;
+    }
 
     sendRadio(*entry, lte::ue::link::MessageType::NAS_DOWNLINK, std::move(downlink.nasPdu));
     Log("INFO", "Forwarded Downlink NAS Transport to " + Describe(*entry));
@@ -1485,8 +1555,152 @@ void EnbMultiplexer::startInitialUeMessage(EnbUeEntry &entry, std::vector<uint8_
 
 void EnbMultiplexer::sendRadio(EnbUeEntry &entry, lte::ue::link::MessageType type, std::vector<uint8_t> payload)
 {
+    // The transport is a property of this UE, not of the message. A Uu/SRB1 UE
+    // has no legacy endpoint: it learns everything it needs from RRC and NAS on
+    // its own bearer, so a legacy software-radio frame for it has nowhere to go.
+    // Dropping it here is deliberate and never falls back to the legacy link.
+    if (entry.transport == RadioTransportKind::UuSrb1)
+    {
+        m_bridgeDroppedLegacyFrames++;
+        return;
+    }
     auto frame = lte::ue::link::Encode({type, entry.radioUeId, std::move(payload)});
     m_ueLink.Send(entry.peer, frame.data(), frame.size());
+}
+
+void EnbMultiplexer::initUuTransport()
+{
+    if (m_config.uuPort == 0 || m_config.uuAddress.empty())
+        return;
+
+    std::string why;
+    auto socket = uu::Socket::BindLoopback(m_config.uuPort, &why);
+    if (!socket)
+        throw std::runtime_error("The eNB Uu endpoint could not be bound: " + why);
+    m_uuSocket = std::make_unique<uu::Socket>(std::move(*socket));
+
+    s1ap::EnbRrcBridge::Config bridge;
+    bridge.enb = m_config;
+    bridge.srb1.setup.transactionId = 0;
+    bridge.srb1.setup.srbIdentity = 1;
+    bridge.srb1.setup.tPollRetransmit = 2;   // ms15
+    bridge.srb1.setup.pollPdu = 7;           // pInfinity
+    bridge.srb1.setup.pollByte = 14;         // kBinfinity
+    bridge.srb1.setup.maxRetxThreshold = 5;  // t8
+    bridge.srb1.setup.tReordering = 1;       // ms5
+    bridge.srb1.setup.tStatusProhibit = 1;   // ms5
+    bridge.algorithms.ciphering.ordered = {2, 1, 0};
+    bridge.algorithms.integrity.ordered = {2, 1, 0};
+    bridge.algorithms.ciphering.generation = 1;
+    bridge.algorithms.integrity.generation = 1;
+    bridge.algorithms.nasIntegrityAlgorithm = 2;
+
+    m_bridge = std::make_unique<s1ap::EnbRrcBridge>(
+        *m_uuSocket, bridge,
+        [this](uint32_t enbUeS1apId, const std::vector<uint8_t> &pdu) {
+            (void)sendS1ap(SctpStreamForUe(m_outboundStreams, enbUeS1apId), pdu);
+        },
+        [this] { return m_registry.allocateEnbUeS1apId(); },
+        [this](uint32_t association, uint32_t enbUeS1apId, uint16_t peerPort, const std::vector<uint8_t> &) {
+            // The pending context exists before the Initial UE Message leaves,
+            // so no downlink answer can arrive for an unregistered UE.
+            auto &entry = m_registry.registerPeer(association, InetAddress(m_config.uuAddress, peerPort));
+            entry.transport = RadioTransportKind::UuSrb1;
+            m_registry.bindEnbUeS1apId(entry, enbUeS1apId);
+            entry.s1 = UeS1State::CONTEXT_PENDING;
+            Log("INFO", "SRB1 UE association " + std::to_string(association) + " bound to eNB-UE-S1AP-ID=" +
+                            std::to_string(enbUeS1apId));
+        });
+}
+
+void EnbMultiplexer::pollUu()
+{
+    if (m_bridge == nullptr)
+        return;
+    m_bridge->Pump(0);
+    m_bridge->Tick();
+    commitPendingIcs();
+}
+
+size_t EnbMultiplexer::bridgeAssociationCount() const
+{
+    return m_bridge == nullptr ? 0 : m_bridge->Runtime().ContextCount();
+}
+
+bool EnbMultiplexer::bridgeHasAssociation(uint32_t association) const
+{
+    return m_bridge != nullptr && m_bridge->Runtime().HasContext(association);
+}
+
+bool EnbMultiplexer::asSecurityActive(uint32_t association) const
+{
+    return m_bridge != nullptr && m_bridge->AsSecurityActive(association);
+}
+
+void EnbMultiplexer::cancelPendingIcs(uint32_t enbUeS1apId)
+{
+    const auto it = m_pendingIcs.find(enbUeS1apId);
+    if (it == m_pendingIcs.end())
+        return;
+    for (const auto &item : it->second.established)
+        m_registry.unbindLocalTeid(it->second.candidate, TeidFromBytes(item.gtpTeid));
+    m_pendingIcs.erase(it);
+}
+
+void EnbMultiplexer::commitPendingIcs()
+{
+    if (m_pendingIcs.empty() || m_bridge == nullptr)
+        return;
+
+    std::vector<uint32_t> finished;
+    for (auto &slot : m_pendingIcs)
+    {
+        PendingIcs &pending = slot.second;
+        auto *entry = m_registry.findByEnbUeS1apId(pending.enbUeS1apId);
+        if (entry == nullptr || entry->transport != RadioTransportKind::UuSrb1)
+        {
+            finished.push_back(slot.first);
+            continue;
+        }
+        if (!m_bridge->AsSecurityActive(entry->radioUeId))
+        {
+            if (--pending.ticksLeft == 0)
+            {
+                Log("WARN", "Initial Context Setup transaction timed out waiting for AS security");
+                cancelPendingIcs(slot.first);
+                finished.push_back(slot.first);
+            }
+            continue;
+        }
+
+        // The radio-side procedure is complete; only now may the outcome be
+        // committed and answered.
+        std::vector<s1ap::ErabSetupItem> established = pending.established;
+        try
+        {
+            for (const auto &item : established)
+            {
+                auto *bearer = m_registry.findBearer(pending.candidate, item.erabId);
+                if (bearer != nullptr)
+                    m_registry.bindLocalTeid(*entry, *bearer, TeidFromBytes(item.gtpTeid));
+            }
+            m_registry.setMmeUeS1apId(*entry, pending.mmeUeS1apId);
+            if (!sendS1ap(streamFor(*entry), pending.response))
+                throw BearerError("Initial Context Setup Response could not be transmitted");
+            pending.candidate.mmeUeS1apId = pending.mmeUeS1apId;
+            *entry = std::move(pending.candidate);
+            if (pending.deliverNas && !pending.nasPdu.empty())
+                m_bridge->SendDownlinkNas(entry->radioUeId, pending.nasPdu);
+        }
+        catch (const std::exception &)
+        {
+            for (const auto &item : established)
+                m_registry.unbindLocalTeid(*entry, TeidFromBytes(item.gtpTeid));
+        }
+        finished.push_back(slot.first);
+    }
+    for (uint32_t id : finished)
+        m_pendingIcs.erase(id);
 }
 
 uint16_t EnbMultiplexer::streamFor(const EnbUeEntry &entry) const

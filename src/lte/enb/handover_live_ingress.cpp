@@ -146,6 +146,8 @@ const char *ToString(HandoverCapability capability)
     case HandoverCapability::ENB_KE_NB_SECURITY_CONTEXT_READY: return "ENB_KE_NB_SECURITY_CONTEXT_READY";
     case HandoverCapability::LTE_EPS_ATTACH_OVER_SRB1_READY: return "LTE_EPS_ATTACH_OVER_SRB1_READY";
     case HandoverCapability::LTE_OPEN5GS_ATTACH_ACCEPTED: return "LTE_OPEN5GS_ATTACH_ACCEPTED";
+    case HandoverCapability::LTE_PRODUCTION_ENB_SRB1_READY: return "LTE_PRODUCTION_ENB_SRB1_READY";
+    case HandoverCapability::LTE_PRODUCTION_MULTIPLEXER_BRIDGE_READY: return "LTE_PRODUCTION_MULTIPLEXER_BRIDGE_READY";
     case HandoverCapability::AS_SMC_RUNTIME_READY: return "AS_SMC_RUNTIME_READY";
     case HandoverCapability::AS_INITIAL_SECURITY_ACTIVATION_READY: return "AS_INITIAL_SECURITY_ACTIVATION_READY";
     case HandoverCapability::HANDOVER_SECURITY_READY: return "HANDOVER_SECURITY_READY";
@@ -234,6 +236,11 @@ std::vector<HandoverCapability> LiveHandoverReadiness::missing() const
         // A live Open5GS Attach is external acceptance evidence, not something
         // this build can be made to satisfy by code.
         if (assessment.capability == HandoverCapability::LTE_OPEN5GS_ATTACH_ACCEPTED)
+            continue;
+        // Production SRB1 readiness is eNB integration evidence, not a
+        // live-handover execution prerequisite.
+        if (assessment.capability == HandoverCapability::LTE_PRODUCTION_ENB_SRB1_READY ||
+            assessment.capability == HandoverCapability::LTE_PRODUCTION_MULTIPLEXER_BRIDGE_READY)
             continue;
         if (!assessment.available)
             out.push_back(assessment.capability);
@@ -348,6 +355,15 @@ LiveHandoverReadiness AssessLiveHandoverCapabilities()
                "lte::security::EnbAsSecurityContext accepts only the KeNB the MME sends, holds no KASME and no NAS "
                "COUNT, and derives the same RRC keys as the UE context derives from KASME; the AS procedure takes an "
                "AsKeySource, so it cannot ask for a KASME"),
+        Assess(HandoverCapability::LTE_PRODUCTION_ENB_SRB1_READY, true,
+               "EnbMultiplexer owns the EnbRrcBridge, allocates its radio identities through the UE registry, "
+               "dispatches control messages by an explicit per-UE RadioTransportKind, and completes the deferred "
+               "Initial Context Setup transaction only after AS security is active; test/lte/enb_uu_integration.cpp runs "
+               "two SRB1 peers against one multiplexer over real UDP"),
+        Assess(HandoverCapability::LTE_PRODUCTION_MULTIPLEXER_BRIDGE_READY, true,
+               "the production multiplexer binds the bridge to its own S1AP sender, SCTP stream selection and identity "
+               "allocator, and keeps the E-RAB and GTP-U lifecycle authoritative; the same test asserts two distinct "
+               "identities, two Initial UE Messages, two NAS transports and two Initial Context Setup responses"),
         Assess(HandoverCapability::LTE_EPS_ATTACH_OVER_SRB1_READY, false,
                "the Attach ran over SRB1 and the S1AP codec with a deterministic MME fixture, but the production UE NAS "
                "state machine is not wired into the UE application yet and no live MME was used"),
