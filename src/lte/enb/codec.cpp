@@ -1143,6 +1143,15 @@ InitialContextSetupRequest DecodeInitialContextSetupRequest(const uint8_t *data,
             reader.requireFinished();
             ambrPresent = true;
         }
+        else if (ie.id == IE_NAS_PDU)
+        {
+            if (ie.criticality != Criticality::REJECT)
+                throw CodecError("NAS-PDU has invalid criticality");
+            result.nasPdu = DecodeNasPdu(ie.value);
+            if (result.nasPdu.empty())
+                throw CodecError("Initial Context Setup Request carries an empty NAS-PDU");
+            result.nasPduPresent = true;
+        }
         else if (ie.id == IE_E_RAB_TO_BE_SETUP_LIST_CTXT_SU_REQ)
         {
             if (ie.criticality != Criticality::REJECT)
@@ -1246,6 +1255,12 @@ std::vector<uint8_t> EncodeInitialContextSetupRequest(const InitialContextSetupR
     ies.push_back({{IE_E_RAB_TO_BE_SETUP_LIST_CTXT_SU_REQ, Criticality::REJECT}, listBytes});
     ies.push_back({{IE_UE_SECURITY_CAPABILITIES, Criticality::REJECT}, securityCapabilities.take()});
     ies.push_back({{IE_SECURITY_KEY, Criticality::REJECT}, securityKey.take()});
+    if (request.nasPduPresent)
+    {
+        if (request.nasPdu.empty())
+            throw CodecError("Initial Context Setup Request carries an empty NAS-PDU");
+        ies.push_back({{IE_NAS_PDU, Criticality::REJECT}, EncodeNasPdu(request.nasPdu)});
+    }
     return EncodePdu(0, PROCEDURE_INITIAL_CONTEXT_SETUP, Criticality::REJECT, ies);
 }
 

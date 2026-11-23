@@ -168,6 +168,11 @@ struct InitialContextSetupRequest
     std::array<uint8_t, 2> encryptionAlgorithms{};
     std::array<uint8_t, 2> integrityAlgorithms{};
     std::array<uint8_t, 32> securityKey{};
+    // The message-level NAS-PDU (IE id 26), which is distinct from the per-E-RAB
+    // one. It carries the protected Attach Accept the network wants the UE to
+    // receive after AS security is active.
+    bool nasPduPresent{false};
+    std::vector<uint8_t> nasPdu{};
 };
 
 InitialContextSetupRequest DecodeInitialContextSetupRequest(const uint8_t *data, size_t length);

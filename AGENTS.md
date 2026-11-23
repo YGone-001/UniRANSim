@@ -1401,3 +1401,15 @@ configured. `docs/lte-nas-s1ap-runtime.md` is the record.
   and releases only their reservations; no callback may commit an old one.
 - **Keep the fixture honest.** A deterministic MME fixture is not Open5GS, and a
   green eNB integration is not production UE or EPS Attach acceptance.
+
+## LTE eNB boundary closure (B6-D2 Commit A)
+
+- **Two NAS-PDU fields, not one.** Initial Context Setup carries a message-level
+  NAS-PDU (IE 26) *and* an optional per-E-RAB one. Do not conflate them. The
+  message-level PDU is delivered over SRB1 only after AS security is active.
+- **One transaction per UE.** A duplicate Initial Context Setup Request while a
+  pending transaction exists is refused and its reservations are released; it
+  must never stage a second transaction or produce a second response.
+- **No capability change without evidence.** The production UE application is
+  still not SRB1-enabled; `LTE_PRODUCTION_UE_SRB1_READY` and
+  `LTE_EPS_ATTACH_OVER_SRB1_READY` stay false until it is.

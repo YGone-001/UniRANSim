@@ -144,3 +144,17 @@ reported as a successful E-RAB setup.
 the optional NAS-PDU is still not delivered (the decoder carries none).
 - The production UE application still sends NAS over the legacy link (B6-D2).
 - There is no live Open5GS run: `REAL_OPEN5GS_ATTACH_ACCEPTANCE = NOT_EXECUTED`.
+
+## B6-D2: the message-level NAS-PDU
+
+The Initial Context Setup Request codec now carries the message-level NAS-PDU
+(IE id 26), which is distinct from the per-E-RAB one the E-RAB item already had.
+Decoding preserves it opaquely, refuses an empty or malformed one, and encoding
+supports it for fixtures. The multiplexer keeps it in the pending transaction
+and delivers it through the SRB1 downlink path **after** AS security is active,
+exactly once; when the field is absent the normal Downlink NAS Transport path is
+unchanged.
+
+A duplicate Initial Context Setup Request while the first is still pending is
+refused and its reservations are released, so one request can never stage two
+transactions or produce two responses.

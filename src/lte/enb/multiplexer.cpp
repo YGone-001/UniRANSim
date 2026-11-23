@@ -838,6 +838,15 @@ void EnbMultiplexer::onInitialContextSetupRequest(const uint8_t *data, size_t si
             fail("radioNetwork", 33);
             return;
         }
+        // A duplicate request while the first is still pending must not stage a
+        // second transaction: that would leak the first request's reservations
+        // and could emit two responses.
+        if (m_pendingIcs.find(entry->enbUeS1apId) != m_pendingIcs.end())
+        {
+            rollbackReservations();
+            fail("radioNetwork", 30);
+            return;
+        }
         try
         {
             m_bridge->StartAsSecurity(entry->radioUeId, request);
@@ -854,9 +863,10 @@ void EnbMultiplexer::onInitialContextSetupRequest(const uint8_t *data, size_t si
         pending.response = response;
         pending.established = established;
         pending.candidate = candidate;
-        // The S1AP codec in this repository decodes no message-level NAS-PDU for
-        // Initial Context Setup, so there is nothing to defer here yet.
-        pending.deliverNas = false;
+        // A message-level NAS-PDU is retained and delivered only after the
+        // radio-side security procedure is active, exactly once.
+        pending.deliverNas = request.nasPduPresent && !request.nasPdu.empty();
+        pending.nasPdu = request.nasPdu;
         pending.ticksLeft = kPendingIcsPolls;
         m_pendingIcs[entry->enbUeS1apId] = std::move(pending);
         return;

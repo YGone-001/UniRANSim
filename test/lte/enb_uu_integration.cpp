@@ -285,6 +285,10 @@ TEST_CASE("lte/enb-uu/one multiplexer manages two srb1 ues with independent s1ap
             request.encryptionAlgorithms = {0xE0, 0x00};
             request.integrityAlgorithms = {0xE0, 0x00};
             request.securityKey = security::DeriveKenb(a.kasme, 7);
+            // The first UE's request carries the message-level NAS-PDU, which may
+            // only be delivered after AS security is active.
+            request.nasPduPresent = true;
+            request.nasPdu = {0x07, 0x42, 0x01, 0x30, 0xAB, 0xCD};
             const auto pdu = EncodeInitialContextSetupRequest(request);
             mux.handleS1ap(pdu.data(), pdu.size(), 1);
             icsA = true;
@@ -334,9 +338,171 @@ TEST_CASE("lte/enb-uu/one multiplexer manages two srb1 ues with independent s1ap
     CHECK(b.runtime->AsSecurityActive());
     CHECK(a.runtime->SecurityContext()->ActiveKenb() != b.runtime->SecurityContext()->ActiveKenb());
 
-    // Each UE received only its own downlink NAS.
-    REQUIRE(a.downlinkNas.size() == 1);
+    // UE A received the security mode command and then the NAS-PDU from its
+    // Initial Context Setup, exactly once; UE B received only its command.
+    REQUIRE(a.downlinkNas.size() == 2);
+    CHECK(a.downlinkNas[0] == b.downlinkNas[0]);
+    CHECK(a.downlinkNas[1] == std::vector<uint8_t>({0x07, 0x42, 0x01, 0x30, 0xAB, 0xCD}));
     REQUIRE(b.downlinkNas.size() == 1);
-    CHECK(a.downlinkNas[0] == b.downlinkNas[0]);  // same fixture message
     CHECK(mux.bridgeDroppedLegacyFrames() == 0);
 }
+
+TEST_CASE("lte/enb-uu/the initial context setup nas-pdu survives the aper round trip")
+{
+    InitialContextSetupRequest request;
+    request.mmeUeS1apId = 0x4101;
+    request.enbUeS1apId = 0x1234;
+    request.ueAmbrUl = request.ueAmbrDl = 100000000;
+    ErabToBeSetupItem erab;
+    erab.erabId = 5;
+    erab.qci = 9;
+    erab.transportLayerAddress = {10, 0, 0, 1};
+    erab.gtpTeid = {0x11, 0x22, 0x33, 0x44};
+    request.erabs.push_back(erab);
+    request.encryptionAlgorithms = {0xE0, 0x00};
+    request.integrityAlgorithms = {0xE0, 0x00};
+    request.securityKey.fill(0x5A);
+
+    // Absent.
+    {
+        const auto pdu = EncodeInitialContextSetupRequest(request);
+        const auto decoded = DecodeInitialContextSetupRequest(pdu.data(), pdu.size());
+        CHECK_FALSE(decoded.nasPduPresent);
+        CHECK(decoded.nasPdu.empty());
+        CHECK(decoded.erabs.size() == 1);
+    }
+
+    // Message-level NAS-PDU present, opaque bytes preserved.
+    {
+        const std::vector<uint8_t> nas{0x07, 0x42, 0x01, 0x30, 0xDE, 0xAD};
+        request.nasPduPresent = true;
+        request.nasPdu = nas;
+        const auto pdu = EncodeInitialContextSetupRequest(request);
+        const auto decoded = DecodeInitialContextSetupRequest(pdu.data(), pdu.size());
+        REQUIRE(decoded.nasPduPresent);
+        CHECK(decoded.nasPdu == nas);
+        CHECK(decoded.mmeUeS1apId == request.mmeUeS1apId);
+        CHECK(decoded.erabs.size() == 1);
+        CHECK(decoded.erabs[0].erabId == 5);
+    }
+
+    // Message-level and E-RAB-level NAS-PDU coexist and stay distinct.
+    {
+        request.erabs[0].nasPduPresent = true;
+        request.erabs[0].nasPdu = {0xAA, 0xBB};
+        const auto pdu = EncodeInitialContextSetupRequest(request);
+        const auto decoded = DecodeInitialContextSetupRequest(pdu.data(), pdu.size());
+        CHECK(decoded.nasPduPresent);
+        CHECK(decoded.nasPdu == std::vector<uint8_t>({0x07, 0x42, 0x01, 0x30, 0xDE, 0xAD}));
+        REQUIRE(decoded.erabs.size() == 1);
+        CHECK(decoded.erabs[0].nasPduPresent);
+        CHECK(decoded.erabs[0].nasPdu == std::vector<uint8_t>({0xAA, 0xBB}));
+    }
+
+    // A truncated PDU is refused, never repaired.
+    {
+        const auto pdu = EncodeInitialContextSetupRequest(request);
+        CHECK_THROWS_AS(DecodeInitialContextSetupRequest(pdu.data(), pdu.size() - 2), CodecError);
+    }
+}
+
+
+TEST_CASE("lte/enb-uu/a duplicate initial context setup request is refused without a second response")
+{
+    uint16_t uuPort = 0;
+    {
+        auto probe = uu::Socket::BindLoopback(0, nullptr);
+        REQUIRE(probe.has_value());
+        uuPort = probe->Port();
+    }
+
+    Sender sender;
+    EnbMultiplexer mux(MakeConfig(uuPort), sender);
+    Peer a;
+    REQUIRE(a.Build(AssocA, MmeIdA, 0x21, uuPort));
+    a.runtime->StartAccess();
+
+    bool setupSent = false;
+    bool icsSent = false;
+    bool uplinkSeen = false;
+    uint32_t enbId = 0;
+    size_t responses = 0;
+    for (int round = 0; round < 900; round++)
+    {
+        mux.poll();
+        a.runtime->Pump(0);
+        a.runtime->Tick();
+        if (!setupSent && a.runtime->State() == RrcState::RRC_SRB1_CONFIGURING)
+        {
+            a.runtime->SubmitSetupComplete(AttachRequest());
+            setupSent = true;
+        }
+        for (const auto &pdu : sender.sent)
+        {
+            const auto probe = ProbeS1apPdu(pdu.data(), pdu.size());
+            if (probe.kind == S1apPdu::Kind::SUCCESSFUL_OUTCOME)
+            {
+                responses++;
+                continue;
+            }
+            if (probe.kind != S1apPdu::Kind::INITIATING)
+                continue;
+            UplinkNas uplink;
+            try
+            {
+                uplink = DecodeUplinkNas(pdu.data(), pdu.size());
+            }
+            catch (const CodecError &)
+            {
+                continue;
+            }
+            if (uplink.mmeUeS1apId.has_value())
+            {
+                uplinkSeen = true;
+                continue;
+            }
+            if (enbId != 0)
+                continue;
+            enbId = uplink.enbUeS1apId;
+            const std::vector<uint8_t> nas{0x07, 0x5D, 0x02, 0x00, 0x02, 0xA0, 0x20};
+            const auto downlink = EncodeDownlinkNasTransport(MmeIdA, enbId, nas);
+            mux.handleS1ap(downlink.data(), downlink.size(), 1);
+        }
+        sender.sent.clear();
+        if (a.downlinkNas.size() > a.responded)
+        {
+            a.responded = a.downlinkNas.size();
+            a.runtime->SubmitNas(std::vector<uint8_t>{0x07, 0x5E, 0x11, 0x22});
+        }
+        if (!icsSent && enbId != 0 && uplinkSeen)
+        {
+            InitialContextSetupRequest request;
+            request.mmeUeS1apId = MmeIdA;
+            request.enbUeS1apId = enbId;
+            request.ueAmbrUl = request.ueAmbrDl = 100000000;
+            ErabToBeSetupItem erab;
+            erab.erabId = 5;
+            erab.qci = 9;
+            erab.transportLayerAddress = {10, 0, 0, 1};
+            erab.gtpTeid = {0x11, 0x22, 0x33, 0x44};
+            request.erabs.push_back(erab);
+            request.encryptionAlgorithms = {0xE0, 0x00};
+            request.integrityAlgorithms = {0xE0, 0x00};
+            request.securityKey = security::DeriveKenb(a.kasme, 7);
+            const auto pdu = EncodeInitialContextSetupRequest(request);
+            // Twice on purpose: the second must be refused while the first is
+            // still waiting for AS security.
+            mux.handleS1ap(pdu.data(), pdu.size(), 1);
+            mux.handleS1ap(pdu.data(), pdu.size(), 1);
+            CHECK(mux.pendingInitialContextSetups() == 1);
+            icsSent = true;
+        }
+        if (responses == 1 && mux.pendingInitialContextSetups() == 0 && mux.asSecurityActive(AssocA))
+            break;
+    }
+
+    CHECK(mux.asSecurityActive(AssocA));
+    CHECK(responses == 1);
+    CHECK(mux.pendingInitialContextSetups() == 0);
+}
+
