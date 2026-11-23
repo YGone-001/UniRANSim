@@ -133,16 +133,28 @@ Socket &Socket::operator=(Socket &&other) noexcept
     sent_ = other.sent_;
     dropped_ = other.dropped_;
     malformed_ = other.malformed_;
+    held_ = other.held_;
+    released_ = other.released_;
+    pendingDropped_ = other.pendingDropped_;
     sequence_ = other.sequence_;
     link_ = other.link_;
     pending_ = std::move(other.pending_);
     other.fd_ = -1;
     other.port_ = 0;
+    other.pending_.reset();
     return *this;
 }
 
 void Socket::Close() noexcept
 {
+    // A pending frame has no receiver left. Dropping it is the cancellation
+    // outcome: counted, never handed to a local Receive() and never leaked into
+    // another socket.
+    if (pending_)
+    {
+        pending_.reset();
+        pendingDropped_++;
+    }
     if (fd_ >= 0)
         ::close(fd_);
     fd_ = -1;
@@ -181,6 +193,32 @@ std::optional<Socket> Socket::BindLoopback(uint16_t port, std::string *why)
     return socket;
 }
 
+bool Socket::RawSend(uint16_t port, const Frame &frame, std::string *why)
+{
+    const auto bytes = EncodeFrame(frame);
+    const sockaddr_in address = Loopback(port);
+    const ssize_t written =
+        ::sendto(fd_, bytes.data(), bytes.size(), 0, reinterpret_cast<const sockaddr *>(&address), sizeof(address));
+    if (written != static_cast<ssize_t>(bytes.size()))
+    {
+        if (why)
+            *why = "sendto() failed";
+        return false;
+    }
+    sent_++;
+    return true;
+}
+
+bool Socket::FlushPending(std::string *why)
+{
+    if (!pending_)
+        return true;
+    const Pending held = std::move(*pending_);
+    pending_.reset();
+    released_++;
+    return RawSend(held.destination, held.frame, why);
+}
+
 bool Socket::Send(uint16_t port, const Frame &frame, std::string *why)
 {
     if (fd_ < 0)
@@ -204,53 +242,46 @@ bool Socket::Send(uint16_t port, const Frame &frame, std::string *why)
         return true;  // accepted and lost: the upper layer must notice
     }
 
-    Frame toSend = frame;
     if (link_.duplicateEveryNth != 0 && (sequence_ % link_.duplicateEveryNth) == 0)
-    {
-        const auto bytes = EncodeFrame(toSend);
-        const sockaddr_in address = Loopback(port);
-        ::sendto(fd_, bytes.data(), bytes.size(), 0, reinterpret_cast<const sockaddr *>(&address), sizeof(address));
-    }
+        RawSend(port, frame, nullptr);
 
     if (link_.reorderEveryNth != 0 && (sequence_ % link_.reorderEveryNth) == 0)
     {
+        if (pending_ && pending_->destination != port)
+        {
+            // A frame for another destination is held. Never swap across
+            // destinations: release it to its own port first.
+            if (!FlushPending(why))
+                return false;
+        }
         if (!pending_)
         {
-            pending_ = toSend;
+            pending_ = Pending{frame, port};
+            held_++;
             sent_++;
             return true;
         }
-        std::swap(*pending_, toSend);
+        // Same destination: send this frame now and release the held one after
+        // it, so the peer sees the pair out of order.
+        if (!RawSend(port, frame, why))
+            return false;
+        return FlushPending(why);
     }
 
-    const auto bytes = EncodeFrame(toSend);
-    const sockaddr_in address = Loopback(port);
-    const ssize_t written =
-        ::sendto(fd_, bytes.data(), bytes.size(), 0, reinterpret_cast<const sockaddr *>(&address), sizeof(address));
-    if (written != static_cast<ssize_t>(bytes.size()))
-    {
-        if (why)
-            *why = "sendto() failed";
+    // Any other frame releases a held one first: the held frame was emitted
+    // earlier, so it must not be overtaken indefinitely.
+    if (pending_ && !FlushPending(why))
         return false;
-    }
-    sent_++;
-    return true;
+    return RawSend(port, frame, why);
 }
 
-bool Socket::Receive(Frame &out, int timeoutMs, std::string *why)
+bool Socket::Receive(Frame &out, int timeoutMs, std::string *why, uint16_t *sourcePort)
 {
     if (fd_ < 0)
     {
         if (why)
             *why = "socket is closed";
         return false;
-    }
-
-    if (pending_)
-    {
-        out = std::move(*pending_);
-        pending_.reset();
-        return true;
     }
 
     pollfd entry{};
@@ -265,11 +296,13 @@ bool Socket::Receive(Frame &out, int timeoutMs, std::string *why)
     }
 
     uint8_t buffer[EnvelopeSize + MaxPayload + 8];
-    const ssize_t size = ::recv(fd_, buffer, sizeof(buffer), 0);
+    sockaddr_in source{};
+    socklen_t sourceLength = sizeof(source);
+    const ssize_t size = ::recvfrom(fd_, buffer, sizeof(buffer), 0, reinterpret_cast<sockaddr *>(&source), &sourceLength);
     if (size <= 0)
     {
         if (why)
-            *why = "recv() failed";
+            *why = "recvfrom() failed";
         return false;
     }
     if (!DecodeFrame(buffer, static_cast<size_t>(size), out, why))
@@ -277,6 +310,8 @@ bool Socket::Receive(Frame &out, int timeoutMs, std::string *why)
         malformed_++;
         return false;
     }
+    if (sourcePort != nullptr)
+        *sourcePort = ntohs(source.sin_port);
     return true;
 }
 

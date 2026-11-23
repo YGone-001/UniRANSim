@@ -8,9 +8,38 @@
 namespace lte::rlc::am
 {
 
-LteAmBearer::LteAmBearer(uu::Socket socket, uint16_t peerPort, uint32_t association, AmConfig config,
-                         LteAmEntity::Deliverer deliverer)
-    : socket_(std::move(socket)), peerPort_(peerPort), association_(association)
+const char *ToString(EndpointRole role)
+{
+    return role == EndpointRole::UE ? "UE" : "ENB";
+}
+
+uu::Direction TransmitDirection(EndpointRole role)
+{
+    return role == EndpointRole::UE ? uu::Direction::UPLINK : uu::Direction::DOWNLINK;
+}
+
+uu::Direction ReceiveDirection(EndpointRole role)
+{
+    return role == EndpointRole::UE ? uu::Direction::DOWNLINK : uu::Direction::UPLINK;
+}
+
+LteAmBearer::LteAmBearer(std::unique_ptr<uu::Socket> socket, uint16_t peerPort, EndpointRole role,
+                         uint32_t association, AmConfig config, LteAmEntity::Deliverer deliverer)
+    : owned_(std::move(socket)), transport_(owned_.get()), peerPort_(peerPort), role_(role),
+      association_(association)
+{
+    entity_ = LteAmEntity(
+        config, [this](std::vector<uint8_t> pdu) { Send(pdu); },
+        [this, deliver = std::move(deliverer)](std::vector<uint8_t> sdu) {
+            delivered_++;
+            if (deliver)
+                deliver(std::move(sdu));
+        });
+}
+
+LteAmBearer::LteAmBearer(uu::Socket &transport, uint16_t peerPort, EndpointRole role, uint32_t association,
+                         AmConfig config, LteAmEntity::Deliverer deliverer)
+    : transport_(&transport), peerPort_(peerPort), role_(role), association_(association)
 {
     entity_ = LteAmEntity(
         config, [this](std::vector<uint8_t> pdu) { Send(pdu); },
@@ -23,12 +52,14 @@ LteAmBearer::LteAmBearer(uu::Socket socket, uint16_t peerPort, uint32_t associat
 
 void LteAmBearer::Send(const std::vector<uint8_t> &pdu)
 {
+    if (transport_ == nullptr)
+        return;
     uu::Frame frame;
     frame.association = association_;
-    frame.direction = uu::Direction::UPLINK;
+    frame.direction = TransmitDirection(role_);
     frame.channel = uu::LogicalChannel::DCCH;
     frame.payload = pdu;
-    if (socket_.Send(peerPort_, frame, nullptr))
+    if (transport_->Send(peerPort_, frame, nullptr))
         sent_++;
 }
 
@@ -44,18 +75,62 @@ void LteAmBearer::SubmitSdus(const std::vector<std::vector<uint8_t>> &sdus)
 
 bool LteAmBearer::Pump(int timeoutMs)
 {
-    uu::Frame frame;
-    if (!socket_.Receive(frame, timeoutMs, nullptr))
+    if (transport_ == nullptr)
         return false;
-    if (frame.payload.empty() || frame.association != association_)
-        return true;
+    uu::Frame frame;
+    if (!transport_->Receive(frame, timeoutMs, nullptr))
+        return false;
+    OnFrame(frame);
+    return true;
+}
+
+bool LteAmBearer::OnFrame(const uu::Frame &frame)
+{
+    if (frame.association != association_)
+    {
+        refused_.foreignAssociation++;
+        return false;
+    }
+    if (frame.direction != ReceiveDirection(role_))
+    {
+        refused_.wrongDirection++;
+        return false;
+    }
+    if (frame.channel != uu::LogicalChannel::DCCH)
+    {
+        refused_.wrongChannel++;
+        return false;
+    }
+    if (frame.payload.empty())
+    {
+        refused_.emptyPayload++;
+        return false;
+    }
 
     // D/C = 1 is an AMD PDU, D/C = 0 a control PDU (STATUS). The LTE header
     // itself carries the discriminator, so the transport stays protocol-neutral.
+    // A frame that does not decode as its own type never reaches the entity.
     if ((frame.payload[0] & 0x80U) != 0)
+    {
+        AmdPdu decoded;
+        std::string why;
+        if (!DecodeAmd(frame.payload.data(), frame.payload.size(), decoded, &why))
+        {
+            refused_.malformedRlc++;
+            return false;
+        }
         entity_.OnPdu(frame.payload);
-    else
-        entity_.OnStatusPdu(frame.payload);
+        return true;
+    }
+
+    StatusPdu status;
+    std::string why;
+    if (!DecodeStatus(frame.payload.data(), frame.payload.size(), status, &why))
+    {
+        refused_.malformedRlc++;
+        return false;
+    }
+    entity_.OnStatusPdu(frame.payload);
     return true;
 }
 

@@ -1002,8 +1002,9 @@ Phase 18-F-B6-A starts the runtime carrier under the AS security work.
   by FI before delivery - a segmented SDU must never be delivered piece by piece.
 - **Timers are tick-driven.** The entity has no clock; the caller owns the tick.
   Reaching `maxRetx` fails the entity instead of retrying forever.
-- **No SRB1 claim.** This entity is not wired to SRB1, PDCP or the RRC connection;
-  `SRB1_RLC_AM_READY` stays false until B6-B2.
+- **SRB1 is a bearer, not a connection.** `lte_am_bearer` now carries SRB1 on
+  DCCH and B6-B2 reports `SRB1_RLC_AM_READY`, but the entity itself still knows
+  nothing about PDCP, NAS or RRC state. Do not move RRC or NAS logic into it.
 
 `lte_am_bearer.{hpp,cpp}` puts one entity on one simulated Uu endpoint; the design
 records are `docs/lte-rlc-am-engine.md`, `docs/lte-rlc-am-state-machine.md`,
@@ -1031,6 +1032,46 @@ records are `docs/lte-rlc-am-engine.md`, `docs/lte-rlc-am-state-machine.md`,
   PDU type, SN, SO, length, poll bit and STATUS result from the decoded frames it
   actually saw, plus the entity counters for transmission and retransmission; it
   does not infer success from the absence of a crash.
+
+## LTE SRB1 runtime and the RRC connection (B6-B2)
+
+`rrc_srb1_runtime.{hpp,cpp}` carries the first real SRB1 message;
+`srb1_pdcp.{hpp,cpp}` and `srb1_rlc_config.{hpp,cpp}` are its two halves.
+`docs/lte-srb1-pdcp-runtime.md` is the design record.
+
+- **Pre-security means pre-security.** RRCConnectionSetupComplete is sent before
+  SecurityModeCommand, so the SRB1 PDCP PDU has a one-octet header (three
+  reserved bits, five-bit SN) and **no MAC-I and no ciphering**. Never call
+  `PdcpSecurityEntity` on this path, and never invent a protected PDU that the
+  peer has no keys to verify.
+- **An enumerator is not a tick count.** Resolve every TS 36.331 RLC field through
+  `MapSrb1Configuration`; a spare value, an SRB identity other than 1, a zero
+  tick or an unknown field is a typed refusal, never a default. The eNB maps the
+  exact message it sends, so the two sides cannot disagree.
+- **maxRetxThreshold counts retransmissions.** `AmConfig.maxRetx` counts
+  transmissions, so the mapper adds one. Do not compare the two directly again.
+- **One direction per bearer, decided by the role.** A UE bearer transmits uplink
+  and accepts only downlink; an eNB bearer the reverse. Never infer the local role
+  from an incoming frame, and never let a test relay rewrite a wrong direction
+  into a right one - a mislabelled frame must be refused by the receiving bearer.
+- **A held frame belongs to its destination.** The socket's reorder impairment
+  must never hand a delayed outgoing frame to the local receive path and must
+  keep its destination. Release it on the next send, on `FlushPending()`, or
+  count it when the socket closes.
+- **RRC_CONNECTED needs an acknowledgement.** The UE moves to
+  `RRC_CONNECTION_COMPLETE_PENDING` when it submits SetupComplete and to
+  `RRC_CONNECTED` only when RLC acknowledges that PDU; the eNB moves only after
+  it has decoded and validated the message.
+- **One SetupComplete per context.** A second message, a duplicate PDCP SN, a
+  wrong transaction identifier or a wrong PLMN must not deliver the NAS payload
+  again; the callback fires exactly once.
+- **No NAS interpretation.** The dedicatedInfoNAS bytes are opaque here and stop
+  at the callback. Do not route them into S1AP in this phase; that is B6-C.
+- **Nothing above this is claimed.** `AS_SMC_RUNTIME_READY`,
+  `AS_INITIAL_SECURITY_ACTIVATION_READY`, `HANDOVER_SECURITY_READY`,
+  `UE_RADIO_EXECUTION_READY` and `LIVE_HANDOVER_EXECUTION_READY` stay false:
+  there is no SecurityMode procedure on this bearer, no security activation and
+  no radio execution.
 
 ## LTE performance and capacity
 

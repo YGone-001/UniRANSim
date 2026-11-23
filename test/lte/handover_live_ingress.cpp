@@ -221,6 +221,10 @@ TEST_CASE("lte/handover/live: the capability model names every missing live prer
     CHECK(readiness.available(HandoverCapability::AS_KEY_DERIVATION_READY));
     CHECK(readiness.available(HandoverCapability::SIMULATED_UU_TRANSPORT_READY));
     CHECK(readiness.available(HandoverCapability::SRB0_INITIAL_ACCESS_READY));
+    // Phase 18-F-B6-B2: the SRB1 runtime exists and its acceptance suite passes.
+    CHECK(readiness.available(HandoverCapability::SRB1_RLC_AM_READY));
+    CHECK(readiness.available(HandoverCapability::SRB1_PDCP_RUNTIME_READY));
+    CHECK(readiness.available(HandoverCapability::RRC_CONNECTION_RUNTIME_READY));
     CHECK(readiness.available(HandoverCapability::AS_ALGORITHM_SELECTION_READY));
     CHECK(readiness.available(HandoverCapability::AS_SMC_CODEC_READY));
     CHECK(readiness.available(HandoverCapability::PDCP_RRC_INTEGRITY_READY));
@@ -260,7 +264,7 @@ TEST_CASE("lte/handover/live: the capability model names every missing live prer
     CHECK_FALSE(readiness.available(HandoverCapability::MME_PATH_UPDATE_OBSERVABLE));
 
     // Every assessment carries the fact it rests on.
-    REQUIRE(readiness.assessments.size() == 23);
+    REQUIRE(readiness.assessments.size() == 26);
     for (const auto &assessment : readiness.assessments)
     {
         CHECK_FALSE(assessment.evidence.empty());

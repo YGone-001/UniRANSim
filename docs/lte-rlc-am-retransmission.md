@@ -46,8 +46,18 @@ pins down.
 
 ## Polling
 
-When `pollTicks` expires and something is still unacknowledged, the transmitter
-re-sends the oldest stored PDU with P=1. The receiver answers any PDU with a
+A poll is included in one of three ways, and the counters reset whenever one is
+sent:
+
+| Trigger | Field |
+|---|---|---|
+| timer | `pollTicks` since the last transmission of the oldest PDU |
+| PDU count | `pollPdu` new-data PDUs since the last poll (0 disables) |
+| byte count | `pollByte` new data bytes since the last poll (0 disables) |
+
+The counter-based triggers are what the SRB1 configuration maps from TS 36.331
+`pollPDU` and `pollByte`. When `pollTicks` expires and something is still
+unacknowledged, the transmitter re-sends the oldest stored PDU with P=1. The receiver answers any PDU with a
 pending report, so a lost STATUS or a lost NACK is recovered without the
 transport retrying anything. The tests cover both cases:
 

@@ -40,6 +40,11 @@ struct AmConfig
     uint32_t pollTicks{10};
     uint32_t reorderingTicks{10};
     uint32_t prohibitTicks{5};
+    // PDU-count and byte-count poll triggers (TS 36.331 pollPDU / pollByte).
+    // Zero disables the trigger; a poll is included when either counter reaches
+    // its limit, and both counters reset when a poll is sent.
+    uint32_t pollPdu{0};
+    uint32_t pollByte{0};
 };
 
 // One stored transmission: the exact Data field plus the framing that produced
@@ -131,6 +136,8 @@ class LteAmEntity
         std::vector<uint16_t> li{};
     };
 
+    // Counts one new-data PDU and asks whether it must carry a poll.
+    bool CountNewData(size_t bytes);
     void SendPdu(uint16_t sn, bool poll, FramingInfo fi, const std::vector<uint8_t> &data,
                  std::optional<std::pair<uint16_t, uint16_t>> soRange, const std::vector<uint16_t> &li = {});
     void TransmitStored(StoredSdu &stored, bool poll);
@@ -156,7 +163,8 @@ class LteAmEntity
     uint32_t prohibitTimer_{0};
     bool reordering_{false};
     bool statusPending_{false};
-    bool pollPending_{false};
+    uint32_t pduWithoutPoll_{0};
+    uint32_t byteWithoutPoll_{0};
 
     std::map<uint16_t, StoredSdu> transmissions_{};
     std::map<uint16_t, RxEntry> receive_{};

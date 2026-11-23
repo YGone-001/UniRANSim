@@ -392,7 +392,7 @@ TEST_CASE("lte/rlc-am-bearer/an independent process receives over the uu transpo
     if (child == 0)
     {
         // The transmitter runs in its own process with its own entity.
-        LteAmBearer tx(std::move(*a), portB, 0x77, AmConfig{}, nullptr);
+        LteAmBearer tx(std::make_unique<uu::Socket>(std::move(*a)), portB, EndpointRole::UE, 0x77, AmConfig{}, nullptr);
         tx.SubmitSdu({0xAA, 0xBB});
         tx.SubmitSdu({0xCC});
         for (int i = 0; i < 60; i++)
@@ -404,7 +404,7 @@ TEST_CASE("lte/rlc-am-bearer/an independent process receives over the uu transpo
     }
 
     std::vector<std::vector<uint8_t>> delivered;
-    LteAmBearer rx(std::move(*b), portA, 0x77, AmConfig{},
+    LteAmBearer rx(std::make_unique<uu::Socket>(std::move(*b)), portA, EndpointRole::ENB, 0x77, AmConfig{},
                    [&delivered](std::vector<uint8_t> sdu) { delivered.push_back(std::move(sdu)); });
     for (int i = 0; i < 200 && delivered.size() < 2; i++)
     {

@@ -138,6 +138,9 @@ const char *ToString(HandoverCapability capability)
     case HandoverCapability::PDCP_UP_CIPHERING_READY: return "PDCP_UP_CIPHERING_READY";
     case HandoverCapability::SIMULATED_UU_TRANSPORT_READY: return "SIMULATED_UU_TRANSPORT_READY";
     case HandoverCapability::SRB0_INITIAL_ACCESS_READY: return "SRB0_INITIAL_ACCESS_READY";
+    case HandoverCapability::SRB1_RLC_AM_READY: return "SRB1_RLC_AM_READY";
+    case HandoverCapability::SRB1_PDCP_RUNTIME_READY: return "SRB1_PDCP_RUNTIME_READY";
+    case HandoverCapability::RRC_CONNECTION_RUNTIME_READY: return "RRC_CONNECTION_RUNTIME_READY";
     case HandoverCapability::AS_SMC_RUNTIME_READY: return "AS_SMC_RUNTIME_READY";
     case HandoverCapability::AS_INITIAL_SECURITY_ACTIVATION_READY: return "AS_INITIAL_SECURITY_ACTIVATION_READY";
     case HandoverCapability::HANDOVER_SECURITY_READY: return "HANDOVER_SECURITY_READY";
@@ -310,9 +313,23 @@ LiveHandoverReadiness AssessLiveHandoverCapabilities()
                "SRB0 runs RLC TM (no header, no SN, no PDCP) over that transport and exchanges real TS 36.331 "
                "RRCConnectionRequest / RRCConnectionSetup / RRCConnectionReject; a separate-process test completes the "
                "exchange and the UE stops at SRB1 configuration"),
+        Assess(HandoverCapability::SRB1_RLC_AM_READY, true,
+               "LteAmBearer carries the accepted LTE AM entity as SRB1 on DCCH with an explicit UE/eNB role, validates "
+               "association, direction, channel and RLC format before an entity sees a frame, and recovers a lost "
+               "SetupComplete by RLC AM retransmission; test/lte/lte_am_uu.cpp, test/lte/uu_socket.cpp and "
+               "test/lte/srb1_runtime.cpp pin each of those"),
+        Assess(HandoverCapability::SRB1_PDCP_RUNTIME_READY, true,
+               "lte::pdcp::SrbPdcpEntity implements the pre-security TS 36.323 SRB profile (one-octet header, three "
+               "reserved bits, five-bit SN, no MAC-I, no ciphering), with COUNT/HFN progression, wraparound, duplicate "
+               "and out-of-sequence refusal; test/lte/srb1_runtime.cpp pins the header, SN 0..39 and each refusal"),
+        Assess(HandoverCapability::RRC_CONNECTION_RUNTIME_READY, true,
+               "RRCConnectionRequest -> RRCConnectionSetup -> SRB1 AM and PDCP construction -> "
+               "RRCConnectionSetupComplete -> eNB decode -> dedicatedInfoNAS delivery runs over the simulated Uu, in one "
+               "process and across two, with the RLC acknowledgement deciding the UE's RRC_CONNECTED transition; "
+               "test/lte/srb1_runtime.cpp executes the complete procedure"),
         Assess(HandoverCapability::AS_SMC_RUNTIME_READY, false,
-               "the UE and eNB state machines run end to end in-process over real RRC and PDCP bytes, but this simulator "
-               "has no RRC connection and no SRB1 transport: there is no peer to carry a SecurityModeCommand to"),
+               "the SMC state machines run end to end in-process over real RRC and PDCP bytes, and an SRB1 runtime now "
+               "exists, but the procedure is not carried over it yet: B6-C wires SecurityModeCommand to this bearer"),
         Assess(HandoverCapability::AS_INITIAL_SECURITY_ACTIVATION_READY, false,
                "activation depends on AS_SMC_RUNTIME_READY; the transitions and the PDCP activation points are implemented "
                "and tested, but nothing in the running LTE stack drives them"),

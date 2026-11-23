@@ -28,6 +28,9 @@ enum class RrcState : uint8_t
     RRC_CONNECTION_REQUEST_PENDING,
     RRC_SETUP_PENDING,
     RRC_SRB1_CONFIGURING,
+    // SetupComplete has been submitted on SRB1 and the RLC acknowledgement for
+    // it has not arrived yet. RRC_CONNECTED is claimed only after that ack.
+    RRC_CONNECTION_COMPLETE_PENDING,
     RRC_CONNECTED,
     RRC_CONNECTION_REJECTED,
     RRC_CONNECTION_FAILED,
@@ -145,6 +148,18 @@ class EnbInitialAccess
         waitTime_ = waitTime;
     }
 
+    // The SRB1 configuration this eNB offers. The runtime that carries SRB1
+    // must map exactly this message, so there is one source of truth for what
+    // the UE receives and what the eNB instantiates.
+    void SetSetup(const RrcConnectionSetupMessage &setup)
+    {
+        setup_ = setup;
+    }
+    [[nodiscard]] const RrcConnectionSetupMessage &Setup() const
+    {
+        return setup_;
+    }
+
     // Handles an UL-CCCH RRCConnectionRequest and returns the DL-CCCH answer.
     // A repeated request for a pending association returns the same answer and
     // does not create a second context.
@@ -169,6 +184,7 @@ class EnbInitialAccess
 
     bool reject_{false};
     uint8_t waitTime_{0};
+    RrcConnectionSetupMessage setup_{0, 1, 2, 1, 1, 5, 1, 1};
     std::map<uint32_t, Pending> contexts_{};
 };
 

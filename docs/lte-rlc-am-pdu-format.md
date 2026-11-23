@@ -53,9 +53,11 @@ identifier, not a C-RNTI.
 
 `test/lte/lte_am_uu.cpp` decodes every frame that crosses its link node into one
 record: round, direction, PDU type, SN, segment flag, SO, LSF, poll bit, LI
-count, length and, for a STATUS, ACK_SN and the first NACK range. A dropped frame
-keeps its decoded identity and is marked as lost, so the log states what the
-endpoints emitted as well as what arrived.
+count, length, the direction label the endpoint emitted and, for a STATUS, ACK_SN
+and the first NACK range. A dropped frame keeps its decoded identity and is
+marked as lost, so the log states what the endpoints emitted as well as what
+arrived. Only DCCH payloads are decoded as RLC PDUs; a CCCH payload is an RRC
+message in transparent mode and is reported by length only.
 
 Examples from the passing run:
 

@@ -103,6 +103,7 @@ const char *ToString(RrcState state)
     case RrcState::RRC_CONNECTION_REQUEST_PENDING: return "RRC_CONNECTION_REQUEST_PENDING";
     case RrcState::RRC_SETUP_PENDING: return "RRC_SETUP_PENDING";
     case RrcState::RRC_SRB1_CONFIGURING: return "RRC_SRB1_CONFIGURING";
+    case RrcState::RRC_CONNECTION_COMPLETE_PENDING: return "RRC_CONNECTION_COMPLETE_PENDING";
     case RrcState::RRC_CONNECTED: return "RRC_CONNECTED";
     case RrcState::RRC_CONNECTION_REJECTED: return "RRC_CONNECTION_REJECTED";
     case RrcState::RRC_CONNECTION_FAILED: return "RRC_CONNECTION_FAILED";
@@ -512,16 +513,7 @@ std::vector<uint8_t> EnbInitialAccess::OnRequest(uint32_t association, const std
     }
     else
     {
-        RrcConnectionSetupMessage setup;
-        setup.transactionId = 0;
-        setup.srbIdentity = 1;
-        setup.tPollRetransmit = 2;   // a legal TS 36.331 enumeration value
-        setup.pollPdu = 1;
-        setup.pollByte = 1;
-        setup.maxRetxThreshold = 5;
-        setup.tReordering = 1;
-        setup.tStatusProhibit = 1;
-        pending.answer = EncodeRrcConnectionSetup(setup);
+        pending.answer = EncodeRrcConnectionSetup(setup_);
         pending.state = RrcState::RRC_SETUP_PENDING;
     }
 

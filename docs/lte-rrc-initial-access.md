@@ -9,7 +9,7 @@ Phase 18-F-B6-A. `src/lte/rrc-runtime/rrc_initial_access.{hpp,cpp}`.
 | RRCConnectionRequest | UE -> eNB | UL-CCCH | SRB0 / RLC TM |
 | RRCConnectionSetup | eNB -> UE | DL-CCCH | SRB0 / RLC TM |
 | RRCConnectionReject | eNB -> UE | DL-CCCH | SRB0 / RLC TM |
-| RRCConnectionSetupComplete | UE -> eNB | UL-DCCH | **B6-B, not implemented** |
+| RRCConnectionSetupComplete | UE -> eNB | UL-DCCH | SRB1 / RLC AM, protocol above PDCP (B6-B2) |
 
 All three are real TS 36.331 messages encoded with the accepted asn1c LTE RRC
 UPER codec. The request carries an S-TMSI (`mmec`, `m-TMSI`) and an
@@ -26,16 +26,18 @@ eNB: per association, `RRC_SETUP_PENDING` after a valid request, or
 `RRC_CONNECTION_REJECTED`. A repeated request for a pending association returns
 the same answer and does **not** create a second context.
 
-**The UE never reaches `RRC_CONNECTED` in this phase.** SRB1 needs RLC AM, which
-is B6-B; until then the UE holds the staged configuration and stops.
+In B6-A the UE stopped at `RRC_SRB1_CONFIGURING` because SRB1 did not exist.
+B6-B2 continues from there: `UeSrb1Runtime` maps the staged configuration, builds
+the SRB1 AM and PDCP entities and sends RRCConnectionSetupComplete, reaching
+`RRC_CONNECTED` only after RLC acknowledges that PDU. The state machine here is
+unchanged; the connection runtime above it owns the rest.
 
-## Why not connected
+## Why the steps stop where they do
 
-`RRC_CONNECTED` requires a received and validated RRCConnectionSetupComplete on
-SRB1, which requires RLC AM and a PDCP SRB1 entity. Neither exists yet. The
-capability table therefore reports `SRB0_INITIAL_ACCESS_READY = true` and keeps
+`RRC_CONNECTED` still requires a validated RRCConnectionSetupComplete on SRB1,
+which is exactly what B6-B2 implements. AS security is still absent, so
 `AS_SMC_RUNTIME_READY`, `AS_INITIAL_SECURITY_ACTIVATION_READY` and
-`HANDOVER_SECURITY_READY` false.
+`HANDOVER_SECURITY_READY` remain false.
 
 ## NAS
 

@@ -112,7 +112,7 @@ void LteAmEntity::SubmitSdu(const std::vector<uint8_t> &sdu)
         stored.transmissions = 1;
         transmissions_[vtS_] = stored;
 
-        SendPdu(vtS_, false, fi, stored.data, std::nullopt);
+        SendPdu(vtS_, CountNewData(chunk), fi, stored.data, std::nullopt);
         vtS_ = static_cast<uint16_t>((vtS_ + 1) % SnModulus);
         offset += chunk;
     }
@@ -159,8 +159,29 @@ void LteAmEntity::SubmitSdus(const std::vector<std::vector<uint8_t>> &sdus)
     stored.li = li;
     stored.transmissions = 1;
     transmissions_[vtS_] = stored;
-    SendPdu(vtS_, false, FramingInfo::COMPLETE, data, std::nullopt, li);
+    SendPdu(vtS_, CountNewData(total), FramingInfo::COMPLETE, data, std::nullopt, li);
     vtS_ = static_cast<uint16_t>((vtS_ + 1) % SnModulus);
+}
+
+bool LteAmEntity::CountNewData(size_t bytes)
+{
+    // TS 36.322 5.3.3.2: PDU_WITHOUT_POLL counts AMD PDUs carrying new data,
+    // BYTE_WITHOUT_POLL counts their new data bytes. Either reaching its
+    // configured limit asks for a poll, and both reset when one is sent.
+    pduWithoutPoll_++;
+    byteWithoutPoll_ += bytes;
+
+    bool poll = false;
+    if (config_.pollPdu != 0 && pduWithoutPoll_ >= config_.pollPdu)
+        poll = true;
+    if (config_.pollByte != 0 && byteWithoutPoll_ >= config_.pollByte)
+        poll = true;
+    if (poll)
+    {
+        pduWithoutPoll_ = 0;
+        byteWithoutPoll_ = 0;
+    }
+    return poll;
 }
 
 void LteAmEntity::TransmitStored(StoredSdu &stored, bool poll)

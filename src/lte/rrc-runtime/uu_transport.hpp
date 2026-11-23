@@ -83,7 +83,19 @@ class Socket
     // absence, so nothing is retried here.
     bool Send(uint16_t port, const Frame &frame, std::string *why);
     // Waits up to timeoutMs for one frame. Returns false on timeout or error.
-    bool Receive(Frame &out, int timeoutMs, std::string *why);
+    // When sourcePort is not null it receives the sender's port, which lets a
+    // multi-UE endpoint answer an association it has just learned about without
+    // adding a field to the envelope.
+    bool Receive(Frame &out, int timeoutMs, std::string *why, uint16_t *sourcePort = nullptr);
+
+    // Releases a frame the reorder impairment is holding to its own destination.
+    // A held frame is bounded: it leaves on the next send, on this call, or is
+    // counted and discarded by Close(). It is never handed to Receive().
+    bool FlushPending(std::string *why);
+    [[nodiscard]] bool HasPending() const noexcept
+    {
+        return pending_.has_value();
+    }
 
     [[nodiscard]] uint64_t Sent() const noexcept
     {
@@ -97,20 +109,43 @@ class Socket
     {
         return malformed_;
     }
+    [[nodiscard]] uint64_t Held() const noexcept
+    {
+        return held_;
+    }
+    [[nodiscard]] uint64_t Released() const noexcept
+    {
+        return released_;
+    }
+    [[nodiscard]] uint64_t PendingDropped() const noexcept
+    {
+        return pendingDropped_;
+    }
     void SetLinkModel(const LinkModel &model) noexcept
     {
         link_ = model;
     }
 
   private:
+    struct Pending
+    {
+        Frame frame{};
+        uint16_t destination{0};
+    };
+
+    bool RawSend(uint16_t port, const Frame &frame, std::string *why);
+
     int fd_{-1};
     uint16_t port_{0};
     uint64_t sent_{0};
     uint64_t dropped_{0};
     uint64_t malformed_{0};
+    uint64_t held_{0};
+    uint64_t released_{0};
+    uint64_t pendingDropped_{0};
     uint32_t sequence_{0};
     LinkModel link_{};
-    std::optional<Frame> pending_{};
+    std::optional<Pending> pending_{};
 };
 
 } // namespace lte::uu

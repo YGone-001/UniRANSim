@@ -15,6 +15,8 @@
 #include <lte/rrc-runtime/lte_am_bearer.hpp>
 #include <lte/rrc-runtime/uu_transport.hpp>
 
+#include "uu_relay.hpp"
+
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -45,353 +47,7 @@ std::vector<uint8_t> Pattern(size_t count, uint8_t seed)
     return out;
 }
 
-enum class Endpoint
-{
-    UE,
-    ENB
-};
-
-// Deterministic link behaviour for one direction. Every counter is one-based
-// and counts PDUs of that type in that direction; -1 disables the rule.
-struct Impairment
-{
-    int dropAmdAt{-1};
-    int dropStatusAt{-1};
-    int splitAmdAt{-1};
-    uint16_t splitSo{0};
-    // false: the head is delivered and the tail is lost. true: the tail is
-    // delivered and the head is lost.
-    bool splitKeepTail{false};
-    int duplicateAmdAt{-1};
-    int reorderAmdAt{-1};
-    int delayAmdAt{-1};
-    int delayRounds{0};
-    bool dropAllAmd{false};
-    bool dropAllStatus{false};
-};
-
-// One frame as it crossed the link, decoded with the LTE codec. This is the
-// evidence stream: direction, endpoint, PDU type, SN, SO, LSF, LI count, poll
-// bit, length and, for a STATUS, the ACK_SN and the first NACK range.
-struct TraceEntry
-{
-    uint32_t round{0};
-    Endpoint from{Endpoint::UE};
-    Endpoint to{Endpoint::ENB};
-    bool delivered{true};
-    bool amd{true};
-    size_t bytes{0};
-    uint16_t sn{0};
-    bool segment{false};
-    uint16_t so{0};
-    bool lsf{false};
-    bool poll{false};
-    size_t liCount{0};
-    uint16_t ackSn{0};
-    size_t nacks{0};
-    bool nackHasSo{false};
-    uint16_t nackSoStart{0};
-    uint16_t nackSoEnd{0};
-};
-
-std::string Describe(const TraceEntry &entry)
-{
-    std::string line = "r" + std::to_string(entry.round) + " " +
-                       (entry.from == Endpoint::UE ? "ue->enb " : "enb->ue ");
-    line += entry.delivered ? "sent " : "lost ";
-    line += entry.amd ? "AMD" : "STATUS";
-    if (entry.amd)
-    {
-        line += " sn=" + std::to_string(entry.sn);
-        if (entry.segment)
-            line += " so=" + std::to_string(entry.so) + (entry.lsf ? " lsf" : "");
-        if (entry.poll)
-            line += " poll";
-        if (entry.liCount != 0)
-            line += " li=" + std::to_string(entry.liCount);
-    }
-    else
-    {
-        line += " ack=" + std::to_string(entry.ackSn) + " nacks=" + std::to_string(entry.nacks);
-        if (entry.nackHasSo)
-            line += " so=" + std::to_string(entry.nackSoStart) + ".." + std::to_string(entry.nackSoEnd);
-    }
-    line += " len=" + std::to_string(entry.bytes);
-    return line;
-}
-
-// A test-owned node on the Uu link. It owns the two sockets the endpoints talk
-// to, so every datagram it forwards has crossed the real transport twice.
-class UuRelay
-{
-  public:
-    bool Bind(std::string *why)
-    {
-        auto ueSide = uu::Socket::BindLoopback(0, why);
-        auto enbSide = uu::Socket::BindLoopback(0, why);
-        if (!ueSide || !enbSide)
-            return false;
-        ueSide_ = std::move(*ueSide);
-        enbSide_ = std::move(*enbSide);
-        return true;
-    }
-
-    void CloseSockets() noexcept
-    {
-        ueSide_.Close();
-        enbSide_.Close();
-    }
-
-    [[nodiscard]] uint16_t UeFacingPort() const
-    {
-        return ueSide_.Port();
-    }
-    [[nodiscard]] uint16_t EnbFacingPort() const
-    {
-        return enbSide_.Port();
-    }
-
-    void SetPeers(uint16_t uePort, uint16_t enbPort)
-    {
-        uePort_ = uePort;
-        enbPort_ = enbPort;
-    }
-
-    void SetImpairments(const Impairment &uplink, const Impairment &downlink)
-    {
-        uplink_ = uplink;
-        downlink_ = downlink;
-    }
-
-    void Pump()
-    {
-        round_++;
-        uu::Frame frame;
-        while (ueSide_.Receive(frame, 0, nullptr))
-            Handle(Endpoint::UE, frame);
-        while (enbSide_.Receive(frame, 0, nullptr))
-            Handle(Endpoint::ENB, frame);
-
-        for (size_t i = 0; i < delayed_.size();)
-        {
-            Delayed item = delayed_[i];
-            if (--item.roundsLeft <= 0)
-            {
-                delayed_.erase(delayed_.begin() + static_cast<long>(i));
-                Deliver(item.to == Endpoint::ENB ? Endpoint::UE : Endpoint::ENB, item.to, item.frame);
-            }
-            else
-            {
-                delayed_[i].roundsLeft = item.roundsLeft;
-                i++;
-            }
-        }
-    }
-
-    [[nodiscard]] const std::vector<TraceEntry> &Trace() const
-    {
-        return trace_;
-    }
-
-  private:
-    struct Delayed
-    {
-        Endpoint to{Endpoint::ENB};
-        uu::Frame frame{};
-        int roundsLeft{0};
-    };
-
-    static size_t Index(Endpoint to)
-    {
-        return to == Endpoint::ENB ? 0U : 1U;
-    }
-
-    void RawSend(Endpoint to, uu::Frame frame)
-    {
-        frame.direction = to == Endpoint::ENB ? uu::Direction::DOWNLINK : uu::Direction::UPLINK;
-        if (to == Endpoint::ENB)
-            enbSide_.Send(enbPort_, frame, nullptr);
-        else
-            ueSide_.Send(uePort_, frame, nullptr);
-    }
-
-    void Record(Endpoint from, Endpoint to, const uu::Frame &frame, bool delivered)
-    {
-        if (frame.payload.empty())
-            return;
-        TraceEntry entry;
-        entry.round = round_;
-        entry.from = from;
-        entry.to = to;
-        entry.delivered = delivered;
-        entry.bytes = frame.payload.size();
-        entry.amd = (frame.payload[0] & 0x80U) != 0;
-
-        std::string why;
-        if (entry.amd)
-        {
-            AmdPdu pdu;
-            if (DecodeAmd(frame.payload.data(), frame.payload.size(), pdu, &why))
-            {
-                entry.sn = pdu.sn;
-                entry.segment = pdu.segment;
-                entry.so = pdu.segment ? pdu.so : 0;
-                entry.lsf = pdu.lsf;
-                entry.poll = pdu.poll;
-                entry.liCount = pdu.li.size();
-            }
-        }
-        else
-        {
-            StatusPdu status;
-            if (DecodeStatus(frame.payload.data(), frame.payload.size(), status, &why))
-            {
-                entry.ackSn = status.ackSn;
-                entry.nacks = status.nacks.size();
-                if (!status.nacks.empty() && status.nacks[0].soRange)
-                {
-                    entry.nackHasSo = true;
-                    entry.nackSoStart = status.nacks[0].soRange->first;
-                    entry.nackSoEnd = status.nacks[0].soRange->second;
-                }
-            }
-        }
-        trace_.push_back(entry);
-    }
-
-    // Delivers one frame and, when a reordered frame is waiting, releases that
-    // one afterwards so the peer sees them out of order.
-    void Deliver(Endpoint from, Endpoint to, const uu::Frame &frame, bool hold = false)
-    {
-        const size_t index = Index(to);
-        if (hold)
-        {
-            reorderHold_[index] = frame;
-            return;
-        }
-        RawSend(to, frame);
-        Record(from, to, frame, true);
-        if (reorderHold_[index])
-        {
-            uu::Frame held = *reorderHold_[index];
-            reorderHold_[index].reset();
-            RawSend(to, held);
-            Record(from, to, held, true);
-        }
-    }
-
-    // Replaces one AMD PDU with an AMD segment pair and loses one of them, which
-    // is how a selected byte range is dropped without touching the transport or
-    // the header the transmitter built.
-    bool Split(Endpoint from, Endpoint to, const uu::Frame &frame, const Impairment &policy)
-    {
-        AmdPdu pdu;
-        std::string why;
-        if (!DecodeAmd(frame.payload.data(), frame.payload.size(), pdu, &why))
-            return false;
-        if (pdu.segment)
-            return false;
-        const size_t split = policy.splitSo;
-        if (split == 0 || split >= pdu.data.size())
-            return false;
-        size_t described = 0;
-        for (auto value : pdu.li)
-            described += value;
-        // An LI chain longer than the head would make the head undecodable.
-        if (described > split)
-            return false;
-
-        AmdPdu head;
-        head.sn = pdu.sn;
-        head.poll = pdu.poll;
-        head.fi = pdu.fi;
-        head.segment = true;
-        head.so = 0;
-        head.lsf = false;
-        head.li = pdu.li;
-        head.data.assign(pdu.data.begin(), pdu.data.begin() + static_cast<long>(split));
-
-        AmdPdu tail;
-        tail.sn = pdu.sn;
-        tail.poll = pdu.poll;
-        tail.fi = pdu.fi;
-        tail.segment = true;
-        tail.so = static_cast<uint16_t>(split);
-        tail.lsf = true;
-        tail.data.assign(pdu.data.begin() + static_cast<long>(split), pdu.data.end());
-
-        uu::Frame headFrame = frame;
-        headFrame.payload = EncodeAmd(head);
-        uu::Frame tailFrame = frame;
-        tailFrame.payload = EncodeAmd(tail);
-
-        if (policy.splitKeepTail)
-        {
-            Record(from, to, headFrame, false);
-            Deliver(from, to, tailFrame);
-        }
-        else
-        {
-            Deliver(from, to, headFrame);
-            Record(from, to, tailFrame, false);
-        }
-        return true;
-    }
-
-    void Handle(Endpoint from, const uu::Frame &frame)
-    {
-        if (frame.payload.empty())
-            return;
-
-        const Endpoint to = from == Endpoint::UE ? Endpoint::ENB : Endpoint::UE;
-        const Impairment &policy = from == Endpoint::UE ? uplink_ : downlink_;
-        const bool amd = (frame.payload[0] & 0x80U) != 0;
-
-        int &counter = amd ? (from == Endpoint::UE ? uplinkAmd_ : downlinkAmd_)
-                           : (from == Endpoint::UE ? uplinkStatus_ : downlinkStatus_);
-        counter++;
-        const int occurrence = counter;
-
-        if (amd ? policy.dropAllAmd : policy.dropAllStatus)
-        {
-            Record(from, to, frame, false);
-            return;
-        }
-        if (amd ? occurrence == policy.dropAmdAt : occurrence == policy.dropStatusAt)
-        {
-            Record(from, to, frame, false);
-            return;
-        }
-        if (amd && occurrence == policy.splitAmdAt && Split(from, to, frame, policy))
-            return;
-        if (amd && occurrence == policy.delayAmdAt && policy.delayRounds > 0)
-        {
-            delayed_.push_back(Delayed{to, frame, policy.delayRounds});
-            return;
-        }
-        if (amd && occurrence == policy.duplicateAmdAt)
-        {
-            RawSend(to, frame);
-            Record(from, to, frame, true);
-        }
-        Deliver(from, to, frame, amd && occurrence == policy.reorderAmdAt);
-    }
-
-    uu::Socket ueSide_{};
-    uu::Socket enbSide_{};
-    uint16_t uePort_{0};
-    uint16_t enbPort_{0};
-    Impairment uplink_{};
-    Impairment downlink_{};
-    int uplinkAmd_{0};
-    int downlinkAmd_{0};
-    int uplinkStatus_{0};
-    int downlinkStatus_{0};
-    uint32_t round_{0};
-    std::vector<Delayed> delayed_{};
-    std::vector<TraceEntry> trace_{};
-    std::optional<uu::Frame> reorderHold_[2]{};
-};
+using namespace uu_test;
 
 // Two independent LTE AM endpoints inside one process, each with its own entity
 // and its own socket, connected only through the relay.
@@ -408,12 +64,13 @@ class UuSession
             return;
 
         enbPort_ = enbSocket->Port();
-        relay_.SetPeers(ueSocket->Port(), enbPort_);
-        ue_ = std::make_unique<LteAmBearer>(std::move(*ueSocket), relay_.UeFacingPort(), association, ueConfig,
+        uePort_ = ueSocket->Port();
+        relay_.SetPeers(uePort_, enbPort_);
+        ue_ = std::make_unique<LteAmBearer>(std::make_unique<uu::Socket>(std::move(*ueSocket)), relay_.UeFacingPort(), EndpointRole::UE, association, ueConfig,
                                             [this](std::vector<uint8_t> sdu) {
                                                 ueDelivered_.push_back(std::move(sdu));
                                             });
-        enb_ = std::make_unique<LteAmBearer>(std::move(*enbSocket), relay_.EnbFacingPort(), association, enbConfig,
+        enb_ = std::make_unique<LteAmBearer>(std::make_unique<uu::Socket>(std::move(*enbSocket)), relay_.EnbFacingPort(), EndpointRole::ENB, association, enbConfig,
                                              [this](std::vector<uint8_t> sdu) {
                                                  enbDelivered_.push_back(std::move(sdu));
                                              });
@@ -445,6 +102,10 @@ class UuSession
     [[nodiscard]] uint16_t EnbPort() const
     {
         return enbPort_;
+    }
+    [[nodiscard]] uint16_t UePort() const
+    {
+        return uePort_;
     }
     [[nodiscard]] const std::vector<std::vector<uint8_t>> &UeDelivered() const
     {
@@ -507,6 +168,7 @@ class UuSession
     UuRelay relay_{};
     std::unique_ptr<LteAmBearer> ue_{};
     std::unique_ptr<LteAmBearer> enb_{};
+    uint16_t uePort_{0};
     uint16_t enbPort_{0};
     std::string why_{};
     bool ok_{false};
@@ -1064,7 +726,7 @@ ProcessOutcome RunUeProcess(const std::vector<std::vector<uint8_t>> &sdus, const
 
         ChildReport report;
         {
-            LteAmBearer ue(std::move(*socket), relay.UeFacingPort(), ChanA, ueConfig, nullptr);
+            LteAmBearer ue(std::make_unique<uu::Socket>(std::move(*socket)), relay.UeFacingPort(), EndpointRole::UE, ChanA, ueConfig, nullptr);
             if (concatenate)
                 ue.SubmitSdus(sdus);
             else
@@ -1103,7 +765,7 @@ ProcessOutcome RunUeProcess(const std::vector<std::vector<uint8_t>> &sdus, const
     int status = 0;
     bool reaped = false;
     {
-        LteAmBearer enb(std::move(*enbSocket), relay.EnbFacingPort(), ChanA, AmConfig{},
+        LteAmBearer enb(std::make_unique<uu::Socket>(std::move(*enbSocket)), relay.EnbFacingPort(), EndpointRole::ENB, ChanA, AmConfig{},
                         [&outcome](std::vector<uint8_t> sdu) { outcome.delivered.push_back(std::move(sdu)); });
         for (int i = 0; i < roundBudget + 2000; i++)
         {
@@ -1216,5 +878,112 @@ TEST_CASE("lte/rlc-am-uu/separate ue process preserves an li chain across a lost
     CHECK(outcome.trace[1].poll);
     CHECK_FALSE(outcome.trace[2].amd);
     CHECK(outcome.trace[2].ackSn == 1);
+}
+
+
+namespace
+{
+
+// Sends one frame from a third socket straight to an endpoint, so a test can
+// put a wrong label, channel or association on the wire without asking a bearer
+// to emit it.
+bool Inject(uint16_t destination, const uu::Frame &frame)
+{
+    auto probe = uu::Socket::BindLoopback(0, nullptr);
+    if (!probe)
+        return false;
+    return probe->Send(destination, frame, nullptr);
+}
+
+uu::Frame AmdFrame(uint32_t association, uu::Direction direction, uu::LogicalChannel channel, uint16_t sn)
+{
+    AmdPdu pdu;
+    pdu.sn = sn;
+    pdu.data = {0x5A};
+    uu::Frame frame;
+    frame.association = association;
+    frame.direction = direction;
+    frame.channel = channel;
+    frame.payload = EncodeAmd(pdu);
+    return frame;
+}
+
+} // namespace
+
+TEST_CASE("lte/rlc-am-uu/a ue bearer transmits uplink and accepts only downlink")
+{
+    UuSession session(AmConfig{}, AmConfig{}, ChanA);
+    REQUIRE(session.Ok());
+
+    session.Ue().SubmitSdu({0x91});
+    REQUIRE(session.RunUntil([&] { return session.EnbDelivered().size() == 1 && session.Ue().VtA() == 1; }, 20));
+
+    const auto &trace = session.Trace();
+    REQUIRE(trace.size() >= 1);
+    CHECK(trace[0].label == uu::Direction::UPLINK);
+    CHECK(trace[0].amd);
+    // The eNB answered with a STATUS labelled downlink, and only that reached
+    // the UE: a bearer never accepts a frame with its own transmit direction.
+    REQUIRE(trace.size() >= 2);
+    CHECK(trace[1].label == uu::Direction::DOWNLINK);
+    CHECK(session.Ue().Refused().Total() == 0);
+    CHECK(session.Enb().Refused().Total() == 0);
+}
+
+TEST_CASE("lte/rlc-am-uu/a frame with the wrong direction never reaches the entity")
+{
+    UuSession session(AmConfig{}, AmConfig{}, ChanA);
+    REQUIRE(session.Ok());
+
+    // The UE expects DOWNLINK; this one claims UPLINK.
+    REQUIRE(Inject(session.UePort(), AmdFrame(ChanA, uu::Direction::UPLINK, uu::LogicalChannel::DCCH, 0)));
+    for (int i = 0; i < 3; i++)
+    {
+        session.Round();
+        session.Ue().Tick();
+    }
+    CHECK(session.Ue().Refused().wrongDirection == 1);
+    CHECK(session.Ue().VrR() == 0);
+    CHECK(session.UeDelivered().empty());
+    CHECK(session.Ue().VtA() == 0);
+
+    // The eNB expects UPLINK; this one claims DOWNLINK.
+    REQUIRE(Inject(session.EnbPort(), AmdFrame(ChanA, uu::Direction::DOWNLINK, uu::LogicalChannel::DCCH, 0)));
+    for (int i = 0; i < 3; i++)
+    {
+        session.Round();
+        session.Enb().Tick();
+    }
+    CHECK(session.Enb().Refused().wrongDirection == 1);
+    CHECK(session.Enb().VrR() == 0);
+    CHECK(session.EnbDelivered().empty());
+}
+
+TEST_CASE("lte/rlc-am-uu/wrong channel, association and malformed rlc are refused before the entity")
+{
+    UuSession session(AmConfig{}, AmConfig{}, ChanA);
+    REQUIRE(session.Ok());
+
+    REQUIRE(Inject(session.EnbPort(), AmdFrame(ChanA, uu::Direction::UPLINK, uu::LogicalChannel::CCCH, 0)));
+    REQUIRE(Inject(session.EnbPort(), AmdFrame(ChanA + 1, uu::Direction::UPLINK, uu::LogicalChannel::DCCH, 0)));
+
+    uu::Frame empty = AmdFrame(ChanA, uu::Direction::UPLINK, uu::LogicalChannel::DCCH, 0);
+    empty.payload.clear();
+    REQUIRE(Inject(session.EnbPort(), empty));
+
+    uu::Frame malformed = AmdFrame(ChanA, uu::Direction::UPLINK, uu::LogicalChannel::DCCH, 0);
+    malformed.payload = {0x80};  // D/C = data, but no second header octet
+    REQUIRE(Inject(session.EnbPort(), malformed));
+
+    for (int i = 0; i < 6; i++)
+        session.Enb().Pump(1);
+
+    CHECK(session.Enb().Refused().wrongChannel == 1);
+    CHECK(session.Enb().Refused().foreignAssociation == 1);
+    CHECK(session.Enb().Refused().emptyPayload == 1);
+    CHECK(session.Enb().Refused().malformedRlc == 1);
+    CHECK(session.Enb().VrR() == 0);
+    CHECK(session.EnbDelivered().empty());
+    CHECK(session.Ue().VtA() == 0);
 }
 

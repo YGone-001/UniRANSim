@@ -102,9 +102,19 @@ enum class HandoverCapability : uint8_t
     // This is a simulator bearer, not physical radio.
     SIMULATED_UU_TRANSPORT_READY,
     SRB0_INITIAL_ACCESS_READY,
-    // The procedure exists and is exercised end to end in-process, but this
-    // simulator has no SRB1 transport and no RRC connection, so no runtime
-    // message is carried: the bytes go to a test, not to a peer.
+    // Phase 18-F-B6-B2: the accepted LTE AM bearer now runs as SRB1 on DCCH,
+    // with the endpoint role deciding the direction on the wire.
+    SRB1_RLC_AM_READY,
+    // The pre-security SRB PDCP profile (one-octet header, five-bit SN, no
+    // MAC-I) carries RRCConnectionSetupComplete and delivers the NAS PDU.
+    SRB1_PDCP_RUNTIME_READY,
+    // RRCConnectionRequest -> RRCConnectionSetup -> SRB1 AM/PDCP ->
+    // RRCConnectionSetupComplete -> eNB decode -> NAS boundary, over the
+    // simulated Uu, in one process and across two.
+    RRC_CONNECTION_RUNTIME_READY,
+    // The procedure exists and is exercised end to end in-process. The SRB1
+    // runtime now exists, but the SecurityMode messages are not carried over it
+    // yet: that is B6-C.
     AS_SMC_RUNTIME_READY,
     // Activation at runtime follows from the two above and is therefore false.
     AS_INITIAL_SECURITY_ACTIVATION_READY,
