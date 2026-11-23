@@ -67,6 +67,11 @@ struct EnbConfig
     int pagingDrx{128};
     std::string ueLinkAddress{"127.0.0.1"};
     uint16_t ueLinkPort{4998};
+    // The simulated Uu endpoint that carries SRB0/SRB1 for B6-D. Empty address
+    // or zero port means the endpoint is not configured and no Uu socket is
+    // bound; the legacy radio link above stays the only transport.
+    std::string uuAddress;
+    uint16_t uuPort{0};
     // Real S1-U GTP-U endpoint owned and advertised by this eNB.
     std::string s1uAddress;
     uint16_t s1uPort{2152};

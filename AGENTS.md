@@ -1364,3 +1364,17 @@ observed, and correct a record only for a demonstrated inconsistency.
 - **No live claim.** `LTE_OPEN5GS_ATTACH_ACCEPTED` and
   `LTE_EPS_ATTACH_OVER_SRB1_READY` stay false until the production UE NAS path is
   wired and a live Attach is accepted.
+
+## LTE Uu endpoint configuration (B6-D)
+
+`docs/lte-uu-endpoint-configuration.md` is the record. Both the UE and the eNB
+accept an optional `uu` block; absence means the endpoint is not configured and
+the legacy `enbLink`/`ueLink` transport stays the only radio path.
+
+- **Opt-in, never inferred.** Do not bind a Uu socket because some other field
+  looks like an address, and do not silently fall back to a different endpoint.
+- **One endpoint per address and port.** The loader refuses a `uu` block that
+  reuses `ueLink`, `s1u` or the UE's `enbLink` local endpoint.
+- **No configuration without a consumer.** A `uu` block that nothing reads is a
+  promise, not a feature: until the UE application and the multiplexer bind it,
+  do not describe the production path as integrated.

@@ -44,12 +44,26 @@ class EnbRrcBridge
     };
 
     using S1apSink = std::function<void(const std::vector<uint8_t> &pdu)>;
-    // Called once the RRC connection is up so the owner can bind the S1AP UE
-    // context (registry slot, E-RAB transaction) to this association.
-    using SetupHandler = std::function<void(uint32_t association, uint32_t enbUeS1apId, uint32_t mmeUeS1apId,
-                                            const std::vector<uint8_t> &nas)>;
+    // The owner's own identity allocator. An eNB that owns its UE registry must
+    // supply it, so the bridge's Initial UE Message carries an identifier the
+    // registry already knows; without one the bridge allocates its own.
+    using IdAllocator = std::function<uint32_t()>;
+    // Called once the RRC connection is up, with the identifier that was
+    // allocated and the radio endpoint the setup arrived from, so the owner can
+    // bind its registry slot to this association before any S1AP message about
+    // it arrives.
+    using SetupHandler =
+        std::function<void(uint32_t association, uint32_t enbUeS1apId, uint16_t peerPort, const std::vector<uint8_t> &nas)>;
+    // The sink that also receives the identifier, so an owner can select the
+    // SCTP stream the existing binding uses for that UE.
+    using IdentifiedSink = std::function<void(uint32_t enbUeS1apId, const std::vector<uint8_t> &pdu)>;
 
     EnbRrcBridge(uu::Socket &socket, Config config, S1apSink sink);
+    // The production form: the owner allocates the identifier, sends through its
+    // existing association binding, and learns of the binding before any S1AP
+    // message is answered.
+    EnbRrcBridge(uu::Socket &socket, Config config, IdentifiedSink sink, IdAllocator allocator,
+                 SetupHandler onSetup);
 
     void Pump(int timeoutMs);
     void Tick();
@@ -113,11 +127,15 @@ class EnbRrcBridge
     };
 
     void OnSetupComplete(uint32_t association, const RrcConnectionSetupCompleteMessage &message);
+    void Emit(uint32_t enbUeS1apId, const std::vector<uint8_t> &pdu);
     void OnUplinkNas(uint32_t association, const std::vector<uint8_t> &nas);
 
     uu::Socket &socket_;
     Config config_;
     S1apSink sink_;
+    IdentifiedSink identifiedSink_;
+    IdAllocator allocator_;
+    SetupHandler onSetup_;
     EnbSrb1Runtime runtime_;
     std::map<uint32_t, Association> associations_{};
     std::map<uint32_t, uint32_t> byEnbId_{};

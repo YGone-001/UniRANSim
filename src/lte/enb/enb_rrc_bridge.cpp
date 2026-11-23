@@ -24,6 +24,20 @@ EnbRrcBridge::EnbRrcBridge(uu::Socket &socket, Config config, S1apSink sink)
     });
 }
 
+EnbRrcBridge::EnbRrcBridge(uu::Socket &socket, Config config, IdentifiedSink sink, IdAllocator allocator,
+                         SetupHandler onSetup)
+    : socket_(socket), config_(std::move(config)), identifiedSink_(std::move(sink)), allocator_(std::move(allocator)),
+      onSetup_(std::move(onSetup)),
+      runtime_(socket, config_.srb1,
+               [this](uint32_t association, const RrcConnectionSetupCompleteMessage &message) {
+                   OnSetupComplete(association, message);
+               })
+{
+    runtime_.SetUplinkNasCallback([this](uint32_t association, const std::vector<uint8_t> &nas) {
+        OnUplinkNas(association, nas);
+    });
+}
+
 void EnbRrcBridge::Pump(int timeoutMs)
 {
     runtime_.Pump(timeoutMs);
@@ -43,15 +57,32 @@ void EnbRrcBridge::OnSetupComplete(uint32_t association, const RrcConnectionSetu
     }
 
     Association entry;
-    entry.enbUeS1apId = nextEnbUeS1apId_++;
+    entry.enbUeS1apId = allocator_ ? allocator_() : nextEnbUeS1apId_++;
+    if (entry.enbUeS1apId == 0)
+    {
+        refused_++;
+        return;
+    }
     associations_.emplace(association, entry);
     byEnbId_[entry.enbUeS1apId] = association;
+
+    // The owner binds its own registry slot before any S1AP answer about this
+    // UE can arrive; the MME identity is still unknown and stays zero.
+    if (onSetup_)
+        onSetup_(association, entry.enbUeS1apId, runtime_.PeerPortOf(association), message.dedicatedInfoNas);
 
     // The MME has not named the UE yet: an Initial UE Message carries no
     // MME-UE-S1AP-ID, and none is invented here.
     const auto pdu = EncodeInitialUeMessage(config_.enb, entry.enbUeS1apId, message.dedicatedInfoNas);
     initialUeMessages_++;
-    if (sink_)
+    Emit(entry.enbUeS1apId, pdu);
+}
+
+void EnbRrcBridge::Emit(uint32_t enbUeS1apId, const std::vector<uint8_t> &pdu)
+{
+    if (identifiedSink_)
+        identifiedSink_(enbUeS1apId, pdu);
+    else if (sink_)
         sink_(pdu);
 }
 

@@ -552,3 +552,78 @@ TEST_CASE("lte/cp-runtime/two ue contexts keep independent s1ap identity and sec
     CHECK(second.ue->Evidence().uplinkNas == 3);
 }
 
+
+TEST_CASE("lte/cp-runtime/the bridge can take the owners identity allocator and report the binding")
+{
+    auto ueSocket = uu::Socket::BindLoopback(0, nullptr);
+    auto enbSocket = uu::Socket::BindLoopback(0, nullptr);
+    REQUIRE(ueSocket.has_value());
+    REQUIRE(enbSocket.has_value());
+
+    UeSrb1Runtime::Config ueRuntime;
+    ueRuntime.association = Assoc;
+    ueRuntime.mmec = 0x01;
+    ueRuntime.mTmsi = 0xC000038D;
+    ueRuntime.selectedPlmnIdentity = 1;
+    UeSrb1Runtime ue(*ueSocket, enbSocket->Port(), ueRuntime);
+
+    std::vector<std::pair<uint32_t, std::vector<uint8_t>>> sent;
+    std::optional<std::tuple<uint32_t, uint32_t, uint16_t, std::vector<uint8_t>>> binding;
+
+    EnbRrcBridge::Config config;
+    config.enb.plmn = {"460", "02"};
+    config.enb.enbId = 0x00A1B2;
+    config.enb.tac = 1;
+    config.srb1.setup = Srb1Setup();
+    config.algorithms = Policy();
+    EnbRrcBridge bridge(
+        *enbSocket, config,
+        [&sent](uint32_t enbUeS1apId, const std::vector<uint8_t> &pdu) { sent.emplace_back(enbUeS1apId, pdu); },
+        [] { return 0x777U; },
+        [&binding](uint32_t association, uint32_t enbUeS1apId, uint16_t peerPort, const std::vector<uint8_t> &nas) {
+            binding = std::make_tuple(association, enbUeS1apId, peerPort, nas);
+        });
+
+    ue.StartAccess();
+    bool setupSent = false;
+    for (int i = 0; i < 40 && sent.empty(); i++)
+    {
+        ue.Pump(0);
+        bridge.Pump(0);
+        ue.Tick();
+        bridge.Tick();
+        if (!setupSent && ue.State() == RrcState::RRC_SRB1_CONFIGURING)
+        {
+            ue.SubmitSetupComplete(AttachRequestNas());
+            setupSent = true;
+        }
+    }
+    REQUIRE(setupSent);
+    for (int i = 0; i < 40 && sent.empty(); i++)
+    {
+        ue.Pump(0);
+        bridge.Pump(0);
+        ue.Tick();
+        bridge.Tick();
+    }
+
+    // The owner's allocator, not the bridge's own counter, named the UE.
+    REQUIRE(sent.size() == 1);
+    CHECK(sent[0].first == 0x777U);
+    CHECK(bridge.EnbUeS1apIdOf(Assoc).has_value());
+    CHECK(*bridge.EnbUeS1apIdOf(Assoc) == 0x777U);
+
+    const UplinkNas initial = DecodeUplinkNas(sent[0].second.data(), sent[0].second.size());
+    CHECK(initial.enbUeS1apId == 0x777U);
+    CHECK_FALSE(initial.mmeUeS1apId.has_value());
+    CHECK(initial.nasPdu == AttachRequestNas());
+
+    // The owner learned the association, the identifier, the radio endpoint and
+    // the NAS before any S1AP answer can arrive.
+    REQUIRE(binding.has_value());
+    CHECK(std::get<0>(*binding) == Assoc);
+    CHECK(std::get<1>(*binding) == 0x777U);
+    CHECK(std::get<2>(*binding) == ueSocket->Port());
+    CHECK(std::get<3>(*binding) == AttachRequestNas());
+}
+

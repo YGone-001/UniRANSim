@@ -73,6 +73,21 @@ EnbConfig ParseNode(const YAML::Node &root)
         result.ueLinkPort = static_cast<uint16_t>(yaml::GetInt32(link, "port", 1, 65535));
     }
 
+    if (yaml::HasField(root, "uu"))
+    {
+        const YAML::Node uu = root["uu"];
+        if (!uu.IsMap())
+            throw std::runtime_error("Field 'uu' must be a mapping");
+        result.uuAddress = yaml::GetIpAddress(uu, "address");
+        result.uuPort = static_cast<uint16_t>(yaml::GetInt32(uu, "port", 1, 65535));
+        if (result.uuAddress == "0.0.0.0")
+            throw std::runtime_error("Field 'uu.address' must be a concrete IPv4 address");
+        // One UDP endpoint per address and port: the simulated Uu must not
+        // silently share the port of the legacy radio link or of S1-U.
+        if (result.uuAddress == result.ueLinkAddress && result.uuPort == result.ueLinkPort)
+            throw std::runtime_error("Field 'uu' must not reuse the 'ueLink' endpoint");
+    }
+
     if (yaml::HasField(root, "s1u"))
     {
         const YAML::Node s1u = root["s1u"];
@@ -90,6 +105,8 @@ EnbConfig ParseNode(const YAML::Node &root)
     }
     if (result.s1uAddress == "0.0.0.0")
         throw std::runtime_error("Field 's1u.address' must be a concrete advertised IPv4 address");
+    if (!result.uuAddress.empty() && result.uuAddress == result.s1uAddress && result.uuPort == result.s1uPort)
+        throw std::runtime_error("Field 'uu' must not reuse the 's1u' endpoint");
 
     if (yaml::HasField(root, "maxUes"))
         // Phase 19-B: the production bound is now 512, the target capacity of

@@ -228,6 +228,10 @@ class EnbSrb1Runtime
         return contexts_.size();
     }
     [[nodiscard]] RrcState StateOf(uint32_t association) const;
+    // The radio endpoint this association was learned from, or zero when the
+    // association has no context. The eNB owner uses it to bind its registry
+    // slot to the same endpoint the SRB1 bearer answers on.
+    [[nodiscard]] uint16_t PeerPortOf(uint32_t association) const;
     [[nodiscard]] size_t Deliveries(uint32_t association) const;
     [[nodiscard]] const std::vector<uint8_t> &DeliveredNas(uint32_t association) const;
     [[nodiscard]] const std::optional<RrcConnectionSetupCompleteMessage> &ReceivedOf(uint32_t association) const;

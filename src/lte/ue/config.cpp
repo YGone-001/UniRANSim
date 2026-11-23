@@ -204,6 +204,23 @@ Config ParseNode(const YAML::Node &root)
     config.link.localPort = static_cast<uint16_t>(yaml::GetInt32(link, "localPort", 1, 65535));
     config.link.enbAddress = yaml::GetIpAddress(link, "address");
     config.link.enbPort = static_cast<uint16_t>(yaml::GetInt32(link, "port", 1, 65535));
+    // Optional simulated Uu endpoint. Presence enables it; nothing is inferred
+    // from the legacy link, and the two must not share a local endpoint.
+    if (yaml::HasField(root, "uu"))
+    {
+        const YAML::Node uu = root["uu"];
+        if (!uu || !uu.IsMap())
+            throw std::runtime_error("Field 'uu' must be a mapping");
+        config.uu.enabled = true;
+        config.uu.localAddress = yaml::GetIpAddress(uu, "localAddress");
+        config.uu.localPort = static_cast<uint16_t>(yaml::GetInt32(uu, "localPort", 1, 65535));
+        config.uu.enbAddress = yaml::GetIpAddress(uu, "address");
+        config.uu.enbPort = static_cast<uint16_t>(yaml::GetInt32(uu, "port", 1, 65535));
+        if (config.uu.localAddress == config.link.localAddress && config.uu.localPort == config.link.localPort)
+            throw std::runtime_error("Field 'uu' must not reuse the 'enbLink' local endpoint");
+        if (config.uu.enbAddress == config.uu.localAddress && config.uu.enbPort == config.uu.localPort)
+            throw std::runtime_error("Field 'uu' must not send to its own endpoint");
+    }
     // Optional. Absent means "this configuration states no identifier for the
     // serving cell", which is the ordinary case for everything that does not
     // execute a connected-mode handover. A handover command naming a cell whose

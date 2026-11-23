@@ -564,6 +564,12 @@ RrcState EnbSrb1Runtime::StateOf(uint32_t association) const
     return it == contexts_.end() ? RrcState::RRC_IDLE : it->second.state;
 }
 
+uint16_t EnbSrb1Runtime::PeerPortOf(uint32_t association) const
+{
+    const auto it = contexts_.find(association);
+    return it == contexts_.end() ? 0 : it->second.peerPort;
+}
+
 size_t EnbSrb1Runtime::Deliveries(uint32_t association) const
 {
     const auto it = contexts_.find(association);

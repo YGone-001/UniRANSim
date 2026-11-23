@@ -188,6 +188,18 @@ struct LifecycleConfig
     int recoveryMaxAttempts{3};
 };
 
+// Phase 18-F-B6-D: the simulated Uu endpoint that carries SRB0/SRB1. It is
+// separate from enbLink, which stays the legacy NAS/user-plane transport for
+// the paths this phase does not migrate.
+struct UuConfig
+{
+    bool enabled{false};
+    std::string localAddress;
+    uint16_t localPort{0};
+    std::string enbAddress;
+    uint16_t enbPort{0};
+};
+
 struct Config
 {
     std::string imsi;
@@ -211,6 +223,7 @@ struct Config
     // not a subscriber secret and not a real device identity.
     std::array<uint8_t, 8> imeisv{{0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88}};
     LinkConfig link;
+    UuConfig uu;
     TunConfig tun;
     LifecycleConfig lifecycle;
 };
