@@ -94,6 +94,10 @@ if (BUILD_TESTS)
     file(GLOB_RECURSE TEST_SRC_FILES CONFIGURE_DEPENDS test/*.cpp)
     add_executable(nr-tests ${TEST_SRC_FILES})
     target_include_directories(nr-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    # Fixture files (shipped example configurations) are addressed through this
+    # absolute path: ctest runs the binary from the build directory, so a path
+    # relative to the source tree would not resolve.
+    target_compile_definitions(nr-tests PRIVATE UNIRANSIM_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     target_link_libraries(nr-tests pthread)
     target_compile_options(nr-tests PRIVATE -Wall -Wextra -pedantic)
     target_link_libraries(nr-tests common-lib)

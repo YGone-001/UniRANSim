@@ -24,8 +24,15 @@
 namespace
 {
 
-const char *EnbSample = "config/open5gs-lte-enb.yaml";
-const char *UeSample = "config/open5gs-lte-ue.yaml";
+const char *EnbSample = "open5gs-lte-enb.yaml";
+const char *UeSample = "open5gs-lte-ue.yaml";
+
+// ctest runs the binary from the build directory, so the shipped fixtures are
+// addressed through the absolute source path the build defines.
+std::string Sample(const char *name)
+{
+    return std::string(UNIRANSIM_SOURCE_DIR) + "/config/" + name;
+}
 
 std::string Read(const std::string &path)
 {
@@ -59,12 +66,12 @@ std::string WriteTemp(const std::string &name, const std::string &body)
 
 TEST_CASE("lte/uu-config/the enb uu endpoint is optional and loads when present")
 {
-    const auto plain = lte::enb::LoadConfig(EnbSample);
+    const auto plain = lte::enb::LoadConfig(Sample(EnbSample));
     CHECK(plain.uuAddress.empty());
     CHECK(plain.uuPort == 0);
 
     const std::string path = WriteTemp("b6d-enb-uu.yaml",
-                                       WithUu(EnbSample, "uu:\n  address: 127.0.0.9\n  port: 21500\n"));
+                                       WithUu(Sample(EnbSample), "uu:\n  address: 127.0.0.9\n  port: 21500\n"));
     const auto loaded = lte::enb::LoadConfig(path);
     CHECK(loaded.uuAddress == "127.0.0.9");
     CHECK(loaded.uuPort == 21500);
@@ -75,22 +82,22 @@ TEST_CASE("lte/uu-config/the enb uu endpoint is optional and loads when present"
 
 TEST_CASE("lte/uu-config/an enb uu endpoint may not reuse another local endpoint")
 {
-    const auto plain = lte::enb::LoadConfig(EnbSample);
+    const auto plain = lte::enb::LoadConfig(Sample(EnbSample));
     const std::string duplicate = "uu:\n  address: " + plain.ueLinkAddress + "\n  port: " +
                                   std::to_string(plain.ueLinkPort) + "\n";
-    const std::string path = WriteTemp("b6d-enb-uu-duplicate.yaml", WithUu(EnbSample, duplicate));
+    const std::string path = WriteTemp("b6d-enb-uu-duplicate.yaml", WithUu(Sample(EnbSample), duplicate));
     CHECK_THROWS_AS(lte::enb::LoadConfig(path), std::runtime_error);
 
-    const std::string zero = WithUu(EnbSample, "uu:\n  address: 127.0.0.9\n  port: 0\n");
+    const std::string zero = WithUu(Sample(EnbSample), "uu:\n  address: 127.0.0.9\n  port: 0\n");
     CHECK_THROWS_AS(lte::enb::LoadConfig(WriteTemp("b6d-enb-uu-zero.yaml", zero)), std::exception);
 }
 
 TEST_CASE("lte/uu-config/the ue uu endpoint is optional and loads when present")
 {
-    const auto plain = lte::ue::LoadConfig(UeSample);
+    const auto plain = lte::ue::LoadConfig(Sample(UeSample));
     CHECK_FALSE(plain.uu.enabled);
 
-    const std::string path = WriteTemp("b6d-ue-uu.yaml", WithUu(UeSample,
+    const std::string path = WriteTemp("b6d-ue-uu.yaml", WithUu(Sample(UeSample),
         "uu:\n  localAddress: 127.0.0.2\n  localPort: 21600\n  address: 127.0.0.1\n  port: 21500\n"));
     const auto loaded = lte::ue::LoadConfig(path);
     REQUIRE(loaded.uu.enabled);
@@ -104,15 +111,15 @@ TEST_CASE("lte/uu-config/the ue uu endpoint is optional and loads when present")
 
 TEST_CASE("lte/uu-config/a ue uu endpoint may not collide with its own legacy endpoint")
 {
-    const auto plain = lte::ue::LoadConfig(UeSample);
+    const auto plain = lte::ue::LoadConfig(Sample(UeSample));
     const std::string duplicate = "uu:\n  localAddress: " + plain.link.localAddress + "\n  localPort: " +
                                   std::to_string(plain.link.localPort) +
                                   "\n  address: 127.0.0.1\n  port: 21500\n";
-    const std::string path = WriteTemp("b6d-ue-uu-duplicate.yaml", WithUu(UeSample, duplicate));
+    const std::string path = WriteTemp("b6d-ue-uu-duplicate.yaml", WithUu(Sample(UeSample), duplicate));
     CHECK_THROWS_AS(lte::ue::LoadConfig(path), std::runtime_error);
 
     const std::string selfish = "uu:\n  localAddress: 127.0.0.2\n  localPort: 21600\n"
                                 "  address: 127.0.0.2\n  port: 21600\n";
-    CHECK_THROWS_AS(lte::ue::LoadConfig(WriteTemp("b6d-ue-uu-self.yaml", WithUu(UeSample, selfish))),
+    CHECK_THROWS_AS(lte::ue::LoadConfig(WriteTemp("b6d-ue-uu-self.yaml", WithUu(Sample(UeSample), selfish))),
                     std::runtime_error);
 }
