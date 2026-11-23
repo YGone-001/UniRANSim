@@ -1,0 +1,89 @@
+//
+// This file is a part of UERANSIM project.
+// Copyright (c) 2027 ALİ GÜNGÖR.
+//
+
+// Phase 18-F-B6-D2 Commit B: the transport the production UE application uses
+// for connected-mode NAS.
+//
+// It owns one UeSrb1Runtime and its socket, decides whether a NAS message is the
+// initial one (carried in RRCConnectionSetupComplete) or a later one (carried in
+// ULInformationTransfer), and hands downlink NAS back through one callback. The
+// application keeps its NAS state machine; only this transport changes.
+#pragma once
+
+#include <lte/rrc-runtime/rrc_srb1_runtime.hpp>
+#include <lte/rrc-runtime/uu_transport.hpp>
+#include <lte/security/as_security.hpp>
+
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace lte::ue
+{
+
+struct UuEndpoint
+{
+    std::string localAddress{};
+    uint16_t localPort{0};
+    std::string enbAddress{};
+    uint16_t enbPort{0};
+};
+
+class UuNasTransport
+{
+  public:
+    using NasHandler = std::function<void(const std::vector<uint8_t> &)>;
+
+    UuNasTransport(UuEndpoint endpoint, rrc::UeSrb1Runtime::Config config);
+    ~UuNasTransport();
+
+    UuNasTransport(const UuNasTransport &) = delete;
+    UuNasTransport &operator=(const UuNasTransport &) = delete;
+
+    // Binds the configured endpoint and starts RRCConnectionRequest. Throws when
+    // the endpoint cannot be bound: the transport never falls back to another
+    // address or to the legacy link.
+    void Start();
+    void SetNasHandler(NasHandler handler);
+
+    // The initial NAS message travels in SetupComplete; every later one in
+    // ULInformationTransfer. Returns false when the RRC connection is not yet
+    // established or the bearer refused the message - the caller must not retry
+    // it over another transport.
+    bool SendNas(const std::vector<uint8_t> &nas);
+
+    // Bounded: at most one frame, and never blocks longer than timeoutMs.
+    void Pump(int timeoutMs);
+    void Tick();
+
+    // Told by the NAS layer once NAS security is active, so the next downlink
+    // SRB1 PDU is expected to carry the RRC SecurityModeCommand.
+    void PrepareAsSecurity(const security::Key256 &kasme, uint32_t ulNasCount, uint64_t nasGeneration);
+
+    [[nodiscard]] rrc::RrcState State() const;
+    [[nodiscard]] bool Connected() const;
+    [[nodiscard]] bool AsSecurityActive() const;
+    [[nodiscard]] bool SetupCompleteSent() const noexcept
+    {
+        return setupCompleteSent_;
+    }
+    [[nodiscard]] uint16_t LocalPort() const;
+
+    void Release();
+
+  private:
+    UuEndpoint endpoint_{};
+    rrc::UeSrb1Runtime::Config config_{};
+    std::unique_ptr<uu::Socket> socket_{};
+    std::unique_ptr<rrc::UeSrb1Runtime> runtime_{};
+    NasHandler handler_{};
+    bool setupCompleteSent_{false};
+    bool released_{false};
+};
+
+} // namespace lte::ue

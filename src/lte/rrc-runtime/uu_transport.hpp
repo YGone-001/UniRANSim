@@ -68,6 +68,10 @@ class Socket
     Socket &operator=(Socket &&other) noexcept;
 
     static std::optional<Socket> BindLoopback(uint16_t port, std::string *why);
+    // Binds one concrete IPv4 address. The configured Uu endpoint is not
+    // necessarily loopback, and a bind that silently fell back to 127.0.0.1
+    // would be a different endpoint than the operator stated.
+    static std::optional<Socket> Bind(const std::string &address, uint16_t port, std::string *why);
     [[nodiscard]] uint16_t Port() const noexcept
     {
         return port_;

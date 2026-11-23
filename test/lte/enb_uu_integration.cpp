@@ -13,6 +13,7 @@
 #include <lte/enb/multiplexer.hpp>
 #include <lte/rrc-runtime/rrc_srb1_runtime.hpp>
 #include <lte/ue/nas.hpp>
+#include <lte/ue/uu_transport.hpp>
 #include <lte/ue/types.hpp>
 
 #include <deque>
@@ -504,5 +505,113 @@ TEST_CASE("lte/enb-uu/a duplicate initial context setup request is refused witho
     CHECK(mux.asSecurityActive(AssocA));
     CHECK(responses == 1);
     CHECK(mux.pendingInitialContextSetups() == 0);
+}
+
+
+TEST_CASE("lte/enb-uu/the production ue nas transport carries the attach request in setupcomplete")
+{
+    uint16_t uuPort = 0;
+    {
+        auto probe = uu::Socket::BindLoopback(0, nullptr);
+        REQUIRE(probe.has_value());
+        uuPort = probe->Port();
+    }
+
+    Sender sender;
+    EnbMultiplexer mux(MakeConfig(uuPort), sender);
+
+    // The production UE-side transport: it owns the socket and the runtime.
+    lte::ue::UuEndpoint endpoint;
+    endpoint.localAddress = "127.0.0.1";
+    endpoint.localPort = 0;
+    endpoint.enbAddress = "127.0.0.1";
+    endpoint.enbPort = uuPort;
+
+    lte::rrc::UeSrb1Runtime::Config config;
+    config.association = AssocA;
+    config.mmec = 0x01;
+    config.mTmsi = 0xC000038D;
+    config.selectedPlmnIdentity = 1;
+    lte::ue::UuNasTransport transport(endpoint, config);
+
+    std::vector<std::vector<uint8_t>> downlink;
+    transport.SetNasHandler([&downlink](const std::vector<uint8_t> &nas) { downlink.push_back(nas); });
+
+    transport.Start();
+    REQUIRE(transport.LocalPort() != 0);
+
+    const auto attachRequest = AttachRequest();
+    bool submitted = false;
+    uint32_t enbId = 0;
+    bool nasAnswered = false;
+    bool secondUplink = false;
+    size_t uplinks = 0;
+
+    for (int round = 0; round < 300; round++)
+    {
+        mux.poll();
+        transport.Pump(0);
+        transport.Tick();
+
+        if (!submitted && transport.State() == lte::rrc::RrcState::RRC_SRB1_CONFIGURING)
+        {
+            REQUIRE(transport.SendNas(attachRequest));
+            submitted = true;
+        }
+
+        for (const auto &pdu : sender.sent)
+        {
+            if (pdu.empty())
+                continue;
+            const auto probe = ProbeS1apPdu(pdu.data(), pdu.size());
+            if (probe.kind != S1apPdu::Kind::INITIATING)
+                continue;
+            UplinkNas uplink;
+            try
+            {
+                uplink = DecodeUplinkNas(pdu.data(), pdu.size());
+            }
+            catch (const CodecError &)
+            {
+                continue;
+            }
+            if (uplink.mmeUeS1apId.has_value())
+            {
+                uplinks++;
+                // The second connected-mode NAS message the state machine sends.
+                if (uplink.nasPdu == std::vector<uint8_t>({0x07, 0x53, 0x99}))
+                    secondUplink = true;
+                continue;
+            }
+            enbId = uplink.enbUeS1apId;
+            // The Initial UE Message must carry the real Attach Request.
+            CHECK(uplink.nasPdu == attachRequest);
+            const std::vector<uint8_t> nas{0x07, 0x5D, 0x02, 0x00, 0x02, 0xA0, 0x20};
+            const auto downlinkPdu = EncodeDownlinkNasTransport(MmeIdA, enbId, nas);
+            mux.handleS1ap(downlinkPdu.data(), downlinkPdu.size(), 1);
+            nasAnswered = true;
+        }
+        sender.sent.clear();
+
+        if (nasAnswered && !downlink.empty() && !secondUplink)
+        {
+            // The NAS state machine answers the downlink message; it now goes
+            // through ULInformationTransfer rather than the legacy link.
+            REQUIRE(transport.SendNas({0x07, 0x53, 0x99}));
+        }
+        if (secondUplink)
+            break;
+    }
+
+    CHECK(transport.SetupCompleteSent());
+    CHECK(nasAnswered);
+    REQUIRE(downlink.size() == 1);
+    CHECK(downlink[0] == std::vector<uint8_t>({0x07, 0x5D, 0x02, 0x00, 0x02, 0xA0, 0x20}));
+    CHECK(secondUplink);
+    CHECK(uplinks == 1);
+
+    // Releasing the transport closes the endpoint and refuses further sends.
+    transport.Release();
+    CHECK_FALSE(transport.SendNas(attachRequest));
 }
 

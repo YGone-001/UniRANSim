@@ -38,3 +38,22 @@ The endpoint is parsed, validated and stored, but no consumer exists: the UE
 application still sends NAS over `enbLink` and the eNB multiplexer does not bind
 it. Wiring those two is the remaining work of B6-D and is listed as
 NOT_EXECUTED in the final report.
+
+## B6-D2 Commit B: the UE NAS transport
+
+`lte::ue::UuNasTransport` (`src/lte/ue/uu_transport.{hpp,cpp}`) is the seam the
+production UE application will use. It owns one `UeSrb1Runtime` and one socket
+bound to the configured local endpoint (`uu::Socket::Bind`, not a loopback
+fallback), carries the first NAS message in RRCConnectionSetupComplete and every
+later one in ULInformationTransfer, and hands downlink NAS to one callback. A
+send that the transport cannot make returns false; it is never retried on the
+legacy link.
+
+`test/lte/enb-uu/the production ue nas transport carries the attach request in
+setupcomplete` drives it against the real `EnbMultiplexer`: the actual Attach
+Request arrives in the Initial UE Message, a Downlink NAS Transport reaches the
+callback, the reply travels as an Uplink NAS Transport, and a released transport
+refuses further sends.
+
+**`src/lte/ue/app.cpp` does not use it yet**; wiring the loop and the shared
+downlink handler is the remaining work.

@@ -160,6 +160,48 @@ void Socket::Close() noexcept
     fd_ = -1;
 }
 
+std::optional<Socket> Socket::Bind(const std::string &address, uint16_t port, std::string *why)
+{
+    in_addr parsed{};
+    if (::inet_pton(AF_INET, address.c_str(), &parsed) != 1)
+    {
+        if (why)
+            *why = "not a concrete IPv4 address";
+        return std::nullopt;
+    }
+    const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0)
+    {
+        if (why)
+            *why = "socket() failed";
+        return std::nullopt;
+    }
+    sockaddr_in address4{};
+    address4.sin_family = AF_INET;
+    address4.sin_addr = parsed;
+    address4.sin_port = htons(port);
+    if (::bind(fd, reinterpret_cast<const sockaddr *>(&address4), sizeof(address4)) != 0)
+    {
+        if (why)
+            *why = "bind() failed";
+        ::close(fd);
+        return std::nullopt;
+    }
+    socklen_t length = sizeof(address4);
+    sockaddr_in bound{};
+    if (::getsockname(fd, reinterpret_cast<sockaddr *>(&bound), &length) != 0)
+    {
+        if (why)
+            *why = "getsockname() failed";
+        ::close(fd);
+        return std::nullopt;
+    }
+    Socket socket;
+    socket.fd_ = fd;
+    socket.port_ = ntohs(bound.sin_port);
+    return socket;
+}
+
 std::optional<Socket> Socket::BindLoopback(uint16_t port, std::string *why)
 {
     const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
