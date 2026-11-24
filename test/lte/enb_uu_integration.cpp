@@ -16,9 +16,11 @@
 #include <lte/ue/uu_transport.hpp>
 #include <lte/ue/types.hpp>
 
+#include <chrono>
 #include <deque>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace lte;
@@ -320,6 +322,22 @@ TEST_CASE("lte/enb-uu/one multiplexer manages two srb1 ues with independent s1ap
     }
 
     // Both UEs are managed by this one multiplexer.
+    // The message-level NAS-PDU of the committed Initial Context Setup is
+    // emitted after the response; with the Uu path drained per poll the test
+    // loop may reach the second response before the UEs have received it, so a
+    // bounded wait observes the delivery rather than assuming a turn count.
+    const auto acceptDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < acceptDeadline &&
+           (a.downlinkNas.size() < 2 || b.downlinkNas.size() < 2))
+    {
+        mux.poll();
+        a.runtime->Pump(0);
+        b.runtime->Pump(0);
+        a.runtime->Tick();
+        b.runtime->Tick();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
     CHECK(mux.bridgeAssociationCount() == 2);
     CHECK(mux.bridgeHasAssociation(AssocA));
     CHECK(mux.bridgeHasAssociation(AssocB));

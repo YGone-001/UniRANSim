@@ -157,7 +157,13 @@ enum class LifecycleScenario
     // configured trusted target cell, and continue the existing EPS session
     // there. Whether that calls for a Normal Tracking Area Update is decided
     // from the registered tracking area list, not from the scenario name.
-    IDLE_RESELECTION
+    IDLE_RESELECTION,
+    // Phase 18-F-B6-D7: the production user-plane lifecycle. The UE attaches,
+    // keeps its Linux TUN and DRB user plane up, accepts a network-triggered
+    // ECM-IDLE release, restores the same EPS session with a Service Request
+    // and keeps running so bidirectional IP traffic can continue after the
+    // restoration. It never exits on a successful restoration.
+    USER_PLANE
 };
 
 struct LifecycleConfig

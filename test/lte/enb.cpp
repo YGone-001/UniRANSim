@@ -467,3 +467,25 @@ TEST_CASE("lte/enb/codec: every truncation of an Initial Context Setup Request i
     for (size_t length = 0; length < encoded.size(); ++length)
         CHECK_THROWS(lte::enb::s1ap::DecodeInitialContextSetupRequest(encoded.data(), length));
 }
+
+TEST_CASE("lte/d7/codec: the initial context setup response names the eNB transport endpoint")
+{
+    // The deterministic MME must learn the eNB's S1-U endpoint from the eNB's
+    // own answer, not from a fixture or a guess.
+    std::vector<lte::enb::s1ap::ErabSetupItem> items;
+    items.push_back({5, {192, 168, 77, 1}, {0x11, 0x22, 0x33, 0x44}});
+    const auto encoded = lte::enb::s1ap::EncodeInitialContextSetupResponse(0x4001, 0x56, items);
+    const auto decoded = lte::enb::s1ap::DecodeInitialContextSetupResponse(encoded.data(), encoded.size());
+    CHECK(decoded.mmeUeS1apId == 0x4001);
+    CHECK(decoded.enbUeS1apId == 0x56);
+    REQUIRE(decoded.established.size() == 1);
+    CHECK(decoded.established[0].erabId == 5);
+    CHECK(decoded.established[0].transportLayerAddress == std::array<uint8_t, 4>{192, 168, 77, 1});
+    CHECK(decoded.established[0].gtpTeid == std::array<uint8_t, 4>{0x11, 0x22, 0x33, 0x44});
+
+    // A truncated answer and a non-answer are refused whole.
+    for (size_t length = 0; length < encoded.size(); ++length)
+        CHECK_THROWS(lte::enb::s1ap::DecodeInitialContextSetupResponse(encoded.data(), length));
+    const auto request = lte::enb::s1ap::EncodeInitialContextSetupFailure(0x4001, 0x56, "radioNetwork", 25);
+    CHECK_THROWS(lte::enb::s1ap::DecodeInitialContextSetupResponse(request.data(), request.size()));
+}

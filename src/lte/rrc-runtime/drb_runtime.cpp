@@ -26,6 +26,12 @@ uint32_t GetU32(const uint8_t *data)
            (static_cast<uint32_t>(data[2]) << 8U) | static_cast<uint32_t>(data[3]);
 }
 
+rlc::am::AmConfig NormalizeAm(rlc::am::AmConfig am)
+{
+    am.maxPduBytes = DrbAmMaxPduBytes;
+    return am;
+}
+
 } // namespace
 
 std::vector<uint8_t> EncodeDrbData(uint8_t drbIdentity, const std::vector<uint8_t> &rlcPdu)
@@ -83,7 +89,7 @@ bool DecodeDrbReady(const uint8_t *data, size_t size, uint8_t routingEbi, DrbRea
 DrbBearer::DrbBearer(DrbBearerConfig config, rlc::am::EndpointRole role, uint32_t association, Sender sender,
                      Deliverer deliverer)
     : config_(config), role_(role), association_(association), deliverer_(std::move(deliverer)),
-      rlc_(role, association, config.am,
+      rlc_(role, association, NormalizeAm(config.am),
            [this](std::vector<uint8_t> sdu) {
                if (released_)
                    return;
@@ -108,6 +114,7 @@ DrbBearer::DrbBearer(DrbBearerConfig config, rlc::am::EndpointRole role, uint32_
            },
            uu::LogicalChannel::DTCH, [sender = std::move(sender)](const std::vector<uint8_t> &pdu) { sender(pdu); })
 {
+    config_.am = NormalizeAm(config.am);
     // The PDCP direction is the direction of the traffic, not the local role:
     // a UE transmits uplink and receives downlink, an eNB the reverse. The
     // COUNT, BEARER and DIRECTION inputs of the ciphering must therefore match

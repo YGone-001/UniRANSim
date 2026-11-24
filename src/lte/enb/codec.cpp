@@ -1220,6 +1220,79 @@ InitialContextSetupRequest DecodeInitialContextSetupRequest(const uint8_t *data,
     return result;
 }
 
+InitialContextSetupResponse DecodeInitialContextSetupResponse(const uint8_t *data, size_t length)
+{
+    auto envelope =
+        DecodeEnvelope(data, length, PROCEDURE_INITIAL_CONTEXT_SETUP, static_cast<int>(Criticality::REJECT));
+    if (envelope.choice != 1)
+        throw CodecError("Initial Context Setup Response is not a successful outcome");
+
+    InitialContextSetupResponse result{};
+    bool mmePresent = false;
+    bool enbPresent = false;
+    bool listPresent = false;
+    for (const auto &ie : DecodeIeContainer(envelope.value))
+    {
+        if (ie.id == IE_MME_UE_S1AP_ID)
+        {
+            if (ie.criticality != Criticality::IGNORE)
+                throw CodecError("MME-UE-S1AP-ID has invalid criticality");
+            result.mmeUeS1apId = DecodeUeId(ie.value, 0xFFFFFFFFU);
+            mmePresent = true;
+        }
+        else if (ie.id == IE_ENB_UE_S1AP_ID)
+        {
+            if (ie.criticality != Criticality::IGNORE)
+                throw CodecError("eNB-UE-S1AP-ID has invalid criticality");
+            result.enbUeS1apId = DecodeUeId(ie.value, 0xFFFFFFU);
+            enbPresent = true;
+        }
+        else if (ie.id == IE_E_RAB_SETUP_LIST_CTXT_SU_RES)
+        {
+            if (ie.criticality != Criticality::IGNORE)
+                throw CodecError("E-RABSetupListCtxtSURes has invalid criticality");
+            BitReader reader(ie.value);
+            const size_t count = ReadConstrained(reader, 1, 256, true);
+            result.established.reserve(count);
+            for (size_t i = 0; i < count; ++i)
+            {
+                const auto id = static_cast<uint16_t>(ReadConstrained(reader, 0, 65535, true));
+                if (id != IE_E_RAB_SETUP_ITEM_CTXT_SU_RES)
+                    throw CodecError("Unexpected E-RABSetupItemCtxtSURes identity");
+                if (reader.readBits(2) != static_cast<uint8_t>(Criticality::IGNORE))
+                    throw CodecError("E-RAB setup response item has invalid criticality");
+                reader.align();
+                auto value = reader.readOpenType();
+                BitReader item(value);
+                if (item.readBit())
+                    throw CodecError("Extended E-RABSetupItemCtxtSURes is not supported");
+                const bool extensionsPresent = item.readBit();
+                ErabSetupItem established{};
+                established.erabId = ReadErabId(item);
+                established.transportLayerAddress = ReadTransportLayerAddress(item);
+                {
+                    auto teid = ReadFixedOctets(item, 4);
+                    std::copy(teid.begin(), teid.end(), established.gtpTeid.begin());
+                }
+                if (extensionsPresent)
+                    throw CodecError("E-RABSetupItemCtxtSURes extensions are not supported");
+                item.requireFinished();
+                result.established.push_back(established);
+            }
+            reader.requireFinished();
+            listPresent = true;
+        }
+        else if (ie.criticality == Criticality::REJECT)
+            throw CodecError("Unknown reject-criticality IE in Initial Context Setup Response");
+    }
+
+    if (!mmePresent || !enbPresent || !listPresent || result.established.empty())
+        throw CodecError("Initial Context Setup Response is missing a mandatory IE");
+    if (result.mmeUeS1apId == 0 || result.enbUeS1apId == 0)
+        throw CodecError("Initial Context Setup Response has a zero UE identity");
+    return result;
+}
+
 std::vector<uint8_t> EncodeInitialContextSetupRequest(const InitialContextSetupRequest &request)
 {
     if (request.erabs.empty() || request.erabs.size() > 256)

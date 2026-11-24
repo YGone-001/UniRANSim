@@ -230,6 +230,63 @@ jobs:
   # suite deliberately uses. It needs a real kernel TUN device and the root
   # capability to create one, which is what the runner's kernel provides and
   # what a non-root suite must never assume.
+  # Phase 18-F-B6-D7: the production UE process, the production eNB and an
+  # independent deterministic SGW-U/PGW-U in three OS processes and two isolated
+  # network namespaces. Real TUNs, real GTP-U and real ICMP/UDP/TCP. It is
+  # blocking and never skipped: the case itself is marked skip only so the
+  # unprivileged matrix does not run it; this job forces it with --no-skip and
+  # requires both of its own sentinels.
+  production-ue-tun-user-plane:
+    name: Production UE DRB TUN End-to-End User Plane (multi-process, blocking)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsctp-dev iproute2 tcpdump iperf3
+      - name: Configure
+        run: cmake -S . -B cmake-build-d7 -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: |
+          cmake --build cmake-build-d7 --target nr-tests lte-ue lte-uu-user-plane-peer lte-uu-sgw-peer \
+            lte-uu-traffic-probe --parallel "$(nproc)"
+          for binary in nr-tests lte-ue lte-uu-user-plane-peer lte-uu-sgw-peer lte-uu-traffic-probe; do
+            test -x "cmake-build-d7/$binary"
+          done
+      - name: Verify the TUN device node
+        run: |
+          sudo modprobe tun
+          sudo test -c /dev/net/tun
+      - name: Run the multi-process TUN user-plane acceptance
+        run: |
+          sudo unshare --net --mount --pid --fork --mount-proc -- bash -euo pipefail -c '
+            ip link set lo up
+            export UNIRANSIM_RUN_PRIVILEGED_TUN_TESTS=1
+            ./cmake-build-d7/nr-tests --no-skip \
+              --test-case="lte/d7/acceptance: the production ue carries tun ip traffic over drb and gtpu end to end" \
+              2>&1 | tee d7-user-plane.log
+            grep -q "UNIRANSIM-PHASE18D7-PRIVILEGED-EXECUTED" d7-user-plane.log
+            grep -q "UNIRANSIM-PHASE18D7-PRIVILEGED-COMPLETE" d7-user-plane.log
+            grep -Eq "test cases: +1 \| +1 passed \| 0 failed" d7-user-plane.log
+            test -s reports/evidence/phase-18-f-b6-d7/traffic-summary.json
+            grep -q "\"map_updates\": 2" reports/evidence/phase-18-f-b6-d7/traffic-summary.json
+            grep -q "\"active_generation\": 2" reports/evidence/phase-18-f-b6-d7/traffic-summary.json
+            grep -q "\"retired_teids\": \"1358954497\"" reports/evidence/phase-18-f-b6-d7/traffic-summary.json
+            grep -q "DRB user-plane statistics:" reports/evidence/phase-18-f-b6-d7/ue.log
+            grep -q "DRB user plane ready for LTE UE" reports/evidence/phase-18-f-b6-d7/enb.log
+            grep -q "complete ul=" reports/evidence/phase-18-f-b6-d7/sgw-upgw.log
+            ! pgrep -af "cmake-build-d7/(lte-ue|lte-uu-user-plane-peer|lte-uu-sgw-peer)"
+            ! ip netns list | grep -q "d7ran-"
+          '
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: d7-user-plane-evidence
+          path: |
+            d7-user-plane.log
+            reports/evidence/phase-18-f-b6-d7/
+
   privileged-tun:
     name: Privileged LTE Mobility TUN Integration
     runs-on: ubuntu-24.04

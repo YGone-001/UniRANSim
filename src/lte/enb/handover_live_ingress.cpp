@@ -430,10 +430,12 @@ LiveHandoverReadiness AssessLiveHandoverCapabilities()
                "Initial Context Setup and E-RAB Setup decode the E-RAB identity, QoS, transport address and GTP "
                "TEID, allocate fresh local TEIDs through the registry allocator and answer with the established and "
                "failed items (test/lte/enb.cpp, test/lte/erab.cpp)"),
-        Assess(HandoverCapability::LTE_PRODUCTION_UE_DRB_READY, false,
-               "the production lte-ue handles the RRCConnectionReconfiguration, builds its DRBs from the AS keys "
-               "and sends RRCConnectionReconfigurationComplete, but no accepted multi-process case with a real TUN "
-               "exercises it; that acceptance is reported NOT_EXECUTED rather than claimed"),
+        Assess(HandoverCapability::LTE_PRODUCTION_UE_DRB_READY, true,
+               "the production lte-ue runs in its own network namespace, creates a real Linux TUN after the "
+               "Attach Accept, receives the RRCConnectionReconfiguration over SRB1 and builds the DRB, PDCP and "
+               "RLC AM entities; test/lte/production_uu_user_plane.cpp runs it as one of three real OS processes "
+               "against the production EnbMultiplexer and a deterministic SGW-U/PGW-U, and the privileged CI job "
+               "runs that case without a skip"),
         Assess(HandoverCapability::LTE_PRODUCTION_PDCP_USER_PLANE_READY, true,
                "the accepted DRB12 PDCP profile protects and unprotects IP packets in both directions with a "
                "12-bit SN and EEA2 from K_UPenc; two production DRB endpoints exchange payloads over real Uu "
@@ -446,13 +448,17 @@ LiveHandoverReadiness AssessLiveHandoverCapabilities()
                "the production S1uEndpoint turns a DRB uplink SDU into a real GTP-U G-PDU sent to the bearer's SGW "
                "TEID, and delivers a downlink G-PDU naming the local TEID back through the DRB with exact payload "
                "equality; retired and unknown TEIDs reach no UE (test/lte/drb_user_plane.cpp)"),
-        Assess(HandoverCapability::LTE_PRODUCTION_UE_BIDIRECTIONAL_USER_PLANE_READY, false,
-               "the bidirectional data plane is proven at the component level only: no accepted production-UE "
-               "process case with a real TUN and a deterministic PGW endpoint exists yet"),
+        Assess(HandoverCapability::LTE_PRODUCTION_UE_BIDIRECTIONAL_USER_PLANE_READY, true,
+               "the production lte-ue TUN and a real Core-side TUN in a second network namespace exchange ICMP, "
+               "UDP and TCP in both directions through the DRB, DRB12 PDCP, RLC AM, Uu DTCH, the production "
+               "S1uEndpoint and a real GTP-U UDP socket on :2152; payload hashes and per-direction counters match "
+               "(test/lte/production_uu_user_plane.cpp)"),
         Assess(HandoverCapability::LTE_ECM_IDLE_BEARER_RESTORATION_READY, true,
                "an ECM-IDLE release retires the access TEID and destroys the DRBs; a restoration establishes a "
                "fresh local/SGW TEID pair and fresh K_UPenc on the same EBI, both directions carry traffic again, "
-               "and the old TEID remains retired (test/lte/drb_user_plane.cpp)"),
+               "and the old TEID remains retired; the production-UE process case drives the release, the compact "
+               "Service Request and post-restoration TUN traffic on the same EPS bearer "
+               "(test/lte/drb_user_plane.cpp, test/lte/production_uu_user_plane.cpp)"),
         Assess(HandoverCapability::LTE_OPEN5GS_ATTACH_ACCEPTED, false,
                "REAL_OPEN5GS_ATTACH_ACCEPTANCE = NOT_EXECUTED: no authorized live Open5GS Attach was run in this phase"),
         Assess(HandoverCapability::AS_SMC_RUNTIME_READY, true,

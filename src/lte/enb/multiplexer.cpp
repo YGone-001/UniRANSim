@@ -1717,13 +1717,31 @@ void EnbMultiplexer::initUuTransport()
         [this] { return m_registry.allocateEnbUeS1apId(); },
         [this](uint32_t association, uint32_t enbUeS1apId, uint16_t peerPort, const std::vector<uint8_t> &) {
             // The pending context exists before the Initial UE Message leaves,
-            // so no downlink answer can arrive for an unregistered UE.
-            auto &entry = m_registry.registerPeer(association, InetAddress(m_config.uuAddress, peerPort));
-            entry.transport = RadioTransportKind::UuSrb1;
-            m_registry.bindEnbUeS1apId(entry, enbUeS1apId);
-            entry.s1 = UeS1State::CONTEXT_PENDING;
+            // so no downlink answer can arrive for an unregistered UE. A UE
+            // that reconnects for a Service Request keeps its radio identity and
+            // endpoint and therefore its retained registry entry; reusing it is
+            // what keeps the EPS bearer contexts and the access epoch, while a
+            // fresh RRC connection binds a fresh eNB-UE-S1AP-ID to it.
+            auto *existing = m_registry.find(association);
+            EnbUeEntry *entry = existing;
+            if (entry == nullptr)
+            {
+                entry = &m_registry.registerPeer(association, InetAddress(m_config.uuAddress, peerPort));
+            }
+            else
+            {
+                if (entry->transport != RadioTransportKind::UuSrb1 || !entry->sessionRetained ||
+                    entry->s1 != UeS1State::IDLE_RETAINED ||
+                    entry->peer != InetAddress(m_config.uuAddress, peerPort))
+                    throw std::runtime_error(
+                        "A new SRB1 connection does not match this cell's retained UE session");
+            }
+            entry->transport = RadioTransportKind::UuSrb1;
+            m_registry.bindEnbUeS1apId(*entry, enbUeS1apId);
+            entry->s1 = UeS1State::CONTEXT_PENDING;
             Log("INFO", "SRB1 UE association " + std::to_string(association) + " bound to eNB-UE-S1AP-ID=" +
-                            std::to_string(enbUeS1apId));
+                            std::to_string(enbUeS1apId) +
+                            (existing != nullptr ? " (retained EPS session)" : ""));
         });
     m_bridge->SetUserPlaneHandler(
         [this](uint32_t association, const uu::Frame &frame) { onUuUserPlane(association, frame); });
@@ -1740,8 +1758,16 @@ void EnbMultiplexer::pollUu()
 {
     if (m_bridge == nullptr)
         return;
-    m_bridge->Pump(0);
+    // The Uu socket is the production user-plane carrier now. A single frame
+    // per turn let a TCP burst overflow the loopback UDP receive queue, and a
+    // lost RLC PDU was never recovered because the DRB entities were not
+    // ticked. Drain a bounded batch, then tick the SRB and every DRB entity so
+    // STATUS and retransmission timers advance.
+    for (int i = 0; i < 16; ++i)
+        m_bridge->Pump(0);
     m_bridge->Tick();
+    for (auto &entry : m_drbs)
+        entry.second->Tick();
     commitPendingIcs();
 }
 

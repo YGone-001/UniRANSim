@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <deque>
 #include <chrono>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -214,6 +215,12 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
     // machine and the single downlink entry both transports deliver into.
     std::unique_ptr<UuNasTransport> uuTransport;
     std::deque<std::vector<uint8_t>> uuDownlink;
+    // A DRB configuration can arrive in the same Uu batch as the Attach Accept
+    // that creates the TUN. The RRC callback runs while the NAS is still queued,
+    // so a configuration that finds no TUN is deferred and applied by the loop
+    // right after the NAS queue (and the TUN) has been handled.
+    std::deque<rrc::DrbReconfiguration> pendingUuDrbConfigurations;
+    std::function<void(const rrc::DrbReconfiguration &)> applyUuDrbConfiguration;
     // Phase 18-F-B6-D6: the DRB user plane of this UE. It exists only while a
     // Uu access is up; the rrc-prefixed DRB runtime owns the PDCP/RLC entities
     // and the DTCH routing. It is released on an RRC release and rebuilt from
@@ -246,9 +253,10 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
         // mixing the two transports.
         const auto uuScenario = config.lifecycle.scenario;
         if (uuScenario != LifecycleScenario::ATTACH_ONLY && uuScenario != LifecycleScenario::DETACH &&
-            uuScenario != LifecycleScenario::SERVICE_REQUEST && uuScenario != LifecycleScenario::PAGING)
+            uuScenario != LifecycleScenario::SERVICE_REQUEST && uuScenario != LifecycleScenario::PAGING &&
+            uuScenario != LifecycleScenario::USER_PLANE)
             throw std::runtime_error("a Uu configuration supports the ATTACH_ONLY, ATTACH_DETACH, "
-                                     "SERVICE_REQUEST and PAGING lifecycle scenarios only");
+                                     "SERVICE_REQUEST, PAGING and USER_PLANE lifecycle scenarios only");
         UuEndpoint endpoint{config.uu.localAddress, config.uu.localPort, config.uu.enbAddress,
                             config.uu.enbPort};
         rrc::UeSrb1Runtime::Config rrcConfig{};
@@ -274,7 +282,7 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
         // with RRCConnectionReconfigurationComplete and then restates its PDN
         // address on the new DRBs, exactly as the accepted legacy and handover
         // confirmations do; the eNB never decrypts NAS to learn that address.
-        uuTransport->SetDrbReconfigurationHandler([&](const rrc::DrbReconfiguration &configuration) {
+        applyUuDrbConfiguration = [&](const rrc::DrbReconfiguration &configuration) {
             try
             {
                 if (tun == nullptr)
@@ -367,6 +375,15 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 ++uuDrbDrops;
                 Log("ERROR", std::string("DRB configuration failed: ") + e.what());
             }
+        };
+        uuTransport->SetDrbReconfigurationHandler([&](const rrc::DrbReconfiguration &configuration) {
+            if (tun == nullptr)
+            {
+                pendingUuDrbConfigurations.push_back(configuration);
+                Log("INFO", "DRB configuration deferred until the UE TUN exists");
+                return;
+            }
+            applyUuDrbConfiguration(configuration);
         });
         uuTransport->SetUserPlaneHandler([&](const uu::Frame &frame) {
             if (uuDrbs == nullptr)
@@ -952,6 +969,8 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
         {
             uuTransport->Pump(0);
             uuTransport->Tick();
+            if (uuDrbs != nullptr)
+                uuDrbs->Tick();
             if (!initialAttachSent && uuTransport->SendNas(attach))
             {
                 initialAttachSent = true;
@@ -972,6 +991,17 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 if (auto outcome = deliverNas(nas))
                     return *outcome;
             }
+            // A configuration that arrived with the Attach Accept is applied
+            // now, after the NAS queue has created the TUN.
+            if (tun != nullptr && applyUuDrbConfiguration)
+            {
+                while (!pendingUuDrbConfigurations.empty())
+                {
+                    auto configuration = std::move(pendingUuDrbConfigurations.front());
+                    pendingUuDrbConfigurations.pop_front();
+                    applyUuDrbConfiguration(configuration);
+                }
+            }
 
             if (uuEvents.released)
             {
@@ -990,6 +1020,7 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                         uuDrbs.reset();
                     }
                     uuUserPlaneReady = false;
+                    pendingUuDrbConfigurations.clear();
                     const bool wasConnected = mobility.ecm == EcmState::CONNECTED;
                     mobility.onS1ContextReleased();
                     // The RRC release is not the simulator's generation-bound
@@ -1007,6 +1038,13 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                                     "context are preserved (ECM-IDLE)");
                     if (config.lifecycle.scenario == LifecycleScenario::PAGING)
                         uuPagingDeadline = now + std::chrono::milliseconds(config.lifecycle.pagingWaitMs);
+                    if (config.lifecycle.scenario == LifecycleScenario::USER_PLANE)
+                    {
+                        // The network released the access after the user-plane
+                        // phase; restore the same EPS session with a compact
+                        // Service Request over a new RRC connection.
+                        uuTriggerDeadline = now + std::chrono::milliseconds(50);
+                    }
                 }
             }
 
@@ -1030,7 +1068,8 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
 
             if (uuIdle && !uuSrArmed &&
                 (config.lifecycle.scenario == LifecycleScenario::SERVICE_REQUEST ||
-                 config.lifecycle.scenario == LifecycleScenario::PAGING) &&
+                 config.lifecycle.scenario == LifecycleScenario::PAGING ||
+                 config.lifecycle.scenario == LifecycleScenario::USER_PLANE) &&
                 now >= uuTriggerDeadline)
             {
                 mobility.startServiceRequest();
@@ -1084,7 +1123,10 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 state = State::EPS_REGISTERED;
                 LogState(state);
                 Log("INFO", "EPS Service Request accepted; AS security restored; ECM-CONNECTED");
-                return 0;
+                if (config.lifecycle.scenario != LifecycleScenario::USER_PLANE)
+                    return 0;
+                Log("INFO", "User-plane scenario continues on the restored access; the same EPS bearer will "
+                                "carry post-restoration traffic");
             }
 
             // The access is connected and the DRBs exist: the retained EPS
@@ -1108,18 +1150,24 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
         {
             scenarioTriggered = true;
             if (uuTransport && (config.lifecycle.scenario == LifecycleScenario::SERVICE_REQUEST ||
-                                config.lifecycle.scenario == LifecycleScenario::PAGING))
+                                config.lifecycle.scenario == LifecycleScenario::PAGING ||
+                                config.lifecycle.scenario == LifecycleScenario::USER_PLANE))
             {
                 // The network, not the UE, releases the access. The peer sends
                 // the S1 UE Context Release Command and the eNB releases RRC.
-                uuDeadline = now + std::chrono::milliseconds(config.lifecycle.procedureTimeoutMs);
+                uuDeadline = config.lifecycle.scenario == LifecycleScenario::USER_PLANE
+                                 ? now + std::chrono::seconds(120)
+                                 : now + std::chrono::milliseconds(config.lifecycle.procedureTimeoutMs);
                 if (config.lifecycle.scenario == LifecycleScenario::SERVICE_REQUEST)
                     uuTriggerDeadline = now;
                 Log("INFO", config.lifecycle.scenario == LifecycleScenario::PAGING
                                 ? "Waiting for the network to release the RRC connection; a Paging indication "
                                   "will start the restoration"
-                                : "Waiting for the network to release the RRC connection; the UE will send a "
-                                  "Service Request from ECM-IDLE");
+                                : (config.lifecycle.scenario == LifecycleScenario::USER_PLANE
+                                       ? "Waiting for the network to release the RRC connection after the "
+                                         "user-plane phase; the UE will restore the same EPS session from ECM-IDLE"
+                                       : "Waiting for the network to release the RRC connection; the UE will send a "
+                                         "Service Request from ECM-IDLE"));
             }
             else if (config.lifecycle.scenario == LifecycleScenario::SERVICE_REQUEST ||
                      config.lifecycle.scenario == LifecycleScenario::PAGING ||
@@ -1220,8 +1268,9 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
         if (!shutdownRequested && uuTransport)
         {
             const bool idleScenario = config.lifecycle.scenario == LifecycleScenario::SERVICE_REQUEST ||
-                                      config.lifecycle.scenario == LifecycleScenario::PAGING;
-            if (!uuIdle && scenarioTriggered && idleScenario && !uuSrArmed && now >= uuDeadline)
+                                      config.lifecycle.scenario == LifecycleScenario::PAGING ||
+                                      config.lifecycle.scenario == LifecycleScenario::USER_PLANE;
+            if (!uuIdle && scenarioTriggered && idleScenario && !uuSrArmed && !uuRestored && now >= uuDeadline)
             {
                 Log("ERROR", "Timed out waiting for the network to release the RRC connection");
                 return 1;
@@ -2042,6 +2091,17 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                         std::to_string(uuUplinkBytes) + " dl=" + std::to_string(uuDownlinkPackets) + "/" +
                         std::to_string(uuDownlinkBytes) + " configurations=" +
                         std::to_string(uuDrbConfigurations) + " drops=" + std::to_string(uuDrbDrops));
+    if (uuDrbs != nullptr)
+    {
+        if (const auto *bearer = uuDrbs->Bearer(activeEbi); bearer != nullptr)
+        {
+            const auto &rlc = bearer->Rlc();
+            Log("INFO", "UE DRB RLC: tx=" + std::to_string(rlc.Transmissions()) +
+                            " retx=" + std::to_string(rlc.Retransmissions()) +
+                            " out-of-window=" + std::to_string(rlc.DroppedOutOfWindow()) +
+                            " state=" + std::to_string(static_cast<int>(rlc.State())));
+        }
+    }
     uuDrbs.reset();
     Log("INFO", "NAS security counts: UL-next=" + std::to_string(security.ulNasCount) +
                     " DL-last=" + std::to_string(security.dlNasCount));

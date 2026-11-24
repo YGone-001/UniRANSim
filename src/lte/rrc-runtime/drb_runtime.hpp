@@ -49,6 +49,11 @@ constexpr size_t DrbRoutingHeaderSize = 2;
 // A DRB SDU is an IP packet. This bound is the largest IPv4 packet this data
 // path will carry; a larger one is refused and counted, never truncated.
 constexpr size_t MaxDrbSduBytes = 1600;
+// The AM PDU bound is the DRB's local implementation profile, not a value the
+// RRC message carries. Both ends must use the same bound or one side fragments
+// every IP packet into 128-octet PDUs; the DRB composer therefore normalizes it
+// on both the UE and the eNB.
+constexpr size_t DrbAmMaxPduBytes = 1700;
 
 struct DrbBearerConfig
 {

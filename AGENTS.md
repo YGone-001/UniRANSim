@@ -1558,13 +1558,93 @@ configuration is `src/lte/rrc-runtime/rrc_drb_config.{hpp,cpp}`.
   carries traffic again on the same EBI, and the old TEID stays retired.
 - **No production-UE user-plane claim without its acceptance.**
   `LTE_PRODUCTION_UE_DRB_READY` and
-  `LTE_PRODUCTION_UE_BIDIRECTIONAL_USER_PLANE_READY` stay false until a
-  multi-process case with a real TUN and a deterministic PGW endpoint runs. The
-  component-level flags are true only on the evidence in
-  `test/lte/drb_user_plane.cpp`.
+  `LTE_PRODUCTION_UE_BIDIRECTIONAL_USER_PLANE_READY` stayed false through D6
+  until a multi-process case with a real TUN and a deterministic PGW endpoint
+  ran. The component-level flags are true only on the evidence in
+  `test/lte/drb_user_plane.cpp`; the production promotion is D7's acceptance in
+  the next section.
 
 The deterministic cases live in `test/lte/drb_user_plane.cpp`:
 
 ```bash
 ./cmake-build-release/nr-tests --no-version --test-case="lte/drb/*"
 ```
+
+## LTE production UE TUN user plane (D7)
+
+`docs/lte-production-ue-tun-user-plane.md` is the record. The acceptance is
+`test/lte/production_uu_user_plane.cpp`: three real OS processes (production
+`lte-ue`, production `EnbMultiplexer` + deterministic MME, deterministic
+SGW-U/PGW-U) in two isolated network namespaces, with real TUNs and real GTP-U.
+
+- **Three processes, no object shortcuts.** The UE reaches the eNB over the Uu
+  UDP socket and the eNB reaches the SGW-U over a real GTP-U UDP socket on
+  `:2152`. Never replace a socket hop with a function call, never inject a
+  downlink packet directly into the UE TUN, and never claim a Core-network
+  round trip from an in-process buffer.
+- **The deterministic EPC is not an EPC.** The MME is a fixture; the
+  SGW-U/PGW-U is test infrastructure. The bearer map file it consumes is an
+  explicitly labelled simulator control written from the eNB's Initial Context
+  Setup Response. It is not S11, not GTP-C and not Open5GS. Do not claim a live
+  EPC path update or a real Open5GS Attach.
+- **Two namespaces, two TUNs.** The UE TUN and the Core TUN are in different
+  namespaces, connected only by the veth/GTP-U path. Both TUN addresses and the
+  PDN address come from the same NAS assignment. A same-namespace setup would
+  let the kernel route around the GTP-U path and is not acceptable evidence.
+- **The production UE lifecycle must stay alive.** The `user-plane` scenario
+  attaches, keeps the TUN and DRB, accepts a network release, restores the same
+  EPS session with a compact Service Request and continues. It never exits on a
+  successful restoration, never re-Attaches and never treats ECM-IDLE as Detach.
+- **A DRB configuration that arrives before the TUN is deferred, not dropped.**
+  The RRC callback can run in the same Uu batch as the Attach Accept; the
+  application queues the configuration and applies it right after the NAS queue
+  creates the TUN. It never acknowledges a configuration it did not apply.
+- **Drain the Uu path and tick the DRB entities.** The production Uu receive
+  path is drained in a bounded batch on both ends, and every DRB RLC AM entity
+  is ticked each turn. Without the ticks no STATUS is generated and a lost PDU
+  is never retransmitted; without the drain a TCP burst overflows the loopback
+  UDP queue.
+- **The DRB AM PDU bound is local and symmetric.** The RRC message carries the
+  RLC enumerators, not the local AM PDU size. `DrbBearer` normalizes
+  `DrbAmMaxPduBytes` on both ends; leaving the UE at the 128-octet SRB default
+  fragmented every IP packet and collapsed the sustained TCP flow.
+- **A Uu Service Request reuses the retained registry entry.** A reconnecting
+  UE keeps its radio identity and endpoint; the multiplexer binds a fresh
+  eNB-UE-S1AP-ID to the retained entry instead of registering a second UE. The
+  EPS bearer contexts, the access epoch and the TEID retirement state survive.
+- **TEIDs stay fresh and retired.** A restoration allocates a new local/SGW TEID
+  pair; the old local TEID is retired and a late G-PDU for it is dropped as
+  retired. A late old-SGW-TEID G-PDU is dropped by the SGW as retired traffic.
+  Both cases are counted and neither reaches the UE.
+- **Evidence is real, including its limits.** The acceptance checks ICMP, UDP
+  and TCP payloads/hashes in both directions, the SGW UL/DL counters, the
+  restored map generation and the retired TEID. iperf3 is attempted; the
+  recorded local run stalled after a first-interval peak, so the throughput
+  baseline is PARTIAL and must be reported with that observation, never as a
+  fabricated sustained rate. PCAPs are written to
+  `reports/evidence/phase-18-f-b6-d7/` only when `tcpdump` exists; otherwise the
+  evidence says NOT_GENERATED.
+- **Promotion is earned.** `LTE_PRODUCTION_UE_DRB_READY` and
+  `LTE_PRODUCTION_UE_BIDIRECTIONAL_USER_PLANE_READY` are true only because this
+  three-process acceptance passes. `LTE_OPEN5GS_ATTACH_ACCEPTED`,
+  `LTE_512_UE_SCALE_ACCEPTED`, `LTE_SINGLE_UE_1GBPS_ACCEPTED` and
+  `LTE_DEFAULT_BEARER_OVER_SRB1_READY` stay false.
+
+Build and run:
+
+```bash
+cmake -S . -B cmake-build-d7 -DCMAKE_BUILD_TYPE=Release
+cmake --build cmake-build-d7 --target nr-tests lte-ue lte-uu-user-plane-peer \
+  lte-uu-sgw-peer lte-uu-traffic-probe --parallel "$(nproc)"
+
+sudo unshare --net --mount --pid --fork --mount-proc -- bash -c '
+  ip link set lo up
+  export UNIRANSIM_RUN_PRIVILEGED_TUN_TESTS=1
+  ./cmake-build-d7/nr-tests --no-skip \
+    --test-case="lte/d7/acceptance: the production ue carries tun ip traffic over drb and gtpu end to end"'
+```
+
+The blocking CI job is `Production UE DRB TUN End-to-End User Plane
+(multi-process, blocking)`; it installs `iproute2`, `tcpdump` and `iperf3`,
+forces the skipped case with `--no-skip`, and requires both sentinels, the pass
+line and the evidence summary.

@@ -191,6 +191,18 @@ struct ErabSetupItem
     std::array<uint8_t, 4> gtpTeid{};
 };
 
+// The target eNB's successful answer to an Initial Context Setup Request. D7's
+// deterministic MME reads it to learn the transport endpoint the eNB will
+// receive downlink user plane on; the identifiers never invent a value.
+struct InitialContextSetupResponse
+{
+    uint32_t mmeUeS1apId{0};
+    uint32_t enbUeS1apId{0};
+    std::vector<ErabSetupItem> established;
+};
+
+InitialContextSetupResponse DecodeInitialContextSetupResponse(const uint8_t *data, size_t length);
+
 // Per-E-RAB failure, shared by Initial Context Setup and E-RAB management.
 struct ErabFailedItem
 {

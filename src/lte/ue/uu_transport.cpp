@@ -131,7 +131,12 @@ void UuNasTransport::Pump(int timeoutMs)
 {
     if (released_ || runtime_ == nullptr)
         return;
+    // The first call may wait for the caller's timeout; the following bounded
+    // calls drain a burst without sleeping. A single frame per turn let a TCP
+    // burst overflow the Uu UDP receive queue.
     runtime_->Pump(timeoutMs);
+    for (int i = 0; i < 15; ++i)
+        runtime_->Pump(0);
 }
 
 void UuNasTransport::Tick()

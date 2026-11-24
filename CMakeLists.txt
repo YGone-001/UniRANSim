@@ -119,6 +119,31 @@ if (BUILD_TESTS)
     target_link_libraries(lte-uu-attach-peer pthread common-lib ext lte-enb-lib lte-rrc lte-ue-lib)
     add_dependencies(nr-tests lte-uu-attach-peer)
 
+    # Phase 18-F-B6-D7: the deterministic SGW-U/PGW-U user-plane endpoint. It
+    # terminates the real GTP-U tunnel and owns a real Core-side Linux TUN.
+    add_executable(lte-uu-sgw-peer tools/lte-uu-sgw-peer.cpp)
+    target_compile_options(lte-uu-sgw-peer PRIVATE -Wall -Wextra -pedantic)
+    target_include_directories(lte-uu-sgw-peer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/asn/lte-rrc
+                                                      ${CMAKE_CURRENT_SOURCE_DIR}/src/asn/asn1c)
+    target_link_libraries(lte-uu-sgw-peer pthread common-lib utils ext lte-enb-lib lte-ue-lib
+                          lte-user-plane-common)
+    add_dependencies(nr-tests lte-uu-sgw-peer)
+
+    # Phase 18-F-B6-D7: the production eNB + deterministic MME user-plane peer.
+    add_executable(lte-uu-user-plane-peer tools/lte-uu-user-plane-peer.cpp)
+    target_compile_options(lte-uu-user-plane-peer PRIVATE -Wall -Wextra -pedantic)
+    target_include_directories(lte-uu-user-plane-peer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/asn/lte-rrc
+                                                             ${CMAKE_CURRENT_SOURCE_DIR}/src/asn/asn1c)
+    target_link_libraries(lte-uu-user-plane-peer pthread common-lib utils ext lte-enb-lib lte-rrc lte-ue-lib)
+    add_dependencies(nr-tests lte-uu-user-plane-peer)
+
+    # Phase 18-F-B6-D7: real UDP/TCP traffic probe used inside the acceptance
+    # network namespaces. It is a test tool, not part of the production stack.
+    add_executable(lte-uu-traffic-probe tools/lte-uu-traffic-probe.cpp)
+    target_compile_options(lte-uu-traffic-probe PRIVATE -Wall -Wextra -pedantic)
+    target_link_libraries(lte-uu-traffic-probe pthread utils)
+    add_dependencies(nr-tests lte-uu-traffic-probe)
+
     enable_testing()
     # Registers each doctest test case as its own ctest test, as listed by the built binary, so a failure or a crash
     # is reported against the test case that caused it instead of the whole suite. A test that hangs fails after a

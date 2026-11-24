@@ -150,6 +150,8 @@ Config ParseNode(const YAML::Node &root)
             else if (scenario == "paging") config.lifecycle.scenario = LifecycleScenario::PAGING;
             else if (scenario == "idle-reselection")
                 config.lifecycle.scenario = LifecycleScenario::IDLE_RESELECTION;
+            else if (scenario == "user-plane" || scenario == "attach-user-plane")
+                config.lifecycle.scenario = LifecycleScenario::USER_PLANE;
             else throw std::runtime_error("Field 'lifecycle.scenario' is not supported");
         }
         if (yaml::HasField(lifecycle, "triggerAfterMs"))
