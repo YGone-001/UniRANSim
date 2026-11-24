@@ -1411,5 +1411,36 @@ configured. `docs/lte-nas-s1ap-runtime.md` is the record.
   pending transaction exists is refused and its reservations are released; it
   must never stage a second transaction or produce a second response.
 - **No capability change without evidence.** The production UE application is
-  still not SRB1-enabled; `LTE_PRODUCTION_UE_SRB1_READY` and
-  `LTE_EPS_ATTACH_OVER_SRB1_READY` stay false until it is.
+  now SRB1-enabled (B6-D3), so `LTE_PRODUCTION_UE_SRB1_READY` and
+  `LTE_EPS_ATTACH_OVER_SRB1_READY` are true as of that phase;
+  `LTE_DEFAULT_BEARER_OVER_SRB1_READY` and `LTE_OPEN5GS_ATTACH_ACCEPTED` stay
+  false.
+
+## LTE production UE SRB1 Attach (B6-D3)
+
+`docs/lte-production-ue-srb1-attach.md` is the record.
+
+- **One NAS downlink entry.** Both the legacy `NAS_DOWNLINK` path and the
+  `UuNasTransport` callback deliver into `handleNasDownlink` through
+  `deliverNas`. Do not add a second state machine, and do not process the same
+  message from two places.
+- **The application owns the transport.** When `uu` is configured, `Run` owns
+  the `UuNasTransport` for its lifetime and releases it by RAII. It is never a
+  global, a temporary or a test-only object.
+- **RRC before the first NAS.** The Attach Request is built once and is offered
+  to `SendNas` only after the connection can carry it. Never send it over the
+  legacy link in Uu mode and never sleep to fake the ordering.
+- **One uplink interface.** Every Attach-exchange NAS message goes through
+  `sendNas`; a refusal fails the run instead of falling back to `enbLink`.
+- **Security is not bypassed.** `PrepareAsSecurity` is called with the same
+  KASME and uplink NAS COUNT the Security Mode Complete used. The eNB's KeNB in
+  the Initial Context Setup Request must be derived from that COUNT.
+- **The callback only queues.** `Pump`/Tick run on the UE thread; the callback
+  appends bytes and returns. Release clears the callback before the runtime and
+  socket are destroyed, so no late NAS reaches a dead handler.
+- **ATTACH_ONLY is the current Uu scope.** Paging, recovery, TAU, detach and the
+  user plane still travel on the legacy link; a Uu configuration naming another
+  lifecycle scenario is refused at startup rather than mixed.
+- **Two processes, opt-in.** `UNIRANSIM_RUN_TWO_PROCESS_ATTACH=1` runs
+  `tools/lte-uu-attach-peer.cpp` and the real `lte-ue`. Without it the case is
+  NOT_EXERCISED. A deterministic MME is still not Open5GS.

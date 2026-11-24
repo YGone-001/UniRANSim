@@ -18,8 +18,10 @@
 #include "security.hpp"
 #include "trigger.hpp"
 #include "tun.hpp"
+#include "uu_transport.hpp"
 
 #include <algorithm>
+#include <deque>
 #include <chrono>
 #include <iomanip>
 #include <iostream>
@@ -90,15 +92,6 @@ void SendServiceRequest(udp::UdpServer &socket, const InetAddress &enb, uint32_t
     payload.insert(payload.end(), nas.begin(), nas.end());
     auto frame = link::Encode({link::MessageType::SERVICE_REQUEST, ueId, std::move(payload)});
     socket.Send(enb, frame.data(), frame.size());
-}
-
-// Sends a security-protected NAS message and advances the uplink NAS COUNT.
-void SendProtected(udp::UdpServer &socket, const InetAddress &enb, uint32_t ueId, SecurityContext &security,
-                   bool newContext, const std::vector<uint8_t> &plain)
-{
-    auto protectedMessage = nas::Protect(security, true, newContext, plain);
-    SendNas(socket, enb, ueId, std::move(protectedMessage));
-    security.ulNasCount = (security.ulNasCount + 1U) & 0xFFFFFFU;
 }
 
 // Protected uplink NAS that continues an existing EPS session over a new S1
@@ -213,20 +206,585 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
     state = State::CONNECTED_TO_ENB;
     LogState(state);
     Log("INFO", "LTE UE " + std::to_string(ueId) + " using subscriber IMSI ..." + config.imsi.substr(config.imsi.size() - 4));
+
+    // Phase 18-F-B6-D3: a configuration that states a Uu endpoint makes the
+    // production UE carry its connected-mode NAS over SRB1. The transport owns
+    // the RRC connection and the socket; this application keeps the NAS state
+    // machine and the single downlink entry both transports deliver into.
+    std::unique_ptr<UuNasTransport> uuTransport;
+    std::deque<std::vector<uint8_t>> uuDownlink;
+    rrc::RrcState lastUuState = rrc::RrcState::RRC_IDLE;
+    if (config.uu.enabled)
+    {
+        // This phase moves the Attach exchange onto SRB1. The later lifecycle
+        // procedures still travel on the legacy link, so enabling both at once
+        // is refused here rather than silently mixing the two transports.
+        if (config.lifecycle.scenario != LifecycleScenario::ATTACH_ONLY)
+            throw std::runtime_error("a Uu configuration currently supports the ATTACH_ONLY lifecycle scenario only");
+        UuEndpoint endpoint{config.uu.localAddress, config.uu.localPort, config.uu.enbAddress,
+                            config.uu.enbPort};
+        rrc::UeSrb1Runtime::Config rrcConfig{};
+        rrcConfig.association = ueId;
+        rrcConfig.mmec = 0;
+        rrcConfig.mTmsi = ueId;
+        rrcConfig.selectedPlmnIdentity = 1;
+        uuTransport = std::make_unique<UuNasTransport>(endpoint, rrcConfig);
+        // The callback only queues. The transport is pumped on this thread and
+        // the queued NAS is handled by the loop, so no application state is
+        // mutated from inside the RRC runtime.
+        uuTransport->SetNasHandler([&uuDownlink](const std::vector<uint8_t> &nas) { uuDownlink.push_back(nas); });
+        // A bind failure throws here: there is no fallback to the legacy link
+        // and no substitution of a different address.
+        uuTransport->Start();
+        Log("INFO", "Uu SRB1 transport started on " + config.uu.localAddress + ":" +
+                        std::to_string(uuTransport->LocalPort()) + " towards " + config.uu.enbAddress + ":" +
+                        std::to_string(config.uu.enbPort));
+    }
+
+    // The one uplink NAS interface. A refusal is reported to the caller and is
+    // never retried over another transport.
+    auto sendNas = [&](const std::vector<uint8_t> &nas) -> bool {
+        if (uuTransport)
+            return uuTransport->SendNas(nas);
+        SendNas(socket, enb, ueId, nas);
+        return true;
+    };
+    // Protects and sends, and fails loudly: a state machine that advanced past
+    // a message it never sent would invent an outcome.
+    auto sendProtected = [&](bool newContext, const std::vector<uint8_t> &plain) {
+        auto protectedMessage = nas::Protect(security, true, newContext, plain);
+        if (!sendNas(protectedMessage))
+            throw std::runtime_error("the uplink NAS transport refused a protected NAS message");
+        security.ulNasCount = (security.ulNasCount + 1U) & 0xFFFFFFU;
+    };
     mobility.beginNewAttach();
     auto attach = nas::EncodeAttachRequest(config);
-    SendNas(socket, enb, ueId, std::move(attach));
-    state = State::ATTACH_REQUEST_SENT;
-    LogState(state);
+    // In Uu mode the Attach Request is the first NAS message and may only leave
+    // once the RRC connection exists; the loop retries SendNas until the
+    // transport accepts it. The legacy form sends it immediately, as before.
+    bool initialAttachSent = false;
+    if (!uuTransport)
+    {
+        SendNas(socket, enb, ueId, attach);
+        initialAttachSent = true;
+        state = State::ATTACH_REQUEST_SENT;
+        LogState(state);
+    }
+    else
+    {
+        Log("INFO", "The Attach Request waits for the RRC connection before it is sent");
+    }
     state = State::AUTHENTICATION_PENDING;
     LogState(state);
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(config.link.timeoutMs);
     auto scenarioDeadline = std::chrono::steady_clock::time_point::max();
+
+    // The single NAS downlink entry. The legacy link and the Uu transport both
+    // deliver here; the application has one NAS state machine, not two. The
+    // return value is a process exit code when the message ended the run.
+    auto handleNasDownlink = [&](const std::vector<uint8_t> &nasPayload) -> std::optional<int>
+    {
+        if (!security.securityActive)
+        {
+                    // Only a Security Mode Command may arrive before the context is active.
+                    if (!nas::IsSecurityModeCommand(nasPayload.data(), nasPayload.size()))
+                    {
+                        // Authentication Request is still plain EMM.
+                        if (state == State::AUTHENTICATION_PENDING || state == State::AUTHENTICATION_RESPONSE_SENT ||
+                            state == State::EPS_AKA_ACCEPTED)
+                        {
+                            if (state == State::EPS_AKA_ACCEPTED)
+                                throw nas::DecodeError("Plain NAS received after EPS AKA acceptance");
+                        }
+                        else
+                            throw nas::DecodeError("Unexpected plain NAS message before security activation");
+
+                        auto request = nas::DecodeAuthenticationRequest(nasPayload.data(), nasPayload.size());
+                        state = State::AUTHENTICATION_REQUEST_RECEIVED;
+                        LogState(state);
+                        auto result = nas::Authenticate(config, request);
+                        if (result.failure != nas::AkaFailure::NONE)
+                        {
+                            state = State::AUTHENTICATION_FAILED;
+                            LogState(state);
+                            if (result.failure == nas::AkaFailure::MAC_FAILURE)
+                            {
+                                Log("ERROR",
+                                    "AUTN MAC verification failed; returning EPS Authentication Failure (MAC failure)");
+                                if (!sendNas(nas::EncodeAuthenticationFailureMac()))
+                                throw std::runtime_error(
+                                    "the uplink NAS transport refused the Authentication Failure");
+                            }
+                            else if (result.failure == nas::AkaFailure::SYNCHRONIZATION_FAILURE)
+                                Log("ERROR", "AUTN SQN is stale; AUTS resynchronization is unsupported, failing closed");
+                            else
+                                Log("ERROR", "Authentication Request processing failed");
+                            return 1;
+                        }
+                        // A fresh EPS AKA replaces KASME, so the AS context that
+                        // was derived from the old one is worthless.
+                        asSecurity.reset();
+                        nasSecurityGeneration++;
+                        security = result.context;
+                        // Record the exact UE security capability octets that went
+                        // out in the Attach Request so the SMC replay check can use
+                        // them (TS 24.301 5.4.3.3).
+                        security.advertisedSecurityCapabilities.assign(config.networkCapability.begin(),
+                                                                        config.networkCapability.end());
+                        if (!sendNas(nas::EncodeAuthenticationResponse(result.res)))
+                            throw std::runtime_error(
+                                "the uplink NAS transport refused the Authentication Response");
+                        state = State::AUTHENTICATION_RESPONSE_SENT;
+                        LogState(state);
+                        return std::nullopt;
+                    }
+
+                    // Security Mode Command: header type 3, integrity protected with the
+                    // new context and not ciphered, so the IEs are readable in the clear.
+                    if (!security.valid)
+                        throw nas::DecodeError("Security Mode Command received before a valid AKA response");
+                    auto parsed = nas::ParseProtectedHeader(nasPayload.data(), nasPayload.size());
+                    if (parsed.headerType != nas::SecurityHeaderType::INTEGRITY_PROTECTED_WITH_NEW_CONTEXT)
+                        throw nas::DecodeError("Security Mode Command must use the new EPS security context header");
+                    auto command = nas::DecodeSecurityModeCommand(parsed.plain.data(), parsed.plain.size());
+                    nas::ValidateSecurityModeCommand(config, command, security);
+                    security.kNasInt = nas::DeriveKnasInt(security.kasme, security.integrity);
+                    security.kNasEnc = nas::DeriveKnasEnc(security.kasme, security.ciphering);
+                    security.keysDerived = true;
+                    // MAC verification is mandatory before the context becomes active.
+                    nas::UnprotectBody(security, false, parsed.headerType, parsed.sequenceNumber, parsed.mac,
+                                       parsed.plain);
+                    security.dlNasCount = parsed.sequenceNumber;
+                    security.ulNasCount = 0;
+                    security.securityActive = true;
+                    mobility.securityContextValid = true;
+                    state = State::SECURITY_MODE_COMMAND_RECEIVED;
+                    LogState(state);
+                    Log("INFO", std::string("NAS security activated: ") + nas::ToString(security.integrity) + "/" +
+                                    nas::ToString(security.ciphering) + " KSI=" + std::to_string(security.ksi));
+                    state = State::NAS_SECURITY_ACTIVE;
+                    LogState(state);
+
+                    // TS 33.401 7.2.1: the uplink NAS COUNT that activates AS
+                    // security is the one the Security Mode Complete travels with.
+                    // It is read before the send advances the COUNT.
+                    const uint32_t securityModeCompleteCount = security.ulNasCount;
+                    sendProtected(true,
+                                  nas::EncodeSecurityModeComplete(config, command.imeisvRequested));
+                    if (uuTransport)
+                    {
+                        // The next downlink SRB1 PDU is the RRC SecurityModeCommand,
+                        // so the RRC runtime is told the same KASME and the uplink
+                        // NAS COUNT this Security Mode Complete travelled with. The
+                        // eNB derives its KeNB from the MME's Initial Context Setup
+                        // key at that COUNT; the two must name the same key.
+                        uuTransport->PrepareAsSecurity(security.kasme, securityModeCompleteCount,
+                                                       nasSecurityGeneration);
+                        Log("INFO", "RRC AS security prepared from KASME at uplink NAS COUNT " +
+                                        std::to_string(securityModeCompleteCount));
+                    }
+                    else
+                    {
+                        // No RRC security mode procedure exists in this simulator,
+                        // so no AS algorithm has been selected. The context is built
+                        // with that stated, and it refuses to derive RRC/UP keys
+                        // rather than reusing the NAS selection in a role the
+                        // standard gives to a different procedure.
+                        lte::security::AsAlgorithmSet algorithms;
+                        algorithms.negotiated = false;
+                        asSecurity.emplace(lte::security::AsSecurityContext::Create(
+                            static_cast<uint32_t>(ueId), security.kasme, securityModeCompleteCount,
+                            nasSecurityGeneration, algorithms));
+                        Log("INFO", "EPS AS security context established: " + asSecurity->Describe());
+                    }
+                    state = State::SECURITY_MODE_COMPLETE_SENT;
+                    LogState(state);
+                    return std::nullopt;
+                }
+
+                // A network without a matching security context may return a plain
+                // Service Reject. It can only fail a pending Service Request; it
+                // never updates trusted mobility state. Every other downlink after
+                // security activation must verify integrity.
+                std::vector<uint8_t> plain;
+                if (mobility.pending == PendingProcedure::SERVICE_REQUEST && nasPayload.size() >= 3 &&
+                    nasPayload[0] == 0x07 && nasPayload[1] == 0x4E)
+                {
+                    plain = nasPayload;
+                    Log("WARN", "Received unprotected Service Reject while restoring a released context");
+                }
+                else
+                    plain = ReceiveProtected(security, nasPayload);
+                // Handle C9 here so a malformed optional IE still receives a
+                // protected Reject using the authenticated EBI/PTI header.
+                if (plain.size() >= 3 && (plain[0] & 15U) == 2 && plain[2] == 0xC9)
+                {
+                    const uint8_t ebi = plain[0] >> 4U, pti = plain[1];
+                    uint8_t cause = 0;
+                    std::string error;
+                    nas::EpsBearerConfiguration *target = nullptr;
+                    nas::EpsBearerConfiguration candidate;
+                    try
+                    {
+                        if (mobility.emm != EmmState::REGISTERED || mobility.ecm != EcmState::CONNECTED ||
+                            mobility.pending != PendingProcedure::NONE)
+                            throw nas::EsmError(101, "Bearer modification conflicts with mobility state");
+                        const auto request = nas::DecodeModifyEpsBearerContextRequest(plain.data(), plain.size());
+                        if (ebi == activeEbi)
+                            target = &defaultConfiguration;
+                        else
+                            for (auto &bearer : dedicatedBearers)
+                                if (bearer.ebi == ebi)
+                                    target = &bearer;
+                        if (!target)
+                            throw nas::EsmError(43, "Unknown EPS bearer");
+                        candidate = *target;
+                        nas::ApplyBearerModification(candidate, request);
+                    }
+                    catch (const nas::EsmError &e)
+                    {
+                        cause = e.cause;
+                        error = e.what();
+                    }
+                    catch (const std::bad_alloc &)
+                    {
+                        cause = 26;
+                        error = "Insufficient local resources";
+                    }
+                    if (cause)
+                    {
+                        sendProtected(false,
+                                      nas::EncodeModifyEpsBearerContextReject(ebi, pti, cause));
+                        Log("WARN", "Modify EPS bearer rejected EBI=" + std::to_string(ebi) +
+                                        " cause=" + std::to_string(cause) + ": " + error);
+                    }
+                    else
+                    {
+                        sendProtected(false,
+                                      nas::EncodeModifyEpsBearerContextAccept(ebi, pti));
+                        *target = std::move(candidate);
+                        Log("INFO", "Modify EPS bearer accepted EBI=" + std::to_string(ebi) +
+                                        " PTI=" + std::to_string(pti) + " QCI=" + std::to_string(target->qci) +
+                                        " filters=" + std::to_string(target->tft.size()) +
+                                        " UL-COUNT-next=" + std::to_string(security.ulNasCount) +
+                                        " DL-COUNT=" + std::to_string(security.dlNasCount));
+                    }
+                    return std::nullopt;
+                }
+                auto downlink = nas::DecodeDownlink(plain.data(), plain.size());
+
+                if (downlink.type == nas::DownlinkEmm::ACTIVATE_DEDICATED_EPS_BEARER_CONTEXT)
+                {
+                    const auto &request = downlink.dedicatedBearer;
+                    try
+                    {
+                        if (mobility.emm != EmmState::REGISTERED || mobility.ecm != EcmState::CONNECTED ||
+                            mobility.pending != PendingProcedure::NONE)
+                            throw nas::DecodeError("Dedicated bearer activation conflicts with mobility state");
+                        if (request.linkedEpsBearerIdentity != activeEbi)
+                            throw nas::DecodeError("Dedicated bearer references a different default bearer");
+                        for (const auto &bearer : dedicatedBearers)
+                        {
+                            if (bearer.ebi == request.epsBearerIdentity)
+                                throw nas::DecodeError("Dedicated bearer identity is already active");
+                        }
+                        if (dedicatedBearers.size() >= 7)
+                            throw nas::DecodeError("Dedicated bearer capacity is exhausted");
+
+                        DedicatedBearerRuntime bearer;
+                        bearer.ebi = request.epsBearerIdentity;
+                        bearer.qci = request.qci;
+                        bearer.linkedEbi = request.linkedEpsBearerIdentity;
+                        bearer.epsQos = {request.qci};
+                        if (!request.tft.empty())
+                            bearer.tft.apply(lte::tft::Decode(request.tft.data(), request.tft.size()));
+
+                        dedicatedBearers.push_back(std::move(bearer));
+                        sendProtected(false,
+                                      nas::EncodeActivateDedicatedEpsBearerContextAccept(
+                                          request.epsBearerIdentity, request.procedureTransactionId));
+
+                        std::vector<uint8_t> activated{request.epsBearerIdentity};
+                        auto activatedFrame =
+                            link::Encode({link::MessageType::BEARER_ACTIVATED, ueId, std::move(activated)});
+                        socket.Send(enb, activatedFrame.data(), activatedFrame.size());
+
+                        Log("INFO", "Dedicated EPS bearer " + std::to_string(request.epsBearerIdentity) +
+                                        " activated (QCI=" + std::to_string(request.qci) + ", linked-EBI=" +
+                                        std::to_string(request.linkedEpsBearerIdentity) + ", filters=" +
+                                        std::to_string(dedicatedBearers.back().tft.size()) + ")");
+                    }
+                    catch (const std::exception &e)
+                    {
+                        // Reject with insufficient resources and keep every other
+                        // bearer untouched; a failed activation must not disturb the
+                        // default bearer.
+                        sendProtected(false,
+                                      nas::EncodeActivateDedicatedEpsBearerContextReject(
+                                          request.epsBearerIdentity, request.procedureTransactionId, 26));
+                        Log("WARN", std::string("Rejected dedicated EPS bearer activation: ") + e.what());
+                    }
+                    return std::nullopt;
+                }
+
+                if (downlink.type == nas::DownlinkEmm::DEACTIVATE_EPS_BEARER_CONTEXT)
+                {
+                    const auto &request = downlink.deactivateBearer;
+                    const auto bearer = std::find_if(dedicatedBearers.begin(), dedicatedBearers.end(),
+                                                     [&request](const DedicatedBearerRuntime &candidate) {
+                                                         return candidate.ebi == request.epsBearerIdentity;
+                                                     });
+                    if (bearer == dedicatedBearers.end())
+                        throw nas::DecodeError("Deactivation names an unknown dedicated bearer");
+                    dedicatedBearers.erase(bearer);
+                    sendProtected(false,
+                                  nas::EncodeDeactivateEpsBearerContextAccept(request.epsBearerIdentity,
+                                                                              request.procedureTransactionId));
+                    Log("INFO", "Dedicated EPS bearer " + std::to_string(request.epsBearerIdentity) +
+                                    " deactivated; default bearer retained");
+                    return std::nullopt;
+                }
+
+                if (downlink.type == nas::DownlinkEmm::DETACH_ACCEPT)
+                {
+                    if (mobility.pending != PendingProcedure::DETACH)
+                        throw nas::DecodeError("Unexpected EPS Detach Accept");
+                    auto deleted = link::Encode({link::MessageType::EPS_SESSION_DELETED, ueId,
+                        link::EncodeBearerRestoration(activeEbi, mobility.accessGeneration)});
+                    socket.Send(enb, deleted.data(), deleted.size());
+                    mobility.onDetachAccepted();
+                    if (asSecurity)
+                    {
+                        asSecurity->Reset();
+                        asSecurity.reset();
+                    }
+                    security = SecurityContext{};
+                    pendingWire.clear();
+                    tun.reset();
+                    dedicatedBearers.clear();
+                    defaultConfiguration = {};
+                    Log("INFO", "EPS Detach accepted; State=EMM_DEREGISTERED, bearer and TUN released");
+                    return 0;
+                }
+                if (downlink.type == nas::DownlinkEmm::SERVICE_REJECT)
+                {
+                    mobility.onProcedureRejected();
+                    Log("ERROR", "EPS Service Request rejected, EMM cause=" + std::to_string(downlink.emmCause));
+                    return 1;
+                }
+                if (downlink.type == nas::DownlinkEmm::TAU_REJECT)
+                {
+                    mobility.onProcedureRejected();
+                    Log("ERROR", "Tracking Area Update rejected, EMM cause=" + std::to_string(downlink.emmCause));
+                    return 1;
+                }
+                if (downlink.type == nas::DownlinkEmm::TAU_ACCEPT)
+                {
+                    if (mobility.pending != PendingProcedure::TAU_NORMAL &&
+                        mobility.pending != PendingProcedure::TAU_PERIODIC)
+                        throw nas::DecodeError("Unexpected Tracking Area Update Accept");
+                    // The Accept is one NAS message carrying several independent
+                    // assignments. It is applied as one validated step, so an
+                    // Accept that is malformed in any one of them cannot leave the
+                    // bearer set, the GUTI or the tracking areas half-changed
+                    // behind a rejected update.
+                    const auto acceptance = ApplyTauAccept(mobility, dedicatedBearers, downlink.tauAccept);
+                    for (const uint8_t ebi : acceptance.releasedDedicated)
+                        Log("INFO", "Dedicated EPS bearer " + std::to_string(ebi) +
+                                        " was not retained by the network and is no longer active");
+                    pendingWire.clear();
+                    pendingMobilityFrame.reset();
+                    if (acceptance.completeRequired)
+                        sendProtected(false, nas::EncodeTauComplete());
+                    Log("INFO", std::string("Tracking Area Update accepted; context preserved") +
+                                    (acceptance.completeRequired ? "; TAU Complete sent for new GUTI" : ""));
+                    scenarioDeadline = std::chrono::steady_clock::time_point::max();
+                    return std::nullopt;
+                }
+
+                if (downlink.type == nas::DownlinkEmm::ESM_INFORMATION_REQUEST)
+                {
+                    state = State::ESM_INFORMATION_REQUEST_RECEIVED;
+                    LogState(state);
+                    sendProtected(false,
+                                  nas::EncodeEsmInformationResponse(downlink.esmInformationRequest.procedureTransactionId,
+                                                                   downlink.esmInformationRequest.apn));
+                    state = State::ESM_INFORMATION_RESPONSE_SENT;
+                    LogState(state);
+                    return std::nullopt;
+                }
+
+                if (downlink.type == nas::DownlinkEmm::ATTACH_REJECT)
+                {
+                    state = State::PROCEDURE_FAILED;
+                    LogState(state);
+                    Log("ERROR", "EPS Attach rejected by the MME, EMM cause=" + std::to_string(downlink.emmCause));
+                    return 1;
+                }
+
+                if (downlink.type != nas::DownlinkEmm::ATTACH_ACCEPT)
+                {
+                    Log("WARN", "Ignoring unexpected protected EMM message type " +
+                                   std::to_string(downlink.messageType));
+                    return std::nullopt;
+                }
+
+                if (!attachAcceptSeen)
+                {
+                    attachAcceptSeen = true;
+                    state = State::ATTACH_ACCEPT_RECEIVED;
+                    LogState(state);
+                }
+
+                const auto &accept = downlink.attachAccept;
+                if (!accept.bearer.has_value())
+                    throw nas::DecodeError("Attach Accept did not carry Activate Default EPS Bearer Context Request");
+                if (defaultBearerAccepted)
+                    throw nas::DecodeError("Duplicate Activate Default EPS Bearer Context Request");
+                defaultBearerAccepted = true;
+                state = State::DEFAULT_BEARER_PENDING;
+                LogState(state);
+                Log("INFO", "Default EPS bearer: EBI=" + std::to_string(accept.bearer->epsBearerIdentity) +
+                                " QCI=" + std::to_string(accept.bearer->qci) + " APN=" + accept.bearer->apn);
+
+                auto esmAccept = nas::EncodeActivateDefaultEpsBearerContextAccept(
+                    accept.bearer->epsBearerIdentity, accept.bearer->procedureTransactionId);
+                sendProtected(false, nas::EncodeAttachComplete(esmAccept));
+                state = State::ATTACH_COMPLETE_SENT;
+                LogState(state);
+                state = State::EPS_REGISTERED;
+                LogState(state);
+                state = State::DEFAULT_BEARER_SIGNALING_COMPLETE;
+                LogState(state);
+
+                activeEbi = accept.bearer->epsBearerIdentity;
+                defaultConfiguration.ebi = activeEbi;
+                defaultConfiguration.qci = accept.bearer->qci;
+                defaultConfiguration.epsQos = {accept.bearer->qci};
+                assignedIpv4 = accept.bearer->pdnAddress;
+                if (assignedIpv4 == std::array<uint8_t, 4>{})
+                    throw nas::DecodeError("Default bearer did not provide a supported non-zero IPv4 PDN address");
+                mobility.onAttachComplete(activeEbi, assignedIpv4, accept.guti, accept.taiList, accept.t3412);
+                mobility.securityContextValid = security.securityActive;
+                {
+                    std::ostringstream taiText;
+                    for (size_t i = 0; i < mobility.taiList.size(); ++i)
+                    {
+                        if (i != 0)
+                            taiText << ',';
+                        taiText << mobility.taiList[i].plmn.toString() << '/' << mobility.taiList[i].tac;
+                    }
+                    std::string sTmsiText = "none";
+                    if (mobility.guti.has_value())
+                    {
+                        const auto derived = STmsiFromGuti(*mobility.guti);
+                        if (derived.has_value())
+                        {
+                            std::ostringstream sTmsi;
+                            sTmsi << "MMEC=" << static_cast<int>(derived->mmeCode) << " M-TMSI=0x" << std::hex
+                                  << std::uppercase << std::setw(8) << std::setfill('0') << derived->mTmsi;
+                            sTmsiText = sTmsi.str();
+                        }
+                    }
+                    Log("INFO", "Assigned EPS bearer EBI=" + std::to_string(activeEbi) + " IPv4=" +
+                                    Ipv4ToString(assignedIpv4) + " S-TMSI{" + sTmsiText + "} TAI-list=" +
+                                    taiText.str());
+                }
+                try { tun = std::make_unique<TunDevice>(config.tun, assignedIpv4); }
+                catch (const std::exception &e)
+                {
+                    if (config.tun.required) throw;
+                    Log("WARN", std::string("Control-plane-only mode: LTE TUN unavailable: ") + e.what());
+                }
+                if (tun)
+                {
+                    state = State::TUN_READY;
+                    LogState(state);
+                    Log("INFO", "LTE TUN " + tun->name() + " configured with " + Ipv4ToString(assignedIpv4) +
+                                    "/32 MTU=" + std::to_string(config.tun.mtu) +
+                                    " explicit-routes=" + std::to_string(config.tun.routes.size()));
+
+                    std::vector<uint8_t> ready{activeEbi, assignedIpv4[0], assignedIpv4[1], assignedIpv4[2],
+                                               assignedIpv4[3]};
+                    auto readyFrame = link::Encode({link::MessageType::BEARER_READY, ueId, std::move(ready)});
+                    if (!socket.TrySend(enb, readyFrame.data(), readyFrame.size()))
+                        throw std::runtime_error("LTE bearer-ready frame could not be sent");
+                    state = State::USER_PLANE_ACTIVE;
+                    LogState(state);
+                    mobility.onUserPlaneReady();
+                }
+                scenarioDeadline = std::chrono::steady_clock::now() +
+                                   std::chrono::milliseconds(config.lifecycle.triggerAfterMs);
+                Log("INFO", tun ? "EPS Attach complete; persistent IPv4 user plane is active"
+                                 : "EPS Attach complete; bearer signaling active without local user plane");
+                return std::nullopt;
+    };
+
+    auto deliverNas = [&](const std::vector<uint8_t> &nas) -> std::optional<int> {
+        try
+        {
+            return handleNasDownlink(nas);
+        }
+        catch (const nas::SecurityError &e)
+        {
+            if (mobility.emm == EmmState::REGISTERED)
+            {
+                ++malformedDrops;
+                Log("WARN", std::string("Dropped unauthenticated/replayed NAS: ") + e.what());
+                return std::nullopt;
+            }
+            state = State::PROCEDURE_FAILED;
+            LogState(state);
+            Log("ERROR", std::string("NAS security failure: ") + e.what());
+            return 1;
+        }
+        catch (const std::exception &e)
+        {
+            if (mobility.emm == EmmState::REGISTERED &&
+                state != State::DEFAULT_BEARER_SIGNALING_COMPLETE && state != State::TUN_READY)
+            {
+                ++malformedDrops;
+                Log("WARN", std::string("Dropped invalid LTE radio-link message: ") + e.what());
+                return std::nullopt;
+            }
+            state = State::PROCEDURE_FAILED;
+            LogState(state);
+            Log("ERROR", e.what());
+            return 1;
+        }
+    };
     uint8_t buffer[link::MaxDataPduSize + link::HeaderSize];
     while (!shutdownRequested && (mobility.emm == EmmState::REGISTERED || std::chrono::steady_clock::now() < deadline))
     {
         const auto now = std::chrono::steady_clock::now();
+
+        if (uuTransport)
+        {
+            uuTransport->Pump(0);
+            uuTransport->Tick();
+            if (!initialAttachSent && uuTransport->SendNas(attach))
+            {
+                initialAttachSent = true;
+                state = State::ATTACH_REQUEST_SENT;
+                LogState(state);
+                state = State::AUTHENTICATION_PENDING;
+                LogState(state);
+            }
+            if (uuTransport->State() != lastUuState)
+            {
+                lastUuState = uuTransport->State();
+                Log("INFO", std::string("Uu RRC state=") + rrc::ToString(lastUuState));
+            }
+            while (!uuDownlink.empty())
+            {
+                auto nas = std::move(uuDownlink.front());
+                uuDownlink.pop_front();
+                if (auto outcome = deliverNas(nas))
+                    return *outcome;
+            }
+        }
+
         if (mobility.emm == EmmState::REGISTERED && !scenarioTriggered &&
             scenarioRoundsDone < config.lifecycle.idleRounds && now >= scenarioDeadline)
         {
@@ -483,9 +1041,14 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
         }
 
         InetAddress peer;
-        int received = socket.Receive(
-            buffer, sizeof(buffer),
-            RadioReceiveTimeoutMs(mobility.emm == EmmState::REGISTERED, tunHadUplink), peer);
+        // With a Uu transport the legacy socket is polled only to keep its
+        // pre-existing paths alive; a short bound keeps RRC and SRB1 timers
+        // advancing instead of sleeping inside the legacy receive.
+        const auto radioTimeout = uuTransport
+                                      ? std::min(5, RadioReceiveTimeoutMs(mobility.emm == EmmState::REGISTERED,
+                                                                          tunHadUplink))
+                                      : RadioReceiveTimeoutMs(mobility.emm == EmmState::REGISTERED, tunHadUplink);
+        int received = socket.Receive(buffer, sizeof(buffer), radioTimeout, peer);
         if (received <= 0)
             continue;
         if (peer != enb)
@@ -1001,422 +1564,8 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
             }
             if (message.type != link::MessageType::NAS_DOWNLINK)
                 throw link::DecodeError("Data/NAS direction mismatch");
-            if (!security.securityActive)
-            {
-                // Only a Security Mode Command may arrive before the context is active.
-                if (!nas::IsSecurityModeCommand(message.payload.data(), message.payload.size()))
-                {
-                    // Authentication Request is still plain EMM.
-                    if (state == State::AUTHENTICATION_PENDING || state == State::AUTHENTICATION_RESPONSE_SENT ||
-                        state == State::EPS_AKA_ACCEPTED)
-                    {
-                        if (state == State::EPS_AKA_ACCEPTED)
-                            throw nas::DecodeError("Plain NAS received after EPS AKA acceptance");
-                    }
-                    else
-                        throw nas::DecodeError("Unexpected plain NAS message before security activation");
-
-                    auto request = nas::DecodeAuthenticationRequest(message.payload.data(), message.payload.size());
-                    state = State::AUTHENTICATION_REQUEST_RECEIVED;
-                    LogState(state);
-                    auto result = nas::Authenticate(config, request);
-                    if (result.failure != nas::AkaFailure::NONE)
-                    {
-                        state = State::AUTHENTICATION_FAILED;
-                        LogState(state);
-                        if (result.failure == nas::AkaFailure::MAC_FAILURE)
-                        {
-                            Log("ERROR",
-                                "AUTN MAC verification failed; returning EPS Authentication Failure (MAC failure)");
-                            SendNas(socket, enb, ueId, nas::EncodeAuthenticationFailureMac());
-                        }
-                        else if (result.failure == nas::AkaFailure::SYNCHRONIZATION_FAILURE)
-                            Log("ERROR", "AUTN SQN is stale; AUTS resynchronization is unsupported, failing closed");
-                        else
-                            Log("ERROR", "Authentication Request processing failed");
-                        return 1;
-                    }
-                    // A fresh EPS AKA replaces KASME, so the AS context that
-                    // was derived from the old one is worthless.
-                    asSecurity.reset();
-                    nasSecurityGeneration++;
-                    security = result.context;
-                    // Record the exact UE security capability octets that went
-                    // out in the Attach Request so the SMC replay check can use
-                    // them (TS 24.301 5.4.3.3).
-                    security.advertisedSecurityCapabilities.assign(config.networkCapability.begin(),
-                                                                    config.networkCapability.end());
-                    SendNas(socket, enb, ueId, nas::EncodeAuthenticationResponse(result.res));
-                    state = State::AUTHENTICATION_RESPONSE_SENT;
-                    LogState(state);
-                    continue;
-                }
-
-                // Security Mode Command: header type 3, integrity protected with the
-                // new context and not ciphered, so the IEs are readable in the clear.
-                if (!security.valid)
-                    throw nas::DecodeError("Security Mode Command received before a valid AKA response");
-                auto parsed = nas::ParseProtectedHeader(message.payload.data(), message.payload.size());
-                if (parsed.headerType != nas::SecurityHeaderType::INTEGRITY_PROTECTED_WITH_NEW_CONTEXT)
-                    throw nas::DecodeError("Security Mode Command must use the new EPS security context header");
-                auto command = nas::DecodeSecurityModeCommand(parsed.plain.data(), parsed.plain.size());
-                nas::ValidateSecurityModeCommand(config, command, security);
-                security.kNasInt = nas::DeriveKnasInt(security.kasme, security.integrity);
-                security.kNasEnc = nas::DeriveKnasEnc(security.kasme, security.ciphering);
-                security.keysDerived = true;
-                // MAC verification is mandatory before the context becomes active.
-                nas::UnprotectBody(security, false, parsed.headerType, parsed.sequenceNumber, parsed.mac,
-                                   parsed.plain);
-                security.dlNasCount = parsed.sequenceNumber;
-                security.ulNasCount = 0;
-                security.securityActive = true;
-                mobility.securityContextValid = true;
-                state = State::SECURITY_MODE_COMMAND_RECEIVED;
-                LogState(state);
-                Log("INFO", std::string("NAS security activated: ") + nas::ToString(security.integrity) + "/" +
-                                nas::ToString(security.ciphering) + " KSI=" + std::to_string(security.ksi));
-                state = State::NAS_SECURITY_ACTIVE;
-                LogState(state);
-
-                // TS 33.401 7.2.1: the uplink NAS COUNT that activates AS
-                // security is the one the Security Mode Complete travels with.
-                // It is read before SendProtected advances the COUNT.
-                const uint32_t securityModeCompleteCount = security.ulNasCount;
-                SendProtected(socket, enb, ueId, security, true,
-                              nas::EncodeSecurityModeComplete(config, command.imeisvRequested));
-                {
-                    // No RRC security mode procedure exists in this simulator,
-                    // so no AS algorithm has been selected. The context is built
-                    // with that stated, and it refuses to derive RRC/UP keys
-                    // rather than reusing the NAS selection in a role the
-                    // standard gives to a different procedure.
-                    lte::security::AsAlgorithmSet algorithms;
-                    algorithms.negotiated = false;
-                    asSecurity.emplace(lte::security::AsSecurityContext::Create(
-                        static_cast<uint32_t>(ueId), security.kasme, securityModeCompleteCount,
-                        nasSecurityGeneration, algorithms));
-                    Log("INFO", "EPS AS security context established: " + asSecurity->Describe());
-                }
-                state = State::SECURITY_MODE_COMPLETE_SENT;
-                LogState(state);
-                continue;
-            }
-
-            // A network without a matching security context may return a plain
-            // Service Reject. It can only fail a pending Service Request; it
-            // never updates trusted mobility state. Every other downlink after
-            // security activation must verify integrity.
-            std::vector<uint8_t> plain;
-            if (mobility.pending == PendingProcedure::SERVICE_REQUEST && message.payload.size() >= 3 &&
-                message.payload[0] == 0x07 && message.payload[1] == 0x4E)
-            {
-                plain = message.payload;
-                Log("WARN", "Received unprotected Service Reject while restoring a released context");
-            }
-            else
-                plain = ReceiveProtected(security, message.payload);
-            // Handle C9 here so a malformed optional IE still receives a
-            // protected Reject using the authenticated EBI/PTI header.
-            if (plain.size() >= 3 && (plain[0] & 15U) == 2 && plain[2] == 0xC9)
-            {
-                const uint8_t ebi = plain[0] >> 4U, pti = plain[1];
-                uint8_t cause = 0;
-                std::string error;
-                nas::EpsBearerConfiguration *target = nullptr;
-                nas::EpsBearerConfiguration candidate;
-                try
-                {
-                    if (mobility.emm != EmmState::REGISTERED || mobility.ecm != EcmState::CONNECTED ||
-                        mobility.pending != PendingProcedure::NONE)
-                        throw nas::EsmError(101, "Bearer modification conflicts with mobility state");
-                    const auto request = nas::DecodeModifyEpsBearerContextRequest(plain.data(), plain.size());
-                    if (ebi == activeEbi)
-                        target = &defaultConfiguration;
-                    else
-                        for (auto &bearer : dedicatedBearers)
-                            if (bearer.ebi == ebi)
-                                target = &bearer;
-                    if (!target)
-                        throw nas::EsmError(43, "Unknown EPS bearer");
-                    candidate = *target;
-                    nas::ApplyBearerModification(candidate, request);
-                }
-                catch (const nas::EsmError &e)
-                {
-                    cause = e.cause;
-                    error = e.what();
-                }
-                catch (const std::bad_alloc &)
-                {
-                    cause = 26;
-                    error = "Insufficient local resources";
-                }
-                if (cause)
-                {
-                    SendProtected(socket, enb, ueId, security, false,
-                                  nas::EncodeModifyEpsBearerContextReject(ebi, pti, cause));
-                    Log("WARN", "Modify EPS bearer rejected EBI=" + std::to_string(ebi) +
-                                    " cause=" + std::to_string(cause) + ": " + error);
-                }
-                else
-                {
-                    SendProtected(socket, enb, ueId, security, false,
-                                  nas::EncodeModifyEpsBearerContextAccept(ebi, pti));
-                    *target = std::move(candidate);
-                    Log("INFO", "Modify EPS bearer accepted EBI=" + std::to_string(ebi) +
-                                    " PTI=" + std::to_string(pti) + " QCI=" + std::to_string(target->qci) +
-                                    " filters=" + std::to_string(target->tft.size()) +
-                                    " UL-COUNT-next=" + std::to_string(security.ulNasCount) +
-                                    " DL-COUNT=" + std::to_string(security.dlNasCount));
-                }
-                continue;
-            }
-            auto downlink = nas::DecodeDownlink(plain.data(), plain.size());
-
-            if (downlink.type == nas::DownlinkEmm::ACTIVATE_DEDICATED_EPS_BEARER_CONTEXT)
-            {
-                const auto &request = downlink.dedicatedBearer;
-                try
-                {
-                    if (mobility.emm != EmmState::REGISTERED || mobility.ecm != EcmState::CONNECTED ||
-                        mobility.pending != PendingProcedure::NONE)
-                        throw nas::DecodeError("Dedicated bearer activation conflicts with mobility state");
-                    if (request.linkedEpsBearerIdentity != activeEbi)
-                        throw nas::DecodeError("Dedicated bearer references a different default bearer");
-                    for (const auto &bearer : dedicatedBearers)
-                    {
-                        if (bearer.ebi == request.epsBearerIdentity)
-                            throw nas::DecodeError("Dedicated bearer identity is already active");
-                    }
-                    if (dedicatedBearers.size() >= 7)
-                        throw nas::DecodeError("Dedicated bearer capacity is exhausted");
-
-                    DedicatedBearerRuntime bearer;
-                    bearer.ebi = request.epsBearerIdentity;
-                    bearer.qci = request.qci;
-                    bearer.linkedEbi = request.linkedEpsBearerIdentity;
-                    bearer.epsQos = {request.qci};
-                    if (!request.tft.empty())
-                        bearer.tft.apply(lte::tft::Decode(request.tft.data(), request.tft.size()));
-
-                    dedicatedBearers.push_back(std::move(bearer));
-                    SendProtected(socket, enb, ueId, security, false,
-                                  nas::EncodeActivateDedicatedEpsBearerContextAccept(
-                                      request.epsBearerIdentity, request.procedureTransactionId));
-
-                    std::vector<uint8_t> activated{request.epsBearerIdentity};
-                    auto activatedFrame =
-                        link::Encode({link::MessageType::BEARER_ACTIVATED, ueId, std::move(activated)});
-                    socket.Send(enb, activatedFrame.data(), activatedFrame.size());
-
-                    Log("INFO", "Dedicated EPS bearer " + std::to_string(request.epsBearerIdentity) +
-                                    " activated (QCI=" + std::to_string(request.qci) + ", linked-EBI=" +
-                                    std::to_string(request.linkedEpsBearerIdentity) + ", filters=" +
-                                    std::to_string(dedicatedBearers.back().tft.size()) + ")");
-                }
-                catch (const std::exception &e)
-                {
-                    // Reject with insufficient resources and keep every other
-                    // bearer untouched; a failed activation must not disturb the
-                    // default bearer.
-                    SendProtected(socket, enb, ueId, security, false,
-                                  nas::EncodeActivateDedicatedEpsBearerContextReject(
-                                      request.epsBearerIdentity, request.procedureTransactionId, 26));
-                    Log("WARN", std::string("Rejected dedicated EPS bearer activation: ") + e.what());
-                }
-                continue;
-            }
-
-            if (downlink.type == nas::DownlinkEmm::DEACTIVATE_EPS_BEARER_CONTEXT)
-            {
-                const auto &request = downlink.deactivateBearer;
-                const auto bearer = std::find_if(dedicatedBearers.begin(), dedicatedBearers.end(),
-                                                 [&request](const DedicatedBearerRuntime &candidate) {
-                                                     return candidate.ebi == request.epsBearerIdentity;
-                                                 });
-                if (bearer == dedicatedBearers.end())
-                    throw nas::DecodeError("Deactivation names an unknown dedicated bearer");
-                dedicatedBearers.erase(bearer);
-                SendProtected(socket, enb, ueId, security, false,
-                              nas::EncodeDeactivateEpsBearerContextAccept(request.epsBearerIdentity,
-                                                                          request.procedureTransactionId));
-                Log("INFO", "Dedicated EPS bearer " + std::to_string(request.epsBearerIdentity) +
-                                " deactivated; default bearer retained");
-                continue;
-            }
-
-            if (downlink.type == nas::DownlinkEmm::DETACH_ACCEPT)
-            {
-                if (mobility.pending != PendingProcedure::DETACH)
-                    throw nas::DecodeError("Unexpected EPS Detach Accept");
-                auto deleted = link::Encode({link::MessageType::EPS_SESSION_DELETED, ueId,
-                    link::EncodeBearerRestoration(activeEbi, mobility.accessGeneration)});
-                socket.Send(enb, deleted.data(), deleted.size());
-                mobility.onDetachAccepted();
-                if (asSecurity)
-                {
-                    asSecurity->Reset();
-                    asSecurity.reset();
-                }
-                security = SecurityContext{};
-                pendingWire.clear();
-                tun.reset();
-                dedicatedBearers.clear();
-                defaultConfiguration = {};
-                Log("INFO", "EPS Detach accepted; State=EMM_DEREGISTERED, bearer and TUN released");
-                return 0;
-            }
-            if (downlink.type == nas::DownlinkEmm::SERVICE_REJECT)
-            {
-                mobility.onProcedureRejected();
-                Log("ERROR", "EPS Service Request rejected, EMM cause=" + std::to_string(downlink.emmCause));
-                return 1;
-            }
-            if (downlink.type == nas::DownlinkEmm::TAU_REJECT)
-            {
-                mobility.onProcedureRejected();
-                Log("ERROR", "Tracking Area Update rejected, EMM cause=" + std::to_string(downlink.emmCause));
-                return 1;
-            }
-            if (downlink.type == nas::DownlinkEmm::TAU_ACCEPT)
-            {
-                if (mobility.pending != PendingProcedure::TAU_NORMAL &&
-                    mobility.pending != PendingProcedure::TAU_PERIODIC)
-                    throw nas::DecodeError("Unexpected Tracking Area Update Accept");
-                // The Accept is one NAS message carrying several independent
-                // assignments. It is applied as one validated step, so an
-                // Accept that is malformed in any one of them cannot leave the
-                // bearer set, the GUTI or the tracking areas half-changed
-                // behind a rejected update.
-                const auto acceptance = ApplyTauAccept(mobility, dedicatedBearers, downlink.tauAccept);
-                for (const uint8_t ebi : acceptance.releasedDedicated)
-                    Log("INFO", "Dedicated EPS bearer " + std::to_string(ebi) +
-                                    " was not retained by the network and is no longer active");
-                pendingWire.clear();
-                pendingMobilityFrame.reset();
-                if (acceptance.completeRequired)
-                    SendProtected(socket, enb, ueId, security, false, nas::EncodeTauComplete());
-                Log("INFO", std::string("Tracking Area Update accepted; context preserved") +
-                                (acceptance.completeRequired ? "; TAU Complete sent for new GUTI" : ""));
-                scenarioDeadline = std::chrono::steady_clock::time_point::max();
-                continue;
-            }
-
-            if (downlink.type == nas::DownlinkEmm::ESM_INFORMATION_REQUEST)
-            {
-                state = State::ESM_INFORMATION_REQUEST_RECEIVED;
-                LogState(state);
-                SendProtected(socket, enb, ueId, security, false,
-                              nas::EncodeEsmInformationResponse(downlink.esmInformationRequest.procedureTransactionId,
-                                                               downlink.esmInformationRequest.apn));
-                state = State::ESM_INFORMATION_RESPONSE_SENT;
-                LogState(state);
-                continue;
-            }
-
-            if (downlink.type == nas::DownlinkEmm::ATTACH_REJECT)
-            {
-                state = State::PROCEDURE_FAILED;
-                LogState(state);
-                Log("ERROR", "EPS Attach rejected by the MME, EMM cause=" + std::to_string(downlink.emmCause));
-                return 1;
-            }
-
-            if (downlink.type != nas::DownlinkEmm::ATTACH_ACCEPT)
-            {
-                Log("WARN", "Ignoring unexpected protected EMM message type " +
-                               std::to_string(downlink.messageType));
-                continue;
-            }
-
-            if (!attachAcceptSeen)
-            {
-                attachAcceptSeen = true;
-                state = State::ATTACH_ACCEPT_RECEIVED;
-                LogState(state);
-            }
-
-            const auto &accept = downlink.attachAccept;
-            if (!accept.bearer.has_value())
-                throw nas::DecodeError("Attach Accept did not carry Activate Default EPS Bearer Context Request");
-            if (defaultBearerAccepted)
-                throw nas::DecodeError("Duplicate Activate Default EPS Bearer Context Request");
-            defaultBearerAccepted = true;
-            state = State::DEFAULT_BEARER_PENDING;
-            LogState(state);
-            Log("INFO", "Default EPS bearer: EBI=" + std::to_string(accept.bearer->epsBearerIdentity) +
-                            " QCI=" + std::to_string(accept.bearer->qci) + " APN=" + accept.bearer->apn);
-
-            auto esmAccept = nas::EncodeActivateDefaultEpsBearerContextAccept(
-                accept.bearer->epsBearerIdentity, accept.bearer->procedureTransactionId);
-            SendProtected(socket, enb, ueId, security, false, nas::EncodeAttachComplete(esmAccept));
-            state = State::ATTACH_COMPLETE_SENT;
-            LogState(state);
-            state = State::EPS_REGISTERED;
-            LogState(state);
-            state = State::DEFAULT_BEARER_SIGNALING_COMPLETE;
-            LogState(state);
-
-            activeEbi = accept.bearer->epsBearerIdentity;
-            defaultConfiguration.ebi = activeEbi;
-            defaultConfiguration.qci = accept.bearer->qci;
-            defaultConfiguration.epsQos = {accept.bearer->qci};
-            assignedIpv4 = accept.bearer->pdnAddress;
-            if (assignedIpv4 == std::array<uint8_t, 4>{})
-                throw nas::DecodeError("Default bearer did not provide a supported non-zero IPv4 PDN address");
-            mobility.onAttachComplete(activeEbi, assignedIpv4, accept.guti, accept.taiList, accept.t3412);
-            mobility.securityContextValid = security.securityActive;
-            {
-                std::ostringstream taiText;
-                for (size_t i = 0; i < mobility.taiList.size(); ++i)
-                {
-                    if (i != 0)
-                        taiText << ',';
-                    taiText << mobility.taiList[i].plmn.toString() << '/' << mobility.taiList[i].tac;
-                }
-                std::string sTmsiText = "none";
-                if (mobility.guti.has_value())
-                {
-                    const auto derived = STmsiFromGuti(*mobility.guti);
-                    if (derived.has_value())
-                    {
-                        std::ostringstream sTmsi;
-                        sTmsi << "MMEC=" << static_cast<int>(derived->mmeCode) << " M-TMSI=0x" << std::hex
-                              << std::uppercase << std::setw(8) << std::setfill('0') << derived->mTmsi;
-                        sTmsiText = sTmsi.str();
-                    }
-                }
-                Log("INFO", "Assigned EPS bearer EBI=" + std::to_string(activeEbi) + " IPv4=" +
-                                Ipv4ToString(assignedIpv4) + " S-TMSI{" + sTmsiText + "} TAI-list=" +
-                                taiText.str());
-            }
-            try { tun = std::make_unique<TunDevice>(config.tun, assignedIpv4); }
-            catch (const std::exception &e)
-            {
-                if (config.tun.required) throw;
-                Log("WARN", std::string("Control-plane-only mode: LTE TUN unavailable: ") + e.what());
-            }
-            if (tun)
-            {
-                state = State::TUN_READY;
-                LogState(state);
-                Log("INFO", "LTE TUN " + tun->name() + " configured with " + Ipv4ToString(assignedIpv4) +
-                                "/32 MTU=" + std::to_string(config.tun.mtu) +
-                                " explicit-routes=" + std::to_string(config.tun.routes.size()));
-
-                std::vector<uint8_t> ready{activeEbi, assignedIpv4[0], assignedIpv4[1], assignedIpv4[2],
-                                           assignedIpv4[3]};
-                auto readyFrame = link::Encode({link::MessageType::BEARER_READY, ueId, std::move(ready)});
-                if (!socket.TrySend(enb, readyFrame.data(), readyFrame.size()))
-                    throw std::runtime_error("LTE bearer-ready frame could not be sent");
-                state = State::USER_PLANE_ACTIVE;
-                LogState(state);
-                mobility.onUserPlaneReady();
-            }
-            scenarioDeadline = std::chrono::steady_clock::now() +
-                               std::chrono::milliseconds(config.lifecycle.triggerAfterMs);
-            Log("INFO", tun ? "EPS Attach complete; persistent IPv4 user plane is active"
-                             : "EPS Attach complete; bearer signaling active without local user plane");
+            if (auto outcome = deliverNas(message.payload))
+                return *outcome;
             continue;
         }
         catch (const nas::SecurityError &e)

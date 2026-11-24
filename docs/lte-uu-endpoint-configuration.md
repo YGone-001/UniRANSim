@@ -32,12 +32,13 @@ Absent: `Config::uu.enabled` is false and every NAS message keeps travelling ove
 `enbLink`. Present: the loader refuses a local endpoint that would reuse
 `enbLink.localAddress:localPort` and a peer that equals the local endpoint.
 
-## What this configuration does not do yet
+## What the configuration now drives
 
-The endpoint is parsed, validated and stored, but no consumer exists: the UE
-application still sends NAS over `enbLink` and the eNB multiplexer does not bind
-it. Wiring those two is the remaining work of B6-D and is listed as
-NOT_EXECUTED in the final report.
+The eNB multiplexer binds the block when it is present, and since B6-D3 the
+production UE application owns a `UuNasTransport` bound to the same block. With
+`uu` present the UE sends its Attach exchange over SRB1 and never over
+`enbLink`; without it nothing changes. See
+`docs/lte-production-ue-srb1-attach.md`.
 
 ## B6-D2 Commit B: the UE NAS transport
 
@@ -55,5 +56,7 @@ Request arrives in the Initial UE Message, a Downlink NAS Transport reaches the
 callback, the reply travels as an Uplink NAS Transport, and a released transport
 refuses further sends.
 
-**`src/lte/ue/app.cpp` does not use it yet**; wiring the loop and the shared
-downlink handler is the remaining work.
+**B6-D3 wires it into `src/lte/ue/app.cpp`**: the application owns the transport,
+both transports deliver into one downlink entry, and every uplink NAS of the
+Attach exchange goes through it. The two-process acceptance is recorded in
+`docs/lte-production-ue-srb1-attach.md`.

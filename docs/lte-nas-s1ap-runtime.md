@@ -142,7 +142,8 @@ reported as a successful E-RAB setup.
 
 - The S1AP codec decodes no message-level NAS-PDU for Initial Context Setup, so
 the optional NAS-PDU is still not delivered (the decoder carries none).
-- The production UE application still sends NAS over the legacy link (B6-D2).
+- The production UE application sends its Attach NAS over SRB1 (B6-D3); the
+  later lifecycle procedures and the user plane are still on the legacy link.
 - There is no live Open5GS run: `REAL_OPEN5GS_ATTACH_ACCEPTANCE = NOT_EXECUTED`.
 
 ## B6-D2: the message-level NAS-PDU

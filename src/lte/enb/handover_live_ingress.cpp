@@ -364,9 +364,11 @@ LiveHandoverReadiness AssessLiveHandoverCapabilities()
                "the production multiplexer binds the bridge to its own S1AP sender, SCTP stream selection and identity "
                "allocator, and keeps the E-RAB and GTP-U lifecycle authoritative; the same test asserts two distinct "
                "identities, two Initial UE Messages, two NAS transports and two Initial Context Setup responses"),
-        Assess(HandoverCapability::LTE_EPS_ATTACH_OVER_SRB1_READY, false,
-               "the Attach ran over SRB1 and the S1AP codec with a deterministic MME fixture, but the production UE NAS "
-               "state machine is not wired into the UE application yet and no live MME was used"),
+        Assess(HandoverCapability::LTE_EPS_ATTACH_OVER_SRB1_READY, true,
+               "the production lte-ue process owns a UuNasTransport, sends the Attach Request in "
+               "RRCConnectionSetupComplete and the rest of the Attach exchange through ULInformationTransfer, and "
+               "completes Authentication, NAS Security Mode, Attach Accept and Attach Complete against a deterministic "
+               "MME in a second process (test/lte/production_uu_attach.cpp); this is still not a live Open5GS Attach"),
         Assess(HandoverCapability::LTE_OPEN5GS_ATTACH_ACCEPTED, false,
                "REAL_OPEN5GS_ATTACH_ACCEPTANCE = NOT_EXECUTED: no authorized live Open5GS Attach was run in this phase"),
         Assess(HandoverCapability::AS_SMC_RUNTIME_READY, true,

@@ -228,7 +228,7 @@ void VerifyServiceRequest(const SecurityContext &context, const uint8_t *data, s
 }
 
 std::vector<uint8_t> Protect(const SecurityContext &context, bool uplink, bool newContext,
-                             const std::vector<uint8_t> &plain)
+                             const std::vector<uint8_t> &plain, bool cipher)
 {
     if (!context.valid || !context.keysDerived)
         throw SecurityError("Attempted to protect NAS without a derived security context");
@@ -241,9 +241,11 @@ std::vector<uint8_t> Protect(const SecurityContext &context, bool uplink, bool n
 
     SecurityHeaderType headerType;
     if (newContext)
-        headerType = SecurityHeaderType::INTEGRITY_PROTECTED_AND_CIPHERED_WITH_NEW_CONTEXT;
+        headerType = cipher ? SecurityHeaderType::INTEGRITY_PROTECTED_AND_CIPHERED_WITH_NEW_CONTEXT
+                            : SecurityHeaderType::INTEGRITY_PROTECTED_WITH_NEW_CONTEXT;
     else
-        headerType = SecurityHeaderType::INTEGRITY_PROTECTED_AND_CIPHERED;
+        headerType = cipher ? SecurityHeaderType::INTEGRITY_PROTECTED_AND_CIPHERED
+                            : SecurityHeaderType::INTEGRITY_PROTECTED;
 
     // A fresh context starts both COUNTs at zero; otherwise the caller has
     // already advanced the COUNT for this message.
@@ -251,7 +253,7 @@ std::vector<uint8_t> Protect(const SecurityContext &context, bool uplink, bool n
     count &= 0xFFFFFFU;
 
     OctetString body = ToOctets(plain.data(), plain.size());
-    if (IsCipheredHeader(headerType))
+    if (cipher && IsCipheredHeader(headerType))
         Cipher(context, uplink, count, body);
 
     uint8_t sequenceNumber = static_cast<uint8_t>(count & 0xFFU);

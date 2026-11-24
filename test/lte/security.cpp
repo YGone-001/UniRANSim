@@ -15,6 +15,7 @@
 #include <lte/ue/security.hpp>
 #include <lte/ue/types.hpp>
 
+#include <algorithm>
 #include <array>
 #include <numeric>
 #include <vector>
@@ -291,4 +292,53 @@ TEST_CASE("lte/ue/security: EIA0 and unknown algorithms cannot protect or unprot
     CHECK_THROWS_AS(lte::ue::nas::UnprotectBody(context, true, lte::ue::SecurityHeaderType::INTEGRITY_PROTECTED, 0, mac,
                                                 {0x07, 0x5E}),
                     lte::ue::nas::SecurityError);
+}
+
+TEST_CASE("lte/ue/security: an integrity-only message keeps its body and names the non-ciphered header")
+{
+    using namespace lte::ue::nas;
+    auto context = MakeContext(lte::ue::IntegrityAlgorithm::EIA2, lte::ue::CipheringAlgorithm::EEA0);
+    const std::vector<uint8_t> plain{0x07, 0x5D, 0x02, 0x00, 0x02, 0xA0, 0x20};
+
+    // A Security Mode Command is integrity protected with the new context and
+    // is not ciphered (TS 24.301 8.2.10), so it carries header type 3.
+    const auto command = Protect(context, false, true, plain, false);
+    REQUIRE(command.size() == 6 + plain.size());
+    CHECK((command[0] >> 4U) == static_cast<uint8_t>(SecurityHeaderType::INTEGRITY_PROTECTED_WITH_NEW_CONTEXT));
+
+    const auto parsed = ParseProtectedHeader(command.data(), command.size());
+    CHECK(parsed.headerType == SecurityHeaderType::INTEGRITY_PROTECTED_WITH_NEW_CONTEXT);
+    CHECK(UnprotectBody(context, false, parsed.headerType, parsed.sequenceNumber, parsed.mac, parsed.plain) == plain);
+
+    // The same body under the ciphered header differs only in that header when
+    // the negotiated ciphering is EEA0: it is the flag, not a second encoding.
+    const auto ciphered = Protect(context, false, true, plain, true);
+    REQUIRE(ciphered.size() == command.size());
+    CHECK((ciphered[0] >> 4U) ==
+          static_cast<uint8_t>(SecurityHeaderType::INTEGRITY_PROTECTED_AND_CIPHERED_WITH_NEW_CONTEXT));
+    CHECK(std::equal(ciphered.begin() + 1, ciphered.end(), command.begin() + 1));
+
+    // A tampered body under the integrity-only header is refused, so the flag
+    // does not weaken verification.
+    auto tampered = command;
+    tampered.back() ^= 0x01U;
+    const auto tamperedParsed = ParseProtectedHeader(tampered.data(), tampered.size());
+    CHECK_THROWS_AS(UnprotectBody(context, false, tamperedParsed.headerType, tamperedParsed.sequenceNumber,
+                                 tamperedParsed.mac, tamperedParsed.plain),
+                    SecurityError);
+}
+
+TEST_CASE("lte/ue/security: an active context can send an integrity-only NAS message")
+{
+    using namespace lte::ue::nas;
+    auto context = MakeContext(lte::ue::IntegrityAlgorithm::EIA2, lte::ue::CipheringAlgorithm::EEA0);
+    const std::vector<uint8_t> plain{0x07, 0x42, 0x01, 0x30};
+
+    const auto protectedMessage = Protect(context, false, false, plain, false);
+    REQUIRE(protectedMessage.size() == 6 + plain.size());
+    CHECK((protectedMessage[0] >> 4U) == static_cast<uint8_t>(SecurityHeaderType::INTEGRITY_PROTECTED));
+
+    const auto parsed = ParseProtectedHeader(protectedMessage.data(), protectedMessage.size());
+    CHECK(parsed.headerType == SecurityHeaderType::INTEGRITY_PROTECTED);
+    CHECK(UnprotectBody(context, false, parsed.headerType, parsed.sequenceNumber, parsed.mac, parsed.plain) == plain);
 }

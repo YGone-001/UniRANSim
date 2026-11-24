@@ -59,8 +59,10 @@ struct ProtectedNas
 // is only valid for the first protected message of a fresh context. The caller
 // owns COUNT bookkeeping: the COUNT used is `uplink ? ulNasCount : dlNasCount`
 // at entry, and the caller increments it after a successful send/receive.
+// `cipher` selects the integrity-only header (TS 24.301 type 1/3) when false;
+// the Security Mode Command is integrity protected and never ciphered.
 std::vector<uint8_t> Protect(const SecurityContext &context, bool uplink, bool newContext,
-                             const std::vector<uint8_t> &plain);
+                             const std::vector<uint8_t> &plain, bool cipher = true);
 
 // Parses the outer header and returns the still-protected payload pieces. The
 // caller decides which COUNT to use and then calls UnprotectBody.

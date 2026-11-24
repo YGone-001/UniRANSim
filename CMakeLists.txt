@@ -109,6 +109,16 @@ if (BUILD_TESTS)
                                                 ${CMAKE_CURRENT_SOURCE_DIR}/src/asn/asn1c)
     target_link_libraries(nr-tests lte-ue-lib)
 
+    # The deterministic EPC peer for the two-process Attach acceptance. It is a
+    # test artifact, never installed, and it links the production eNB bridge and
+    # NAS code rather than reimplementing them.
+    add_executable(lte-uu-attach-peer tools/lte-uu-attach-peer.cpp)
+    target_compile_options(lte-uu-attach-peer PRIVATE -Wall -Wextra -pedantic)
+    target_include_directories(lte-uu-attach-peer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/asn/lte-rrc
+                                                        ${CMAKE_CURRENT_SOURCE_DIR}/src/asn/asn1c)
+    target_link_libraries(lte-uu-attach-peer pthread common-lib ext lte-enb-lib lte-rrc lte-ue-lib)
+    add_dependencies(nr-tests lte-uu-attach-peer)
+
     enable_testing()
     # Registers each doctest test case as its own ctest test, as listed by the built binary, so a failure or a crash
     # is reported against the test case that caused it instead of the whole suite. A test that hangs fails after a
