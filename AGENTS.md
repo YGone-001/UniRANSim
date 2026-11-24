@@ -1411,8 +1411,9 @@ configured. `docs/lte-nas-s1ap-runtime.md` is the record.
   pending transaction exists is refused and its reservations are released; it
   must never stage a second transaction or produce a second response.
 - **No capability change without evidence.** The production UE application is
-  now SRB1-enabled (B6-D3), so `LTE_PRODUCTION_UE_SRB1_READY` and
-  `LTE_EPS_ATTACH_OVER_SRB1_READY` are true as of that phase;
+  SRB1-enabled (B6-D3), so `LTE_EPS_ATTACH_OVER_SRB1_READY` is true, and since
+  B6-D4 `LTE_EPS_DETACH_OVER_SRB1_READY` is true as well. There is no separate
+  "production UE" switch in the registry; do not cite one.
   `LTE_DEFAULT_BEARER_OVER_SRB1_READY` and `LTE_OPEN5GS_ATTACH_ACCEPTED` stay
   false.
 
@@ -1438,9 +1439,47 @@ configured. `docs/lte-nas-s1ap-runtime.md` is the record.
 - **The callback only queues.** `Pump`/Tick run on the UE thread; the callback
   appends bytes and returns. Release clears the callback before the runtime and
   socket are destroyed, so no late NAS reaches a dead handler.
-- **ATTACH_ONLY is the current Uu scope.** Paging, recovery, TAU, detach and the
-  user plane still travel on the legacy link; a Uu configuration naming another
-  lifecycle scenario is refused at startup rather than mixed.
+- **ATTACH_ONLY and ATTACH_DETACH are the current Uu scope.** Attach and the
+  UE-initiated Detach that closes the same session travel on SRB1. Paging,
+  recovery, TAU and the user plane still travel on the legacy link; a Uu
+  configuration naming another lifecycle scenario is refused at startup rather
+  than mixed.
 - **Two processes, opt-in.** `UNIRANSIM_RUN_TWO_PROCESS_ATTACH=1` runs
   `tools/lte-uu-attach-peer.cpp` and the real `lte-ue`. Without it the case is
   NOT_EXERCISED. A deterministic MME is still not Open5GS.
+## LTE production UE Detach and EPS lifecycle (B6-D4)
+
+`docs/lte-production-ue-srb1-detach.md` is the record.
+
+- **One send interface, no exceptions.** The Detach Request goes through the
+  same `sendNas` as the Attach exchange. In Uu mode it is a protected
+  ULInformationTransfer on SRB1; a refusal fails the run and is never retried
+  over `enbLink`.
+- **The Detach scenario is attach-then-detach.** `attach-detach` is an alias of
+  `detach`, not a second mode: the UE attaches, registers, then detaches the
+  same session after `triggerAfterMs`. Do not add a mode that skips the Attach
+  or starts a new session for the Detach.
+- **No security reset at Detach.** The Detach reuses the Attach's NAS security
+  context. UL COUNT 2 and DL COUNT 2 follow the Security Mode Complete (0) and
+  Attach Complete (1) / Attach Accept (1); never re-key, re-initialise or
+  hardcode a COUNT to make a test pass.
+- **Deregistration requires a verified Accept.** `EMM_DEREGISTERED` is entered
+  only after the protected Detach Accept verifies. A corrupted MAC, a replayed
+  COUNT or a peer that stops answering must leave the UE registered and fail the
+  run, never produce a Detach success.
+- **Release belongs to the layer that owns it.** Only the NAS context, bearer
+  set, TUN and pending wire are released on Detach completion; the transport is
+  released by RAII at process exit. Do not destroy RRC/PDCP state another layer
+  still owns, and do not send a legacy `EPS_SESSION_DELETED` control frame for
+  a Uu session.
+- **The peer is still a deterministic MME.** It assigns a GUTI in the Attach
+  Accept and verifies the Detach Request with the production decoder and the
+  active EIA2 key; it must not accept a Detach by message type or length.
+- **Failure modes are part of the acceptance.** Duplicate downlink, peer exit,
+  corrupted MAC and an unreachable peer each have their own case. A new failure
+  path that is not exercised stays reported as PARTIAL in the final report.
+- **Two processes, opt-in.** `UNIRANSIM_RUN_TWO_PROCESS_ATTACH=1` runs
+  `tools/lte-uu-attach-peer.cpp` and the real `lte-ue`; the GitHub Actions job
+  `Production UE Attach-Detach (two processes)` sets it for the lifecycle cases.
+  Without it they are NOT_EXERCISED, and a deterministic MME is still not
+  Open5GS.

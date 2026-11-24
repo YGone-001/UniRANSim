@@ -216,11 +216,14 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
     rrc::RrcState lastUuState = rrc::RrcState::RRC_IDLE;
     if (config.uu.enabled)
     {
-        // This phase moves the Attach exchange onto SRB1. The later lifecycle
-        // procedures still travel on the legacy link, so enabling both at once
-        // is refused here rather than silently mixing the two transports.
-        if (config.lifecycle.scenario != LifecycleScenario::ATTACH_ONLY)
-            throw std::runtime_error("a Uu configuration currently supports the ATTACH_ONLY lifecycle scenario only");
+        // The Attach exchange and the UE-initiated Detach that closes the same
+        // session travel on SRB1. Every other lifecycle procedure still uses the
+        // legacy link, so a configuration that names one is refused here rather
+        // than silently mixing the two transports.
+        if (config.lifecycle.scenario != LifecycleScenario::ATTACH_ONLY &&
+            config.lifecycle.scenario != LifecycleScenario::DETACH)
+            throw std::runtime_error("a Uu configuration supports the ATTACH_ONLY and ATTACH_DETACH lifecycle "
+                                     "scenarios only");
         UuEndpoint endpoint{config.uu.localAddress, config.uu.localPort, config.uu.enbAddress,
                             config.uu.enbPort};
         rrc::UeSrb1Runtime::Config rrcConfig{};
@@ -550,9 +553,16 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 {
                     if (mobility.pending != PendingProcedure::DETACH)
                         throw nas::DecodeError("Unexpected EPS Detach Accept");
-                    auto deleted = link::Encode({link::MessageType::EPS_SESSION_DELETED, ueId,
-                        link::EncodeBearerRestoration(activeEbi, mobility.accessGeneration)});
-                    socket.Send(enb, deleted.data(), deleted.size());
+                    // The legacy notification is addressed to the legacy eNB. In Uu
+                    // mode the eNB is the peer that accepted the Detach, and the
+                    // S1 release that follows a Detach is the MME's decision, not a
+                    // message this UE may invent on another transport.
+                    if (!uuTransport)
+                    {
+                        auto deleted = link::Encode({link::MessageType::EPS_SESSION_DELETED, ueId,
+                            link::EncodeBearerRestoration(activeEbi, mobility.accessGeneration)});
+                        socket.Send(enb, deleted.data(), deleted.size());
+                    }
                     mobility.onDetachAccepted();
                     if (asSecurity)
                     {
@@ -565,6 +575,8 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                     dedicatedBearers.clear();
                     defaultConfiguration = {};
                     Log("INFO", "EPS Detach accepted; State=EMM_DEREGISTERED, bearer and TUN released");
+                    if (uuTransport)
+                        Log("INFO", "The Uu SRB1 transport is released with the process after the Detach");
                     return 0;
                 }
                 if (downlink.type == nas::DownlinkEmm::SERVICE_REJECT)
@@ -813,16 +825,33 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 auto plain = nas::EncodeDetachRequest(security.ksi, *mobility.guti, config.lifecycle.switchOff);
                 pendingWire = nas::Protect(security, true, false, plain);
                 pendingMobilityFrame.reset();
-                SendNas(socket, enb, ueId, pendingWire);
+                // The Detach Request is the same kind of connected-mode uplink NAS
+                // as the Attach exchange: it leaves through the one send interface,
+                // so in Uu mode it travels in ULInformationTransfer over SRB1. A
+                // refusal fails the run; it is never retried on the legacy link.
+                if (!sendNas(pendingWire))
+                {
+                    state = State::PROCEDURE_FAILED;
+                    LogState(state);
+                    Log("ERROR", "The uplink NAS transport refused the EPS Detach Request");
+                    return 1;
+                }
                 security.ulNasCount = (security.ulNasCount + 1U) & 0xFFFFFFU;
                 procedureDeadline = now + std::chrono::milliseconds(config.lifecycle.procedureTimeoutMs);
                 Log("INFO", std::string("Protected EPS Detach Request sent; switch-off=") +
-                                (config.lifecycle.switchOff ? "true" : "false"));
+                                (config.lifecycle.switchOff ? "true" : "false") + " UL-COUNT=" +
+                                std::to_string((security.ulNasCount + 0xFFFFFFU) & 0xFFFFFFU));
                 if (config.lifecycle.switchOff)
                 {
-                    auto deleted = link::Encode({link::MessageType::EPS_SESSION_DELETED, ueId,
-                        link::EncodeBearerRestoration(activeEbi, mobility.accessGeneration)});
-                    socket.Send(enb, deleted.data(), deleted.size());
+                    // A switch-off Detach ends locally (TS 24.301 5.5.2.2.2).
+                    // The legacy control frame is addressed to the legacy eNB, so
+                    // it is not emitted when the session ran over Uu.
+                    if (!uuTransport)
+                    {
+                        auto deleted = link::Encode({link::MessageType::EPS_SESSION_DELETED, ueId,
+                            link::EncodeBearerRestoration(activeEbi, mobility.accessGeneration)});
+                        socket.Send(enb, deleted.data(), deleted.size());
+                    }
                     mobility.onDetachAccepted();
                     dedicatedBearers.clear();
                     defaultConfiguration = {};
@@ -959,8 +988,15 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 SendMobilityNas(socket, enb, *pendingMobilityFrame);
             else if (mobility.pending == PendingProcedure::SERVICE_REQUEST)
                 SendServiceRequest(socket, enb, ueId, *mobility.guti, pendingWire);
-            else
-                SendNas(socket, enb, ueId, pendingWire);
+            else if (!sendNas(pendingWire))
+            {
+                // A retransmission cannot be diverted to another transport: the
+                // procedure is bound to the one that carried its first message.
+                state = State::PROCEDURE_FAILED;
+                LogState(state);
+                Log("ERROR", "The uplink NAS transport refused a procedure retransmission");
+                return 1;
+            }
             ++procedureRetries;
             procedureDeadline = now + std::chrono::milliseconds(config.lifecycle.procedureTimeoutMs);
             Log("WARN", std::string("Retransmitted ") + ToString(mobility.pending) +

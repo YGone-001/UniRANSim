@@ -85,6 +85,72 @@ jobs:
           name: coverage
           path: cmake-build-coverage/report/
 
+  # The production UE Attach -> Detach lifecycle runs in its own job: it starts
+  # two operating-system processes per case and binds real UDP sockets, so it
+  # must not share a runner with the ordinary unit matrix. Every case is blocking
+  # and the job asserts the peer result files, so a skipped or crashed run cannot
+  # be mistaken for a pass.
+  production-ue-lifecycle:
+    name: Production UE Attach-Detach (two processes)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsctp-dev
+      - name: Configure
+        run: cmake -S . -B cmake-build-lifecycle -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: |
+          cmake --build cmake-build-lifecycle --target lte-ue nr-tests --parallel "$(nproc)"
+          test -x cmake-build-lifecycle/lte-ue
+          test -x cmake-build-lifecycle/lte-uu-attach-peer
+      - name: Run the production UE lifecycle acceptance
+        run: |
+          set -euo pipefail
+          export UNIRANSIM_RUN_TWO_PROCESS_ATTACH=1
+          cases=(
+            "lte/uu/lifecycle: the production ue attaches and detaches the same session over srb1"
+            "lte/uu/lifecycle: a duplicate attach accept does not repeat the ue attach completion"
+            "lte/uu/lifecycle: a peer that exits during detach leaves the ue without a deregistration"
+            "lte/uu/lifecycle: a corrupted detach accept fails nas integrity and is not acted on"
+            "lte/uu/lifecycle: attach-only keeps the d3 behaviour under the detach-capable peer"
+            "lte/uu/acceptance: a separate production ue process attaches through srb1"
+            "lte/uu/acceptance: an unreachable uu peer fails without using the legacy link"
+          )
+          index=0
+          for tc in "${cases[@]}"; do
+            index=$((index + 1))
+            log="lifecycle-${index}.log"
+            ./cmake-build-lifecycle/nr-tests --no-skip --test-case="$tc" 2>&1 | tee "$log"
+            grep -Eq "test cases: +1 \| +1 passed \| 0 failed" "$log"
+          done
+
+          # The main acceptance really completed an Attach and a Detach in one
+          # session on the same security context.
+          grep -q "result=COMPLETE" /tmp/uniransim-uu-lifecycle/peer.result
+          grep -q "uplink_nas_transports=4" /tmp/uniransim-uu-lifecycle/peer.result
+          grep -q "detach_request=0745010bf664f02000010112345678" /tmp/uniransim-uu-lifecycle/peer.result
+          grep -q "detach_ul_count=2" /tmp/uniransim-uu-lifecycle/peer.result
+          grep -q "detach_dl_count=2" /tmp/uniransim-uu-lifecycle/peer.result
+          grep -q "enb_context_released=1" /tmp/uniransim-uu-lifecycle/peer.result
+          grep -q "EPS Detach accepted; State=EMM_DEREGISTERED" /tmp/uniransim-uu-lifecycle/ue.log
+
+          # The injected failure really was injected and really was refused.
+          grep -q "injected_corruption=1" /tmp/uniransim-uu-bad-mac/peer.result
+          grep -q "EPS NAS integrity verification failed" /tmp/uniransim-uu-bad-mac/ue.log
+          ! grep -q "EPS Detach accepted" /tmp/uniransim-uu-bad-mac/ue.log
+
+          # No case may leave a child behind.
+          ! pgrep -af "cmake-build-lifecycle/(lte-ue|lte-uu-attach-peer)"
+      - name: Report
+        if: always()
+        run: |
+          for log in lifecycle-*.log; do
+            if [ -f "$log" ]; then
+              { echo "### $log"; echo '```'; cat "$log"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+
   # One privileged integration only, in its own job and its own network
   # namespace, so the ordinary matrix stays unprivileged and this case cannot
   # silently pass by running in the control-plane-only mode the rest of the

@@ -641,3 +641,41 @@ TEST_CASE("lte/lifecycle: a connected-mode handover checks the held MME identity
     // refused, so one access cannot carry two half-finished relocations.
     CHECK_THROWS(context.onConnectedHandover(201));
 }
+
+TEST_CASE("lte/nas: a Detach Request decodes only the EPS detach this UE performs")
+{
+    const auto wire = lte::ue::nas::EncodeDetachRequest(0, Guti(), false);
+    const auto decoded = lte::ue::nas::DecodeDetachRequest(wire.data(), wire.size());
+    CHECK(decoded.detachType == 0x01);
+    CHECK(decoded.ksi == 0);
+    CHECK_FALSE(decoded.switchOff);
+    CHECK(decoded.guti == Guti());
+
+    const auto switchOffWire = lte::ue::nas::EncodeDetachRequest(3, Guti(), true);
+    const auto switchOff = lte::ue::nas::DecodeDetachRequest(switchOffWire.data(), switchOffWire.size());
+    CHECK(switchOff.detachType == 0x39);
+    CHECK(switchOff.ksi == 3);
+    CHECK(switchOff.switchOff);
+    CHECK(switchOff.guti == Guti());
+
+    // A detach type this UE never sends is refused rather than approximated:
+    // 010 would be a combined EPS/IMSI detach and 011 a GPRS detach.
+    auto combined = wire;
+    combined[2] = 0x02;
+    CHECK_THROWS_AS(lte::ue::nas::DecodeDetachRequest(combined.data(), combined.size()), lte::ue::nas::DecodeError);
+
+    // The GUTI is mandatory, eleven octets, and the message length is fixed.
+    auto wrongLength = wire;
+    wrongLength[3] = 10;
+    CHECK_THROWS(lte::ue::nas::DecodeDetachRequest(wrongLength.data(), wrongLength.size()));
+    auto truncated = wire;
+    truncated.pop_back();
+    CHECK_THROWS(lte::ue::nas::DecodeDetachRequest(truncated.data(), truncated.size()));
+
+    // Detach Accept is the header alone (TS 24.301 8.2.12) and the existing
+    // downlink dispatcher recognises it.
+    const auto accept = lte::ue::nas::EncodeDetachAccept();
+    CHECK(accept == std::vector<uint8_t>{0x07, 0x46});
+    CHECK(lte::ue::nas::DecodeDownlink(accept.data(), accept.size()).type ==
+          lte::ue::nas::DownlinkEmm::DETACH_ACCEPT);
+}

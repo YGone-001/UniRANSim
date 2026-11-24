@@ -36,9 +36,11 @@ Absent: `Config::uu.enabled` is false and every NAS message keeps travelling ove
 
 The eNB multiplexer binds the block when it is present, and since B6-D3 the
 production UE application owns a `UuNasTransport` bound to the same block. With
-`uu` present the UE sends its Attach exchange over SRB1 and never over
+`uu` present the UE sends its Attach exchange and, since B6-D4, the
+UE-initiated Detach that closes the same session over SRB1, never over
 `enbLink`; without it nothing changes. See
-`docs/lte-production-ue-srb1-attach.md`.
+`docs/lte-production-ue-srb1-attach.md` and
+`docs/lte-production-ue-srb1-detach.md`.
 
 ## B6-D2 Commit B: the UE NAS transport
 

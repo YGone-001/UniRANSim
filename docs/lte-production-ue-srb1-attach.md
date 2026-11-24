@@ -62,11 +62,13 @@ socket. The loop is not made busy: `Pump(0)` is a `poll` with zero timeout.
 
 ## What is deliberately not migrated
 
-`uu.enabled` currently accepts only `lifecycle.scenario = ATTACH_ONLY`; any other
-scenario is refused at startup rather than silently sending its NAS over the
-legacy link. Paging, recovery, TAU, detach, the default bearer user plane and
-GTP-U remain legacy. `LTE_DEFAULT_BEARER_OVER_SRB1_READY` and
-`LTE_OPEN5GS_ATTACH_ACCEPTED` stay false.
+`uu.enabled` accepts `lifecycle.scenario = ATTACH_ONLY` and
+`ATTACH_DETACH`; any other scenario is refused at startup rather than silently
+sending its NAS over the legacy link. The Detach that closes the same session is
+covered in `docs/lte-production-ue-srb1-detach.md`. Paging, recovery, TAU, the
+default bearer user plane and GTP-U remain legacy.
+`LTE_DEFAULT_BEARER_OVER_SRB1_READY` and `LTE_OPEN5GS_ATTACH_ACCEPTED` stay
+false.
 
 ## Two-process acceptance
 

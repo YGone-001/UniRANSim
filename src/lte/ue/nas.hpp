@@ -240,6 +240,23 @@ std::vector<uint8_t> EncodeDeactivateEpsBearerContextAccept(uint8_t epsBearerIde
 
 std::vector<uint8_t> EncodeDetachRequest(uint8_t ksi, const std::array<uint8_t, 11> &guti, bool switchOff);
 
+// Decoded UE-initiated EPS Detach Request (TS 24.301 8.2.11). The decoder
+// refuses every detach type this project does not perform, so a peer cannot
+// mistake a combined or GPRS-only detach for the EPS detach it expects.
+struct DetachRequest
+{
+    uint8_t detachType{};
+    uint8_t ksi{};
+    bool switchOff{};
+    std::array<uint8_t, 11> guti{};
+};
+
+DetachRequest DecodeDetachRequest(const uint8_t *data, size_t size);
+
+// Plain EPS Detach Accept (TS 24.301 8.2.12). It carries no mandatory IE, so
+// the body is the two-octet EPS EMM header; the caller protects it.
+std::vector<uint8_t> EncodeDetachAccept();
+
 // EPS bearer context status information element value (TS 24.301 9.9.2.1):
 // two octets in which bit n of the first octet reports EBI n for n in 0..7 and
 // bit n of the second reports EBI n for n in 8..15. Every EPS bearer context

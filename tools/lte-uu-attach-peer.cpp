@@ -2,15 +2,22 @@
 // This file is a part of UERANSIM project.
 // Copyright (c) 2027 ALİ GÜNGÖR.
 //
-// Phase 18-F-B6-D3: a deterministic EPC peer for the two-process Attach test.
+// Phase 18-F-B6-D4: a deterministic EPC peer for the two-process EPS lifecycle.
 //
 // Process 2 of the acceptance: it owns the real eNB-side SRB1 bridge and a
-// deterministic MME that runs EPS AKA, NAS security and the Attach exchange
-// against the production UE process over the simulated Uu socket. It writes a
-// result file so the test can state what actually happened instead of inferring
-// it from a log line.
+// deterministic MME that runs EPS AKA, NAS security, the Attach exchange and the
+// UE-initiated Detach of the same session, against the production UE process
+// over the simulated Uu socket. It writes a result file so the test can state
+// what actually happened instead of inferring it from a log line.
 //
-// Usage: lte-uu-attach-peer <port> <ready-file> <result-file>
+// Usage: lte-uu-attach-peer <port> <ready-file> <result-file> [mode]
+//
+// Modes:
+//   attach-only             stop after the Attach Complete (D3 behaviour, default)
+//   attach-detach           continue and complete a UE-initiated Detach
+//   duplicate-attach-accept send the Attach Accept twice
+//   exit-on-detach          leave without answering the Detach Request
+//   bad-detach-mac          answer with a deliberately corrupted MAC
 #include <lte/enb/codec.hpp>
 #include <lte/enb/enb_rrc_bridge.hpp>
 #include <lte/rrc-runtime/rrc_connection_setup_complete.hpp>
@@ -127,6 +134,12 @@ std::vector<uint8_t> SecurityModeCommandPlain()
     return {0x07, 0x5D, 0x02, 0x00, 0x02, 0xA0, 0x20};
 }
 
+// The GUTI this MME assigns in the Attach Accept. The UE sends it back in the
+// Detach Request, so the peer builds the expected Detach Request from the same
+// value instead of accepting any well-formed one.
+const std::array<uint8_t, 11> AssignedGuti{0xF6, 0x64, 0xF0, 0x20, 0x00, 0x01,
+                                           0x01, 0x12, 0x34, 0x56, 0x78};
+
 std::vector<uint8_t> AttachAcceptPlain()
 {
     const std::vector<uint8_t> esm{0x52, 0x01, 0xC1, 0x01, 0x05, 0x09, 0x08, 0x69, 0x6E, 0x74,
@@ -137,6 +150,10 @@ std::vector<uint8_t> AttachAcceptPlain()
     out.push_back(static_cast<uint8_t>(esm.size() >> 8U));
     out.push_back(static_cast<uint8_t>(esm.size()));
     out.insert(out.end(), esm.begin(), esm.end());
+    // Optional GUTI (TS 24.301 9.9.3.12): IEI 0x50, length 11.
+    out.push_back(0x50);
+    out.push_back(0x0B);
+    out.insert(out.end(), AssignedGuti.begin(), AssignedGuti.end());
     return out;
 }
 
@@ -163,14 +180,23 @@ std::string Hex(const std::vector<uint8_t> &bytes)
 
 int main(int argc, char **argv)
 {
-    if (argc != 4)
+    if (argc < 4 || argc > 5)
     {
-        std::cerr << "usage: " << argv[0] << " <port> <ready-file> <result-file>" << std::endl;
+        std::cerr << "usage: " << argv[0] << " <port> <ready-file> <result-file> [mode]" << std::endl;
         return 1;
     }
     const auto port = static_cast<uint16_t>(std::stoi(argv[1]));
     const std::string readyPath = argv[2];
     const std::string resultPath = argv[3];
+    const std::string mode = argc == 5 ? argv[4] : "attach-only";
+    const bool attachOnly = mode == "attach-only";
+    const bool expectDetach = mode != "attach-only";
+    if (!attachOnly && mode != "attach-detach" && mode != "duplicate-attach-accept" &&
+        mode != "exit-on-detach" && mode != "bad-detach-mac")
+    {
+        WriteResult(resultPath, "result=FAILED\nreason=unknown mode " + mode + "\n");
+        return 1;
+    }
 
     std::string why;
     auto socket = lte::uu::Socket::Bind("127.0.0.1", port, &why);
@@ -236,6 +262,9 @@ int main(int argc, char **argv)
     const auto expectedSmcComplete = lte::ue::nas::EncodeSecurityModeComplete(subscriber, false);
     const auto expectedAttachComplete =
         lte::ue::nas::EncodeAttachComplete(lte::ue::nas::EncodeActivateDefaultEpsBearerContextAccept(5, 1));
+    // The production application sends a native-KSI, switch-off-clear EPS detach
+    // for the GUTI it was assigned.
+    const auto expectedDetachRequest = lte::ue::nas::EncodeDetachRequest(0, AssignedGuti, false);
 
     lte::ue::SecurityContext nas{};
     nas.valid = true;
@@ -257,6 +286,7 @@ int main(int argc, char **argv)
         SMC_COMPLETE,
         ICS_SECURITY,
         ATTACH_COMPLETE,
+        REGISTERED,
         DONE,
         FAILED
     };
@@ -265,10 +295,21 @@ int main(int argc, char **argv)
     size_t initialUeMessages = 0;
     size_t uplinkTransports = 0;
     std::vector<uint8_t> attachRequest;
+    std::vector<uint8_t> detachRequestRaw;
+    std::vector<uint8_t> detachProtectedRaw;
     bool authVerified = false;
     bool smcVerified = false;
     bool icsResponse = false;
+    bool rrcAsSecurity = false;
     bool attachCompleteVerified = false;
+    bool attachAcceptSent = false;
+    bool detachVerified = false;
+    bool detachAcceptSent = false;
+    bool enbContextReleased = false;
+    bool injectedCorruption = false;
+    uint8_t lastUplinkSequence = 0;
+    uint32_t detachUlCount = 0;
+    uint32_t detachDlCount = 0;
 
     auto fail = [&](const std::string &reason) {
         stage = Stage::FAILED;
@@ -281,6 +322,7 @@ int main(int argc, char **argv)
             const auto parsed = lte::ue::nas::ParseProtectedHeader(pdu.data(), pdu.size());
             auto plain = lte::ue::nas::UnprotectBody(nas, true, parsed.headerType, parsed.sequenceNumber, parsed.mac,
                                                      parsed.plain);
+            lastUplinkSequence = parsed.sequenceNumber;
             if (lte::ue::nas::StartsNewContext(parsed.headerType))
                 nas.ulNasCount = parsed.sequenceNumber;
             else
@@ -352,6 +394,65 @@ int main(int argc, char **argv)
             if (*plain != expectedAttachComplete)
                 return fail("the Attach Complete did not match the production encoder");
             attachCompleteVerified = true;
+            // D3 ended here. The lifecycle peer stays registered and waits for
+            // the UE to detach the same session.
+            stage = attachOnly ? Stage::DONE : Stage::REGISTERED;
+            return;
+        }
+        case Stage::REGISTERED:
+        {
+            const auto plain = verifyUplink(pdu);
+            if (!plain.has_value())
+                return;
+            detachProtectedRaw = pdu;
+            detachRequestRaw = *plain;
+            detachUlCount = nas.ulNasCount;
+            lte::ue::nas::DetachRequest decoded{};
+            try
+            {
+                decoded = lte::ue::nas::DecodeDetachRequest(plain->data(), plain->size());
+            }
+            catch (const std::exception &e)
+            {
+                return fail(std::string("the Detach Request was not decodable: ") + e.what());
+            }
+            if (*plain != expectedDetachRequest)
+                return fail("the Detach Request bytes differ from the production encoder");
+            if (decoded.ksi != 0)
+                return fail("the Detach Request carried a different KSI");
+            if (decoded.switchOff)
+                return fail("the Detach Request requested a switch-off this scenario did not ask for");
+            if (decoded.guti != AssignedGuti)
+                return fail("the Detach Request carried a different GUTI");
+            // Security Mode Complete was UL COUNT 0 and Attach Complete 1, so the
+            // Detach Request must be 2: the context is the same one, never reset.
+            if (detachUlCount != 2)
+                return fail("the Detach Request did not use the next uplink NAS COUNT");
+            detachVerified = true;
+
+            if (mode == "exit-on-detach")
+                return fail("the peer exited during the Detach procedure (injected)");
+
+            detachDlCount = nas.dlNasCount;
+            auto accept = lte::ue::nas::Protect(nas, false, false, lte::ue::nas::EncodeDetachAccept(), false);
+            nas.dlNasCount = (nas.dlNasCount + 1U) & 0xFFFFFFU;
+            if (mode == "bad-detach-mac")
+            {
+                // Corrupt the first MAC octet: the UE must verify it and refuse,
+                // never enter EMM_DEREGISTERED on an unverified message.
+                accept[1] ^= 0x01U;
+                sendDownlinkNas(accept);
+                detachAcceptSent = true;
+                injectedCorruption = true;
+                return fail("the Detach Accept integrity was deliberately corrupted (injected)");
+            }
+            sendDownlinkNas(accept);
+            detachAcceptSent = true;
+            // A real MME releases the S1 UE context after a Detach. The peer
+            // does the same through the bridge's association-loss path, so the
+            // eNB-side release is observed rather than assumed.
+            bridge->OnS1AssociationLost();
+            enbContextReleased = !bridge->HasContext(association);
             stage = Stage::DONE;
             return;
         }
@@ -362,8 +463,7 @@ int main(int argc, char **argv)
         }
     };
 
-    bool attachAcceptSent = false;
-    const auto deadline = Clock::now() + std::chrono::seconds(25);
+    const auto deadline = Clock::now() + std::chrono::seconds(30);
     while (Clock::now() < deadline && stage != Stage::DONE && stage != Stage::FAILED)
     {
         bridge->Pump(5);
@@ -394,29 +494,46 @@ int main(int argc, char **argv)
             established.push_back({5, {10, 0, 0, 1}, {0x11, 0x22, 0x33, 0x44}});
             bridge->CompleteInitialContextSetup(association, established);
             icsResponse = true;
-            sendDownlinkNas(lte::ue::nas::Protect(nas, false, false, AttachAcceptPlain(), false));
+            rrcAsSecurity = bridge->AsSecurityActive(association);
+            auto accept = lte::ue::nas::Protect(nas, false, false, AttachAcceptPlain(), false);
             nas.dlNasCount = (nas.dlNasCount + 1U) & 0xFFFFFFU;
+            sendDownlinkNas(accept);
+            if (mode == "duplicate-attach-accept")
+                // The same protected bytes again: a duplicate downlink with a
+                // replayed COUNT. The UE must drop it and must not repeat the
+                // Attach Complete or disturb the session.
+                sendDownlinkNas(accept);
             attachAcceptSent = true;
             stage = Stage::ATTACH_COMPLETE;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     if (stage != Stage::DONE && stage != Stage::FAILED)
-        fail("timed out before the Attach exchange completed");
+        fail(expectDetach ? "timed out before the Attach to Detach lifecycle completed"
+                          : "timed out before the Attach exchange completed");
 
     std::ostringstream result;
-    result << "result=" << (stage == Stage::DONE ? "COMPLETE" : "FAILED") << "\n";
+    result << "result=" << (stage == Stage::DONE ? "COMPLETE" : (injectedCorruption ? "INJECTED" : "FAILED")) << "\n";
     if (!failure.empty())
         result << "reason=" << failure << "\n";
+    result << "mode=" << mode << "\n";
     result << "initial_ue_messages=" << initialUeMessages << "\n";
     result << "uplink_nas_transports=" << uplinkTransports << "\n";
     result << "attach_request=" << Hex(attachRequest) << "\n";
     result << "auth_response_verified=" << (authVerified ? 1 : 0) << "\n";
     result << "smc_complete_verified=" << (smcVerified ? 1 : 0) << "\n";
     result << "ics_response=" << (icsResponse ? 1 : 0) << "\n";
-    result << "rrc_as_security=" << (bridge->AsSecurityActive(association) ? 1 : 0) << "\n";
+    result << "rrc_as_security=" << (rrcAsSecurity ? 1 : 0) << "\n";
     result << "attach_complete_verified=" << (attachCompleteVerified ? 1 : 0) << "\n";
     result << "attach_accept_sent=" << (attachAcceptSent ? 1 : 0) << "\n";
+    result << "detach_request=" << Hex(detachRequestRaw) << "\n";
+    result << "detach_protected_bytes=" << detachProtectedRaw.size() << "\n";
+    result << "detach_request_verified=" << (detachVerified ? 1 : 0) << "\n";
+    result << "detach_ul_count=" << detachUlCount << "\n";
+    result << "detach_dl_count=" << detachDlCount << "\n";
+    result << "detach_accept_sent=" << (detachAcceptSent ? 1 : 0) << "\n";
+    result << "enb_context_released=" << (enbContextReleased ? 1 : 0) << "\n";
+    result << "injected_corruption=" << (injectedCorruption ? 1 : 0) << "\n";
     WriteResult(resultPath, result.str());
     return stage == Stage::DONE ? 0 : 1;
 }

@@ -763,6 +763,30 @@ std::vector<uint8_t> EncodeDetachRequest(uint8_t ksi, const std::array<uint8_t, 
     return out;
 }
 
+DetachRequest DecodeDetachRequest(const uint8_t *data, size_t size)
+{
+    // Header (2) + detach type (1) + GUTI length (1) + GUTI (11).
+    if (data == nullptr || size != 15 || data[0] != EpsEmm || data[1] != DetachRequestType)
+        throw DecodeError("Malformed EPS Detach Request");
+    DetachRequest result{};
+    result.detachType = data[2];
+    // TS 24.301 9.9.3.21: bits 1-3 are the EPS detach type (001 = EPS detach)
+    // and bit 4 is the switch-off flag. Only the EPS detach type is performed.
+    if ((data[2] & 0x07U) != 0x01U)
+        throw DecodeError("Detach Request does not request an EPS detach");
+    result.switchOff = (data[2] & 0x08U) != 0;
+    result.ksi = static_cast<uint8_t>((data[2] >> 4U) & 0x07U);
+    if (data[3] != 11)
+        throw DecodeError("Invalid GUTI length in Detach Request");
+    std::copy(data + 4, data + 15, result.guti.begin());
+    return result;
+}
+
+std::vector<uint8_t> EncodeDetachAccept()
+{
+    return {EpsEmm, DetachAcceptType};
+}
+
 std::array<uint8_t, 2> EncodeEpsBearerContextStatus(const std::vector<uint8_t> &bearerIdentities)
 {
     if (bearerIdentities.empty())

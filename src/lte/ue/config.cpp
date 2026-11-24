@@ -135,7 +135,11 @@ Config ParseNode(const YAML::Node &root)
         {
             const auto scenario = yaml::GetString(lifecycle, "scenario", 3, 32);
             if (scenario == "attach-only") config.lifecycle.scenario = LifecycleScenario::ATTACH_ONLY;
-            else if (scenario == "detach") config.lifecycle.scenario = LifecycleScenario::DETACH;
+            // The detach scenario always attaches first and then detaches the same
+            // session, so its full lifecycle name is accepted as an alias rather
+            // than duplicated as a second mode with identical behaviour.
+            else if (scenario == "detach" || scenario == "attach-detach")
+                config.lifecycle.scenario = LifecycleScenario::DETACH;
             else if (scenario == "service-request") config.lifecycle.scenario = LifecycleScenario::SERVICE_REQUEST;
             else if (scenario == "tau-normal") config.lifecycle.scenario = LifecycleScenario::TAU_NORMAL;
             else if (scenario == "tau-periodic") config.lifecycle.scenario = LifecycleScenario::TAU_PERIODIC;

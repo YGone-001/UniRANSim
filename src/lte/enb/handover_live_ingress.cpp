@@ -145,6 +145,7 @@ const char *ToString(HandoverCapability capability)
     case HandoverCapability::NAS_S1AP_OVER_SRB1_READY: return "NAS_S1AP_OVER_SRB1_READY";
     case HandoverCapability::ENB_KE_NB_SECURITY_CONTEXT_READY: return "ENB_KE_NB_SECURITY_CONTEXT_READY";
     case HandoverCapability::LTE_EPS_ATTACH_OVER_SRB1_READY: return "LTE_EPS_ATTACH_OVER_SRB1_READY";
+    case HandoverCapability::LTE_EPS_DETACH_OVER_SRB1_READY: return "LTE_EPS_DETACH_OVER_SRB1_READY";
     case HandoverCapability::LTE_OPEN5GS_ATTACH_ACCEPTED: return "LTE_OPEN5GS_ATTACH_ACCEPTED";
     case HandoverCapability::LTE_PRODUCTION_ENB_SRB1_READY: return "LTE_PRODUCTION_ENB_SRB1_READY";
     case HandoverCapability::LTE_PRODUCTION_MULTIPLEXER_BRIDGE_READY: return "LTE_PRODUCTION_MULTIPLEXER_BRIDGE_READY";
@@ -369,6 +370,12 @@ LiveHandoverReadiness AssessLiveHandoverCapabilities()
                "RRCConnectionSetupComplete and the rest of the Attach exchange through ULInformationTransfer, and "
                "completes Authentication, NAS Security Mode, Attach Accept and Attach Complete against a deterministic "
                "MME in a second process (test/lte/production_uu_attach.cpp); this is still not a live Open5GS Attach"),
+        Assess(HandoverCapability::LTE_EPS_DETACH_OVER_SRB1_READY, true,
+               "the production lte-ue process sends a protected EPS Detach Request through the same UuNasTransport "
+               "and NAS security context it attached with (UL COUNT 2, immediately after the Attach Complete), and "
+               "enters EMM_DEREGISTERED only after the protected Detach Accept at DL COUNT 2 verifies; "
+               "test/lte/production_uu_attach.cpp runs Attach and Detach in one session against a deterministic MME "
+               "in a second process, and the same case injects a corrupted Detach Accept MAC to prove the check runs"),
         Assess(HandoverCapability::LTE_OPEN5GS_ATTACH_ACCEPTED, false,
                "REAL_OPEN5GS_ATTACH_ACCEPTANCE = NOT_EXECUTED: no authorized live Open5GS Attach was run in this phase"),
         Assess(HandoverCapability::AS_SMC_RUNTIME_READY, true,

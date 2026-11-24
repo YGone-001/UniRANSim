@@ -126,6 +126,11 @@ enum class HandoverCapability : uint8_t
     // The UE NAS state machine is not wired into the production UE application
     // yet, so this stays false until it drives the messages itself.
     LTE_EPS_ATTACH_OVER_SRB1_READY,
+    // Phase 18-F-B6-D4: the production UE sends a protected EPS Detach Request
+    // in ULInformationTransfer on the same SRB1 session it attached on, and the
+    // same NAS security context verifies the Detach Accept at the next COUNT.
+    // This is deterministic-peer evidence, not a live EPC run.
+    LTE_EPS_DETACH_OVER_SRB1_READY,
     // External acceptance evidence: only an authorized live Open5GS Attach can
     // make it true, and none was executed.
     LTE_OPEN5GS_ATTACH_ACCEPTED,

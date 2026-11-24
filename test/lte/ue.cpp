@@ -133,6 +133,15 @@ TEST_CASE("lte/ue/config: lifecycle scenarios and bounded procedure controls are
     CHECK(value.lifecycle.procedureTimeoutMs == 750);
     CHECK(value.lifecycle.maxRetries == 2);
 
+    // The detach scenario always attaches first and then detaches the same
+    // session, so its full lifecycle name is an alias rather than a second mode.
+    std::string detach = ConfigText;
+    detach += "\nlifecycle:\n  scenario: detach\n";
+    CHECK(lte::ue::ParseConfig(detach).lifecycle.scenario == lte::ue::LifecycleScenario::DETACH);
+    std::string attachDetach = ConfigText;
+    attachDetach += "\nlifecycle:\n  scenario: attach-detach\n";
+    CHECK(lte::ue::ParseConfig(attachDetach).lifecycle.scenario == lte::ue::LifecycleScenario::DETACH);
+
     std::string invalid = ConfigText;
     invalid += "\nlifecycle:\n  scenario: arbitrary\n";
     CHECK_THROWS(lte::ue::ParseConfig(invalid));
