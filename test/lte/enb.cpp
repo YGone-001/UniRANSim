@@ -216,6 +216,17 @@ TEST_CASE("lte/enb/codec: UE-associated NAS messages use the expected S1AP proce
     // aligned to the next octet boundary.
     const std::vector<uint8_t> sTmsiIe{0x00, 0x60, 0x00, 0x06, 0x00, 0x40, 0x12, 0x34, 0x56, 0x78};
     CHECK(std::search(service.begin(), service.end(), sTmsiIe.begin(), sTmsiIe.end()) != service.end());
+
+    // The S-TMSI is what matches a reconnecting UE to its retained context, so
+    // the decoder returns it: the MMEC is bit-packed, the M-TMSI is aligned.
+    const auto decodedService = lte::enb::s1ap::DecodeUplinkNas(service.data(), service.size());
+    REQUIRE(decodedService.sTmsi.has_value());
+    CHECK(decodedService.sTmsi->mmeCode == 1);
+    CHECK(decodedService.sTmsi->mTmsi == 0x12345678U);
+    CHECK(decodedService.nasPdu == std::vector<uint8_t>({0xC7, 0x00, 0xAA, 0xBB}));
+    // An Uplink NAS Transport carries no S-TMSI.
+    const auto decodedUplink = lte::enb::s1ap::DecodeUplinkNas(uplink.data(), uplink.size());
+    CHECK_FALSE(decodedUplink.sTmsi.has_value());
 }
 
 TEST_CASE("lte/enb/codec: UE Context Release Request uses procedure 18 and a valid user-inactivity cause")

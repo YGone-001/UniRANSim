@@ -38,12 +38,48 @@ void UuNasTransport::Start()
         if (!released_ && handler_)
             handler_(nas);
     });
+    runtime_->SetReleaseCallback([this]() {
+        if (!released_ && releaseHandler_)
+            releaseHandler_();
+    });
+    runtime_->SetPagingCallback([this](uint8_t mmec, uint32_t mTmsi) {
+        if (!released_ && pagingHandler_)
+            pagingHandler_(mmec, mTmsi);
+    });
     runtime_->StartAccess();
 }
 
 void UuNasTransport::SetNasHandler(NasHandler handler)
 {
     handler_ = std::move(handler);
+}
+
+void UuNasTransport::SetReleaseHandler(ReleaseHandler handler)
+{
+    releaseHandler_ = std::move(handler);
+}
+
+void UuNasTransport::SetPagingHandler(PagingHandler handler)
+{
+    pagingHandler_ = std::move(handler);
+}
+
+void UuNasTransport::SetIdentity(uint8_t mmec, uint32_t mTmsi)
+{
+    if (released_ || runtime_ == nullptr)
+        throw std::logic_error("the Uu transport is not started");
+    runtime_->SetIdentity(mmec, mTmsi);
+}
+
+void UuNasTransport::ResumeAccess()
+{
+    if (released_ || runtime_ == nullptr)
+        throw std::logic_error("the Uu transport is not started");
+    // The runtime has already moved itself to RRC_IDLE on the release. A new
+    // access sends a fresh RRCConnectionRequest; the first NAS that SendNas
+    // accepts will travel in the new RRCConnectionSetupComplete.
+    setupCompleteSent_ = false;
+    runtime_->StartAccess();
 }
 
 bool UuNasTransport::SendNas(const std::vector<uint8_t> &nas)
@@ -120,6 +156,8 @@ void UuNasTransport::Release()
         return;
     released_ = true;
     handler_ = nullptr;
+    releaseHandler_ = nullptr;
+    pagingHandler_ = nullptr;
     if (runtime_ != nullptr)
     {
         runtime_->Release();

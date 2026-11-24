@@ -131,6 +131,18 @@ enum class HandoverCapability : uint8_t
     // same NAS security context verifies the Detach Accept at the next COUNT.
     // This is deterministic-peer evidence, not a live EPC run.
     LTE_EPS_DETACH_OVER_SRB1_READY,
+    // Phase 18-F-B6-D5: the production UE sends the compact EPS Service Request
+    // in RRCConnectionSetupComplete on the same NAS security context it attached
+    // with, and the network restores the S1 context through a second Initial
+    // Context Setup.
+    LTE_EPS_SERVICE_REQUEST_OVER_SRB1_READY,
+    // The eNB turns an S1AP Paging into a real RRC Paging message on PCCH, and
+    // the idle production UE matches its own S-TMSI. PCCH is not SRB1.
+    LTE_PRODUCTION_UE_PAGING_PCCH_READY,
+    // The whole access-restoration lifecycle: ECM-IDLE with the EPS
+    // registration and NAS context retained, and a Service Request (UE- or
+    // paging-triggered) returning the UE to ECM-CONNECTED.
+    LTE_ECM_IDLE_ACCESS_RESTORATION_READY,
     // External acceptance evidence: only an authorized live Open5GS Attach can
     // make it true, and none was executed.
     LTE_OPEN5GS_ATTACH_ACCEPTED,

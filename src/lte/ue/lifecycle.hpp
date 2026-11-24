@@ -153,6 +153,11 @@ struct MobilityContext
                           std::optional<std::array<uint8_t, 11>> assignedGuti,
                           const std::vector<uint8_t> &assignedTaiList, uint8_t periodicTimer);
     void onS1ContextEstablished(uint32_t enbId, uint32_t mmeId);
+    // The network accepted a Service Request and restored this UE's access. The
+    // S1AP identity pair belongs to the eNB/MME exchange and is not carried to
+    // the UE over RRC, so only the state transition is applied here; the EPS
+    // registration, security context, GUTI and bearer identities all survive.
+    void onServiceRequestAccepted();
     void onBearerTransportEstablished(uint32_t localTeid, uint32_t remoteTeid);
     void onUserPlaneReady();
     void onS1ContextReleased();

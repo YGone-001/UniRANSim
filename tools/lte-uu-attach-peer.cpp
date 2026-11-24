@@ -18,6 +18,13 @@
 //   duplicate-attach-accept send the Attach Accept twice
 //   exit-on-detach          leave without answering the Detach Request
 //   bad-detach-mac          answer with a deliberately corrupted MAC
+//   service-request         release the UE, then accept its Service Request
+//   paging                  release the UE, page it, then accept its Service Request
+//   paging-timeout          release the UE and never page it
+//   paging-wrong-identity   release the UE and page a different S-TMSI
+//   paging-peer-exit        page the UE and leave before the Service Request
+//   bad-service-mac         refuse the Service Request after MAC corruption
+//   duplicate-detach-accept send the protected Detach Accept twice
 #include <lte/enb/codec.hpp>
 #include <lte/enb/enb_rrc_bridge.hpp>
 #include <lte/rrc-runtime/rrc_connection_setup_complete.hpp>
@@ -190,9 +197,15 @@ int main(int argc, char **argv)
     const std::string resultPath = argv[3];
     const std::string mode = argc == 5 ? argv[4] : "attach-only";
     const bool attachOnly = mode == "attach-only";
-    const bool expectDetach = mode != "attach-only";
-    if (!attachOnly && mode != "attach-detach" && mode != "duplicate-attach-accept" &&
-        mode != "exit-on-detach" && mode != "bad-detach-mac")
+    const bool detachMode = mode == "attach-detach" || mode == "duplicate-attach-accept" ||
+                            mode == "exit-on-detach" || mode == "bad-detach-mac" ||
+                            mode == "duplicate-detach-accept";
+    const bool pagingMode = mode == "paging" || mode == "paging-timeout" || mode == "paging-wrong-identity" ||
+                            mode == "paging-peer-exit";
+    const bool idleMode = mode == "service-request" || mode == "bad-service-mac" || pagingMode;
+    const bool expectDetach = detachMode;
+    const bool expectRelease = idleMode;
+    if (!attachOnly && !detachMode && !idleMode)
     {
         WriteResult(resultPath, "result=FAILED\nreason=unknown mode " + mode + "\n");
         return 1;
@@ -287,6 +300,8 @@ int main(int argc, char **argv)
         ICS_SECURITY,
         ATTACH_COMPLETE,
         REGISTERED,
+        RELEASED,
+        SR_ICS,
         DONE,
         FAILED
     };
@@ -310,6 +325,21 @@ int main(int argc, char **argv)
     uint8_t lastUplinkSequence = 0;
     uint32_t detachUlCount = 0;
     uint32_t detachDlCount = 0;
+    // ECM-IDLE restoration bookkeeping.
+    bool releasePending = false;
+    bool releaseCommandSent = false;
+    bool releaseComplete = false;
+    bool idleRetained = false;
+    bool pagingSent = false;
+    bool pagingWrongIdentity = false;
+    bool serviceRequestVerified = false;
+    bool injectedShortMac = false;
+    bool contextRestored = false;
+    std::vector<uint8_t> serviceRequestRaw;
+    uint32_t serviceRequestCount = 0;
+    uint8_t serviceRequestKsi = 0;
+    auto releaseAt = Clock::now();
+    auto pagingAt = Clock::now();
 
     auto fail = [&](const std::string &reason) {
         stage = Stage::FAILED;
@@ -336,7 +366,8 @@ int main(int argc, char **argv)
         }
     };
 
-    auto handleUplink = [&](const std::vector<uint8_t> &pdu) {
+    auto handleUplink = [&](const lte::enb::s1ap::UplinkNas &uplink) {
+        const std::vector<uint8_t> &pdu = uplink.nasPdu;
         switch (stage)
         {
         case Stage::ATTACH:
@@ -394,9 +425,23 @@ int main(int argc, char **argv)
             if (*plain != expectedAttachComplete)
                 return fail("the Attach Complete did not match the production encoder");
             attachCompleteVerified = true;
-            // D3 ended here. The lifecycle peer stays registered and waits for
-            // the UE to detach the same session.
-            stage = attachOnly ? Stage::DONE : Stage::REGISTERED;
+            if (attachOnly)
+            {
+                stage = Stage::DONE;
+                return;
+            }
+            if (detachMode)
+            {
+                // D3/D4: the peer stays registered and waits for the UE to
+                // detach the same session.
+                stage = Stage::REGISTERED;
+                return;
+            }
+            // D5: the network releases the access after a short controlled
+            // delay, and the UE keeps its EPS registration and NAS context.
+            releasePending = true;
+            releaseAt = Clock::now() + std::chrono::milliseconds(120);
+            stage = Stage::REGISTERED;
             return;
         }
         case Stage::REGISTERED:
@@ -447,6 +492,10 @@ int main(int argc, char **argv)
                 return fail("the Detach Accept integrity was deliberately corrupted (injected)");
             }
             sendDownlinkNas(accept);
+            if (mode == "duplicate-detach-accept")
+                // The same protected bytes again: a replayed downlink COUNT.
+                // The UE must complete the Detach once and release once.
+                sendDownlinkNas(accept);
             detachAcceptSent = true;
             // A real MME releases the S1 UE context after a Detach. The peer
             // does the same through the bridge's association-loss path, so the
@@ -455,6 +504,69 @@ int main(int argc, char **argv)
             enbContextReleased = !bridge->HasContext(association);
             stage = Stage::DONE;
             return;
+        }
+        case Stage::RELEASED:
+        {
+            // The compact EPS Service Request is the first NAS of the new RRC
+            // connection. It is not a normal protected message: it carries the
+            // KSI, a five-bit sequence and a two-octet short MAC.
+            serviceRequestRaw = uplink.nasPdu;
+            if (uplink.nasPdu.size() != 4 || uplink.nasPdu[0] != 0xC7)
+                return fail("the Service Request is not the compact EPS Service Request");
+            if (!uplink.sTmsi.has_value() || uplink.sTmsi->mmeCode != 1 || uplink.sTmsi->mTmsi != 0x12345678U)
+                return fail("the Service Request did not name the retained S-TMSI");
+            auto verificationCopy = uplink.nasPdu;
+            if (mode == "bad-service-mac")
+                // The MME receives tampered bytes: integrity must refuse them.
+                verificationCopy[3] ^= 0x01U;
+            try
+            {
+                lte::ue::nas::VerifyServiceRequest(nas, verificationCopy.data(), verificationCopy.size(),
+                                                  nas.ulNasCount);
+            }
+            catch (const std::exception &e)
+            {
+                if (mode == "bad-service-mac")
+                {
+                    injectedShortMac = true;
+                    return fail(std::string("the injected Service Request short MAC was refused: ") + e.what());
+                }
+                return fail(std::string("the Service Request short MAC was refused: ") + e.what());
+            }
+            serviceRequestKsi = static_cast<uint8_t>(uplink.nasPdu[1] >> 5U);
+            serviceRequestCount = lte::ue::nas::EstimateServiceRequestCount(
+                nas.ulNasCount, static_cast<uint8_t>(uplink.nasPdu[1] & 0x1FU));
+            if (serviceRequestCount <= nas.ulNasCount)
+                return fail("the Service Request did not advance the uplink NAS COUNT");
+            nas.ulNasCount = serviceRequestCount;
+            serviceRequestVerified = true;
+
+            lte::enb::s1ap::InitialContextSetupRequest ics{};
+            ics.mmeUeS1apId = 0x4001;
+            ics.enbUeS1apId = uplink.enbUeS1apId;
+            ics.ueAmbrUl = 100000000;
+            ics.ueAmbrDl = 100000000;
+            lte::enb::s1ap::ErabToBeSetupItem erab{};
+            erab.erabId = 5;
+            erab.qci = 9;
+            erab.transportLayerAddress = {10, 0, 0, 1};
+            erab.gtpTeid = {0x11, 0x22, 0x33, 0x44};
+            ics.erabs.push_back(erab);
+            ics.encryptionAlgorithms = {0xE0, 0x00};
+            ics.integrityAlgorithms = {0xE0, 0x00};
+            // TS 33.401 7.2.1: the new KeNB follows the Service Request's
+            // uplink NAS COUNT.
+            ics.securityKey = lte::security::DeriveKenb(kasme, serviceRequestCount);
+            bridge->OnInitialContextSetupRequest(lte::enb::s1ap::EncodeInitialContextSetupRequest(ics));
+            stage = Stage::SR_ICS;
+            return;
+        }
+        case Stage::SR_ICS:
+        {
+            const auto plain = verifyUplink(pdu);
+            if (!plain.has_value())
+                return;
+            return fail("unexpected uplink NAS while restoring the AS security context");
         }
         case Stage::ICS_SECURITY:
         case Stage::DONE:
@@ -480,14 +592,84 @@ int main(int argc, char **argv)
                     ++initialUeMessages;
                 else
                     ++uplinkTransports;
-                handleUplink(uplink.nasPdu);
+                handleUplink(uplink);
             }
             catch (const std::exception &)
             {
-                // Not a NAS-carrying S1AP message (for example the Initial
-                // Context Setup Response this peer itself caused).
+                // Not a NAS-carrying S1AP message. The release complete is the
+                // one this peer must observe.
+                try
+                {
+                    const auto complete = lte::enb::s1ap::DecodeUeContextReleaseComplete(pdu.data(), pdu.size());
+                    if (complete.mmeUeS1apId == 0x4001)
+                        releaseComplete = true;
+                }
+                catch (const std::exception &)
+                {
+                    // The Initial Context Setup Response this peer itself caused.
+                }
             }
         }
+        if (stage == Stage::REGISTERED && releasePending && Clock::now() >= releaseAt)
+        {
+            releasePending = false;
+            const auto enbUeS1apId = bridge->EnbUeS1apIdOf(association);
+            if (!enbUeS1apId.has_value())
+                fail("the eNB holds no radio context to release");
+            else
+            {
+                try
+                {
+                    bridge->OnUeContextReleaseCommand(lte::enb::s1ap::EncodeUeContextReleaseCommand(
+                        0x4001, *enbUeS1apId, "nas", 0));
+                    releaseCommandSent = true;
+                    idleRetained = bridge->IdleUes() == 1;
+                    stage = Stage::RELEASED;
+                    pagingAt = Clock::now() + std::chrono::milliseconds(120);
+                }
+                catch (const std::exception &e)
+                {
+                    fail(std::string("the RRC/S1 release failed: ") + e.what());
+                }
+            }
+
+            if (stage == Stage::RELEASED)
+            {
+                if (mode == "paging-timeout")
+                    fail("no Paging was sent (injected)");
+                else if (mode == "paging-wrong-identity")
+                {
+                    pagingWrongIdentity = true;
+                    pagingSent = bridge->PageUe(lte::enb::s1ap::STmsi{1, 0xDEADBEEFu});
+                    fail("a Paging for a different S-TMSI was sent (injected)");
+                }
+                else if (mode == "paging-peer-exit")
+                {
+                    pagingSent = bridge->PageUe(lte::enb::s1ap::STmsi{1, 0x12345678U});
+                    fail("the peer exited after Paging (injected)");
+                }
+            }
+        }
+
+        if (stage == Stage::RELEASED && (mode == "paging") && !pagingSent && Clock::now() >= pagingAt)
+        {
+            pagingSent = bridge->PageUe(lte::enb::s1ap::STmsi{1, 0x12345678U});
+            if (!pagingSent)
+                fail("the retained idle UE was not found for Paging");
+        }
+
+        if (stage == Stage::SR_ICS && bridge->AsSecurityActive(association))
+        {
+            std::vector<lte::enb::s1ap::ErabSetupItem> established;
+            established.push_back({5, {10, 0, 0, 1}, {0x11, 0x22, 0x33, 0x44}});
+            bridge->CompleteInitialContextSetup(association, established);
+            contextRestored = true;
+            rrcAsSecurity = true;
+            stage = Stage::DONE;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            continue;
+        }
+
         if (stage == Stage::ICS_SECURITY && bridge->AsSecurityActive(association))
         {
             std::vector<lte::enb::s1ap::ErabSetupItem> established;
@@ -510,7 +692,8 @@ int main(int argc, char **argv)
     }
     if (stage != Stage::DONE && stage != Stage::FAILED)
         fail(expectDetach ? "timed out before the Attach to Detach lifecycle completed"
-                          : "timed out before the Attach exchange completed");
+                          : (expectRelease ? "timed out before the ECM-IDLE access restoration completed"
+                                           : "timed out before the Attach exchange completed"));
 
     std::ostringstream result;
     result << "result=" << (stage == Stage::DONE ? "COMPLETE" : (injectedCorruption ? "INJECTED" : "FAILED")) << "\n";
@@ -534,6 +717,19 @@ int main(int argc, char **argv)
     result << "detach_accept_sent=" << (detachAcceptSent ? 1 : 0) << "\n";
     result << "enb_context_released=" << (enbContextReleased ? 1 : 0) << "\n";
     result << "injected_corruption=" << (injectedCorruption ? 1 : 0) << "\n";
+    result << "release_command_sent=" << (releaseCommandSent ? 1 : 0) << "\n";
+    result << "release_complete=" << (releaseComplete ? 1 : 0) << "\n";
+    result << "idle_retained=" << (idleRetained ? 1 : 0) << "\n";
+    result << "paging_sent=" << (pagingSent ? 1 : 0) << "\n";
+    result << "paging_wrong_identity=" << (pagingWrongIdentity ? 1 : 0) << "\n";
+    result << "service_request=" << Hex(serviceRequestRaw) << "\n";
+    result << "service_request_verified=" << (serviceRequestVerified ? 1 : 0) << "\n";
+    result << "sr_ksi=" << static_cast<int>(serviceRequestKsi) << "\n";
+    result << "sr_count=" << serviceRequestCount << "\n";
+    result << "injected_bad_service_mac=" << (injectedShortMac ? 1 : 0) << "\n";
+    result << "context_restored=" << (contextRestored ? 1 : 0) << "\n";
+    result << "ecm_connected=" << (contextRestored ? 1 : 0) << "\n";
+    result << "idle_ues=" << bridge->IdleUes() << "\n";
     WriteResult(resultPath, result.str());
     return stage == Stage::DONE ? 0 : 1;
 }

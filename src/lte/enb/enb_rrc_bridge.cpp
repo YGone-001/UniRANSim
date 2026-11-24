@@ -7,6 +7,7 @@
 
 #include "s1ap_security_capabilities.hpp"
 
+#include <algorithm>
 #include <string>
 
 namespace lte::enb::s1ap
@@ -71,9 +72,20 @@ void EnbRrcBridge::OnSetupComplete(uint32_t association, const RrcConnectionSetu
     if (onSetup_)
         onSetup_(association, entry.enbUeS1apId, runtime_.PeerPortOf(association), message.dedicatedInfoNas);
 
+    // A UE that reconnects for a Service Request is named to the MME by the
+    // S-TMSI it used in the RRC request, exactly as TS 36.413 9.2.3.13 allows.
+    // The UE is no longer idle once its S1 context exists again.
+    std::optional<STmsi> sTmsi;
+    if (const auto &request = runtime_.RequestOf(association); request.has_value())
+        sTmsi = STmsi{request->mmec, request->mTmsi};
+    const uint16_t radioPort = runtime_.PeerPortOf(association);
+    idleEndpoints_.erase(std::remove_if(idleEndpoints_.begin(), idleEndpoints_.end(),
+                                        [radioPort](const IdleEndpoint &entry) { return entry.port == radioPort; }),
+                         idleEndpoints_.end());
+
     // The MME has not named the UE yet: an Initial UE Message carries no
     // MME-UE-S1AP-ID, and none is invented here.
-    const auto pdu = EncodeInitialUeMessage(config_.enb, entry.enbUeS1apId, message.dedicatedInfoNas);
+    const auto pdu = EncodeInitialUeMessage(config_.enb, entry.enbUeS1apId, message.dedicatedInfoNas, sTmsi);
     initialUeMessages_++;
     Emit(entry.enbUeS1apId, pdu);
 }
@@ -241,6 +253,71 @@ void EnbRrcBridge::CompleteInitialContextSetup(uint32_t association, const std::
     it->second.icsCompleted = true;
     setupResponses_++;
     Emit(it->second.enbUeS1apId, pdu);
+}
+
+void EnbRrcBridge::OnUeContextReleaseCommand(const std::vector<uint8_t> &pdu)
+{
+    UeContextReleaseCommand command;
+    try
+    {
+        command = DecodeUeContextReleaseCommand(pdu.data(), pdu.size());
+    }
+    catch (const CodecError &)
+    {
+        refused_++;
+        return;
+    }
+    if (!command.enbUeS1apId.has_value())
+    {
+        // The eNB must be told which of its UEs is released; a command without
+        // the eNB identity cannot be matched to any radio context.
+        refused_++;
+        return;
+    }
+    const auto mapped = byEnbId_.find(*command.enbUeS1apId);
+    if (mapped == byEnbId_.end())
+    {
+        refused_++;
+        return;
+    }
+    const auto it = associations_.find(mapped->second);
+    if (it == associations_.end() || it->second.mmeUeS1apId != command.mmeUeS1apId)
+    {
+        refused_++;
+        return;
+    }
+    const uint32_t association = mapped->second;
+    const uint32_t enbUeS1apId = it->second.enbUeS1apId;
+    const auto request = runtime_.RequestOf(association);
+    const uint16_t peerPort = runtime_.PeerPortOf(association);
+
+    // TS 36.331 5.3.8: the connection is released over the radio, and the S1AP
+    // transaction is only complete once the eNB reports it.
+    runtime_.SendRrcRelease(association);
+    Emit(enbUeS1apId, EncodeUeContextReleaseComplete(command.mmeUeS1apId, enbUeS1apId));
+    releaseCompletes_++;
+
+    // The MME keeps its UE context; the eNB keeps just enough to page the UE
+    // back. The radio bearer and the association itself are gone.
+    const bool alreadyRetained = std::any_of(idleEndpoints_.begin(), idleEndpoints_.end(),
+                                             [peerPort](const IdleEndpoint &entry) { return entry.port == peerPort; });
+    if (!alreadyRetained)
+        idleEndpoints_.push_back({association, peerPort});
+    byEnbId_.erase(enbUeS1apId);
+    associations_.erase(it);
+    runtime_.ReleaseContext(association);
+}
+
+bool EnbRrcBridge::PageUe(const STmsi &sTmsi)
+{
+    if (idleEndpoints_.empty())
+        return false;
+    // One cell-wide page, delivered to every retained idle endpoint. Each UE
+    // matches its own S-TMSI and ignores a page addressed to another identity.
+    for (const auto &endpoint : idleEndpoints_)
+        runtime_.SendPaging(endpoint.port, endpoint.association, sTmsi.mmeCode, sTmsi.mTmsi);
+    pagesSent_++;
+    return true;
 }
 
 void EnbRrcBridge::OnS1AssociationLost()

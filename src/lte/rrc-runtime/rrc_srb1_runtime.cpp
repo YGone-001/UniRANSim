@@ -74,6 +74,42 @@ void UeSrb1Runtime::Pump(int timeoutMs)
         return;
     }
 
+    if (frame.channel == uu::LogicalChannel::PCCH)
+    {
+        // A page is only meaningful while this UE is idle. A connected UE has
+        // no page to answer, and a page for another identity is counted and
+        // never acted on.
+        if (frame.direction != uu::Direction::DOWNLINK || frame.payload.empty())
+        {
+            refused_++;
+            return;
+        }
+        if (state_ != RrcState::RRC_IDLE)
+        {
+            refused_++;
+            return;
+        }
+        PagingMessage paging;
+        if (!DecodePaging(frame.payload.data(), frame.payload.size(), paging))
+        {
+            refused_++;
+            return;
+        }
+        evidence_.pagingsReceived++;
+        for (const auto &record : paging.records)
+        {
+            if (record.csDomain)
+                continue;
+            if (record.mmec != config_.mmec || record.mTmsi != config_.mTmsi)
+                continue;
+            evidence_.pagingsMatched++;
+            if (onPaging_)
+                onPaging_(record.mmec, record.mTmsi);
+            return;
+        }
+        return;
+    }
+
     if (frame.channel == uu::LogicalChannel::CCCH)
     {
         if (frame.direction != uu::Direction::DOWNLINK || frame.payload.empty())
@@ -197,7 +233,61 @@ void UeSrb1Runtime::OnRrc(const std::vector<uint8_t> &rrc)
             onNas_(information.dedicatedInfoNas);
         return;
     }
+
+    RrcConnectionReleaseMessage release;
+    if (DecodeRrcConnectionRelease(rrc.data(), rrc.size(), release))
+    {
+        // TS 36.331 5.3.8: the UE moves to RRC_IDLE. The teardown is deferred
+        // to Tick, once the bearer that is delivering this PDU is no longer on
+        // the stack.
+        evidence_.releases++;
+        releasePending_ = true;
+        return;
+    }
     refused_++;
+}
+
+void UeSrb1Runtime::EnterIdle()
+{
+    if (bearer_ != nullptr)
+    {
+        bearer_->Release();
+        bearer_.reset();
+    }
+    pdcp_.Release();
+    pdcp_ = pdcp::SrbPdcpEntity::Create(true);
+    secureTx_.reset();
+    secureRx_.reset();
+    asContext_.reset();
+    procedure_.reset();
+    secured_ = false;
+    expectingCommand_ = false;
+    setup_.reset();
+    access_ = UeInitialAccess::Idle(config_.association, config_.mmec, config_.mTmsi);
+    expectedAck_ = 0;
+    state_ = RrcState::RRC_IDLE;
+}
+
+void UeSrb1Runtime::SetReleaseCallback(ReleaseCallback callback)
+{
+    onRelease_ = std::move(callback);
+}
+
+void UeSrb1Runtime::SetPagingCallback(PagingCallback callback)
+{
+    onPaging_ = std::move(callback);
+}
+
+void UeSrb1Runtime::SetIdentity(uint8_t mmec, uint32_t mTmsi)
+{
+    if (mTmsi == 0)
+        throw Srb1RuntimeException(Srb1RuntimeError::UNEXPECTED_STATE);
+    config_.mmec = mmec;
+    config_.mTmsi = mTmsi;
+    // While connected the current access keeps the identity it was established
+    // with; EnterIdle() builds the next request from the new one.
+    if (state_ == RrcState::RRC_IDLE)
+        access_ = UeInitialAccess::Idle(config_.association, mmec, mTmsi);
 }
 
 void UeSrb1Runtime::SubmitSetupComplete(const std::vector<uint8_t> &nas)
@@ -264,6 +354,14 @@ bool UeSrb1Runtime::AsSecurityActive() const
 
 void UeSrb1Runtime::Tick()
 {
+    if (releasePending_)
+    {
+        releasePending_ = false;
+        EnterIdle();
+        if (onRelease_)
+            onRelease_();
+        return;
+    }
     if (bearer_ != nullptr)
         bearer_->Tick();
 
@@ -359,6 +457,11 @@ void EnbSrb1Runtime::OnRequestFrame(uint32_t association, const uu::Frame &frame
     context.state = RrcState::RRC_SETUP_PENDING;
     context.peerPort = sourcePort;
     context.transactionId = config_.setup.transactionId;
+    // The RRC request carries the S-TMSI the UE was assigned. It is what the
+    // Initial UE Message reports and what a later page is addressed to.
+    RrcConnectionRequestMessage request;
+    if (DecodeRrcConnectionRequest(frame.payload.data(), frame.payload.size(), request))
+        context.request = request;
     context.resolved = MapSrb1Configuration(config_.setup);
     context.pdcp = pdcp::SrbPdcpEntity::Create(false);
 
@@ -386,6 +489,78 @@ void EnbSrb1Runtime::OnSrb1Frame(uint32_t association, const uu::Frame &frame)
     }
     if (it->second.bearer == nullptr || !it->second.bearer->OnFrame(frame))
         refused_++;
+}
+
+const std::optional<RrcConnectionRequestMessage> &EnbSrb1Runtime::RequestOf(uint32_t association) const
+{
+    static const std::optional<RrcConnectionRequestMessage> empty{};
+    const auto it = contexts_.find(association);
+    return it == contexts_.end() ? empty : it->second.request;
+}
+
+void EnbSrb1Runtime::SendRrcRelease(uint32_t association)
+{
+    const auto it = contexts_.find(association);
+    if (it == contexts_.end() || it->second.bearer == nullptr)
+    {
+        refused_++;
+        return;
+    }
+    Context &context = it->second;
+    if (context.state != RrcState::RRC_CONNECTED)
+    {
+        refusedRrc_++;
+        return;
+    }
+    RrcConnectionReleaseMessage message;
+    message.transactionId = context.transactionId & 0x03U;
+    const std::vector<uint8_t> rrc = EncodeRrcConnectionRelease(message);
+    if (rrc.empty())
+    {
+        refusedRrc_++;
+        return;
+    }
+    context.bearer->SubmitSdu(Protect(context, rrc));
+    context.state = RrcState::RRC_IDLE;
+}
+
+void EnbSrb1Runtime::ReleaseContext(uint32_t association)
+{
+    // The initial-access context belongs to the connection too: keeping it
+    // would make the eNB refuse the UE's next RRCConnectionRequest because it
+    // carries the newly assigned S-TMSI.
+    access_.Release(association);
+    const auto it = contexts_.find(association);
+    if (it == contexts_.end())
+        return;
+    if (it->second.bearer != nullptr)
+    {
+        it->second.bearer->Release();
+        it->second.bearer.reset();
+    }
+    contexts_.erase(it);
+}
+
+void EnbSrb1Runtime::SendPaging(uint16_t peerPort, uint32_t association, uint8_t mmec, uint32_t mTmsi)
+{
+    PagingMessage message;
+    PagingRecord record;
+    record.mmec = mmec;
+    record.mTmsi = mTmsi;
+    record.csDomain = false;
+    message.records.push_back(record);
+    const std::vector<uint8_t> pdu = EncodePaging(message);
+    if (pdu.empty())
+    {
+        refused_++;
+        return;
+    }
+    uu::Frame frame;
+    frame.association = association;
+    frame.direction = uu::Direction::DOWNLINK;
+    frame.channel = uu::LogicalChannel::PCCH;
+    frame.payload = pdu;
+    socket_.Send(peerPort, frame, nullptr);
 }
 
 std::vector<uint8_t> EnbSrb1Runtime::Protect(Context &context, const std::vector<uint8_t> &rrc)

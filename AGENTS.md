@@ -1411,8 +1411,10 @@ configured. `docs/lte-nas-s1ap-runtime.md` is the record.
   pending transaction exists is refused and its reservations are released; it
   must never stage a second transaction or produce a second response.
 - **No capability change without evidence.** The production UE application is
-  SRB1-enabled (B6-D3), so `LTE_EPS_ATTACH_OVER_SRB1_READY` is true, and since
-  B6-D4 `LTE_EPS_DETACH_OVER_SRB1_READY` is true as well. There is no separate
+  SRB1-enabled (B6-D3), so `LTE_EPS_ATTACH_OVER_SRB1_READY` is true, since
+  B6-D4 `LTE_EPS_DETACH_OVER_SRB1_READY` is true as well, and since B6-D5 so are
+  `LTE_EPS_SERVICE_REQUEST_OVER_SRB1_READY`, `LTE_PRODUCTION_UE_PAGING_PCCH_READY`
+  and `LTE_ECM_IDLE_ACCESS_RESTORATION_READY`. There is no separate
   "production UE" switch in the registry; do not cite one.
   `LTE_DEFAULT_BEARER_OVER_SRB1_READY` and `LTE_OPEN5GS_ATTACH_ACCEPTED` stay
   false.
@@ -1439,11 +1441,11 @@ configured. `docs/lte-nas-s1ap-runtime.md` is the record.
 - **The callback only queues.** `Pump`/Tick run on the UE thread; the callback
   appends bytes and returns. Release clears the callback before the runtime and
   socket are destroyed, so no late NAS reaches a dead handler.
-- **ATTACH_ONLY and ATTACH_DETACH are the current Uu scope.** Attach and the
-  UE-initiated Detach that closes the same session travel on SRB1. Paging,
-  recovery, TAU and the user plane still travel on the legacy link; a Uu
-  configuration naming another lifecycle scenario is refused at startup rather
-  than mixed.
+- **ATTACH_ONLY, ATTACH_DETACH, SERVICE_REQUEST and PAGING are the current Uu
+  scope.** Attach, the UE-initiated Detach, and the ECM-IDLE Service Request /
+  Paging restoration travel on the Uu path. Recovery, TAU and the user plane
+  still travel on the legacy link; a Uu configuration naming another lifecycle
+  scenario is refused at startup rather than mixed.
 - **Two processes, opt-in.** `UNIRANSIM_RUN_TWO_PROCESS_ATTACH=1` runs
   `tools/lte-uu-attach-peer.cpp` and the real `lte-ue`. Without it the case is
   NOT_EXERCISED. A deterministic MME is still not Open5GS.
@@ -1483,3 +1485,37 @@ configured. `docs/lte-nas-s1ap-runtime.md` is the record.
   `Production UE Attach-Detach (two processes)` sets it for the lifecycle cases.
   Without it they are NOT_EXERCISED, and a deterministic MME is still not
   Open5GS.
+
+## LTE production UE ECM-IDLE access restoration (B6-D5)
+
+`docs/lte-production-ue-ecm-idle.md` is the record.
+
+- **Three layers, three states.** EMM-REGISTERED, ECM-IDLE and RRC_IDLE coexist:
+  entering ECM-IDLE releases only the access. It is never a Detach, and it never
+  clears the NAS security context, the GUTI or the EPS bearer identities.
+- **The network owns the release.** ECM-IDLE is entered because the MME sent an
+  S1AP UE Context Release Command and the eNB sent a real RRCConnectionRelease.
+  Never set an ECM-IDLE flag directly.
+- **Release after the stack unwinds.** The UE defers its RRC teardown to `Tick()`:
+  the bearer that delivered the release is still on the stack, so destroying it
+  inside `OnRrc` is a use-after-free. Keep that ordering.
+- **Service Request is the first NAS of the new connection.** It travels in
+  RRCConnectionSetupComplete (not ULInformationTransfer), is encoded by
+  `nas::EncodeServiceRequest` and verified by `nas::VerifyServiceRequest`. Never
+  bypass the short MAC, never re-use the previous COUNT, and never accept a
+  COUNT that did not advance.
+- **Paging is PCCH, not SRB1.** `LogicalChannel::PCCH` carries a real RRC Paging
+  message. The eNB delivers it to the bounded idle endpoints; the UE matches its
+  own S-TMSI. Do not deliver a page as a NAS message or as a boolean event.
+- **Identity comes from the Attach.** The UE adopts the assigned S-TMSI after the
+  Attach Accept; the S-TMSI in the next RRC request, the Initial UE Message and
+  the page must be the same one. Never hardcode it in a test.
+- **The new KeNB follows the Service Request COUNT.** `PrepareAsSecurity` and the
+  MME's `DeriveKenb` both use the recovered uplink COUNT; a mismatch fails the
+  scenario rather than falling back.
+- **A failed restoration stays failed.** A wrong page, an absent page, a bad
+  short MAC or a departed peer leaves the UE registered and exits non-zero; it
+  never claims ECM-CONNECTED.
+- **Two processes, opt-in.** The `lte/uu/idle` cases run under
+  `UNIRANSIM_RUN_TWO_PROCESS_ATTACH=1`, and the GitHub Actions job
+  `Production UE EPS lifecycle (two processes)` runs them as blocking tests.

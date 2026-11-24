@@ -382,7 +382,7 @@ struct LifecycleRun
 // One configuration shape for every lifecycle case: the same subscriber, a
 // short controlled trigger and a procedure deadline that bounds a failure.
 void WriteLifecycleConfig(const std::string &path, uint16_t legacyLocal, uint16_t legacyPeer, uint16_t uuLocal,
-                          uint16_t uuPeer, const std::string &scenario, int procedureMs)
+                          uint16_t uuPeer, const std::string &scenario, int procedureMs, int pagingWaitMs)
 {
     std::ofstream config(path);
     REQUIRE(config.good());
@@ -416,6 +416,7 @@ void WriteLifecycleConfig(const std::string &path, uint16_t legacyLocal, uint16_
     config << "  triggerAfterMs: 300\n";
     config << "  procedureTimeoutMs: " << procedureMs << "\n";
     config << "  maxRetries: 2\n";
+    config << "  pagingWaitMs: " << pagingWaitMs << "\n";
     config.flush();
     REQUIRE(config.good());
 }
@@ -439,7 +440,7 @@ int WaitForExit(pid_t pid, int milliseconds)
 // dynamically chosen ports, and returns what both sides actually did. The UE
 // runs unprivileged so the lifecycle is control-plane-only.
 LifecycleRun RunLifecycle(const std::string &work, const std::string &mode, const std::string &scenario,
-                          bool ueLongLived = false, int procedureMs = 900)
+                          bool ueLongLived = false, int procedureMs = 900, int pagingWaitMs = 60000)
 {
     std::filesystem::remove_all(work);
     std::filesystem::create_directories(work);
@@ -456,7 +457,8 @@ LifecycleRun RunLifecycle(const std::string &work, const std::string &mode, cons
     const uint16_t uuLocal = FreeUdpPort();
     const uint16_t legacyLocal = FreeUdpPort();
     const uint16_t legacyPeer = FreeUdpPort();
-    WriteLifecycleConfig(ueConfigPath, legacyLocal, legacyPeer, uuLocal, peerPort, scenario, procedureMs);
+    WriteLifecycleConfig(ueConfigPath, legacyLocal, legacyPeer, uuLocal, peerPort, scenario, procedureMs,
+                         pagingWaitMs);
 
     LifecycleRun run;
     const pid_t peerPid = Spawn(peerBinary, {std::to_string(peerPort), readyPath, resultPath, mode}, peerLog);
@@ -627,3 +629,162 @@ TEST_CASE("lte/uu/lifecycle: attach-only keeps the d3 behaviour under the detach
     CHECK(run.resultWritten);
 }
 
+
+TEST_CASE("lte/uu/idle: the production ue restores access with a service request from ecm-idle")
+{
+    if (std::getenv("UNIRANSIM_RUN_TWO_PROCESS_ATTACH") == nullptr)
+    {
+        MESSAGE("the two-process lifecycle is opt-in; set UNIRANSIM_RUN_TWO_PROCESS_ATTACH=1");
+        return;
+    }
+
+    const auto run = RunLifecycle("/tmp/uniransim-uu-idle-sr", "service-request",
+                                  "attach-idle-service-request", false, 3000);
+
+    CHECK(Contains(run.peerResult, "result=COMPLETE"));
+    // One Attach and one Service Request: the second Initial UE Message is the
+    // Service Request's, and the Attach's three uplink transports are unchanged.
+    CHECK(Contains(run.peerResult, "initial_ue_messages=2"));
+    CHECK(Contains(run.peerResult, "uplink_nas_transports=3"));
+    CHECK(Contains(run.peerResult, "attach_complete_verified=1"));
+    CHECK(Contains(run.peerResult, "release_command_sent=1"));
+    CHECK(Contains(run.peerResult, "release_complete=1"));
+    CHECK(Contains(run.peerResult, "idle_retained=1"));
+    // The compact Service Request: 0xC7, KSI 0 in the top bits with the
+    // five-bit sequence 2, and the two-octet short MAC.
+    CHECK(Contains(run.peerResult, "service_request=c702"));
+    CHECK(Contains(run.peerResult, "service_request_verified=1"));
+    CHECK(Contains(run.peerResult, "sr_ksi=0"));
+    CHECK(Contains(run.peerResult, "sr_count=2"));
+    CHECK(Contains(run.peerResult, "context_restored=1"));
+    CHECK(Contains(run.peerResult, "ecm_connected=1"));
+
+    CHECK(Contains(run.ueLog, "RRC connection released by the network"));
+    CHECK(Contains(run.ueLog, "EMM-REGISTERED and the NAS security context are preserved"));
+    CHECK(Contains(run.ueLog, "EPS Service Request sent in RRCConnectionSetupComplete: KSI=0 COUNT=2"));
+    CHECK(Contains(run.ueLog, "EPS Service Request accepted; AS security restored; ECM-CONNECTED"));
+    CHECK(run.ueExit == 0);
+    CHECK(run.peerExit == 0);
+}
+
+TEST_CASE("lte/uu/idle: a network page wakes the production ue into a service request")
+{
+    if (std::getenv("UNIRANSIM_RUN_TWO_PROCESS_ATTACH") == nullptr)
+    {
+        MESSAGE("the two-process lifecycle is opt-in; set UNIRANSIM_RUN_TWO_PROCESS_ATTACH=1");
+        return;
+    }
+
+    const auto run = RunLifecycle("/tmp/uniransim-uu-idle-paging", "paging", "paging", false, 3000, 3000);
+
+    CHECK(Contains(run.peerResult, "result=COMPLETE"));
+    CHECK(Contains(run.peerResult, "initial_ue_messages=2"));
+    CHECK(Contains(run.peerResult, "release_command_sent=1"));
+    CHECK(Contains(run.peerResult, "release_complete=1"));
+    CHECK(Contains(run.peerResult, "idle_retained=1"));
+    CHECK(Contains(run.peerResult, "paging_sent=1"));
+    CHECK(Contains(run.peerResult, "paging_wrong_identity=0"));
+    CHECK(Contains(run.peerResult, "service_request_verified=1"));
+    CHECK(Contains(run.peerResult, "sr_count=2"));
+    CHECK(Contains(run.peerResult, "context_restored=1"));
+
+    CHECK(Contains(run.ueLog, "PCCH Paging matched the UE identity (MMEC=1 M-TMSI=0x12345678)"));
+    CHECK(Contains(run.ueLog, "EPS Service Request sent in RRCConnectionSetupComplete"));
+    CHECK(Contains(run.ueLog, "EPS Service Request accepted; AS security restored; ECM-CONNECTED"));
+    CHECK(run.ueExit == 0);
+    CHECK(run.peerExit == 0);
+}
+
+TEST_CASE("lte/uu/idle: a page for another s-tmsi does not wake the production ue")
+{
+    if (std::getenv("UNIRANSIM_RUN_TWO_PROCESS_ATTACH") == nullptr)
+    {
+        MESSAGE("the two-process lifecycle is opt-in; set UNIRANSIM_RUN_TWO_PROCESS_ATTACH=1");
+        return;
+    }
+
+    const auto run = RunLifecycle("/tmp/uniransim-uu-idle-wrong-page", "paging-wrong-identity", "paging", false,
+                                  1500, 1200);
+
+    CHECK(Contains(run.peerResult, "paging_wrong_identity=1"));
+    CHECK(Contains(run.peerResult, "paging_sent=1"));
+    CHECK(Contains(run.peerResult, "service_request_verified=0"));
+    CHECK(run.ueExit == 1);
+    CHECK(Contains(run.ueLog, "Timed out waiting for a network Paging indication; no Service Request was sent"));
+    CHECK_FALSE(Contains(run.ueLog, "EPS Service Request sent"));
+    CHECK_FALSE(Contains(run.ueLog, "ECM-CONNECTED"));
+}
+
+TEST_CASE("lte/uu/idle: no page leaves the ue waiting until its bounded deadline")
+{
+    if (std::getenv("UNIRANSIM_RUN_TWO_PROCESS_ATTACH") == nullptr)
+    {
+        MESSAGE("the two-process lifecycle is opt-in; set UNIRANSIM_RUN_TWO_PROCESS_ATTACH=1");
+        return;
+    }
+
+    const auto run = RunLifecycle("/tmp/uniransim-uu-idle-no-page", "paging-timeout", "paging", false, 1500, 1200);
+
+    CHECK(Contains(run.peerResult, "paging_sent=0"));
+    CHECK(Contains(run.peerResult, "service_request_verified=0"));
+    CHECK(run.ueExit == 1);
+    CHECK(Contains(run.ueLog, "Timed out waiting for a network Paging indication"));
+    CHECK_FALSE(Contains(run.ueLog, "ECM-CONNECTED"));
+}
+
+TEST_CASE("lte/uu/idle: a corrupted service request short mac is refused by the mme")
+{
+    if (std::getenv("UNIRANSIM_RUN_TWO_PROCESS_ATTACH") == nullptr)
+    {
+        MESSAGE("the two-process lifecycle is opt-in; set UNIRANSIM_RUN_TWO_PROCESS_ATTACH=1");
+        return;
+    }
+
+    const auto run = RunLifecycle("/tmp/uniransim-uu-idle-bad-mac", "bad-service-mac",
+                                  "attach-idle-service-request", false, 1500);
+
+    CHECK(Contains(run.peerResult, "injected_bad_service_mac=1"));
+    CHECK(Contains(run.peerResult, "service_request_verified=0"));
+    CHECK(Contains(run.peerResult, "context_restored=0"));
+    CHECK(run.ueExit == 1);
+    CHECK(Contains(run.ueLog, "Timed out waiting for the network to restore the AS security context"));
+    CHECK_FALSE(Contains(run.ueLog, "ECM-CONNECTED"));
+}
+
+TEST_CASE("lte/uu/idle: a peer that exits after paging leaves the ue unconnected")
+{
+    if (std::getenv("UNIRANSIM_RUN_TWO_PROCESS_ATTACH") == nullptr)
+    {
+        MESSAGE("the two-process lifecycle is opt-in; set UNIRANSIM_RUN_TWO_PROCESS_ATTACH=1");
+        return;
+    }
+
+    const auto run = RunLifecycle("/tmp/uniransim-uu-idle-peer-exit", "paging-peer-exit", "paging", false, 1500,
+                                  1500);
+
+    CHECK(Contains(run.peerResult, "paging_sent=1"));
+    CHECK(Contains(run.peerResult, "context_restored=0"));
+    CHECK(run.ueExit == 1);
+    CHECK_FALSE(Contains(run.ueLog, "ECM-CONNECTED"));
+}
+
+TEST_CASE("lte/uu/lifecycle: a duplicate detach accept does not repeat the release")
+{
+    if (std::getenv("UNIRANSIM_RUN_TWO_PROCESS_ATTACH") == nullptr)
+    {
+        MESSAGE("the two-process lifecycle is opt-in; set UNIRANSIM_RUN_TWO_PROCESS_ATTACH=1");
+        return;
+    }
+
+    const auto run = RunLifecycle("/tmp/uniransim-uu-dup-detach", "duplicate-detach-accept", "attach-detach");
+
+    CHECK(Contains(run.peerResult, "result=COMPLETE"));
+    CHECK(Contains(run.peerResult, "detach_request_verified=1"));
+    CHECK(Contains(run.peerResult, "detach_accept_sent=1"));
+    CHECK(run.ueExit == 0);
+    // The Detach completed exactly once: one completion line and one exit.
+    const std::string marker = "EPS Detach accepted; State=EMM_DEREGISTERED";
+    const size_t first = run.ueLog.find(marker);
+    REQUIRE(first != std::string::npos);
+    CHECK(run.ueLog.find(marker, first + marker.size()) == std::string::npos);
+}

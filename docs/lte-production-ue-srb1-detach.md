@@ -117,7 +117,8 @@ exercised; no user plane crossed SRB1. `LTE_DEFAULT_BEARER_OVER_SRB1_READY` and
 
 ## Scope
 
-Still on the legacy link and out of this phase: Service Request, Paging, TAU,
-Recovery, network-initiated Detach, the default bearer user plane, GTP-U,
-multi-UE scale and throughput. They remain the direction of the project, not
-abandoned capabilities.
+Still on the legacy link and out of this phase: TAU, Recovery,
+network-initiated Detach, the default bearer user plane, GTP-U, multi-UE scale
+and throughput. Service Request and Paging moved to the Uu path in B6-D5; see
+`docs/lte-production-ue-ecm-idle.md`. They remain the direction of the project,
+not abandoned capabilities.

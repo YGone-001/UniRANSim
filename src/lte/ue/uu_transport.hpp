@@ -38,6 +38,10 @@ class UuNasTransport
 {
   public:
     using NasHandler = std::function<void(const std::vector<uint8_t> &)>;
+    // The network released the RRC connection; the application keeps EMM and
+    // the NAS security context and decides when to request access again.
+    using ReleaseHandler = std::function<void()>;
+    using PagingHandler = std::function<void(uint8_t mmec, uint32_t mTmsi)>;
 
     UuNasTransport(UuEndpoint endpoint, rrc::UeSrb1Runtime::Config config);
     ~UuNasTransport();
@@ -50,6 +54,17 @@ class UuNasTransport
     // address or to the legacy link.
     void Start();
     void SetNasHandler(NasHandler handler);
+    void SetReleaseHandler(ReleaseHandler handler);
+    void SetPagingHandler(PagingHandler handler);
+
+    // Starts a new RRC connection after a network release. The transport keeps
+    // its socket, its NAS handler and the UE identity; only the radio state is
+    // rebuilt, so the next SendNas travels in RRCConnectionSetupComplete.
+    void ResumeAccess();
+
+    // The S-TMSI assigned by the network. It is used by the next RRC access and
+    // by paging identity matching while the UE is idle.
+    void SetIdentity(uint8_t mmec, uint32_t mTmsi);
 
     // The initial NAS message travels in SetupComplete; every later one in
     // ULInformationTransfer. Returns false when the RRC connection is not yet
@@ -82,6 +97,8 @@ class UuNasTransport
     std::unique_ptr<uu::Socket> socket_{};
     std::unique_ptr<rrc::UeSrb1Runtime> runtime_{};
     NasHandler handler_{};
+    ReleaseHandler releaseHandler_{};
+    PagingHandler pagingHandler_{};
     bool setupCompleteSent_{false};
     bool released_{false};
 };

@@ -1070,6 +1070,19 @@ UplinkNas DecodeUplinkNas(const uint8_t *data, size_t length)
         {
             if (!initial) throw CodecError("an Uplink NAS Transport carries no S-TMSI");
             if (ie.criticality != Criticality::REJECT) throw CodecError("S-TMSI has invalid criticality");
+            // The IE value is the S-TMSI SEQUENCE: a two-bit preamble, the one
+            // octet MMEC, then the four octet M-TMSI on the next boundary.
+            if (ie.value.size() != 6 || (ie.value[0] & 0xC0U) != 0)
+                throw CodecError("S-TMSI has a malformed value");
+            STmsi onWire{};
+            // The MMEC is bit-packed: six bits in the first value octet after
+            // the two SEQUENCE preamble bits, the remaining two in the top bits
+            // of the second octet.
+            onWire.mmeCode = static_cast<uint8_t>(((ie.value[0] & 0x3FU) << 2U) | ((ie.value[1] >> 6U) & 0x03U));
+            onWire.mTmsi = (static_cast<uint32_t>(ie.value[2]) << 24U) |
+                           (static_cast<uint32_t>(ie.value[3]) << 16U) |
+                           (static_cast<uint32_t>(ie.value[4]) << 8U) | static_cast<uint32_t>(ie.value[5]);
+            result.sTmsi = onWire;
         }
         else if (ie.criticality == Criticality::REJECT)
             throw CodecError("Unknown reject-criticality IE in an uplink NAS message");

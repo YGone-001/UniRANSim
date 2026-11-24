@@ -342,3 +342,36 @@ TEST_CASE("lte/ue/security: an active context can send an integrity-only NAS mes
     CHECK(parsed.headerType == SecurityHeaderType::INTEGRITY_PROTECTED);
     CHECK(UnprotectBody(context, false, parsed.headerType, parsed.sequenceNumber, parsed.mac, parsed.plain) == plain);
 }
+
+TEST_CASE("lte/ue/security: the compact service request carries KSI, short sequence and a two-octet MAC")
+{
+    using namespace lte::ue::nas;
+    auto context = MakeContext(lte::ue::IntegrityAlgorithm::EIA2, lte::ue::CipheringAlgorithm::EEA0);
+    context.ksi = 0;
+    context.ulNasCount = 2;
+
+    const auto request = EncodeServiceRequest(context);
+    REQUIRE(request.size() == 4);
+    CHECK(request[0] == 0xC7);
+    CHECK((request[1] >> 5U) == context.ksi);
+    CHECK((request[1] & 0x1FU) == 2U);
+    // The MME accepts it against the previous count and recovers the same COUNT.
+    CHECK_NOTHROW(VerifyServiceRequest(context, request.data(), request.size(), 1));
+    CHECK(EstimateServiceRequestCount(1, 2) == 2U);
+    // The same COUNT is a replay, not a new request.
+    CHECK(EstimateServiceRequestCount(2, 2) == 2U);
+    CHECK(EstimateServiceRequestCount(0x1F, 0) == 0x20U);
+
+    // A corrupted short MAC is refused, and so is a different KSI.
+    auto tampered = request;
+    tampered[3] ^= 0x01U;
+    CHECK_THROWS_AS(VerifyServiceRequest(context, tampered.data(), tampered.size(), 1), SecurityError);
+    auto wrongKsi = context;
+    wrongKsi.ksi = static_cast<uint8_t>((context.ksi + 1U) & 0x07U);
+    CHECK_THROWS_AS(VerifyServiceRequest(wrongKsi, request.data(), request.size(), 1), SecurityError);
+
+    // The encoder refuses a context that was never activated.
+    auto inactive = context;
+    inactive.securityActive = false;
+    CHECK_THROWS_AS(EncodeServiceRequest(inactive), SecurityError);
+}

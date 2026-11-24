@@ -71,6 +71,10 @@ class EnbRrcBridge
     // S1AP messages that carry NAS towards the UE, or start AS security.
     void OnDownlinkNasTransport(const std::vector<uint8_t> &pdu);
     void OnInitialContextSetupRequest(const std::vector<uint8_t> &pdu);
+    // The MME releases the UE's S1 context (for example to put it in ECM-IDLE):
+    // the bridge sends the RRC connection release, answers with the Release
+    // Complete and retains the S-TMSI and radio endpoint for paging.
+    void OnUeContextReleaseCommand(const std::vector<uint8_t> &pdu);
 
     // Starts the radio AS security procedure from an Initial Context Setup
     // Request the owner already decoded and validated. The command is emitted on
@@ -88,6 +92,22 @@ class EnbRrcBridge
     // The S1 association is gone: access-bound state is invalidated and no
     // pending transaction may be answered afterwards.
     void OnS1AssociationLost();
+
+    // One real PCCH Paging message for the retained idle UE with this S-TMSI.
+    // Returns false when no such UE is retained; nothing is broadcast.
+    bool PageUe(const STmsi &sTmsi);
+    [[nodiscard]] size_t IdleUes() const
+    {
+        return idleEndpoints_.size();
+    }
+    [[nodiscard]] size_t ReleaseCompletes() const
+    {
+        return releaseCompletes_;
+    }
+    [[nodiscard]] size_t PagesSent() const
+    {
+        return pagesSent_;
+    }
 
     [[nodiscard]] bool HasContext(uint32_t association) const;
     [[nodiscard]] RrcState StateOf(uint32_t association) const;
@@ -153,6 +173,18 @@ class EnbRrcBridge
     size_t downlinkNasTransports_{0};
     size_t setupResponses_{0};
     size_t refused_{0};
+    size_t releaseCompletes_{0};
+    size_t pagesSent_{0};
+    // Radio endpoints of UEs the network released but the MME still knows.
+    // A real eNB broadcasts a page to its whole cell and each UE matches its
+    // own S-TMSI; this software link has no broadcast medium, so the bounded
+    // set of retained idle endpoints is the cell. The UE does the matching.
+    struct IdleEndpoint
+    {
+        uint32_t association{0};
+        uint16_t port{0};
+    };
+    std::vector<IdleEndpoint> idleEndpoints_{};
 };
 
 } // namespace lte::enb::s1ap

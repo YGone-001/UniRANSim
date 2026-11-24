@@ -19,8 +19,10 @@
 
 #include "lte_am_bearer.hpp"
 #include "rlc_tm.hpp"
+#include "rrc_connection_release.hpp"
 #include "rrc_connection_setup_complete.hpp"
 #include "rrc_information_transfer.hpp"
+#include "rrc_paging.hpp"
 #include "rrc_initial_access.hpp"
 #include "srb1_pdcp.hpp"
 #include "srb1_rlc_config.hpp"
@@ -82,6 +84,9 @@ struct Srb1Evidence
     size_t rrcMessages{0};
     size_t uplinkNas{0};
     size_t downlinkNas{0};
+    size_t releases{0};
+    size_t pagingsReceived{0};
+    size_t pagingsMatched{0};
 };
 
 class UeSrb1Runtime
@@ -96,6 +101,11 @@ class UeSrb1Runtime
     };
 
     using NasCallback = std::function<void(const std::vector<uint8_t> &)>;
+    // The network released the RRC connection. The NAS callback and the
+    // configured identity survive; the SRB1, PDCP and AS security state do not.
+    using ReleaseCallback = std::function<void()>;
+    // A PCCH page whose S-TMSI names this UE.
+    using PagingCallback = std::function<void(uint8_t mmec, uint32_t mTmsi)>;
 
     UeSrb1Runtime(uu::Socket &socket, uint16_t enbPort, Config config);
 
@@ -148,6 +158,16 @@ class UeSrb1Runtime
     {
         return refused_;
     }
+    // Leaves the RRC connection on the network's request. Everything above RRC
+    // - the EPS registration and the NAS security context - belongs to the
+    // application and is untouched here.
+    void EnterIdle();
+    void SetReleaseCallback(ReleaseCallback callback);
+    void SetPagingCallback(PagingCallback callback);
+    // The S-TMSI the network assigned in the Attach Accept becomes the identity
+    // this UE uses in RRC and matches a page against. It applies to the next
+    // access and to every page received while idle.
+    void SetIdentity(uint8_t mmec, uint32_t mTmsi);
     [[nodiscard]] const security::UeAsSecurityProcedure *SecurityProcedure() const
     {
         return procedure_.has_value() ? &*procedure_ : nullptr;
@@ -187,7 +207,14 @@ class UeSrb1Runtime
     std::optional<security::PdcpSecurityEntity> secureRx_{};
     bool secured_{false};
     bool expectingCommand_{false};
+    // Set when the bearer delivered an RRCConnectionRelease. The teardown runs
+    // from Tick, after the bearer's own receive call has returned: releasing
+    // the bearer from inside its callback would destroy the object whose
+    // method is still on the stack.
+    bool releasePending_{false};
     NasCallback onNas_{};
+    ReleaseCallback onRelease_{};
+    PagingCallback onPaging_{};
 };
 
 // The eNB side keeps one pending context per association and refuses anything
@@ -215,6 +242,19 @@ class EnbSrb1Runtime
     // profile the context is using.
     void SendDownlinkNas(uint32_t association, const std::vector<uint8_t> &nas);
 
+    // RRCConnectionRelease on SRB1, protected with the profile the context is
+    // using. The context stays until the owner releases it, so the S1AP release
+    // complete can still be produced.
+    void SendRrcRelease(uint32_t association);
+    // Drops the radio context after the network released it. The caller keeps
+    // whatever it needs for paging.
+    void ReleaseContext(uint32_t association);
+
+    // Sends one real PCCH Paging frame carrying this S-TMSI to the endpoint of
+    // the given association. The association is routing metadata of this
+    // simulated link, not an LTE field.
+    void SendPaging(uint16_t peerPort, uint32_t association, uint8_t mmec, uint32_t mTmsi);
+
     // Starts the RRC AS security procedure from the KeNB the MME sent. The
     // command is emitted on SRB1 and the context waits for the completion.
     void StartAsSecurity(uint32_t association, const security::Key256 &kenb,
@@ -232,6 +272,7 @@ class EnbSrb1Runtime
     // association has no context. The eNB owner uses it to bind its registry
     // slot to the same endpoint the SRB1 bearer answers on.
     [[nodiscard]] uint16_t PeerPortOf(uint32_t association) const;
+    [[nodiscard]] const std::optional<RrcConnectionRequestMessage> &RequestOf(uint32_t association) const;
     [[nodiscard]] size_t Deliveries(uint32_t association) const;
     [[nodiscard]] const std::vector<uint8_t> &DeliveredNas(uint32_t association) const;
     [[nodiscard]] const std::optional<RrcConnectionSetupCompleteMessage> &ReceivedOf(uint32_t association) const;
@@ -271,6 +312,7 @@ class EnbSrb1Runtime
         std::unique_ptr<LteAmBearer> bearer{};
         std::vector<std::vector<uint8_t>> pdcpPdus{};
         std::optional<RrcConnectionSetupCompleteMessage> received{};
+        std::optional<RrcConnectionRequestMessage> request{};
         std::vector<uint8_t> deliveredNas{};
         std::vector<std::vector<uint8_t>> uplinkNas{};
         size_t deliveries{0};

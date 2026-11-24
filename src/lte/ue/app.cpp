@@ -213,17 +213,29 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
     // machine and the single downlink entry both transports deliver into.
     std::unique_ptr<UuNasTransport> uuTransport;
     std::deque<std::vector<uint8_t>> uuDownlink;
+    // Events the Uu runtime reports from inside Pump. They only set a flag; the
+    // loop above RRC decides what they mean, so no application state is mutated
+    // from inside the radio runtime.
+    struct UuEvents
+    {
+        bool released{false};
+        bool paging{false};
+        uint8_t pageMmec{0};
+        uint32_t pageMTmsi{0};
+    } uuEvents;
     rrc::RrcState lastUuState = rrc::RrcState::RRC_IDLE;
     if (config.uu.enabled)
     {
-        // The Attach exchange and the UE-initiated Detach that closes the same
-        // session travel on SRB1. Every other lifecycle procedure still uses the
-        // legacy link, so a configuration that names one is refused here rather
-        // than silently mixing the two transports.
-        if (config.lifecycle.scenario != LifecycleScenario::ATTACH_ONLY &&
-            config.lifecycle.scenario != LifecycleScenario::DETACH)
-            throw std::runtime_error("a Uu configuration supports the ATTACH_ONLY and ATTACH_DETACH lifecycle "
-                                     "scenarios only");
+        // The Attach exchange, the UE-initiated Detach and the ECM-IDLE access
+        // restoration (Service Request / Paging) travel on the Uu path. Every
+        // other lifecycle procedure still uses the legacy link, so a
+        // configuration that names one is refused here rather than silently
+        // mixing the two transports.
+        const auto uuScenario = config.lifecycle.scenario;
+        if (uuScenario != LifecycleScenario::ATTACH_ONLY && uuScenario != LifecycleScenario::DETACH &&
+            uuScenario != LifecycleScenario::SERVICE_REQUEST && uuScenario != LifecycleScenario::PAGING)
+            throw std::runtime_error("a Uu configuration supports the ATTACH_ONLY, ATTACH_DETACH, "
+                                     "SERVICE_REQUEST and PAGING lifecycle scenarios only");
         UuEndpoint endpoint{config.uu.localAddress, config.uu.localPort, config.uu.enbAddress,
                             config.uu.enbPort};
         rrc::UeSrb1Runtime::Config rrcConfig{};
@@ -238,6 +250,12 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
         uuTransport->SetNasHandler([&uuDownlink](const std::vector<uint8_t> &nas) { uuDownlink.push_back(nas); });
         // A bind failure throws here: there is no fallback to the legacy link
         // and no substitution of a different address.
+        uuTransport->SetReleaseHandler([&uuEvents]() { uuEvents.released = true; });
+        uuTransport->SetPagingHandler([&uuEvents](uint8_t mmec, uint32_t mTmsi) {
+            uuEvents.paging = true;
+            uuEvents.pageMmec = mmec;
+            uuEvents.pageMTmsi = mTmsi;
+        });
         uuTransport->Start();
         Log("INFO", "Uu SRB1 transport started on " + config.uu.localAddress + ":" +
                         std::to_string(uuTransport->LocalPort()) + " towards " + config.uu.enbAddress + ":" +
@@ -679,6 +697,22 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                     throw nas::DecodeError("Default bearer did not provide a supported non-zero IPv4 PDN address");
                 mobility.onAttachComplete(activeEbi, assignedIpv4, accept.guti, accept.taiList, accept.t3412);
                 mobility.securityContextValid = security.securityActive;
+                if (uuTransport && mobility.guti.has_value())
+                {
+                    // TS 36.331 5.3.3: after the Attach the UE uses the S-TMSI
+                    // the MME assigned. It is the identity a later page names.
+                    if (const auto assigned = STmsiFromGuti(*mobility.guti); assigned.has_value())
+                    {
+                        uuTransport->SetIdentity(assigned->mmeCode, assigned->mTmsi);
+                        Log("INFO", "Uu identity set to the assigned S-TMSI (MMEC=" +
+                                        std::to_string(assigned->mmeCode) + ", M-TMSI=0x" + [&] {
+                                            std::ostringstream value;
+                                            value << std::hex << std::uppercase << std::setw(8)
+                                                  << std::setfill('0') << assigned->mTmsi;
+                                            return value.str();
+                                        }() + ")");
+                    }
+                }
                 {
                     std::ostringstream taiText;
                     for (size_t i = 0; i < mobility.taiList.size(); ++i)
@@ -766,6 +800,16 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
             return 1;
         }
     };
+    // ECM-IDLE access restoration bookkeeping. Only the Uu scenarios use it;
+    // the legacy idle path keeps its own S1 release request.
+    bool uuIdle = false;
+    bool uuSrArmed = false;
+    bool uuSrSent = false;
+    bool uuRestored = false;
+    uint32_t uuServiceRequestCount = 0;
+    auto uuTriggerDeadline = std::chrono::steady_clock::time_point::max();
+    auto uuPagingDeadline = std::chrono::steady_clock::time_point::max();
+    auto uuDeadline = std::chrono::steady_clock::time_point::max();
     uint8_t buffer[link::MaxDataPduSize + link::HeaderSize];
     while (!shutdownRequested && (mobility.emm == EmmState::REGISTERED || std::chrono::steady_clock::now() < deadline))
     {
@@ -795,15 +839,124 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 if (auto outcome = deliverNas(nas))
                     return *outcome;
             }
+
+            if (uuEvents.released)
+            {
+                uuEvents.released = false;
+                if (mobility.emm == EmmState::REGISTERED)
+                {
+                    // TS 23.401 5.3.5: ECM-IDLE keeps the EPS registration and
+                    // the NAS security context. Only the access is gone.
+                    mobility.onS1ContextReleased();
+                    uuIdle = true;
+                    pendingWire.clear();
+                    state = State::EPS_REGISTERED;
+                    LogState(state);
+                    Log("INFO", "RRC connection released by the network; EMM-REGISTERED and the NAS security "
+                                    "context are preserved (ECM-IDLE)");
+                    if (config.lifecycle.scenario == LifecycleScenario::PAGING)
+                        uuPagingDeadline = now + std::chrono::milliseconds(config.lifecycle.pagingWaitMs);
+                }
+            }
+
+            if (uuEvents.paging)
+            {
+                const uint8_t mmec = uuEvents.pageMmec;
+                const uint32_t mTmsi = uuEvents.pageMTmsi;
+                uuEvents.paging = false;
+                if (uuIdle && config.lifecycle.scenario == LifecycleScenario::PAGING && !uuSrArmed)
+                {
+                    std::ostringstream page;
+                    page << "PCCH Paging matched the UE identity (MMEC=" << static_cast<int>(mmec)
+                         << " M-TMSI=0x" << std::hex << std::uppercase << std::setw(8) << std::setfill('0')
+                         << mTmsi << std::dec << ")";
+                    Log("INFO", page.str());
+                    uuTriggerDeadline = now;
+                }
+                else
+                    Log("WARN", "Ignoring a Paging indication that does not match an idle UE state");
+            }
+
+            if (uuIdle && !uuSrArmed &&
+                (config.lifecycle.scenario == LifecycleScenario::SERVICE_REQUEST ||
+                 config.lifecycle.scenario == LifecycleScenario::PAGING) &&
+                now >= uuTriggerDeadline)
+            {
+                mobility.startServiceRequest();
+                pendingWire = nas::EncodeServiceRequest(security);
+                uuServiceRequestCount = security.ulNasCount & 0xFFFFFFU;
+                // A new RRC connection is established; the Service Request is
+                // its first NAS message and travels in SetupComplete.
+                uuTransport->ResumeAccess();
+                uuSrArmed = true;
+                uuDeadline = now + std::chrono::milliseconds(config.lifecycle.procedureTimeoutMs);
+                Log("INFO", "ECM-IDLE access restoration: RRC connection establishment started for the Service "
+                                "Request");
+            }
+
+            if (uuSrArmed && !uuSrSent && uuTransport->State() == rrc::RrcState::RRC_SRB1_CONFIGURING)
+            {
+                // TS 33.401 7.2.1: the KeNB follows the uplink NAS COUNT the
+                // Service Request travels with.
+                uuTransport->PrepareAsSecurity(security.kasme, uuServiceRequestCount, nasSecurityGeneration);
+                if (!uuTransport->SendNas(pendingWire))
+                {
+                    state = State::PROCEDURE_FAILED;
+                    LogState(state);
+                    Log("ERROR", "The uplink NAS transport refused the EPS Service Request");
+                    return 1;
+                }
+                {
+                    std::ostringstream request;
+                    request << "EPS Service Request sent in RRCConnectionSetupComplete: KSI="
+                            << static_cast<int>(security.ksi) << " COUNT=" << uuServiceRequestCount
+                            << " short-MAC=0x" << std::hex << std::uppercase << std::setw(2)
+                            << std::setfill('0') << static_cast<int>(pendingWire[2]) << std::setw(2)
+                            << static_cast<int>(pendingWire[3]) << std::dec;
+                    Log("INFO", request.str());
+                }
+                security.ulNasCount = (security.ulNasCount + 1U) & 0xFFFFFFU;
+                uuSrSent = true;
+                uuDeadline = now + std::chrono::milliseconds(config.lifecycle.procedureTimeoutMs);
+            }
+
+            if (uuSrSent && !uuRestored && uuTransport->AsSecurityActive())
+            {
+                // The network accepted the Service Request: it sent the Initial
+                // Context Setup with a new KeNB and the AS security procedure
+                // completed over this connection.
+                mobility.onServiceRequestAccepted();
+                uuRestored = true;
+                uuIdle = false;
+                uuSrArmed = false;
+                state = State::EPS_REGISTERED;
+                LogState(state);
+                Log("INFO", "EPS Service Request accepted; AS security restored; ECM-CONNECTED");
+                return 0;
+            }
         }
 
         if (mobility.emm == EmmState::REGISTERED && !scenarioTriggered &&
             scenarioRoundsDone < config.lifecycle.idleRounds && now >= scenarioDeadline)
         {
             scenarioTriggered = true;
-            if (config.lifecycle.scenario == LifecycleScenario::SERVICE_REQUEST ||
-                config.lifecycle.scenario == LifecycleScenario::PAGING ||
-                config.lifecycle.scenario == LifecycleScenario::IDLE_RESELECTION)
+            if (uuTransport && (config.lifecycle.scenario == LifecycleScenario::SERVICE_REQUEST ||
+                                config.lifecycle.scenario == LifecycleScenario::PAGING))
+            {
+                // The network, not the UE, releases the access. The peer sends
+                // the S1 UE Context Release Command and the eNB releases RRC.
+                uuDeadline = now + std::chrono::milliseconds(config.lifecycle.procedureTimeoutMs);
+                if (config.lifecycle.scenario == LifecycleScenario::SERVICE_REQUEST)
+                    uuTriggerDeadline = now;
+                Log("INFO", config.lifecycle.scenario == LifecycleScenario::PAGING
+                                ? "Waiting for the network to release the RRC connection; a Paging indication "
+                                  "will start the restoration"
+                                : "Waiting for the network to release the RRC connection; the UE will send a "
+                                  "Service Request from ECM-IDLE");
+            }
+            else if (config.lifecycle.scenario == LifecycleScenario::SERVICE_REQUEST ||
+                     config.lifecycle.scenario == LifecycleScenario::PAGING ||
+                     config.lifecycle.scenario == LifecycleScenario::IDLE_RESELECTION)
             {
                 auto request = link::Encode({link::MessageType::S1_CONTEXT_RELEASE_REQUEST, ueId,
                                              {mobility.defaultEbi}});
@@ -895,6 +1048,33 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
             // its expiry is an unresolved test condition, never paging success.
             Log("ERROR", "Timed out waiting for a network paging indication; no Service Request was sent");
             return 1;
+        }
+
+        if (!shutdownRequested && uuTransport)
+        {
+            const bool idleScenario = config.lifecycle.scenario == LifecycleScenario::SERVICE_REQUEST ||
+                                      config.lifecycle.scenario == LifecycleScenario::PAGING;
+            if (!uuIdle && scenarioTriggered && idleScenario && !uuSrArmed && now >= uuDeadline)
+            {
+                Log("ERROR", "Timed out waiting for the network to release the RRC connection");
+                return 1;
+            }
+            if (uuIdle && config.lifecycle.scenario == LifecycleScenario::PAGING && !uuSrArmed &&
+                now >= uuPagingDeadline)
+            {
+                Log("ERROR", "Timed out waiting for a network Paging indication; no Service Request was sent");
+                return 1;
+            }
+            if (uuSrArmed && !uuSrSent && now >= uuDeadline)
+            {
+                Log("ERROR", "Timed out waiting for the RRC connection during Service Request restoration");
+                return 1;
+            }
+            if (uuSrSent && !uuRestored && now >= uuDeadline)
+            {
+                Log("ERROR", "Timed out waiting for the network to restore the AS security context");
+                return 1;
+            }
         }
 
         // Access restoration after an unexpected S1-MME association loss. The

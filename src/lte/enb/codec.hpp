@@ -88,6 +88,9 @@ struct UplinkNas
     // Absent on an Initial UE Message, which is what starts the association
     // and is sent before the MME has named the UE.
     std::optional<uint32_t> mmeUeS1apId;
+    // Present on an Initial UE Message when the RRC request named the UE by
+    // S-TMSI. This is how a reconnecting UE is matched to its retained context.
+    std::optional<STmsi> sTmsi;
     std::vector<uint8_t> nasPdu;
 };
 

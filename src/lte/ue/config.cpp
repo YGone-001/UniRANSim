@@ -140,7 +140,11 @@ Config ParseNode(const YAML::Node &root)
             // than duplicated as a second mode with identical behaviour.
             else if (scenario == "detach" || scenario == "attach-detach")
                 config.lifecycle.scenario = LifecycleScenario::DETACH;
-            else if (scenario == "service-request") config.lifecycle.scenario = LifecycleScenario::SERVICE_REQUEST;
+            // The Uu lifecycle name for a UE-initiated restoration is explicit
+            // about what the scenario does; it is the same state machine as the
+            // legacy service-request scenario.
+            else if (scenario == "service-request" || scenario == "attach-idle-service-request")
+                config.lifecycle.scenario = LifecycleScenario::SERVICE_REQUEST;
             else if (scenario == "tau-normal") config.lifecycle.scenario = LifecycleScenario::TAU_NORMAL;
             else if (scenario == "tau-periodic") config.lifecycle.scenario = LifecycleScenario::TAU_PERIODIC;
             else if (scenario == "paging") config.lifecycle.scenario = LifecycleScenario::PAGING;

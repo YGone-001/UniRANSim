@@ -96,6 +96,18 @@ void MobilityContext::onS1ContextEstablished(uint32_t enbId, uint32_t mmeId)
     mmeUeS1apId = mmeId;
 }
 
+void MobilityContext::onServiceRequestAccepted()
+{
+    if (pending != PendingProcedure::SERVICE_REQUEST)
+        throw LifecycleError("Unexpected Service Request acceptance");
+    if (emm != EmmState::REGISTERED)
+        throw LifecycleError("Service Request acceptance requires an EPS registration");
+    if (!securityContextValid)
+        throw LifecycleError("Service Request acceptance requires the retained NAS security context");
+    ecm = EcmState::CONNECTED;
+    pending = PendingProcedure::NONE;
+}
+
 void MobilityContext::onBearerTransportEstablished(uint32_t localTeid, uint32_t remoteTeid)
 {
     if (emm != EmmState::REGISTERED || ecm != EcmState::CONNECTED || defaultEbi == 0 ||

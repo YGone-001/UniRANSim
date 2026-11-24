@@ -91,7 +91,7 @@ jobs:
   # and the job asserts the peer result files, so a skipped or crashed run cannot
   # be mistaken for a pass.
   production-ue-lifecycle:
-    name: Production UE Attach-Detach (two processes)
+    name: Production UE EPS lifecycle (two processes)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
@@ -114,6 +114,13 @@ jobs:
             "lte/uu/lifecycle: a peer that exits during detach leaves the ue without a deregistration"
             "lte/uu/lifecycle: a corrupted detach accept fails nas integrity and is not acted on"
             "lte/uu/lifecycle: attach-only keeps the d3 behaviour under the detach-capable peer"
+            "lte/uu/lifecycle: a duplicate detach accept does not repeat the release"
+            "lte/uu/idle: the production ue restores access with a service request from ecm-idle"
+            "lte/uu/idle: a network page wakes the production ue into a service request"
+            "lte/uu/idle: a page for another s-tmsi does not wake the production ue"
+            "lte/uu/idle: no page leaves the ue waiting until its bounded deadline"
+            "lte/uu/idle: a corrupted service request short mac is refused by the mme"
+            "lte/uu/idle: a peer that exits after paging leaves the ue unconnected"
             "lte/uu/acceptance: a separate production ue process attaches through srb1"
             "lte/uu/acceptance: an unreachable uu peer fails without using the legacy link"
           )
@@ -134,6 +141,35 @@ jobs:
           grep -q "detach_dl_count=2" /tmp/uniransim-uu-lifecycle/peer.result
           grep -q "enb_context_released=1" /tmp/uniransim-uu-lifecycle/peer.result
           grep -q "EPS Detach accepted; State=EMM_DEREGISTERED" /tmp/uniransim-uu-lifecycle/ue.log
+
+          # ECM-IDLE access restoration: one Attach, one release, one Service
+          # Request, and a second Initial Context Setup.
+          grep -q "result=COMPLETE" /tmp/uniransim-uu-idle-sr/peer.result
+          grep -q "initial_ue_messages=2" /tmp/uniransim-uu-idle-sr/peer.result
+          grep -q "release_command_sent=1" /tmp/uniransim-uu-idle-sr/peer.result
+          grep -q "release_complete=1" /tmp/uniransim-uu-idle-sr/peer.result
+          grep -q "idle_retained=1" /tmp/uniransim-uu-idle-sr/peer.result
+          grep -q "service_request_verified=1" /tmp/uniransim-uu-idle-sr/peer.result
+          grep -q "sr_count=2" /tmp/uniransim-uu-idle-sr/peer.result
+          grep -q "context_restored=1" /tmp/uniransim-uu-idle-sr/peer.result
+          grep -q "ecm_connected=1" /tmp/uniransim-uu-idle-sr/peer.result
+          grep -q "EPS Service Request sent in RRCConnectionSetupComplete" /tmp/uniransim-uu-idle-sr/ue.log
+          grep -q "EPS Service Request accepted; AS security restored; ECM-CONNECTED" /tmp/uniransim-uu-idle-sr/ue.log
+
+          # Paging: a real PCCH page that the idle UE matches by S-TMSI.
+          grep -q "paging_sent=1" /tmp/uniransim-uu-idle-paging/peer.result
+          grep -q "service_request_verified=1" /tmp/uniransim-uu-idle-paging/peer.result
+          grep -q "context_restored=1" /tmp/uniransim-uu-idle-paging/peer.result
+          grep -q "PCCH Paging matched the UE identity (MMEC=1 M-TMSI=0x12345678)" /tmp/uniransim-uu-idle-paging/ue.log
+
+          # A page for another identity, an absent page, a corrupted short MAC
+          # and a peer that leaves must all fail the restoration.
+          grep -q "paging_wrong_identity=1" /tmp/uniransim-uu-idle-wrong-page/peer.result
+          grep -q "service_request_verified=0" /tmp/uniransim-uu-idle-wrong-page/peer.result
+          grep -q "paging_sent=0" /tmp/uniransim-uu-idle-no-page/peer.result
+          grep -q "injected_bad_service_mac=1" /tmp/uniransim-uu-idle-bad-mac/peer.result
+          grep -q "context_restored=0" /tmp/uniransim-uu-idle-peer-exit/peer.result
+          test "$(grep -c "EPS Detach accepted" /tmp/uniransim-uu-dup-detach/ue.log)" -eq 1
 
           # The injected failure really was injected and really was refused.
           grep -q "injected_corruption=1" /tmp/uniransim-uu-bad-mac/peer.result

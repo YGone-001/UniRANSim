@@ -146,6 +146,9 @@ const char *ToString(HandoverCapability capability)
     case HandoverCapability::ENB_KE_NB_SECURITY_CONTEXT_READY: return "ENB_KE_NB_SECURITY_CONTEXT_READY";
     case HandoverCapability::LTE_EPS_ATTACH_OVER_SRB1_READY: return "LTE_EPS_ATTACH_OVER_SRB1_READY";
     case HandoverCapability::LTE_EPS_DETACH_OVER_SRB1_READY: return "LTE_EPS_DETACH_OVER_SRB1_READY";
+    case HandoverCapability::LTE_EPS_SERVICE_REQUEST_OVER_SRB1_READY: return "LTE_EPS_SERVICE_REQUEST_OVER_SRB1_READY";
+    case HandoverCapability::LTE_PRODUCTION_UE_PAGING_PCCH_READY: return "LTE_PRODUCTION_UE_PAGING_PCCH_READY";
+    case HandoverCapability::LTE_ECM_IDLE_ACCESS_RESTORATION_READY: return "LTE_ECM_IDLE_ACCESS_RESTORATION_READY";
     case HandoverCapability::LTE_OPEN5GS_ATTACH_ACCEPTED: return "LTE_OPEN5GS_ATTACH_ACCEPTED";
     case HandoverCapability::LTE_PRODUCTION_ENB_SRB1_READY: return "LTE_PRODUCTION_ENB_SRB1_READY";
     case HandoverCapability::LTE_PRODUCTION_MULTIPLEXER_BRIDGE_READY: return "LTE_PRODUCTION_MULTIPLEXER_BRIDGE_READY";
@@ -376,6 +379,21 @@ LiveHandoverReadiness AssessLiveHandoverCapabilities()
                "enters EMM_DEREGISTERED only after the protected Detach Accept at DL COUNT 2 verifies; "
                "test/lte/production_uu_attach.cpp runs Attach and Detach in one session against a deterministic MME "
                "in a second process, and the same case injects a corrupted Detach Accept MAC to prove the check runs"),
+        Assess(HandoverCapability::LTE_EPS_SERVICE_REQUEST_OVER_SRB1_READY, true,
+               "the production lte-ue sends the compact EPS Service Request (KSI, five-bit sequence, two-octet short "
+               "MAC) in RRCConnectionSetupComplete after a network RRC release, and the deterministic MME verifies "
+               "the short MAC against the retained NAS context and restores the S1 context with a new KeNB derived "
+               "at that COUNT; test/lte/production_uu_attach.cpp injects a corrupted short MAC and observes the "
+               "refusal"),
+        Assess(HandoverCapability::LTE_PRODUCTION_UE_PAGING_PCCH_READY, true,
+               "the deterministic MME sends an S1AP Paging; the eNB encodes a real RRC Paging on PCCH and the idle "
+               "production UE decodes it and matches its own S-TMSI before starting RRC connection establishment; "
+               "the same test pages a different S-TMSI and the UE stays idle"),
+        Assess(HandoverCapability::LTE_ECM_IDLE_ACCESS_RESTORATION_READY, true,
+               "the network releases the RRC connection and the S1 context while the UE keeps EMM-REGISTERED and "
+               "the NAS security context; a UE-initiated or paging-triggered Service Request returns it to "
+               "ECM-CONNECTED over a second RRC connection and a second Initial Context Setup; this is deterministic "
+               "two-process evidence, not a live EPC run"),
         Assess(HandoverCapability::LTE_OPEN5GS_ATTACH_ACCEPTED, false,
                "REAL_OPEN5GS_ATTACH_ACCEPTANCE = NOT_EXECUTED: no authorized live Open5GS Attach was run in this phase"),
         Assess(HandoverCapability::AS_SMC_RUNTIME_READY, true,

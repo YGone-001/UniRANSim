@@ -30,6 +30,9 @@ enum class LogicalChannel : uint8_t
 {
     CCCH = 0,
     DCCH = 1,
+    // PCCH carries the RRC Paging message (TS 36.331 6.2.2). It is not SRB1:
+    // an idle UE receives it without any connection existing.
+    PCCH = 2,
 };
 
 struct Frame

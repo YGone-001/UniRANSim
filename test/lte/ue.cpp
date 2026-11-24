@@ -141,6 +141,12 @@ TEST_CASE("lte/ue/config: lifecycle scenarios and bounded procedure controls are
     std::string attachDetach = ConfigText;
     attachDetach += "\nlifecycle:\n  scenario: attach-detach\n";
     CHECK(lte::ue::ParseConfig(attachDetach).lifecycle.scenario == lte::ue::LifecycleScenario::DETACH);
+    // The Uu lifecycle name is explicit about the access restoration; it is the
+    // same state machine as the legacy service-request scenario.
+    std::string idleServiceRequest = ConfigText;
+    idleServiceRequest += "\nlifecycle:\n  scenario: attach-idle-service-request\n";
+    CHECK(lte::ue::ParseConfig(idleServiceRequest).lifecycle.scenario ==
+          lte::ue::LifecycleScenario::SERVICE_REQUEST);
 
     std::string invalid = ConfigText;
     invalid += "\nlifecycle:\n  scenario: arbitrary\n";
