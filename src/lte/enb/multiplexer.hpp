@@ -13,6 +13,8 @@
 #include "handover_live_ingress.hpp"
 #include "handover_preparation.hpp"
 #include "handover_source_release.hpp"
+
+#include <lte/rrc-runtime/drb_runtime.hpp>
 #include "s1u_endpoint.hpp"
 #include "types.hpp"
 #include "ue_registry.hpp"
@@ -355,6 +357,13 @@ class EnbMultiplexer
     {
         return m_pendingIcs.size();
     }
+    // Phase 18-F-B6-D6: the DRB user plane of one Uu UE.
+    [[nodiscard]] size_t uuDrbCount(uint32_t radioUeId) const;
+    [[nodiscard]] const lte::rrc::DrbRuntime *uuDrbs(uint32_t radioUeId) const;
+    [[nodiscard]] size_t uuDrbConfigurations() const
+    {
+        return m_uuDrbConfigurations;
+    }
 
   private:
     // B6-D1: the deferred Initial Context Setup transaction of one Uu UE. It
@@ -375,6 +384,13 @@ class EnbMultiplexer
     void pollUu();
     void commitPendingIcs();
     void cancelPendingIcs(uint32_t enbUeS1apId);
+    // Builds the DRBs of one Uu UE from its established E-RABs, keys them from
+    // the AS context of the current access, and sends the RRC configuration.
+    bool establishUuDrbs(EnbUeEntry &entry, const std::vector<uint8_t> &identities);
+    void releaseUuDrbs(uint32_t radioUeId);
+    void onUuUserPlane(uint32_t association, const uu::Frame &frame);
+    void onUuUplinkIp(uint32_t association, uint8_t ebi, const std::vector<uint8_t> &packet);
+    bool onUuDownlink(EnbUeEntry &entry, BearerContext &bearer, const uint8_t *packet, size_t size);
     void onInitialContextSetupRequest(const uint8_t *data, size_t size);
     void onDownlinkNasTransport(const uint8_t *data, size_t size);
     void onUeContextReleaseCommand(const uint8_t *data, size_t size);
@@ -447,6 +463,12 @@ class EnbMultiplexer
     std::unique_ptr<s1ap::EnbRrcBridge> m_bridge;
     uint64_t m_bridgeDroppedLegacyFrames{0};
     std::map<uint32_t, PendingIcs> m_pendingIcs;
+    // DRB user plane of Uu UEs, keyed by the radio identity that is also the
+    // bridge association. Declared after the bridge so it is destroyed first.
+    std::map<uint32_t, std::unique_ptr<lte::rrc::DrbRuntime>> m_drbs;
+    std::map<uint32_t, lte::rrc::DrbReconfiguration> m_drbConfigs;
+    uint8_t m_uuDrbTransaction{0};
+    size_t m_uuDrbConfigurations{0};
     RadioFrameObserver m_radioObserver;
     UeRegistry m_registry;
     S1uEndpoint m_s1u;

@@ -84,6 +84,17 @@ class EnbRrcBridge
     // DLInformationTransfer carrying opaque NAS on an established association.
     void SendDownlinkNas(uint32_t association, const std::vector<uint8_t> &nas);
 
+    // Phase 18-F-B6-D6: RRCConnectionReconfiguration carrying the DRB list, and
+    // the DTCH user-plane transport of the same association.
+    bool SendDrbConfiguration(uint32_t association, const lte::rrc::DrbReconfiguration &configuration);
+    bool SendUserPlane(uint32_t association, const std::vector<uint8_t> &payload);
+    [[nodiscard]] const lte::security::EnbAsSecurityContext *SecurityContextOf(uint32_t association) const;
+
+    using UserPlaneHandler = std::function<void(uint32_t association, const uu::Frame &frame)>;
+    using DrbCompleteHandler = std::function<void(uint32_t association, uint8_t transactionId)>;
+    void SetUserPlaneHandler(UserPlaneHandler handler);
+    void SetDrbCompleteHandler(DrbCompleteHandler handler);
+
     // Called by the owner once the E-RABs of a pending Initial Context Setup are
     // established. Nothing is reported before this, and nothing is reported at
     // all if AS security did not activate.
@@ -167,6 +178,8 @@ class EnbRrcBridge
     EnbSrb1Runtime runtime_;
     std::map<uint32_t, Association> associations_{};
     std::map<uint32_t, uint32_t> byEnbId_{};
+    UserPlaneHandler userPlaneHandler_{};
+    DrbCompleteHandler drbCompleteHandler_{};
     uint32_t nextEnbUeS1apId_{1};
     size_t initialUeMessages_{0};
     size_t uplinkNasTransports_{0};

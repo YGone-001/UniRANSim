@@ -316,11 +316,15 @@ std::vector<uint8_t> PdcpSecurityEntity::Protect(const std::vector<uint8_t> &pla
         pdu.push_back(static_cast<uint8_t>(mac & 0xFFU));
     }
 
-    if (cipheringActive_)
+    if (cipheringActive_ && cipheringAlgorithm_ != 0)
     {
         // TS 36.323 6.2.2: for SRB the MAC-I is ciphered with the data; the
         // header is never ciphered. TS 36.323 6.2.3: the DRB ciphers the data
         // field, and has no MAC-I to consider.
+        //
+        // EEA0 is a real selection that protects nothing: the header is emitted
+        // and the data field is left in the clear, and nothing here describes
+        // that as confidentiality.
         Cipher(count, pdu.data() + headerLength, pdu.size() - headerLength, true);
     }
 
@@ -361,7 +365,7 @@ std::vector<uint8_t> PdcpSecurityEntity::Unprotect(const std::vector<uint8_t> &p
     const uint32_t count = BuildCount(sn);
 
     std::vector<uint8_t> field(pdu.begin() + headerLength, pdu.end());
-    if (cipheringActive_)
+    if (cipheringActive_ && cipheringAlgorithm_ != 0)
         Cipher(count, field.data(), field.size(), false);
 
     const size_t dataLength = field.size() - trailer;

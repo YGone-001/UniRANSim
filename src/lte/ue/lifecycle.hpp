@@ -168,6 +168,13 @@ struct MobilityContext
     // must restart on both sides at the same point, otherwise a later
     // legitimate S1 release reaches this UE already out of step.
     void beginNewAttach();
+    // Phase 18-F-B6-D6: an RRC connection release over the Uu path carries no
+    // generation field (it is not the simulator's generation-bound release
+    // frame), so the UE advances its own access epoch when the released access
+    // ends. The eNB advances its epoch at the same transition when that access
+    // carried a confirmed bearer transport, which is exactly the case a DRB
+    // exists in. Zero is never a real epoch and is skipped.
+    void advanceAccessGeneration();
     // The UE has reselected a different cell while ECM-IDLE. The S1AP
     // identities, the access TEIDs and the access generation belong to the
     // cell being left and are retired here; the target cell allocates its own

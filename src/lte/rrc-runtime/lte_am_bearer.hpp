@@ -54,12 +54,20 @@ class LteAmBearer
 
     // The socket is moved in: the bearer owns this transport endpoint.
     LteAmBearer(std::unique_ptr<uu::Socket> socket, uint16_t peerPort, EndpointRole role, uint32_t association,
-                AmConfig config, LteAmEntity::Deliverer deliverer);
+                AmConfig config, LteAmEntity::Deliverer deliverer,
+                uu::LogicalChannel channel = uu::LogicalChannel::DCCH);
 
     // The socket is borrowed: one endpoint can carry several associations (an
     // eNB radio with several UE contexts) and still route by association.
     LteAmBearer(uu::Socket &transport, uint16_t peerPort, EndpointRole role, uint32_t association, AmConfig config,
-                LteAmEntity::Deliverer deliverer);
+                LteAmEntity::Deliverer deliverer, uu::LogicalChannel channel = uu::LogicalChannel::DCCH);
+
+    // Phase 18-F-B6-D6: a bearer with no socket of its own. The caller supplies
+    // the PDU sender (typically a DRB that adds its own DTCH routing header),
+    // and feeds received frames through OnFrame.
+    using PduSender = std::function<void(const std::vector<uint8_t> &pdu)>;
+    LteAmBearer(EndpointRole role, uint32_t association, AmConfig config, LteAmEntity::Deliverer deliverer,
+                uu::LogicalChannel channel, PduSender sender);
 
     LteAmBearer(const LteAmBearer &) = delete;
     LteAmBearer &operator=(const LteAmBearer &) = delete;
@@ -80,6 +88,10 @@ class LteAmBearer
     [[nodiscard]] EndpointRole Role() const
     {
         return role_;
+    }
+    [[nodiscard]] uu::LogicalChannel Channel() const
+    {
+        return channel_;
     }
     [[nodiscard]] uint32_t Association() const
     {
@@ -128,9 +140,11 @@ class LteAmBearer
 
     std::unique_ptr<uu::Socket> owned_{};
     uu::Socket *transport_{nullptr};
+    PduSender externalSender_{};
     uint16_t peerPort_{0};
     EndpointRole role_{EndpointRole::UE};
     uint32_t association_{0};
+    uu::LogicalChannel channel_{uu::LogicalChannel::DCCH};
     LteAmEntity entity_{};
     size_t sent_{0};
     size_t delivered_{0};

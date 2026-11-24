@@ -24,9 +24,10 @@ uu::Direction ReceiveDirection(EndpointRole role)
 }
 
 LteAmBearer::LteAmBearer(std::unique_ptr<uu::Socket> socket, uint16_t peerPort, EndpointRole role,
-                         uint32_t association, AmConfig config, LteAmEntity::Deliverer deliverer)
+                         uint32_t association, AmConfig config, LteAmEntity::Deliverer deliverer,
+                         uu::LogicalChannel channel)
     : owned_(std::move(socket)), transport_(owned_.get()), peerPort_(peerPort), role_(role),
-      association_(association)
+      association_(association), channel_(channel)
 {
     entity_ = LteAmEntity(
         config, [this](std::vector<uint8_t> pdu) { Send(pdu); },
@@ -38,8 +39,21 @@ LteAmBearer::LteAmBearer(std::unique_ptr<uu::Socket> socket, uint16_t peerPort, 
 }
 
 LteAmBearer::LteAmBearer(uu::Socket &transport, uint16_t peerPort, EndpointRole role, uint32_t association,
-                         AmConfig config, LteAmEntity::Deliverer deliverer)
-    : transport_(&transport), peerPort_(peerPort), role_(role), association_(association)
+                         AmConfig config, LteAmEntity::Deliverer deliverer, uu::LogicalChannel channel)
+    : transport_(&transport), peerPort_(peerPort), role_(role), association_(association), channel_(channel)
+{
+    entity_ = LteAmEntity(
+        config, [this](std::vector<uint8_t> pdu) { Send(pdu); },
+        [this, deliver = std::move(deliverer)](std::vector<uint8_t> sdu) {
+            delivered_++;
+            if (deliver)
+                deliver(std::move(sdu));
+        });
+}
+
+LteAmBearer::LteAmBearer(EndpointRole role, uint32_t association, AmConfig config,
+                         LteAmEntity::Deliverer deliverer, uu::LogicalChannel channel, PduSender sender)
+    : externalSender_(std::move(sender)), role_(role), association_(association), channel_(channel)
 {
     entity_ = LteAmEntity(
         config, [this](std::vector<uint8_t> pdu) { Send(pdu); },
@@ -52,12 +66,18 @@ LteAmBearer::LteAmBearer(uu::Socket &transport, uint16_t peerPort, EndpointRole 
 
 void LteAmBearer::Send(const std::vector<uint8_t> &pdu)
 {
+    if (externalSender_)
+    {
+        externalSender_(pdu);
+        sent_++;
+        return;
+    }
     if (transport_ == nullptr)
         return;
     uu::Frame frame;
     frame.association = association_;
     frame.direction = TransmitDirection(role_);
-    frame.channel = uu::LogicalChannel::DCCH;
+    frame.channel = channel_;
     frame.payload = pdu;
     if (transport_->Send(peerPort_, frame, nullptr))
         sent_++;
@@ -96,7 +116,7 @@ bool LteAmBearer::OnFrame(const uu::Frame &frame)
         refused_.wrongDirection++;
         return false;
     }
-    if (frame.channel != uu::LogicalChannel::DCCH)
+    if (frame.channel != channel_)
     {
         refused_.wrongChannel++;
         return false;

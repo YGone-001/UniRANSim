@@ -97,8 +97,9 @@ TEST_CASE("lte/uu: the PCCH logical channel carries a Paging frame byte for byte
     CHECK(decoded.association == 46001);
     CHECK(decoded.payload == paging);
 
-    // An unknown channel value is still refused.
+    // An unknown channel value is still refused. DTCH is the highest channel
+    // this build defines, so the next value has no meaning.
     auto corrupted = encoded;
-    corrupted[9] = 3;
+    corrupted[9] = static_cast<uint8_t>(lte::uu::LogicalChannel::DTCH) + 1;
     CHECK_FALSE(lte::uu::DecodeFrame(corrupted.data(), corrupted.size(), decoded, &why));
 }

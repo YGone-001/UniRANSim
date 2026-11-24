@@ -25,8 +25,51 @@ EnbRrcBridge::EnbRrcBridge(uu::Socket &socket, Config config, S1apSink sink)
     });
 }
 
+void EnbRrcBridge::SetUserPlaneHandler(UserPlaneHandler handler)
+{
+    userPlaneHandler_ = std::move(handler);
+    runtime_.SetUserPlaneCallback([this](uint32_t association, const uu::Frame &frame) {
+        if (userPlaneHandler_)
+            userPlaneHandler_(association, frame);
+    });
+}
+
+void EnbRrcBridge::SetDrbCompleteHandler(DrbCompleteHandler handler)
+{
+    drbCompleteHandler_ = std::move(handler);
+    runtime_.SetDrbCompleteCallback([this](uint32_t association, uint8_t transactionId) {
+        if (drbCompleteHandler_)
+            drbCompleteHandler_(association, transactionId);
+    });
+}
+
+bool EnbRrcBridge::SendDrbConfiguration(uint32_t association, const lte::rrc::DrbReconfiguration &configuration)
+{
+    return runtime_.SendDrbReconfiguration(association, configuration);
+}
+
+bool EnbRrcBridge::SendUserPlane(uint32_t association, const std::vector<uint8_t> &payload)
+{
+    if (payload.empty() || payload.size() > uu::MaxPayload)
+        return false;
+    const uint16_t peerPort = runtime_.PeerPortOf(association);
+    if (peerPort == 0 || runtime_.StateOf(association) != RrcState::RRC_CONNECTED)
+        return false;
+    uu::Frame frame;
+    frame.association = association;
+    frame.direction = uu::Direction::DOWNLINK;
+    frame.channel = uu::LogicalChannel::DTCH;
+    frame.payload = payload;
+    return socket_.Send(peerPort, frame, nullptr);
+}
+
+const lte::security::EnbAsSecurityContext *EnbRrcBridge::SecurityContextOf(uint32_t association) const
+{
+    return runtime_.SecurityContextOf(association);
+}
+
 EnbRrcBridge::EnbRrcBridge(uu::Socket &socket, Config config, IdentifiedSink sink, IdAllocator allocator,
-                         SetupHandler onSetup)
+                           SetupHandler onSetup)
     : socket_(socket), config_(std::move(config)), identifiedSink_(std::move(sink)), allocator_(std::move(allocator)),
       onSetup_(std::move(onSetup)),
       runtime_(socket, config_.srb1,

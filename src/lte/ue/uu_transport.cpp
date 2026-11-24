@@ -46,6 +46,14 @@ void UuNasTransport::Start()
         if (!released_ && pagingHandler_)
             pagingHandler_(mmec, mTmsi);
     });
+    runtime_->SetUserPlaneCallback([this](const uu::Frame &frame) {
+        if (!released_ && userPlaneHandler_)
+            userPlaneHandler_(frame);
+    });
+    runtime_->SetDrbReconfigurationCallback([this](const rrc::DrbReconfiguration &configuration) {
+        if (!released_ && drbReconfigurationHandler_)
+            drbReconfigurationHandler_(configuration);
+    });
     runtime_->StartAccess();
 }
 
@@ -62,6 +70,16 @@ void UuNasTransport::SetReleaseHandler(ReleaseHandler handler)
 void UuNasTransport::SetPagingHandler(PagingHandler handler)
 {
     pagingHandler_ = std::move(handler);
+}
+
+void UuNasTransport::SetUserPlaneHandler(UserPlaneHandler handler)
+{
+    userPlaneHandler_ = std::move(handler);
+}
+
+void UuNasTransport::SetDrbReconfigurationHandler(DrbReconfigurationHandler handler)
+{
+    drbReconfigurationHandler_ = std::move(handler);
 }
 
 void UuNasTransport::SetIdentity(uint8_t mmec, uint32_t mTmsi)
@@ -150,6 +168,32 @@ uint16_t UuNasTransport::LocalPort() const
     return socket_ == nullptr ? 0 : socket_->Port();
 }
 
+bool UuNasTransport::SendUserPlane(const std::vector<uint8_t> &payload)
+{
+    if (released_ || runtime_ == nullptr || socket_ == nullptr || payload.empty())
+        return false;
+    if (runtime_->State() != rrc::RrcState::RRC_CONNECTED || payload.size() > uu::MaxPayload)
+        return false;
+    uu::Frame frame;
+    frame.association = config_.association;
+    frame.direction = uu::Direction::UPLINK;
+    frame.channel = uu::LogicalChannel::DTCH;
+    frame.payload = payload;
+    return socket_->Send(endpoint_.enbPort, frame, nullptr);
+}
+
+void UuNasTransport::SubmitReconfigurationComplete(uint8_t transactionId)
+{
+    if (released_ || runtime_ == nullptr)
+        throw std::logic_error("the Uu transport is not started");
+    runtime_->SubmitReconfigurationComplete(transactionId);
+}
+
+const security::AsSecurityContext *UuNasTransport::SecurityContext() const
+{
+    return runtime_ == nullptr ? nullptr : runtime_->SecurityContext();
+}
+
 void UuNasTransport::Release()
 {
     if (released_)
@@ -158,6 +202,8 @@ void UuNasTransport::Release()
     handler_ = nullptr;
     releaseHandler_ = nullptr;
     pagingHandler_ = nullptr;
+    userPlaneHandler_ = nullptr;
+    drbReconfigurationHandler_ = nullptr;
     if (runtime_ != nullptr)
     {
         runtime_->Release();

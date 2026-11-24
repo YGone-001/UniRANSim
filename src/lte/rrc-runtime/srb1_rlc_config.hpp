@@ -81,4 +81,11 @@ struct Srb1ResolvedConfig
 [[nodiscard]] Srb1ResolvedConfig MapSrb1Configuration(const RrcConnectionSetupMessage &setup,
                                                       Srb1RuntimeTiming timing = {});
 
+// Phase 18-F-B6-D6: the AM parameters shared by every LTE AM bearer, resolved
+// from the TS 36.331 enumerators. A DRB carries the same fields on a different
+// logical channel, so the mapping is the same and is not duplicated.
+[[nodiscard]] rlc::am::AmConfig MapAmRlcConfiguration(uint8_t tPollRetransmit, uint8_t pollPdu, uint8_t pollByte,
+                                                      uint8_t maxRetxThreshold, uint8_t tReordering,
+                                                      uint8_t tStatusProhibit, Srb1RuntimeTiming timing = {});
+
 } // namespace lte::rrc

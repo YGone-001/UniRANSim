@@ -1519,3 +1519,52 @@ configured. `docs/lte-nas-s1ap-runtime.md` is the record.
 - **Two processes, opt-in.** The `lte/uu/idle` cases run under
   `UNIRANSIM_RUN_TWO_PROCESS_ATTACH=1`, and the GitHub Actions job
   `Production UE EPS lifecycle (two processes)` runs them as blocking tests.
+
+## LTE production UE DRB user plane (B6-D6)
+
+`docs/lte-production-ue-drb.md` is the record. `DrbRuntime`/`DrbBearer`
+(`src/lte/rrc-runtime/drb_runtime.{hpp,cpp}`) compose the accepted PDCP DRB12
+profile and the accepted LTE RLC AM entity on a DTCH logical channel; the RRC
+configuration is `src/lte/rrc-runtime/rrc_drb_config.{hpp,cpp}`.
+
+- **A DRB is not SRB1.** User-plane IP packets never travel on DCCH or in a NAS
+  message. They travel a DRB: PDCP -> RLC AM -> DTCH. `LTE_DEFAULT_BEARER_OVER_SRB1_READY`
+  is a historical, misnamed flag and stays false; the default bearer user plane
+  is a DRB capability.
+- **The RRC configuration is standard.** A DRB is added by an
+  `RRCConnectionReconfiguration` whose `radioResourceConfigDedicated.drb-ToAddModList`
+  carries `eps-BearerIdentity`, `drb-Identity`, PDCP, RLC AM and logical-channel
+  configuration, and is acknowledged by `RRCConnectionReconfigurationComplete`.
+  Never substitute a private simulator message for that configuration. A field
+  the decoder cannot represent is refused, not ignored.
+- **DRB identity is mapped, not guessed.** EPS bearer identity = E-RAB identity
+  = DRB identity in this implementation; do not infer roles from QCI or list
+  order, and configure the default DRB first.
+- **PDCP direction is the traffic direction.** A UE DRB transmits uplink and
+  receives downlink; an eNB DRB the reverse. COUNT, BEARER (identity minus one)
+  and DIRECTION must agree on both ends. EEA0 is null protection and must be
+  described as such; an ordinary UE DRB has no UP integrity and no MAC-I.
+- **Two DTCH payload kinds.** `kind=1` is an RLC PDU. `kind=2` is READY, an
+  internal simulator control that restates the generation and the NAS-assigned
+  PDN address. The eNB never decrypts NAS and never invents an address; it
+  refuses a restatement that contradicts what it holds.
+- **S1-U is reused, not duplicated.** The eNB DRB hands uplink IP packets to
+  `S1uEndpoint::forwardUplink` and receives downlink G-PDUs through its Uu
+  downlink handler. A Uu downlink that no DRB can carry is an inactive-bearer
+  drop; it never falls back to the legacy radio link.
+- **ECM-IDLE destroys the access, not the bearer.** The S1 release retires the
+  access TEID and destroys DRB/PDCP/RLC; the logical EPS bearer context and the
+  TUN address stay. Restoration uses a fresh local/SGW TEID pair and fresh keys,
+  carries traffic again on the same EBI, and the old TEID stays retired.
+- **No production-UE user-plane claim without its acceptance.**
+  `LTE_PRODUCTION_UE_DRB_READY` and
+  `LTE_PRODUCTION_UE_BIDIRECTIONAL_USER_PLANE_READY` stay false until a
+  multi-process case with a real TUN and a deterministic PGW endpoint runs. The
+  component-level flags are true only on the evidence in
+  `test/lte/drb_user_plane.cpp`.
+
+The deterministic cases live in `test/lte/drb_user_plane.cpp`:
+
+```bash
+./cmake-build-release/nr-tests --no-version --test-case="lte/drb/*"
+```

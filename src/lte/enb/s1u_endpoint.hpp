@@ -12,6 +12,7 @@
 #include "ue_registry.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -77,6 +78,14 @@ class S1uEndpoint
     // their own SGW TEID and independently validated readiness state.
     void forwardUplink(EnbUeEntry &entry, BearerContext &bearer, const uint8_t *packet, size_t size);
 
+    // Phase 18-F-B6-D6: the downlink delivery of a Uu/SRB1 UE. The handler
+    // protects the packet through the bearer's DRB and hands it to the radio
+    // transport. It is never a fallback for a legacy UE and never falls back to
+    // the legacy link itself: without a handler, a Uu downlink is dropped and
+    // counted rather than misdelivered.
+    using UuDownlinkHandler = std::function<bool(EnbUeEntry &, BearerContext &, const uint8_t *, size_t)>;
+    void SetUuDownlinkHandler(UuDownlinkHandler handler);
+
     [[nodiscard]] InetAddress localAddress() const;
     [[nodiscard]] const S1uEndpointCounters &counters() const;
 
@@ -96,6 +105,7 @@ class S1uEndpoint
     UeRegistry &m_registry;
     udp::UdpServer &m_ueLink;
     std::unique_ptr<udp::UdpServer> m_socket;
+    UuDownlinkHandler m_uuDownlink{};
     S1uEndpointCounters m_counters{};
     // Effective SO_RCVBUF reported by the kernel, or 0 when the configuration
     // stated no size. It is never the requested value: it is the observed one.

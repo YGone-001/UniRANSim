@@ -31,6 +31,7 @@
 
 #include <lte/enb/codec.hpp>
 #include <lte/ip_packet.hpp>
+#include <lte/rrc-runtime/drb_runtime.hpp>
 #include <lte/security/as_security.hpp>
 #include <lte/tft.hpp>
 
@@ -213,6 +214,18 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
     // machine and the single downlink entry both transports deliver into.
     std::unique_ptr<UuNasTransport> uuTransport;
     std::deque<std::vector<uint8_t>> uuDownlink;
+    // Phase 18-F-B6-D6: the DRB user plane of this UE. It exists only while a
+    // Uu access is up; the rrc-prefixed DRB runtime owns the PDCP/RLC entities
+    // and the DTCH routing. It is released on an RRC release and rebuilt from
+    // the next RRCConnectionReconfiguration, with the keys of that access.
+    std::unique_ptr<rrc::DrbRuntime> uuDrbs;
+    uint64_t uuUplinkPackets = 0;
+    uint64_t uuUplinkBytes = 0;
+    uint64_t uuDownlinkPackets = 0;
+    uint64_t uuDownlinkBytes = 0;
+    uint64_t uuDrbDrops = 0;
+    uint64_t uuDrbConfigurations = 0;
+    bool uuUserPlaneReady = false;
     // Events the Uu runtime reports from inside Pump. They only set a flag; the
     // loop above RRC decides what they mean, so no application state is mutated
     // from inside the radio runtime.
@@ -255,6 +268,114 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
             uuEvents.paging = true;
             uuEvents.pageMmec = mmec;
             uuEvents.pageMTmsi = mTmsi;
+        });
+        // Phase 18-F-B6-D6: the eNB configures the DRBs after the Initial
+        // Context Setup has completed and AS security is active. The UE answers
+        // with RRCConnectionReconfigurationComplete and then restates its PDN
+        // address on the new DRBs, exactly as the accepted legacy and handover
+        // confirmations do; the eNB never decrypts NAS to learn that address.
+        uuTransport->SetDrbReconfigurationHandler([&](const rrc::DrbReconfiguration &configuration) {
+            try
+            {
+                if (tun == nullptr)
+                    throw std::runtime_error("DRB configuration received with no TUN");
+                const auto *securityContext = uuTransport->SecurityContext();
+                if (securityContext == nullptr || !securityContext->IsActive())
+                    throw std::runtime_error("DRB configuration received before AS security is active");
+                const auto keys = securityContext->DeriveAccessKeys();
+                const auto algorithms = securityContext->Algorithms();
+                if (!uuDrbs)
+                    uuDrbs = std::make_unique<rrc::DrbRuntime>(
+                        rlc::am::EndpointRole::UE, uuTransport->Association(),
+                        [&](const std::vector<uint8_t> &payload) { return uuTransport->SendUserPlane(payload); },
+                        [&](uint8_t, const std::vector<uint8_t> &ip) {
+                            if (tun == nullptr)
+                            {
+                                ++uuDrbDrops;
+                                return;
+                            }
+                            try
+                            {
+                                const auto ipv4 = ip::Validate(ip.data(), ip.size(),
+                                                               static_cast<size_t>(config.tun.mtu));
+                                if (ipv4.destination != assignedIpv4)
+                                    throw ip::ValidationError(
+                                        "DRB downlink destination does not match the assigned UE address");
+                                if (tun->writePacket(ip.data(), ip.size()))
+                                {
+                                    ++tunDownlinkPackets;
+                                    tunDownlinkBytes += ip.size();
+                                    ++uuDownlinkPackets;
+                                    uuDownlinkBytes += ip.size();
+                                }
+                            }
+                            catch (const std::exception &e)
+                            {
+                                ++malformedDrops;
+                                Log("WARN", std::string("Dropped invalid DRB downlink packet: ") + e.what());
+                            }
+                        });
+                for (const auto &drb : configuration.drbs)
+                {
+                    if (uuDrbs->HasBearer(drb.ebi))
+                        continue;
+                    rrc::DrbBearerConfig bearer;
+                    bearer.ebi = drb.ebi;
+                    bearer.drbIdentity = drb.drbIdentity;
+                    bearer.am = drb.am;
+                    bearer.cipheringAlgorithm = algorithms.upCiphering;
+                    bearer.kUpEnc = keys.kUpEnc;
+                    if (!uuDrbs->AddBearer(bearer))
+                        throw std::runtime_error("the DRB bearer could not be established");
+                    if (drb.ebi != activeEbi)
+                    {
+                        const auto dedicated = std::find_if(dedicatedBearers.begin(), dedicatedBearers.end(),
+                                                            [&](const auto &candidate) {
+                                                                return candidate.ebi == drb.ebi;
+                                                            });
+                        if (dedicated != dedicatedBearers.end())
+                            dedicated->accessReady = true;
+                    }
+                }
+                uuTransport->SubmitReconfigurationComplete(configuration.transactionId);
+                ++uuDrbConfigurations;
+                for (const auto &drb : configuration.drbs)
+                {
+                    rrc::DrbReady ready;
+                    ready.ebi = drb.ebi;
+                    ready.generation = mobility.accessGeneration;
+                    ready.ipv4 = assignedIpv4;
+                    if (!uuDrbs->SendReady(ready))
+                        throw std::runtime_error("the DRB ready confirmation could not be sent");
+                }
+                state = State::USER_PLANE_ACTIVE;
+                LogState(state);
+                Log("INFO", "DRB user plane configured for EBI(s)=" + [&] {
+                    std::ostringstream list;
+                    for (size_t i = 0; i < configuration.drbs.size(); ++i)
+                    {
+                        if (i != 0)
+                            list << ',';
+                        list << static_cast<int>(configuration.drbs[i].ebi);
+                    }
+                    return list.str();
+                }() + " generation=" + std::to_string(mobility.accessGeneration) +
+                                " IPv4 " + Ipv4ToString(assignedIpv4));
+            }
+            catch (const std::exception &e)
+            {
+                ++uuDrbDrops;
+                Log("ERROR", std::string("DRB configuration failed: ") + e.what());
+            }
+        });
+        uuTransport->SetUserPlaneHandler([&](const uu::Frame &frame) {
+            if (uuDrbs == nullptr)
+            {
+                ++uuDrbDrops;
+                return;
+            }
+            if (!uuDrbs->OnFrame(frame))
+                ++uuDrbDrops;
         });
         uuTransport->Start();
         Log("INFO", "Uu SRB1 transport started on " + config.uu.localAddress + ":" +
@@ -751,14 +872,26 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                                     "/32 MTU=" + std::to_string(config.tun.mtu) +
                                     " explicit-routes=" + std::to_string(config.tun.routes.size()));
 
-                    std::vector<uint8_t> ready{activeEbi, assignedIpv4[0], assignedIpv4[1], assignedIpv4[2],
-                                               assignedIpv4[3]};
-                    auto readyFrame = link::Encode({link::MessageType::BEARER_READY, ueId, std::move(ready)});
-                    if (!socket.TrySend(enb, readyFrame.data(), readyFrame.size()))
-                        throw std::runtime_error("LTE bearer-ready frame could not be sent");
-                    state = State::USER_PLANE_ACTIVE;
-                    LogState(state);
-                    mobility.onUserPlaneReady();
+                    if (uuTransport)
+                    {
+                        // The user plane of a Uu UE is established by the DRB
+                        // configuration the eNB sends after the Initial Context
+                        // Setup. The legacy bearer-ready frame belongs to the
+                        // software-radio link and is never sent from here.
+                        Log("INFO", "Waiting for the RRC DRB configuration; the legacy bearer-ready frame is not "
+                                        "used on the Uu path");
+                    }
+                    else
+                    {
+                        std::vector<uint8_t> ready{activeEbi, assignedIpv4[0], assignedIpv4[1], assignedIpv4[2],
+                                                   assignedIpv4[3]};
+                        auto readyFrame = link::Encode({link::MessageType::BEARER_READY, ueId, std::move(ready)});
+                        if (!socket.TrySend(enb, readyFrame.data(), readyFrame.size()))
+                            throw std::runtime_error("LTE bearer-ready frame could not be sent");
+                        state = State::USER_PLANE_ACTIVE;
+                        LogState(state);
+                        mobility.onUserPlaneReady();
+                    }
                 }
                 scenarioDeadline = std::chrono::steady_clock::now() +
                                    std::chrono::milliseconds(config.lifecycle.triggerAfterMs);
@@ -846,8 +979,26 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 if (mobility.emm == EmmState::REGISTERED)
                 {
                     // TS 23.401 5.3.5: ECM-IDLE keeps the EPS registration and
-                    // the NAS security context. Only the access is gone.
+                    // the NAS security context. Only the access is gone, and
+                    // with it the DRB, PDCP and RLC entities that carried this
+                    // access. The EPS bearer context and the TUN address stay.
+                    if (uuDrbs != nullptr)
+                    {
+                        Log("INFO", "Releasing the DRB user plane of the released access after " +
+                                        std::to_string(uuUplinkPackets) + " UL / " +
+                                        std::to_string(uuDownlinkPackets) + " DL DRB packets");
+                        uuDrbs.reset();
+                    }
+                    uuUserPlaneReady = false;
+                    const bool wasConnected = mobility.ecm == EcmState::CONNECTED;
                     mobility.onS1ContextReleased();
+                    // The RRC release is not the simulator's generation-bound
+                    // release frame, so the UE advances its own access epoch in
+                    // step with the eNB, which advances when this access carried
+                    // a confirmed bearer transport. A duplicate release of an
+                    // access that already ended advances nothing.
+                    if (wasConnected)
+                        mobility.advanceAccessGeneration();
                     uuIdle = true;
                     pendingWire.clear();
                     state = State::EPS_REGISTERED;
@@ -929,10 +1080,26 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                 uuRestored = true;
                 uuIdle = false;
                 uuSrArmed = false;
+                uuSrSent = false;
                 state = State::EPS_REGISTERED;
                 LogState(state);
                 Log("INFO", "EPS Service Request accepted; AS security restored; ECM-CONNECTED");
                 return 0;
+            }
+
+            // The access is connected and the DRBs exist: the retained EPS
+            // bearer's user plane is ready on this access. This is the only
+            // place the UE-lifetime state is told so, and it is driven by the
+            // real DRB objects rather than by the request that opened them.
+            if (uuTransport && uuDrbs != nullptr && !uuUserPlaneReady && mobility.emm == EmmState::REGISTERED &&
+                mobility.ecm == EcmState::CONNECTED && mobility.bearer == EpsBearerState::SIGNALING_ESTABLISHED)
+            {
+                mobility.onUserPlaneReady();
+                uuUserPlaneReady = true;
+                state = State::USER_PLANE_ACTIVE;
+                LogState(state);
+                Log("INFO", "Existing EPS bearer user plane ready over SRB1/DRB; EBI=" +
+                                std::to_string(activeEbi));
             }
         }
 
@@ -1218,6 +1385,45 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                     // back to the default bearer.
                     const auto selection = SelectUplinkBearer(activeEbi, dedicatedBearers, packet.data(), packet.size());
                     const uint8_t selectedEbi = selection.ebi;
+
+                    if (uuTransport)
+                    {
+                        // Every uplink IP packet travels the DRB of its EPS
+                        // bearer: PDCP, then RLC AM, then the simulated Uu. The
+                        // legacy DATA_UPLINK frame is not used for a Uu UE.
+                        if (uuDrbs == nullptr)
+                        {
+                            ++accessUnavailableDrops;
+                            continue;
+                        }
+                        if (selectedEbi != activeEbi)
+                        {
+                            const auto dedicated = std::find_if(dedicatedBearers.begin(), dedicatedBearers.end(),
+                                                                [&](const auto &bearer) {
+                                                                    return bearer.ebi == selectedEbi;
+                                                                });
+                            if (dedicated == dedicatedBearers.end() || !dedicated->accessReady)
+                            {
+                                ++bearerInactiveDrops;
+                                continue;
+                            }
+                        }
+                        if (!uuDrbs->SubmitIp(selectedEbi, packet.data(), packet.size()))
+                        {
+                            ++uuDrbDrops;
+                            continue;
+                        }
+                        ++uuUplinkPackets;
+                        uuUplinkBytes += packet.size();
+                        if (selectedEbi != activeEbi)
+                        {
+                            ++dedicatedUplinkPackets;
+                            ++std::find_if(dedicatedBearers.begin(), dedicatedBearers.end(),
+                                           [&](const auto &bearer) { return bearer.ebi == selectedEbi; })
+                                  ->uplinkPackets;
+                        }
+                        continue;
+                    }
 
                     std::vector<uint8_t> frame;
                     if (selectedEbi != activeEbi)
@@ -1831,6 +2037,12 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                     std::to_string(tunUplinkBytes) + " tun-dl=" + std::to_string(tunDownlinkPackets) + "/" +
                     std::to_string(tunDownlinkBytes) + " drops(malformed/inactive)=" +
                     std::to_string(malformedDrops) + "/" + std::to_string(bearerInactiveDrops));
+    if (uuTransport)
+        Log("INFO", "DRB user-plane statistics: ul=" + std::to_string(uuUplinkPackets) + "/" +
+                        std::to_string(uuUplinkBytes) + " dl=" + std::to_string(uuDownlinkPackets) + "/" +
+                        std::to_string(uuDownlinkBytes) + " configurations=" +
+                        std::to_string(uuDrbConfigurations) + " drops=" + std::to_string(uuDrbDrops));
+    uuDrbs.reset();
     Log("INFO", "NAS security counts: UL-next=" + std::to_string(security.ulNasCount) +
                     " DL-last=" + std::to_string(security.dlNasCount));
     Log("INFO", "Paging statistics: indications=" + std::to_string(pagingIndications) +

@@ -21,6 +21,7 @@
 #include "rlc_tm.hpp"
 #include "rrc_connection_release.hpp"
 #include "rrc_connection_setup_complete.hpp"
+#include "rrc_drb_config.hpp"
 #include "rrc_information_transfer.hpp"
 #include "rrc_paging.hpp"
 #include "rrc_initial_access.hpp"
@@ -87,6 +88,7 @@ struct Srb1Evidence
     size_t releases{0};
     size_t pagingsReceived{0};
     size_t pagingsMatched{0};
+    size_t reconfigurations{0};
 };
 
 class UeSrb1Runtime
@@ -106,6 +108,13 @@ class UeSrb1Runtime
     using ReleaseCallback = std::function<void()>;
     // A PCCH page whose S-TMSI names this UE.
     using PagingCallback = std::function<void(uint8_t mmec, uint32_t mTmsi)>;
+    // Phase 18-F-B6-D6: a DTCH frame that belongs to no RRC entity. The owner
+    // demultiplexes it to the DRB bearer it names. Without a handler the frame
+    // is refused, never reinterpreted as SRB1.
+    using UserPlaneCallback = std::function<void(const uu::Frame &)>;
+    // A decoded RRCConnectionReconfiguration that configures DRBs. The owner
+    // establishes them and then calls SubmitReconfigurationComplete.
+    using DrbReconfigurationCallback = std::function<void(const DrbReconfiguration &)>;
 
     UeSrb1Runtime(uu::Socket &socket, uint16_t enbPort, Config config);
 
@@ -177,6 +186,11 @@ class UeSrb1Runtime
         return asContext_.has_value() ? &*asContext_ : nullptr;
     }
     void SetNasCallback(NasCallback callback);
+    void SetUserPlaneCallback(UserPlaneCallback callback);
+    void SetDrbReconfigurationCallback(DrbReconfigurationCallback callback);
+    // The DL-DCCH RRCConnectionReconfigurationComplete for the configuration
+    // the callback above received.
+    void SubmitReconfigurationComplete(uint8_t transactionId);
     void Release();
 
   private:
@@ -215,6 +229,8 @@ class UeSrb1Runtime
     NasCallback onNas_{};
     ReleaseCallback onRelease_{};
     PagingCallback onPaging_{};
+    UserPlaneCallback onUserPlane_{};
+    DrbReconfigurationCallback onDrbReconfiguration_{};
 };
 
 // The eNB side keeps one pending context per association and refuses anything
@@ -232,6 +248,11 @@ class EnbSrb1Runtime
     using NasCallback = std::function<void(uint32_t association, const RrcConnectionSetupCompleteMessage &message)>;
     // Opaque connected-mode NAS, exactly as it arrives from the UE.
     using UplinkNasCallback = std::function<void(uint32_t association, const std::vector<uint8_t> &nas)>;
+    // Phase 18-F-B6-D6: DTCH frames are routed to the owner, which demuxes the
+    // DRB identity they carry. They never reach an RRC decoder.
+    using UserPlaneCallback = std::function<void(uint32_t association, const uu::Frame &frame)>;
+    // The UE acknowledged the DRB configuration it was sent.
+    using DrbCompleteCallback = std::function<void(uint32_t association, uint8_t transactionId)>;
 
     EnbSrb1Runtime(uu::Socket &socket, Config config, NasCallback onNas);
 
@@ -241,6 +262,9 @@ class EnbSrb1Runtime
     // DLInformationTransfer carrying an opaque NAS PDU, protected with whatever
     // profile the context is using.
     void SendDownlinkNas(uint32_t association, const std::vector<uint8_t> &nas);
+
+    // RRCConnectionReconfiguration carrying drb-ToAddModList on SRB1.
+    bool SendDrbReconfiguration(uint32_t association, const DrbReconfiguration &configuration);
 
     // RRCConnectionRelease on SRB1, protected with the profile the context is
     // using. The context stays until the owner releases it, so the S1AP release
@@ -298,6 +322,8 @@ class EnbSrb1Runtime
         return refusedRrc_;
     }
     void SetUplinkNasCallback(UplinkNasCallback callback);
+    void SetUserPlaneCallback(UserPlaneCallback callback);
+    void SetDrbCompleteCallback(DrbCompleteCallback callback);
 
     void Release(uint32_t association) noexcept;
 
@@ -336,6 +362,8 @@ class EnbSrb1Runtime
     Config config_{};
     NasCallback onNas_;
     UplinkNasCallback onUplinkNas_;
+    UserPlaneCallback onUserPlane_;
+    DrbCompleteCallback onDrbComplete_;
     rlc::TmEntity srb0_;
     EnbInitialAccess access_{};
     std::map<uint32_t, Context> contexts_{};

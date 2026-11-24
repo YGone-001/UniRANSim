@@ -33,6 +33,11 @@ enum class LogicalChannel : uint8_t
     // PCCH carries the RRC Paging message (TS 36.331 6.2.2). It is not SRB1:
     // an idle UE receives it without any connection existing.
     PCCH = 2,
+    // Phase 18-F-B6-D6: DTCH is the dedicated traffic channel that carries a
+    // DRB's RLC PDUs. It is user plane, never RRC and never SRB1. The payload
+    // begins with the DRB identity, which is this simulator's routing stand-in
+    // for MAC LCID demultiplexing; the rest is the RLC PDU byte for byte.
+    DTCH = 3,
 };
 
 struct Frame

@@ -211,9 +211,24 @@ void S1uEndpoint::handleGPdu(const gtpu::Packet &packet, const InetAddress &peer
     ++entry->counters.s1uDownlinkPackets;
     entry->counters.s1uDownlinkBytes += packet.payload.size();
 
+    const size_t ipBytes = packet.payload.size();
+    if (entry->transport == RadioTransportKind::UuSrb1)
+    {
+        // The packet must travel the bearer's DRB, protected, and never the
+        // legacy link. A Uu downlink that no DRB can carry is dropped here.
+        if (!m_uuDownlink || !m_uuDownlink(*entry, *bearer, packet.payload.data(), packet.payload.size()))
+        {
+            ++entry->counters.bearerInactiveDrops;
+            return;
+        }
+        bearer->recordDownlink(ipBytes);
+        ++entry->counters.simulatedDownlinkPackets;
+        entry->counters.simulatedDownlinkBytes += ipBytes;
+        return;
+    }
+
     // The bearer that received this T-PDU decides the framing the UE sees, so a
     // dedicated packet can never be delivered as if it were default traffic.
-    const size_t ipBytes = packet.payload.size();
     std::vector<uint8_t> frame;
     if (bearer->kind() == BearerKind::DEDICATED)
     {
@@ -299,6 +314,11 @@ int S1uEndpoint::receiveBufferBytes() const
 const S1uEndpointCounters &S1uEndpoint::counters() const
 {
     return m_counters;
+}
+
+void S1uEndpoint::SetUuDownlinkHandler(UuDownlinkHandler handler)
+{
+    m_uuDownlink = std::move(handler);
 }
 
 } // namespace lte::enb

@@ -74,6 +74,16 @@ void UeSrb1Runtime::Pump(int timeoutMs)
         return;
     }
 
+    if (frame.channel == uu::LogicalChannel::DTCH)
+    {
+        // User plane. It is not RRC: no decoder and no SRB state may see it.
+        if (onUserPlane_)
+            onUserPlane_(frame);
+        else
+            refused_++;
+        return;
+    }
+
     if (frame.channel == uu::LogicalChannel::PCCH)
     {
         // A page is only meaningful while this UE is idle. A connected UE has
@@ -171,6 +181,26 @@ void UeSrb1Runtime::SetNasCallback(NasCallback callback)
     onNas_ = std::move(callback);
 }
 
+void UeSrb1Runtime::SetUserPlaneCallback(UserPlaneCallback callback)
+{
+    onUserPlane_ = std::move(callback);
+}
+
+void UeSrb1Runtime::SetDrbReconfigurationCallback(DrbReconfigurationCallback callback)
+{
+    onDrbReconfiguration_ = std::move(callback);
+}
+
+void UeSrb1Runtime::SubmitReconfigurationComplete(uint8_t transactionId)
+{
+    if (bearer_ == nullptr || state_ != RrcState::RRC_CONNECTED)
+        throw Srb1RuntimeException(Srb1RuntimeError::NOT_ESTABLISHED);
+    const std::vector<uint8_t> rrc = EncodeDrbReconfigurationComplete(transactionId);
+    if (rrc.empty())
+        throw Srb1RuntimeException(Srb1RuntimeError::ENCODE_FAILED);
+    bearer_->SubmitSdu(Protect(rrc));
+}
+
 std::vector<uint8_t> UeSrb1Runtime::Protect(const std::vector<uint8_t> &rrc)
 {
     if (secured_ && secureTx_.has_value())
@@ -231,6 +261,23 @@ void UeSrb1Runtime::OnRrc(const std::vector<uint8_t> &rrc)
         evidence_.downlinkNas++;
         if (onNas_)
             onNas_(information.dedicatedInfoNas);
+        return;
+    }
+
+    DrbReconfiguration reconfiguration;
+    if (DecodeDrbReconfiguration(rrc.data(), rrc.size(), reconfiguration))
+    {
+        // Only a connected UE can accept a DRB configuration, and only the
+        // owner may establish the bearers. The completion is sent by the owner
+        // once the DRBs exist, so a failure never acknowledges a configuration
+        // the other side would believe is in force.
+        if (state_ != RrcState::RRC_CONNECTED || !onDrbReconfiguration_)
+        {
+            refused_++;
+            return;
+        }
+        evidence_.reconfigurations++;
+        onDrbReconfiguration_(reconfiguration);
         return;
     }
 
@@ -399,6 +446,16 @@ void EnbSrb1Runtime::SetUplinkNasCallback(UplinkNasCallback callback)
     onUplinkNas_ = std::move(callback);
 }
 
+void EnbSrb1Runtime::SetUserPlaneCallback(UserPlaneCallback callback)
+{
+    onUserPlane_ = std::move(callback);
+}
+
+void EnbSrb1Runtime::SetDrbCompleteCallback(DrbCompleteCallback callback)
+{
+    onDrbComplete_ = std::move(callback);
+}
+
 void EnbSrb1Runtime::Pump(int timeoutMs)
 {
     uu::Frame frame;
@@ -408,6 +465,13 @@ void EnbSrb1Runtime::Pump(int timeoutMs)
 
     if (frame.channel == uu::LogicalChannel::CCCH)
         OnRequestFrame(frame.association, frame, sourcePort);
+    else if (frame.channel == uu::LogicalChannel::DTCH)
+    {
+        if (onUserPlane_)
+            onUserPlane_(frame.association, frame);
+        else
+            refused_++;
+    }
     else
         OnSrb1Frame(frame.association, frame);
 }
@@ -668,6 +732,14 @@ void EnbSrb1Runtime::OnRrc(Context &context, uint32_t association, const std::ve
             onUplinkNas_(association, information.dedicatedInfoNas);
         return;
     }
+
+    uint8_t completeTransaction = 0;
+    if (DecodeDrbReconfigurationComplete(rrc.data(), rrc.size(), completeTransaction))
+    {
+        if (onDrbComplete_)
+            onDrbComplete_(association, completeTransaction);
+        return;
+    }
     refusedRrc_++;
 }
 
@@ -696,6 +768,30 @@ void EnbSrb1Runtime::SendDownlinkNas(uint32_t association, const std::vector<uin
     }
     context.bearer->SubmitSdu(Protect(context, rrc));
     context.downlinkNas++;
+}
+
+bool EnbSrb1Runtime::SendDrbReconfiguration(uint32_t association, const DrbReconfiguration &configuration)
+{
+    const auto it = contexts_.find(association);
+    if (it == contexts_.end() || it->second.bearer == nullptr)
+    {
+        refused_++;
+        return false;
+    }
+    Context &context = it->second;
+    if (context.state != RrcState::RRC_CONNECTED || !context.secured)
+    {
+        refusedRrc_++;
+        return false;
+    }
+    const std::vector<uint8_t> rrc = EncodeDrbReconfiguration(configuration);
+    if (rrc.empty())
+    {
+        refusedRrc_++;
+        return false;
+    }
+    context.bearer->SubmitSdu(Protect(context, rrc));
+    return true;
 }
 
 void EnbSrb1Runtime::StartAsSecurity(uint32_t association, const security::Key256 &kenb,

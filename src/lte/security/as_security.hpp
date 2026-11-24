@@ -238,6 +238,13 @@ class AsSecurityContext : public AsKeySource
     // owner of the stored key.
     [[nodiscard]] Key256 ActiveKenb() const override;
     [[nodiscard]] AsKeys DeriveAccessKeys() const override;
+    // The algorithm identities this context was configured with. They are not
+    // key material; the DRB layer uses them to build its PDCP entities with the
+    // same ciphering algorithm the SecurityMode procedure selected.
+    [[nodiscard]] AsAlgorithmSet Algorithms() const noexcept
+    {
+        return algorithms_;
+    }
 
     // Stages a handover candidate. Horizontal when the received NCC equals the
     // NCC of the active KeNB, vertical otherwise; a vertical derivation walks

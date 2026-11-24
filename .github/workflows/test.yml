@@ -187,6 +187,43 @@ jobs:
             fi
           done
 
+  # Phase 18-F-B6-D6: the DRB user plane is blocking. The cases drive the
+  # production PDCP/RLC/Uu/S1-U classes over real loopback UDP sockets and real
+  # GTP-U datagrams; they need no TUN and no privilege, so they run in the
+  # ordinary runner rather than behind a skip.
+  production-ue-user-plane:
+    name: Production DRB GTP-U User Plane (deterministic, blocking)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsctp-dev
+      - name: Configure
+        run: cmake -S . -B cmake-build-user-plane -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build cmake-build-user-plane --target nr-tests --parallel "$(nproc)"
+      - name: Run the DRB user-plane acceptance
+        run: |
+          set -euo pipefail
+          ./cmake-build-user-plane/nr-tests --no-version --test-case="lte/drb/*" 2>&1 | tee user-plane.log
+          grep -Eq "test cases: +5 \| +5 passed \| 0 failed" user-plane.log
+          # The capability statement is part of the gate: the component-level
+          # user-plane flags are true and the production-UE end-to-end flags are
+          # false on this evidence.
+          ./cmake-build-user-plane/nr-tests --no-version \
+            --test-case="lte/handover/live: the capability model names every missing live prerequisite" 2>&1 | tee live.log
+          grep -Eq "test cases: +1 \| +1 passed \| 0 failed" live.log
+          ! pgrep -af "cmake-build-user-plane/nr-tests"
+      - name: Report
+        if: always()
+        run: |
+          for log in user-plane.log live.log; do
+            if [ -f "$log" ]; then
+              { echo "### $log"; echo '```'; cat "$log"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+
   # One privileged integration only, in its own job and its own network
   # namespace, so the ordinary matrix stays unprivileged and this case cannot
   # silently pass by running in the control-plane-only mode the rest of the

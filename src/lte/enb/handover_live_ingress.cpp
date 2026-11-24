@@ -149,6 +149,17 @@ const char *ToString(HandoverCapability capability)
     case HandoverCapability::LTE_EPS_SERVICE_REQUEST_OVER_SRB1_READY: return "LTE_EPS_SERVICE_REQUEST_OVER_SRB1_READY";
     case HandoverCapability::LTE_PRODUCTION_UE_PAGING_PCCH_READY: return "LTE_PRODUCTION_UE_PAGING_PCCH_READY";
     case HandoverCapability::LTE_ECM_IDLE_ACCESS_RESTORATION_READY: return "LTE_ECM_IDLE_ACCESS_RESTORATION_READY";
+    case HandoverCapability::LTE_EPS_DEFAULT_BEARER_READY: return "LTE_EPS_DEFAULT_BEARER_READY";
+    case HandoverCapability::LTE_E_RAB_SETUP_READY: return "LTE_E_RAB_SETUP_READY";
+    case HandoverCapability::LTE_PRODUCTION_UE_DRB_READY: return "LTE_PRODUCTION_UE_DRB_READY";
+    case HandoverCapability::LTE_PRODUCTION_PDCP_USER_PLANE_READY:
+        return "LTE_PRODUCTION_PDCP_USER_PLANE_READY";
+    case HandoverCapability::LTE_UU_DRB_USER_PLANE_READY: return "LTE_UU_DRB_USER_PLANE_READY";
+    case HandoverCapability::LTE_S1U_GTPU_USER_PLANE_READY: return "LTE_S1U_GTPU_USER_PLANE_READY";
+    case HandoverCapability::LTE_PRODUCTION_UE_BIDIRECTIONAL_USER_PLANE_READY:
+        return "LTE_PRODUCTION_UE_BIDIRECTIONAL_USER_PLANE_READY";
+    case HandoverCapability::LTE_ECM_IDLE_BEARER_RESTORATION_READY:
+        return "LTE_ECM_IDLE_BEARER_RESTORATION_READY";
     case HandoverCapability::LTE_OPEN5GS_ATTACH_ACCEPTED: return "LTE_OPEN5GS_ATTACH_ACCEPTED";
     case HandoverCapability::LTE_PRODUCTION_ENB_SRB1_READY: return "LTE_PRODUCTION_ENB_SRB1_READY";
     case HandoverCapability::LTE_PRODUCTION_MULTIPLEXER_BRIDGE_READY: return "LTE_PRODUCTION_MULTIPLEXER_BRIDGE_READY";
@@ -246,6 +257,22 @@ std::vector<HandoverCapability> LiveHandoverReadiness::missing() const
         if (assessment.capability == HandoverCapability::LTE_PRODUCTION_ENB_SRB1_READY ||
             assessment.capability == HandoverCapability::LTE_PRODUCTION_MULTIPLEXER_BRIDGE_READY)
             continue;
+        // User-plane readiness and external acceptance evidence are reported on
+        // their own surfaces; they are not handover execution prerequisites.
+        switch (assessment.capability)
+        {
+        case HandoverCapability::LTE_EPS_DEFAULT_BEARER_READY:
+        case HandoverCapability::LTE_E_RAB_SETUP_READY:
+        case HandoverCapability::LTE_PRODUCTION_UE_DRB_READY:
+        case HandoverCapability::LTE_PRODUCTION_PDCP_USER_PLANE_READY:
+        case HandoverCapability::LTE_UU_DRB_USER_PLANE_READY:
+        case HandoverCapability::LTE_S1U_GTPU_USER_PLANE_READY:
+        case HandoverCapability::LTE_PRODUCTION_UE_BIDIRECTIONAL_USER_PLANE_READY:
+        case HandoverCapability::LTE_ECM_IDLE_BEARER_RESTORATION_READY:
+            continue;
+        default:
+            break;
+        }
         if (!assessment.available)
             out.push_back(assessment.capability);
     }
@@ -394,6 +421,38 @@ LiveHandoverReadiness AssessLiveHandoverCapabilities()
                "the NAS security context; a UE-initiated or paging-triggered Service Request returns it to "
                "ECM-CONNECTED over a second RRC connection and a second Initial Context Setup; this is deterministic "
                "two-process evidence, not a live EPC run"),
+        Assess(HandoverCapability::LTE_EPS_DEFAULT_BEARER_READY, true,
+               "the production UE decodes Activate Default EPS Bearer Context Request from the Attach Accept, "
+               "sends the Accept in Attach Complete and retains the EBI, the QoS and the PDN IPv4 address; the eNB "
+               "holds one DefaultBearerContext per E-RAB with its own S1-U TEIDs (test/lte/nas_esm.cpp, "
+               "test/lte/user_plane.cpp)"),
+        Assess(HandoverCapability::LTE_E_RAB_SETUP_READY, true,
+               "Initial Context Setup and E-RAB Setup decode the E-RAB identity, QoS, transport address and GTP "
+               "TEID, allocate fresh local TEIDs through the registry allocator and answer with the established and "
+               "failed items (test/lte/enb.cpp, test/lte/erab.cpp)"),
+        Assess(HandoverCapability::LTE_PRODUCTION_UE_DRB_READY, false,
+               "the production lte-ue handles the RRCConnectionReconfiguration, builds its DRBs from the AS keys "
+               "and sends RRCConnectionReconfigurationComplete, but no accepted multi-process case with a real TUN "
+               "exercises it; that acceptance is reported NOT_EXECUTED rather than claimed"),
+        Assess(HandoverCapability::LTE_PRODUCTION_PDCP_USER_PLANE_READY, true,
+               "the accepted DRB12 PDCP profile protects and unprotects IP packets in both directions with a "
+               "12-bit SN and EEA2 from K_UPenc; two production DRB endpoints exchange payloads over real Uu "
+               "sockets and the received bytes equal the transmitted ones (test/lte/drb_user_plane.cpp)"),
+        Assess(HandoverCapability::LTE_UU_DRB_USER_PLANE_READY, true,
+               "a DTCH frame carries a DRB's RLC PDUs behind a DRB-identity routing header, and two production "
+               "DrbRuntime endpoints on two real Uu UDP sockets carry both an uplink and a downlink IP packet "
+               "through PDCP and RLC AM on two different EBIs without cross-bearer delivery"),
+        Assess(HandoverCapability::LTE_S1U_GTPU_USER_PLANE_READY, true,
+               "the production S1uEndpoint turns a DRB uplink SDU into a real GTP-U G-PDU sent to the bearer's SGW "
+               "TEID, and delivers a downlink G-PDU naming the local TEID back through the DRB with exact payload "
+               "equality; retired and unknown TEIDs reach no UE (test/lte/drb_user_plane.cpp)"),
+        Assess(HandoverCapability::LTE_PRODUCTION_UE_BIDIRECTIONAL_USER_PLANE_READY, false,
+               "the bidirectional data plane is proven at the component level only: no accepted production-UE "
+               "process case with a real TUN and a deterministic PGW endpoint exists yet"),
+        Assess(HandoverCapability::LTE_ECM_IDLE_BEARER_RESTORATION_READY, true,
+               "an ECM-IDLE release retires the access TEID and destroys the DRBs; a restoration establishes a "
+               "fresh local/SGW TEID pair and fresh K_UPenc on the same EBI, both directions carry traffic again, "
+               "and the old TEID remains retired (test/lte/drb_user_plane.cpp)"),
         Assess(HandoverCapability::LTE_OPEN5GS_ATTACH_ACCEPTED, false,
                "REAL_OPEN5GS_ATTACH_ACCEPTANCE = NOT_EXECUTED: no authorized live Open5GS Attach was run in this phase"),
         Assess(HandoverCapability::AS_SMC_RUNTIME_READY, true,

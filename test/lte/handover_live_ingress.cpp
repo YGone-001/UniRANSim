@@ -235,6 +235,18 @@ TEST_CASE("lte/handover/live: the capability model names every missing live prer
     CHECK(readiness.available(HandoverCapability::LTE_EPS_SERVICE_REQUEST_OVER_SRB1_READY));
     CHECK(readiness.available(HandoverCapability::LTE_PRODUCTION_UE_PAGING_PCCH_READY));
     CHECK(readiness.available(HandoverCapability::LTE_ECM_IDLE_ACCESS_RESTORATION_READY));
+    // Phase 18-F-B6-D6: the default bearer, E-RAB, PDCP user plane, Uu DTCH,
+    // S1-U GTP-U path and ECM-IDLE bearer restoration are exercised by the
+    // deterministic data-plane cases. The production-UE end-to-end flags are
+    // deliberately false because no multi-process TUN case exists.
+    CHECK(readiness.available(HandoverCapability::LTE_EPS_DEFAULT_BEARER_READY));
+    CHECK(readiness.available(HandoverCapability::LTE_E_RAB_SETUP_READY));
+    CHECK(readiness.available(HandoverCapability::LTE_PRODUCTION_PDCP_USER_PLANE_READY));
+    CHECK(readiness.available(HandoverCapability::LTE_UU_DRB_USER_PLANE_READY));
+    CHECK(readiness.available(HandoverCapability::LTE_S1U_GTPU_USER_PLANE_READY));
+    CHECK(readiness.available(HandoverCapability::LTE_ECM_IDLE_BEARER_RESTORATION_READY));
+    CHECK_FALSE(readiness.available(HandoverCapability::LTE_PRODUCTION_UE_DRB_READY));
+    CHECK_FALSE(readiness.available(HandoverCapability::LTE_PRODUCTION_UE_BIDIRECTIONAL_USER_PLANE_READY));
     CHECK_FALSE(readiness.available(HandoverCapability::LTE_OPEN5GS_ATTACH_ACCEPTED));
     CHECK(readiness.available(HandoverCapability::LTE_PRODUCTION_ENB_SRB1_READY));
     CHECK(readiness.available(HandoverCapability::LTE_PRODUCTION_MULTIPLEXER_BRIDGE_READY));
@@ -275,7 +287,7 @@ TEST_CASE("lte/handover/live: the capability model names every missing live prer
     CHECK_FALSE(readiness.available(HandoverCapability::MME_PATH_UPDATE_OBSERVABLE));
 
     // Every assessment carries the fact it rests on.
-    REQUIRE(readiness.assessments.size() == 37);
+    REQUIRE(readiness.assessments.size() == 45);
     for (const auto &assessment : readiness.assessments)
     {
         CHECK_FALSE(assessment.evidence.empty());

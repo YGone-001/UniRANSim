@@ -85,41 +85,58 @@ Srb1ResolvedConfig MapSrb1Configuration(const RrcConnectionSetupMessage &setup, 
         Fail(Srb1ConfigError::INVALID_SRB_IDENTITY);
 
     Srb1ResolvedConfig resolved;
-
+    resolved.am = MapAmRlcConfiguration(setup.tPollRetransmit, setup.pollPdu, setup.pollByte,
+                                        setup.maxRetxThreshold, setup.tReordering, setup.tStatusProhibit, timing);
+    // The durations the enumerators stood for, so a test can state what was
+    // mapped without re-deriving the table.
     if (setup.tPollRetransmit >= PollRetransmitMs.size())
         Fail(Srb1ConfigError::UNSUPPORTED_T_POLL_RETRANSMIT);
     resolved.pollRetransmitMs = PollRetransmitMs[setup.tPollRetransmit];
-
     if (setup.pollPdu >= PollPduCount.size())
         Fail(Srb1ConfigError::UNSUPPORTED_POLL_PDU);
     resolved.pollPduCount = PollPduCount[setup.pollPdu];
-
     if (setup.pollByte >= PollByteCount.size())
         Fail(Srb1ConfigError::UNSUPPORTED_POLL_BYTE);
     resolved.pollByteCount = PollByteCount[setup.pollByte];
-
     if (setup.maxRetxThreshold >= MaxRetransmissions.size())
         Fail(Srb1ConfigError::UNSUPPORTED_MAX_RETX_THRESHOLD);
     resolved.maxRetransmissions = MaxRetransmissions[setup.maxRetxThreshold];
-
     if (setup.tReordering >= ReorderingMs.size())
         Fail(Srb1ConfigError::UNSUPPORTED_T_REORDERING);
     resolved.reorderingMs = ReorderingMs[setup.tReordering];
-
     if (setup.tStatusProhibit >= StatusProhibitMs.size())
         Fail(Srb1ConfigError::UNSUPPORTED_T_STATUS_PROHIBIT);
     resolved.statusProhibitMs = StatusProhibitMs[setup.tStatusProhibit];
-
-    resolved.am.pollTicks = ToTicks(resolved.pollRetransmitMs, timing.tickMilliseconds);
-    resolved.am.reorderingTicks = ToTicks(resolved.reorderingMs, timing.tickMilliseconds);
-    resolved.am.prohibitTicks = ToTicks(resolved.statusProhibitMs, timing.tickMilliseconds);
-    resolved.am.pollPdu = resolved.pollPduCount;
-    resolved.am.pollByte = resolved.pollByteCount;
-    // One more transmission than the retransmission threshold: the counter in
-    // the entity starts at the first transmission, the TS field counts only the
-    // retransmissions.
-    resolved.am.maxRetx = static_cast<uint8_t>(resolved.maxRetransmissions + 1);
     return resolved;
+}
+
+rlc::am::AmConfig MapAmRlcConfiguration(uint8_t tPollRetransmit, uint8_t pollPdu, uint8_t pollByte,
+                                        uint8_t maxRetxThreshold, uint8_t tReordering, uint8_t tStatusProhibit,
+                                        Srb1RuntimeTiming timing)
+{
+    if (timing.tickMilliseconds == 0)
+        Fail(Srb1ConfigError::ZERO_TICK);
+    if (tPollRetransmit >= PollRetransmitMs.size())
+        Fail(Srb1ConfigError::UNSUPPORTED_T_POLL_RETRANSMIT);
+    if (pollPdu >= PollPduCount.size())
+        Fail(Srb1ConfigError::UNSUPPORTED_POLL_PDU);
+    if (pollByte >= PollByteCount.size())
+        Fail(Srb1ConfigError::UNSUPPORTED_POLL_BYTE);
+    if (maxRetxThreshold >= MaxRetransmissions.size())
+        Fail(Srb1ConfigError::UNSUPPORTED_MAX_RETX_THRESHOLD);
+    if (tReordering >= ReorderingMs.size())
+        Fail(Srb1ConfigError::UNSUPPORTED_T_REORDERING);
+    if (tStatusProhibit >= StatusProhibitMs.size())
+        Fail(Srb1ConfigError::UNSUPPORTED_T_STATUS_PROHIBIT);
+
+    rlc::am::AmConfig am;
+    am.pollTicks = ToTicks(PollRetransmitMs[tPollRetransmit], timing.tickMilliseconds);
+    am.reorderingTicks = ToTicks(ReorderingMs[tReordering], timing.tickMilliseconds);
+    am.prohibitTicks = ToTicks(StatusProhibitMs[tStatusProhibit], timing.tickMilliseconds);
+    am.pollPdu = PollPduCount[pollPdu];
+    am.pollByte = PollByteCount[pollByte];
+    am.maxRetx = static_cast<uint8_t>(MaxRetransmissions[maxRetxThreshold] + 1);
+    return am;
 }
 
 } // namespace lte::rrc

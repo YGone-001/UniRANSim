@@ -158,6 +158,9 @@ void EnbMultiplexer::unbindAssociation()
     // Destroyed first, while the registry it holds provisional contexts in is
     // still alive.
     m_preparations.reset();
+    // No DRB may outlive the S1 association that carries its EPS session.
+    m_drbs.clear();
+    m_drbConfigs.clear();
     if (m_associationEpoch != 0)
         m_sender.unbind(m_associationEpoch);
     m_associationEpoch = 0;
@@ -1029,10 +1032,70 @@ void EnbMultiplexer::onErabSetupRequest(const uint8_t *data, size_t size)
                         " QCI=" + std::to_string(bearer->parameters().qci) +
                         " eNB-TEID=" + Hex(bearer->parameters().localTeid, 8) +
                         " SGW-TEID=" + Hex(bearer->parameters().sgwTeid, 8));
-        sendRadio(*entry, lte::ue::link::MessageType::NAS_DOWNLINK, erab.nasPdu);
+        if (entry->transport == RadioTransportKind::UuSrb1)
+        {
+            if (m_bridge != nullptr && !erab.nasPdu.empty())
+                m_bridge->SendDownlinkNas(entry->radioUeId, erab.nasPdu);
+        }
+        else
+            sendRadio(*entry, lte::ue::link::MessageType::NAS_DOWNLINK, erab.nasPdu);
         if (retained[erab.erabId])
             sendRadio(*entry, lte::ue::link::MessageType::DEDICATED_BEARER_RESTORED,
                 lte::ue::link::EncodeBearerRestoration(erab.erabId, entry->accessGeneration));
+    }
+
+    // A Uu UE learns a new dedicated bearer on the same SRB1 its existing DRBs
+    // run on: the new DRB is added and the configuration carries only it.
+    if (entry->transport == RadioTransportKind::UuSrb1 && !established.empty() && m_bridge != nullptr)
+    {
+        auto *securityContext = m_bridge->SecurityContextOf(entry->radioUeId);
+        auto runtime = m_drbs.find(entry->radioUeId);
+        if (securityContext != nullptr && securityContext->IsActive() && runtime != m_drbs.end())
+        {
+            try
+            {
+                const auto keys = securityContext->DeriveAccessKeys();
+                const auto algorithms = securityContext->Algorithms();
+                lte::rrc::DrbReconfiguration configuration;
+                configuration.transactionId = m_uuDrbTransaction & 0x03U;
+                m_uuDrbTransaction = static_cast<uint8_t>((m_uuDrbTransaction + 1U) & 0x03U);
+                uint8_t nextChannel = 3;
+                for (const auto &drb : m_drbConfigs[entry->radioUeId].drbs)
+                    if (drb.logicalChannelIdentity >= nextChannel)
+                        nextChannel = static_cast<uint8_t>(drb.logicalChannelIdentity + 1);
+                for (const auto &item : established)
+                {
+                    if (runtime->second->HasBearer(item.erabId))
+                        continue;
+                    lte::rrc::DrbToAdd drb;
+                    drb.ebi = item.erabId;
+                    drb.drbIdentity = item.erabId;
+                    drb.logicalChannelIdentity = nextChannel++;
+                    drb.priority = 2;
+                    drb.am = lte::rrc::MapAmRlcConfiguration(2, 7, 14, 5, 1, 1);
+                    drb.am.maxPduBytes = 1700;
+                    configuration.drbs.push_back(drb);
+                    lte::rrc::DrbBearerConfig bearerConfig;
+                    bearerConfig.ebi = item.erabId;
+                    bearerConfig.drbIdentity = item.erabId;
+                    bearerConfig.am = drb.am;
+                    bearerConfig.cipheringAlgorithm = algorithms.upCiphering;
+                    bearerConfig.kUpEnc = keys.kUpEnc;
+                    (void)runtime->second->AddBearer(bearerConfig);
+                }
+                if (!configuration.drbs.empty())
+                {
+                    for (const auto &drb : configuration.drbs)
+                        m_drbConfigs[entry->radioUeId].drbs.push_back(drb);
+                    ++m_uuDrbConfigurations;
+                    (void)m_bridge->SendDrbConfiguration(entry->radioUeId, configuration);
+                }
+            }
+            catch (const std::exception &e)
+            {
+                Log("WARN", std::string("Dedicated DRB could not be configured: ") + e.what());
+            }
+        }
     }
 }
 
@@ -1096,7 +1159,15 @@ void EnbMultiplexer::onErabModifyRequest(const uint8_t *data, size_t size)
         // The event loop cannot classify a packet between these operations.
         // NAS delivery is independent of the later UE Accept/Reject.
         if (!entry2.item->transport)
-            sendRadio(*entry, lte::ue::link::MessageType::NAS_DOWNLINK, entry2.item->nasPdu);
+        {
+            if (entry->transport == RadioTransportKind::UuSrb1)
+            {
+                if (m_bridge != nullptr)
+                    m_bridge->SendDownlinkNas(entry->radioUeId, entry2.item->nasPdu);
+            }
+            else
+                sendRadio(*entry, lte::ue::link::MessageType::NAS_DOWNLINK, entry2.item->nasPdu);
+        }
         *entry2.target = std::move(entry2.candidate);
         Log("INFO", "E-RAB Modify applied EBI=" + std::to_string(entry2.item->erabId) + " QCI=" +
                         std::to_string(entry2.target->parameters().qci) +
@@ -1130,6 +1201,12 @@ void EnbMultiplexer::onErabReleaseCommand(const uint8_t *data, size_t size)
     }
     for (auto erabId : command.erabIds)
     {
+        if (entry->transport == RadioTransportKind::UuSrb1)
+        {
+            const auto runtime = m_drbs.find(entry->radioUeId);
+            if (runtime != m_drbs.end())
+                runtime->second->ReleaseBearer(erabId);
+        }
         m_registry.releaseBearer(*entry, erabId);
         Log("INFO", "Released dedicated E-RAB " + std::to_string(erabId) + " for " + Describe(*entry));
     }
@@ -1139,7 +1216,13 @@ void EnbMultiplexer::onErabReleaseCommand(const uint8_t *data, size_t size)
         // The network deactivates the bearer through NAS. Forwarding the
         // protected message lets the UE apply its own ESM state machine and
         // answer with the matching deactivate accept.
-        sendRadio(*entry, lte::ue::link::MessageType::NAS_DOWNLINK, command.nasPdu);
+        if (entry->transport == RadioTransportKind::UuSrb1)
+        {
+            if (m_bridge != nullptr)
+                m_bridge->SendDownlinkNas(entry->radioUeId, command.nasPdu);
+        }
+        else
+            sendRadio(*entry, lte::ue::link::MessageType::NAS_DOWNLINK, command.nasPdu);
     }
     else
     {
@@ -1275,6 +1358,27 @@ void EnbMultiplexer::onUeContextReleaseCommand(const uint8_t *data, size_t size)
     const uint8_t erabId = entry->bearer.parameters().erabId;
     const uint32_t radioUeId = entry->radioUeId;
     const bool notify = entry->bearer.logicalExists();
+    if (entry->transport == RadioTransportKind::UuSrb1)
+    {
+        // The bridge owns the radio release of a Uu UE: it sends the real
+        // RRCConnectionRelease on SRB1, emits the UE Context Release Complete
+        // and keeps the endpoint for paging. The multiplexer then releases only
+        // its own registry and DRB state; sending the legacy notification or a
+        // second Complete would be a duplicate.
+        if (m_bridge == nullptr)
+            throw s1ap::CodecError("UE Context Release for a Uu UE without a bound bridge");
+        m_bridge->OnUeContextReleaseCommand(std::vector<uint8_t>(data, data + size));
+        releaseUuDrbs(radioUeId);
+        m_registry.releaseS1(*entry);
+        Log("INFO", "Released the SRB1 access and DRB user plane of LTE UE " + std::to_string(radioUeId) +
+                        " (eNB-UE-S1AP-ID=" + std::to_string(enbId) + ", MME-UE-S1AP-ID=" +
+                        std::to_string(mmeId) + "); the EPS bearer context is retained");
+        return;
+    }
+    // The DRBs belong to this access and are destroyed with it. The EPS bearer
+    // contexts themselves are retained by releaseS1 below, exactly as ECM-IDLE
+    // requires.
+    releaseUuDrbs(radioUeId);
     m_registry.releaseS1(*entry);
     if (notify)
     {
@@ -1621,6 +1725,15 @@ void EnbMultiplexer::initUuTransport()
             Log("INFO", "SRB1 UE association " + std::to_string(association) + " bound to eNB-UE-S1AP-ID=" +
                             std::to_string(enbUeS1apId));
         });
+    m_bridge->SetUserPlaneHandler(
+        [this](uint32_t association, const uu::Frame &frame) { onUuUserPlane(association, frame); });
+    m_bridge->SetDrbCompleteHandler([](uint32_t association, uint8_t transactionId) {
+        Log("INFO", "DRB configuration " + std::to_string(transactionId) + " acknowledged by SRB1 association " +
+                        std::to_string(association));
+    });
+    m_s1u.SetUuDownlinkHandler([this](EnbUeEntry &entry, BearerContext &bearer, const uint8_t *packet, size_t size) {
+        return onUuDownlink(entry, bearer, packet, size);
+    });
 }
 
 void EnbMultiplexer::pollUu()
@@ -1635,6 +1748,198 @@ void EnbMultiplexer::pollUu()
 size_t EnbMultiplexer::bridgeAssociationCount() const
 {
     return m_bridge == nullptr ? 0 : m_bridge->Runtime().ContextCount();
+}
+
+size_t EnbMultiplexer::uuDrbCount(uint32_t radioUeId) const
+{
+    const auto it = m_drbs.find(radioUeId);
+    return it == m_drbs.end() ? 0 : it->second->BearerCount();
+}
+
+const lte::rrc::DrbRuntime *EnbMultiplexer::uuDrbs(uint32_t radioUeId) const
+{
+    const auto it = m_drbs.find(radioUeId);
+    return it == m_drbs.end() ? nullptr : it->second.get();
+}
+
+bool EnbMultiplexer::establishUuDrbs(EnbUeEntry &entry, const std::vector<uint8_t> &identities)
+{
+    if (m_bridge == nullptr || entry.transport != RadioTransportKind::UuSrb1 || identities.empty())
+        return false;
+    const auto *securityContext = m_bridge->SecurityContextOf(entry.radioUeId);
+    if (securityContext == nullptr || !securityContext->IsActive())
+        return false;
+    security::AsKeys keys;
+    security::AsAlgorithmSet algorithms;
+    try
+    {
+        keys = securityContext->DeriveAccessKeys();
+        algorithms = securityContext->Algorithms();
+    }
+    catch (const std::exception &e)
+    {
+        Log("WARN", std::string("DRB keys cannot be derived for SRB1 association ") +
+                        std::to_string(entry.radioUeId) + ": " + e.what());
+        return false;
+    }
+
+    // The default bearer's DRB is configured first whatever order the MME
+    // listed its E-RABs in, and the logical channel identities are assigned in
+    // that same deterministic order.
+    const uint8_t defaultEbi = entry.bearer.parameters().erabId;
+    std::vector<uint8_t> ordered = identities;
+    std::sort(ordered.begin(), ordered.end());
+    std::stable_sort(ordered.begin(), ordered.end(), [defaultEbi](uint8_t left, uint8_t right) {
+        if (left == defaultEbi)
+            return true;
+        if (right == defaultEbi)
+            return false;
+        return left < right;
+    });
+
+    lte::rrc::DrbReconfiguration configuration;
+    configuration.transactionId = m_uuDrbTransaction & 0x03U;
+    m_uuDrbTransaction = static_cast<uint8_t>((m_uuDrbTransaction + 1U) & 0x03U);
+
+    const uint32_t association = entry.radioUeId;
+    auto runtime = std::make_unique<lte::rrc::DrbRuntime>(
+        rlc::am::EndpointRole::ENB, association,
+        [this, association](const std::vector<uint8_t> &payload) {
+            return m_bridge != nullptr && m_bridge->SendUserPlane(association, payload);
+        },
+        [this, association](uint8_t ebi, const std::vector<uint8_t> &packet) {
+            onUuUplinkIp(association, ebi, packet);
+        });
+    runtime->SetReadyHandler([this, association](const lte::rrc::DrbReady &ready) {
+        auto *target = m_registry.find(association);
+        if (target == nullptr || target->transport != RadioTransportKind::UuSrb1 || !target->s1Active())
+            return false;
+        auto *bearer = m_registry.findBearer(*target, ready.ebi);
+        if (bearer == nullptr || !bearer->signalingEstablished() || bearer->active())
+            return false;
+        if (ready.generation != target->accessGeneration)
+            return false;
+        if (bearer->kind() == BearerKind::DEDICATED && !target->bearer.active())
+            return false;
+        if (bearer->kind() == BearerKind::DEFAULT)
+        {
+            if (bearer->ueIpv4() != std::array<uint8_t, 4>{} && bearer->ueIpv4() != ready.ipv4)
+                return false;
+        }
+        else if (ready.ipv4 != target->bearer.ueIpv4())
+            return false;
+        try
+        {
+            bearer->activateUe(target->radioUeId, ready.ebi, ready.ipv4);
+        }
+        catch (const std::exception &e)
+        {
+            Log("WARN", std::string("DRB ready refused for EBI ") + std::to_string(ready.ebi) + ": " + e.what());
+            return false;
+        }
+        if (bearer->kind() == BearerKind::DEFAULT)
+            target->s1 = UeS1State::BEARER_ACTIVE;
+        Log("INFO", "DRB user plane ready for LTE UE " + std::to_string(target->radioUeId) + " EBI=" +
+                        std::to_string(ready.ebi) + " IPv4 " + Ipv4ToString(ready.ipv4));
+        return true;
+    });
+
+    uint8_t logicalChannel = 3;
+    uint8_t priority = 1;
+    for (uint8_t ebi : ordered)
+    {
+        lte::rrc::DrbToAdd drb;
+        drb.ebi = ebi;
+        drb.drbIdentity = ebi;
+        drb.logicalChannelIdentity = logicalChannel++;
+        drb.priority = priority++;
+        try
+        {
+            drb.am = lte::rrc::MapAmRlcConfiguration(2, 7, 14, 5, 1, 1);
+        }
+        catch (const lte::rrc::Srb1ConfigException &)
+        {
+            return false;
+        }
+        drb.am.maxPduBytes = 1700;
+        configuration.drbs.push_back(drb);
+
+        lte::rrc::DrbBearerConfig bearerConfig;
+        bearerConfig.ebi = ebi;
+        bearerConfig.drbIdentity = ebi;
+        bearerConfig.am = drb.am;
+        bearerConfig.cipheringAlgorithm = algorithms.upCiphering;
+        bearerConfig.kUpEnc = keys.kUpEnc;
+        try
+        {
+            if (!runtime->AddBearer(bearerConfig))
+                return false;
+        }
+        catch (const std::exception &e)
+        {
+            Log("WARN", std::string("DRB could not be established for EBI ") + std::to_string(ebi) + ": " + e.what());
+            return false;
+        }
+    }
+
+    m_drbs[association] = std::move(runtime);
+    m_drbConfigs[association] = configuration;
+    ++m_uuDrbConfigurations;
+    if (!m_bridge->SendDrbConfiguration(association, configuration))
+    {
+        Log("WARN", "DRB configuration could not be sent for SRB1 association " + std::to_string(association));
+        return false;
+    }
+    Log("INFO", "DRB configuration sent for LTE UE " + std::to_string(association) + " with " +
+                    std::to_string(configuration.drbs.size()) + " bearer(s)");
+    return true;
+}
+
+void EnbMultiplexer::releaseUuDrbs(uint32_t radioUeId)
+{
+    m_drbs.erase(radioUeId);
+    m_drbConfigs.erase(radioUeId);
+}
+
+void EnbMultiplexer::onUuUserPlane(uint32_t association, const uu::Frame &frame)
+{
+    const auto it = m_drbs.find(association);
+    if (it == m_drbs.end())
+    {
+        Log("WARN", "DTCH frame for an association with no DRB runtime: " + std::to_string(association));
+        return;
+    }
+    if (!it->second->OnFrame(frame))
+        Log("WARN", "Refused a DTCH user-plane frame for SRB1 association " + std::to_string(association));
+}
+
+void EnbMultiplexer::onUuUplinkIp(uint32_t association, uint8_t ebi, const std::vector<uint8_t> &packet)
+{
+    auto *entry = m_registry.find(association);
+    if (entry == nullptr || entry->transport != RadioTransportKind::UuSrb1 || !entry->s1Active())
+        return;
+    auto *bearer = m_registry.findBearer(*entry, ebi);
+    if (bearer == nullptr || !bearer->active())
+    {
+        ++entry->counters.bearerInactiveDrops;
+        return;
+    }
+    try
+    {
+        m_s1u.forwardUplink(*entry, *bearer, packet.data(), packet.size());
+    }
+    catch (const std::exception &e)
+    {
+        Log("WARN", std::string("Uplink DRB packet refused for EBI ") + std::to_string(ebi) + ": " + e.what());
+    }
+}
+
+bool EnbMultiplexer::onUuDownlink(EnbUeEntry &entry, BearerContext &bearer, const uint8_t *packet, size_t size)
+{
+    const auto it = m_drbs.find(entry.radioUeId);
+    if (it == m_drbs.end() || !it->second->HasBearer(bearer.parameters().erabId))
+        return false;
+    return it->second->SubmitIp(bearer.parameters().erabId, packet, size);
 }
 
 bool EnbMultiplexer::bridgeHasAssociation(uint32_t association) const
@@ -1686,6 +1991,7 @@ void EnbMultiplexer::commitPendingIcs()
         // The radio-side procedure is complete; only now may the outcome be
         // committed and answered.
         std::vector<s1ap::ErabSetupItem> established = pending.established;
+        bool committed = false;
         try
         {
             for (const auto &item : established)
@@ -1701,11 +2007,22 @@ void EnbMultiplexer::commitPendingIcs()
             *entry = std::move(pending.candidate);
             if (pending.deliverNas && !pending.nasPdu.empty())
                 m_bridge->SendDownlinkNas(entry->radioUeId, pending.nasPdu);
+            committed = true;
         }
         catch (const std::exception &)
         {
             for (const auto &item : established)
                 m_registry.unbindLocalTeid(*entry, TeidFromBytes(item.gtpTeid));
+        }
+        if (committed && entry->transport == RadioTransportKind::UuSrb1)
+        {
+            // The user plane is configured over the SRB1 that just became
+            // secure. A failure here leaves the S1 context committed but no
+            // DRB, so no packet can be misdelivered as if the bearer were up.
+            std::vector<uint8_t> identities;
+            for (const auto &item : established)
+                identities.push_back(item.erabId);
+            (void)establishUuDrbs(*entry, identities);
         }
         finished.push_back(slot.first);
     }
@@ -1966,6 +2283,20 @@ void EnbMultiplexer::shutdown()
 {
     for (auto *entry : m_registry.all())
     {
+        if (const auto runtime = m_drbs.find(entry->radioUeId); runtime != m_drbs.end())
+        {
+            const auto &counters = runtime->second->Counters();
+            Log("INFO", "DRB user-plane statistics for LTE UE " + std::to_string(entry->radioUeId) +
+                            ": ul=" + std::to_string(counters.uplinkPackets) + "/" +
+                            std::to_string(counters.uplinkBytes) + " dl=" +
+                            std::to_string(counters.downlinkPackets) + "/" +
+                            std::to_string(counters.downlinkBytes) + " ready=" +
+                            std::to_string(counters.readyReceived) + " drops(oversize/malformed/pdcp/rlc/unknown)=" +
+                            std::to_string(counters.oversizedDrops) + "/" +
+                            std::to_string(counters.malformedDrops) + "/" +
+                            std::to_string(counters.pdcpFailures) + "/" + std::to_string(counters.rlcFailures) + "/" +
+                            std::to_string(counters.unknownBearerDrops));
+        }
         Log("INFO", "User-plane statistics for LTE UE " + std::to_string(entry->radioUeId) +
                         ": radio-ul=" + std::to_string(entry->counters.simulatedUplinkPackets) + "/" +
                         std::to_string(entry->counters.simulatedUplinkBytes) +
@@ -1981,6 +2312,8 @@ void EnbMultiplexer::shutdown()
                         std::to_string(entry->counters.bearerInactiveDrops));
         m_registry.releaseS1(*entry);
     }
+    m_drbs.clear();
+    m_drbConfigs.clear();
     Log("INFO", "Shared S1-U endpoint statistics: echo=" + std::to_string(m_s1u.counters().echoRequests) +
                     " drops(malformed/unknown-teid)=" + std::to_string(m_s1u.counters().malformedDrops) + "/" +
                     std::to_string(m_s1u.counters().unknownTeidDrops) +

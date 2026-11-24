@@ -615,3 +615,146 @@ TEST_CASE("lte/enb-uu/the production ue nas transport carries the attach request
     CHECK_FALSE(transport.SendNas(attachRequest));
 }
 
+
+TEST_CASE("lte/enb-uu/a ue context release sends the rrc release and drops the drb user plane")
+{
+    // Phase 18-F-B6-D6: the production multiplexer must turn an MME release into
+    // the real RRCConnectionRelease on SRB1, answer with one Release Complete,
+    // destroy the access DRB user plane and keep the EPS bearer context. The
+    // deterministic peer exercises the bridge alone; this case drives the
+    // multiplexer's own delegation.
+    uint16_t uuPort = 0;
+    {
+        auto probe = uu::Socket::BindLoopback(0, nullptr);
+        REQUIRE(probe.has_value());
+        uuPort = probe->Port();
+    }
+
+    Sender sender;
+    EnbMultiplexer mux(MakeConfig(uuPort), sender);
+    REQUIRE(mux.uuEnabled());
+
+    Peer a;
+    REQUIRE(a.Build(AssocA, MmeIdA, 0x11, uuPort));
+    a.runtime->StartAccess();
+
+    const auto attachRequest = AttachRequest();
+    bool setup = false;
+    bool nas = false;
+    bool uplink = false;
+    bool ics = false;
+    uint32_t enbUeS1apId = 0;
+    size_t responses = 0;
+
+    for (int round = 0; round < 900; round++)
+    {
+        mux.poll();
+        a.runtime->Pump(0);
+        a.runtime->Tick();
+
+        if (!setup && a.runtime->State() == RrcState::RRC_SRB1_CONFIGURING)
+        {
+            a.runtime->SubmitSetupComplete(attachRequest);
+            setup = true;
+        }
+
+        for (const auto &pdu : sender.sent)
+        {
+            if (pdu.empty())
+                continue;
+            const auto probe = ProbeS1apPdu(pdu.data(), pdu.size());
+            if (probe.kind == S1apPdu::Kind::SUCCESSFUL_OUTCOME)
+            {
+                responses++;
+                continue;
+            }
+            if (probe.kind != S1apPdu::Kind::INITIATING)
+                continue;
+            UplinkNas uplinkNas;
+            try
+            {
+                uplinkNas = DecodeUplinkNas(pdu.data(), pdu.size());
+            }
+            catch (const CodecError &)
+            {
+                continue;
+            }
+            if (uplinkNas.mmeUeS1apId.has_value())
+            {
+                uplink = true;
+                continue;
+            }
+            if (!nas)
+            {
+                enbUeS1apId = uplinkNas.enbUeS1apId;
+                nas = true;
+                const std::vector<uint8_t> downlink{0x07, 0x5D, 0x02, 0x00, 0x02, 0xA0, 0x20};
+                const auto answer = EncodeDownlinkNasTransport(MmeIdA, enbUeS1apId, downlink);
+                mux.handleS1ap(answer.data(), answer.size(), 1);
+            }
+        }
+        sender.sent.clear();
+
+        if (a.downlinkNas.size() > a.responded)
+        {
+            a.responded = a.downlinkNas.size();
+            a.runtime->SubmitNas(std::vector<uint8_t>{0x07, 0x5E, 0x11, 0x22, 0x33});
+        }
+
+        if (!ics && nas && uplink && enbUeS1apId != 0)
+        {
+            InitialContextSetupRequest request;
+            request.mmeUeS1apId = MmeIdA;
+            request.enbUeS1apId = enbUeS1apId;
+            request.ueAmbrUl = request.ueAmbrDl = 100000000;
+            ErabToBeSetupItem erab;
+            erab.erabId = 5;
+            erab.qci = 9;
+            erab.transportLayerAddress = {10, 0, 0, 1};
+            erab.gtpTeid = {0x11, 0x22, 0x33, 0x44};
+            request.erabs.push_back(erab);
+            request.encryptionAlgorithms = {0xE0, 0x00};
+            request.integrityAlgorithms = {0xE0, 0x00};
+            request.securityKey = security::DeriveKenb(a.kasme, 7);
+            const auto pdu = EncodeInitialContextSetupRequest(request);
+            mux.handleS1ap(pdu.data(), pdu.size(), 1);
+            ics = true;
+        }
+
+        if (responses == 1)
+        {
+            // The Initial Context Setup is committed and the DRB runtime exists.
+            REQUIRE(mux.bridgeHasAssociation(AssocA));
+            REQUIRE(mux.uuDrbCount(AssocA) == 1);
+
+            const auto release = EncodeUeContextReleaseCommand(MmeIdA, enbUeS1apId, "radioNetwork", 20);
+            mux.handleS1ap(release.data(), release.size(), 1);
+
+            // The bridge emits the Release Complete synchronously. It is the
+            // only successful outcome this turn and it is not a second response
+            // invented by the multiplexer.
+            size_t completes = 0;
+            for (const auto &sent : sender.sent)
+                if (ProbeS1apPdu(sent.data(), sent.size()).kind == S1apPdu::Kind::SUCCESSFUL_OUTCOME)
+                    completes++;
+            CHECK(completes == 1);
+            CHECK_FALSE(mux.bridgeHasAssociation(AssocA));
+            CHECK(mux.uuDrbCount(AssocA) == 0);
+            break;
+        }
+    }
+
+    REQUIRE(ics);
+    REQUIRE(responses == 1);
+
+    // The UE consumes the RRCConnectionRelease and leaves the connection only at
+    // Tick, once the bearer that delivered it is off the stack.
+    for (int round = 0; round < 100 && a.runtime->State() != RrcState::RRC_IDLE; ++round)
+    {
+        mux.poll();
+        a.runtime->Pump(0);
+        a.runtime->Tick();
+    }
+    CHECK(a.runtime->State() == RrcState::RRC_IDLE);
+    CHECK(mux.bridgeAssociationCount() == 0);
+}

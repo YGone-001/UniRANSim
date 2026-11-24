@@ -143,6 +143,19 @@ enum class HandoverCapability : uint8_t
     // registration and NAS context retained, and a Service Request (UE- or
     // paging-triggered) returning the UE to ECM-CONNECTED.
     LTE_ECM_IDLE_ACCESS_RESTORATION_READY,
+    // Phase 18-F-B6-D6: the EPS default bearer, its E-RAB and DRB, the PDCP
+    // user plane, the Uu DTCH transport, the S1-U GTP-U path and the ECM-IDLE
+    // bearer restoration. None of them is a live-handover execution
+    // prerequisite; they are reported so the build's user-plane state is named
+    // rather than inferred from the control plane.
+    LTE_EPS_DEFAULT_BEARER_READY,
+    LTE_E_RAB_SETUP_READY,
+    LTE_PRODUCTION_UE_DRB_READY,
+    LTE_PRODUCTION_PDCP_USER_PLANE_READY,
+    LTE_UU_DRB_USER_PLANE_READY,
+    LTE_S1U_GTPU_USER_PLANE_READY,
+    LTE_PRODUCTION_UE_BIDIRECTIONAL_USER_PLANE_READY,
+    LTE_ECM_IDLE_BEARER_RESTORATION_READY,
     // External acceptance evidence: only an authorized live Open5GS Attach can
     // make it true, and none was executed.
     LTE_OPEN5GS_ATTACH_ACCEPTED,

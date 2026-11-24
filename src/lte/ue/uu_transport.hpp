@@ -42,6 +42,11 @@ class UuNasTransport
     // the NAS security context and decides when to request access again.
     using ReleaseHandler = std::function<void()>;
     using PagingHandler = std::function<void(uint8_t mmec, uint32_t mTmsi)>;
+    // Phase 18-F-B6-D6: a DTCH frame from the eNB. The owner demultiplexes it to
+    // the DRB runtime; it is user plane and never RRC.
+    using UserPlaneHandler = std::function<void(const uu::Frame &)>;
+    // A decoded RRCConnectionReconfiguration that configures DRBs.
+    using DrbReconfigurationHandler = std::function<void(const rrc::DrbReconfiguration &)>;
 
     UuNasTransport(UuEndpoint endpoint, rrc::UeSrb1Runtime::Config config);
     ~UuNasTransport();
@@ -56,6 +61,8 @@ class UuNasTransport
     void SetNasHandler(NasHandler handler);
     void SetReleaseHandler(ReleaseHandler handler);
     void SetPagingHandler(PagingHandler handler);
+    void SetUserPlaneHandler(UserPlaneHandler handler);
+    void SetDrbReconfigurationHandler(DrbReconfigurationHandler handler);
 
     // Starts a new RRC connection after a network release. The transport keeps
     // its socket, its NAS handler and the UE identity; only the radio state is
@@ -71,6 +78,21 @@ class UuNasTransport
     // established or the bearer refused the message - the caller must not retry
     // it over another transport.
     bool SendNas(const std::vector<uint8_t> &nas);
+
+    // One uplink DTCH payload (routing header included). Refused unless the RRC
+    // connection is established; it never falls back to the legacy link.
+    bool SendUserPlane(const std::vector<uint8_t> &payload);
+    // The DL-DCCH RRCConnectionReconfigurationComplete for a configuration the
+    // callback above delivered.
+    void SubmitReconfigurationComplete(uint8_t transactionId);
+
+    // The AS security context of the current access, or null before the
+    // SecurityMode procedure completed. Its K_UPenc keys the DRBs.
+    [[nodiscard]] const security::AsSecurityContext *SecurityContext() const;
+    [[nodiscard]] uint32_t Association() const
+    {
+        return config_.association;
+    }
 
     // Bounded: at most one frame, and never blocks longer than timeoutMs.
     void Pump(int timeoutMs);
@@ -99,6 +121,8 @@ class UuNasTransport
     NasHandler handler_{};
     ReleaseHandler releaseHandler_{};
     PagingHandler pagingHandler_{};
+    UserPlaneHandler userPlaneHandler_{};
+    DrbReconfigurationHandler drbReconfigurationHandler_{};
     bool setupCompleteSent_{false};
     bool released_{false};
 };

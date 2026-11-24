@@ -200,6 +200,14 @@ void MobilityContext::beginNewAttach()
     handover = HandoverExecution::NONE;
 }
 
+void MobilityContext::advanceAccessGeneration()
+{
+    if (ecm != EcmState::IDLE)
+        throw LifecycleError("An access epoch advances only after the access was released");
+    if (++accessGeneration == 0)
+        ++accessGeneration;
+}
+
 void MobilityContext::onCellReselected()
 {
     // A cell change in ECM-IDLE is not a new session and not a procedure: the
