@@ -247,7 +247,9 @@ TEST_CASE("lte/handover/live: the capability model names every missing live prer
     CHECK(readiness.available(HandoverCapability::LTE_ECM_IDLE_BEARER_RESTORATION_READY));
     CHECK(readiness.available(HandoverCapability::LTE_PRODUCTION_UE_DRB_READY));
     CHECK(readiness.available(HandoverCapability::LTE_PRODUCTION_UE_BIDIRECTIONAL_USER_PLANE_READY));
-    CHECK_FALSE(readiness.available(HandoverCapability::LTE_OPEN5GS_ATTACH_ACCEPTED));
+    // D9: the live Open5GS Attach acceptance is now executed evidence; the
+    // live-handover execution prerequisites below are unchanged.
+    CHECK(readiness.available(HandoverCapability::LTE_OPEN5GS_ATTACH_ACCEPTED));
     CHECK(readiness.available(HandoverCapability::LTE_PRODUCTION_ENB_SRB1_READY));
     CHECK(readiness.available(HandoverCapability::LTE_PRODUCTION_MULTIPLEXER_BRIDGE_READY));
     CHECK(readiness.available(HandoverCapability::AS_ALGORITHM_SELECTION_READY));

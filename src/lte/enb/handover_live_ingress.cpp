@@ -459,8 +459,12 @@ LiveHandoverReadiness AssessLiveHandoverCapabilities()
                "and the old TEID remains retired; the production-UE process case drives the release, the compact "
                "Service Request and post-restoration TUN traffic on the same EPS bearer "
                "(test/lte/drb_user_plane.cpp, test/lte/production_uu_user_plane.cpp)"),
-        Assess(HandoverCapability::LTE_OPEN5GS_ATTACH_ACCEPTED, false,
-               "REAL_OPEN5GS_ATTACH_ACCEPTANCE = NOT_EXECUTED: no authorized live Open5GS Attach was run in this phase"),
+        Assess(HandoverCapability::LTE_OPEN5GS_ATTACH_ACCEPTED, true,
+               "REAL_OPEN5GS_ATTACH_ACCEPTANCE = PASS: the production lte-ue and lte-enb completed a live Open5GS "
+               "Attach through real S1-MME SCTP and S1AP, genuine EPS AKA and NAS security, the Attach Accept/Complete, "
+               "the default EPS bearer (EBI 5, QCI 9, APN cmnet), a PDN IPv4 address from the live pool, a real "
+               "Initial Context Setup/E-RAB/DRB and real S1-U GTP-U in both directions; the bounded Detach returned "
+               "the MME/SMF session count to its pre-test baseline (reports/PHASE-18-F-B6-D9-FINAL-REPORT.md)"),
         Assess(HandoverCapability::AS_SMC_RUNTIME_READY, true,
                "the RRC SecurityModeCommand and SecurityModeComplete are produced, protected and verified by the B5 "
                "procedures over the actual socket-backed SRB1; the command is the first secure downlink COUNT and the "

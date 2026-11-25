@@ -1700,3 +1700,54 @@ fixed.
 - `test/lte/production_uu_user_plane.cpp` (privileged, three processes) now
   requires the restored DRB `rlc_state == 0`, so the blocking CI job fails if
   the stall signature returns.
+
+## Real Open5GS EPC integration (D9)
+
+`docs/lte-open5gs-epc-integration.md` and `docs/lte-open5gs-live-acceptance.md`
+are the records. The production `lte-ue` and `lte-enb` completed a live
+Open5GS Attach and carried real bidirectional IP through the live SGW-U/PGW-U.
+
+- **The live acceptance is production code, not a fixture.** S1-MME is a real
+  SCTP association (`src/lte/enb/app.cpp`); S1AP, NAS, EPS AKA, NAS security,
+  the default EPS bearer, Initial Context Setup, the E-RAB, the DRB12 PDCP, the
+  LTE RLC AM and S1-U GTP-U all run. A deterministic MME or SGW-U must never
+  stand in for the live run.
+- **The PDN address comes from the Attach Accept.** The live pool assigned
+  10.45.0.168/.170 etc.; never reuse the D7/D8 10.45.0.2, and never write an
+  address the ESM bearer did not assign.
+- **The SGW-U F-TEID comes from S1AP.** The eNB allocates its own local S1-U
+  TEID and advertises it; the SGW-U F-TEID is the value the live MME delivered.
+  No TEID is copied from the deterministic bearer map.
+- **Test isolation and secrets.** Live tests use only identities designated for
+  the laboratory and the private `config/*.local.yaml` (mode 600, git-ignored).
+  Generated configs are mode 600 outside Git and deleted after the run. K, OPc,
+  OP and authentication traces never enter Git, a report, a log or a PCAP
+  analysis. The live EPC is never restarted, reconfigured or modified; no
+  subscriber is created, changed or deleted. The test eNB/UE run in an isolated
+  namespace with a new temporary veth, removed afterwards; the test endpoint is
+  the host's own address, not an echo written into the UE TUN.
+- **The Uu is simulated and loopback-only.** The eNB's Uu socket binds
+  `127.0.0.1` and the current eNB uses the configured `uu.address` as the peer
+  address, so the live eNB and UE share one isolated namespace. Separating them
+  requires an eNB Uu source-address change, which is not implemented. Never
+  describe this as a real RF air interface.
+- **Clean lifecycle versus abnormal exit.** A clean Detach releases the eNB SRB
+  and repeated Attach on the same eNB works (verified). If a UE process stops
+  without Detach, the eNB's retained SRB RLC state is not reset; a later Attach
+  from the same radio identity reuses it and its SetupComplete is treated as
+  old. Use a fresh eNB or a clean Detach, and report the abnormal path as a
+  limitation rather than a pass.
+- **ECM-IDLE/Service Request on a live MME is PARTIAL.** The live environment
+  has no controlled network release; the deterministic D5/D7 path remains the
+  functional evidence. Do not claim a live network-initiated restoration from a
+  UE-only test.
+- **Live throughput is not a 1 Gbps claim.** The live Open5GS is a debug build
+  and measured ~19-20 Mbit/s; the D8 deterministic path measured ~70 Mbit/s.
+  `LTE_SINGLE_UE_1GBPS_ACCEPTED` and the 512-UE scale flag stay false.
+- **The live EPC is not in GitHub-hosted CI.** Hosted runners have no Open5GS;
+  the live acceptance is local evidence. The deterministic GitHub matrix stays
+  blocking, and a live job is marked NOT_EXECUTED rather than simulated.
+- `LTE_OPEN5GS_ATTACH_ACCEPTED` is now true on the live evidence (production UE,
+  real MME/HSS, AKA, NAS security, default bearer, ICS, E-RAB, real IP and
+  Attach Complete). The live-handover execution prerequisites remain false and
+  live handover remains unauthorized.
