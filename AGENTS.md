@@ -1751,3 +1751,53 @@ Open5GS Attach and carried real bidirectional IP through the live SGW-U/PGW-U.
   real MME/HSS, AKA, NAS security, default bearer, ICS, E-RAB, real IP and
   Attach Complete). The live-handover execution prerequisites remain false and
   live handover remains unauthorized.
+
+## LTE multi-UE architecture and 256-UE isolated acceptance (D10)
+
+`docs/lte-multi-ue-architecture.md` and `docs/lte-512-ue-scale-testing.md` are
+the records. The production eNB/UE fleet reached **256 simultaneous UEs** on an
+isolated Open5GS instance; the 512 target is blocked by this host's memory, not
+claimed.
+
+- **One context per UE, one owner per layer.** The production UE process owns
+  NAS/ESM, bearer/TFT, TUN, PDCP and RLC AM; the eNB registry owns the S1AP
+  identities, E-RAB, local TEID and peer; the per-association bridge owns the
+  SRB; the isolated EPC owns the SGW-U/PGW-U F-TEIDs and sessions. EBI 5 and DRB
+  identity 5 are legitimately reused across UEs and are scoped by the UE
+  context; never make them globally unique.
+- **Shared sockets, per-UE routing.** The eNB has one SCTP association, one Uu
+  UDP socket and one S1-U socket. Uu frames are routed by association and UE
+  source port; S1-U by local TEID and verified peer. Do not fan a shared socket
+  into a global UE state.
+- **Per-UE TUN traffic uses source policy routing.** A static route to the same
+  PDN test endpoint from every UE would overwrite the previous UE's route; the
+  harness installs `ip rule from <UE IP>` and a per-table route via that UE's
+  TUN after readiness. The 256 UEs shared one test namespace, so their PDN
+  addresses are local interfaces: per-UE EPC traffic is verified, but
+  hostile-tenant L3 isolation is not. Per-UE namespaces/VRFs and a concrete Uu
+  bind address remain future work.
+- **The scale environment is isolated.** A private Open5GS instance in
+  `d10epc`, its own mongod database, its own 10.80.0.0/16 pool and `d10tun`, and
+  512 generated test subscribers in the isolated HSS. The shared laboratory EPC
+  is never restarted, reconfigured, stressed or modified; no shared subscriber
+  is touched. Test credentials are mode-600, outside Git and never printed.
+- **The declared resource budget is a gate.** A production Uu/DRB UE measured
+  about 8.6 MiB RSS. The harness estimates the target footprint and stops with
+  `BLOCKED_RESOURCE_LIMIT` before crossing the `MemAvailable` reserve. On the
+  6-core / 7.7 GiB host 256 UEs was the measured maximum; 512 (~4.4 GiB of UE
+  memory plus the reserve and the shared EPC) was not started. Never run 512
+  into OOM around the shared EPC, and never substitute a deterministic 512 or
+  an extrapolated count for a production 512.
+- **Failure isolation is per UE.** A `SIGKILL` of one UE left the surviving UE
+  carrying its 1372-byte UDP traffic (10/10). The eNB now creates a fresh SRB
+  after a new RRC connection and releases a stale active access (retaining the
+  EPS session and retiring its old local TEIDs) when the same radio identity
+  reconnects. The same-eNB reattach after an abnormal exit still times out in
+  the bridge/MME stale path; it is PARTIAL. A clean Detach and a fresh eNB work.
+- **GUTI Reallocation is still a gap.** EMM message type 97 is ignored by the
+  production UE; do not claim GUTI handling until it is decoded and completed.
+- **The 512 gates are not pass.** 256 attach/bearer/DRB/IP/per-UE data smoke is
+  measured; 512 attach, 512 data plane, 10-minute 512 retention, 60-second
+  concurrent 8/16/32/64 traffic and a 256-UE production Detach pass are not.
+  `LTE_512_UE_SCALE_ACCEPTED` stays false. The deterministic CI remains the
+  blocking matrix; no hosted runner has the isolated EPC.

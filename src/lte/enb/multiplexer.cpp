@@ -1730,11 +1730,22 @@ void EnbMultiplexer::initUuTransport()
             }
             else
             {
-                if (entry->transport != RadioTransportKind::UuSrb1 || !entry->sessionRetained ||
-                    entry->s1 != UeS1State::IDLE_RETAINED ||
+                if (entry->transport != RadioTransportKind::UuSrb1 ||
                     entry->peer != InetAddress(m_config.uuAddress, peerPort))
                     throw std::runtime_error(
                         "A new SRB1 connection does not match this cell's retained UE session");
+                if (!entry->sessionRetained || entry->s1 != UeS1State::IDLE_RETAINED)
+                {
+                    // The UE disappeared without a Detach and the eNB still
+                    // holds an active access for it. A new RRC connection from
+                    // the same radio identity is a new access: retire the old
+                    // local TEIDs, destroy its DRB entities and retain only the
+                    // logical EPS session, then bind the fresh S1 context.
+                    Log("WARN", "SRB1 association " + std::to_string(association) +
+                                    " reconnected over a stale active access; releasing the old access");
+                    m_drbs.erase(association);
+                    m_registry.releaseS1(*entry);
+                }
             }
             entry->transport = RadioTransportKind::UuSrb1;
             m_registry.bindEnbUeS1apId(*entry, enbUeS1apId);

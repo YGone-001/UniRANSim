@@ -523,8 +523,31 @@ void EnbSrb1Runtime::OnRequestFrame(uint32_t association, const uu::Frame &frame
     }
     if (answer.empty())
     {
-        refused_++;
-        return;
+        // The association may still hold an initial-access context from a UE
+        // that disappeared without an RRC release. A genuine new
+        // RRCConnectionRequest is then refused before the SRB is reached.
+        // Drop the stale access and retry once with the same frame.
+        RrcConnectionRequestMessage probe;
+        if (!DecodeRrcConnectionRequest(frame.payload.data(), frame.payload.size(), probe))
+        {
+            refused_++;
+            return;
+        }
+        access_.Release(association);
+        try
+        {
+            answer = access_.OnRequest(association, srb0_.Deliver(frame.payload));
+        }
+        catch (const AccessException &)
+        {
+            refused_++;
+            return;
+        }
+        if (answer.empty())
+        {
+            refused_++;
+            return;
+        }
     }
 
     auto existing = contexts_.find(association);
@@ -535,13 +558,16 @@ void EnbSrb1Runtime::OnRequestFrame(uint32_t association, const uu::Frame &frame
             refused_++;
             return;
         }
-        uu::Frame reply;
-        reply.association = association;
-        reply.direction = uu::Direction::DOWNLINK;
-        reply.channel = uu::LogicalChannel::CCCH;
-        reply.payload = answer;
-        socket_.Send(sourcePort, reply, nullptr);
-        return;
+        // A fresh RRCConnectionRequest is a new connection, not a
+        // retransmission: the access layer already produced a new Setup from
+        // it. Reusing the old SRB RLC/PDCP/security state would make the new
+        // SetupComplete's sequence number look like an old PDU after an
+        // abnormal UE exit. Drop the old context and create a fresh one; the
+        // retained EPS session and its S1AP ownership are the owner's state,
+        // not this radio context's.
+        if (existing->second.bearer != nullptr)
+            existing->second.bearer->Release();
+        contexts_.erase(existing);
     }
 
     Context context;
