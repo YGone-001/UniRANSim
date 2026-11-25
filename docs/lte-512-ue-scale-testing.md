@@ -52,6 +52,8 @@ JSON, the stage table, the eNB/MME/SMF/UPF logs and the 2-UE data probes.
 ## 5. Cleanup
 
 The isolated UEs, eNB, EPC daemons, mongod, `d10tun`, veth pair and namespaces
-are test-owned and are stopped/removed after the run. The shared EPC's session
-count remains at its pre-test baseline (5). A 256-UE production Detach pass was
-not executed; that gate is PARTIAL.
+are test-owned and are stopped/removed after the run. The shared EPC was not
+used for the scale run and no D10 attach/session was created there. Its MME
+session gauge was 5 at the D10 audit and 4 at cleanup; both are the owner's own
+sessions. A 256-UE production Detach pass was not executed; that gate is
+PARTIAL.
