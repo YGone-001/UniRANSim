@@ -1752,12 +1752,16 @@ Open5GS Attach and carried real bidirectional IP through the live SGW-U/PGW-U.
   Attach Complete). The live-handover execution prerequisites remain false and
   live handover remains unauthorized.
 
-## LTE multi-UE architecture and 256-UE isolated acceptance (D10)
+## LTE multi-UE architecture and 512-UE isolated acceptance (D10)
 
 `docs/lte-multi-ue-architecture.md` and `docs/lte-512-ue-scale-testing.md` are
-the records. The production eNB/UE fleet reached **256 simultaneous UEs** on an
-isolated Open5GS instance; the 512 target is blocked by this host's memory, not
-claimed.
+the records. The production eNB/UE fleet reached **512 simultaneous UEs** on the
+rebuilt isolated Open5GS instance: 512 MME sessions, per-UE default bearer, DRB
+and PDN address, 1024/1024 zero-loss probes at the 512 stage and again after a
+10-minute retention window, and a 512-UE production Detach back to 0 sessions.
+The real shared-EPC portion is **256 UEs** with the owner-designated real
+subscribers; it is a separate result, not a 512 real-EPC claim. The 60-second
+concurrent 8/16/32/64 gate and the same-eNB reattach are not pass.
 
 - **One context per UE, one owner per layer.** The production UE process owns
   NAS/ESM, bearer/TFT, TUN, PDCP and RLC AM; the eNB registry owns the S1AP
@@ -1772,32 +1776,47 @@ claimed.
 - **Per-UE TUN traffic uses source policy routing.** A static route to the same
   PDN test endpoint from every UE would overwrite the previous UE's route; the
   harness installs `ip rule from <UE IP>` and a per-table route via that UE's
-  TUN after readiness. The 256 UEs shared one test namespace, so their PDN
-  addresses are local interfaces: per-UE EPC traffic is verified, but
-  hostile-tenant L3 isolation is not. Per-UE namespaces/VRFs and a concrete Uu
-  bind address remain future work.
+  TUN after readiness, and it deletes any stale rule at that priority and
+  verifies both rule and route before reporting the UE ready. A UE without the
+  route is a failed UE, not a silent probe failure. The 512 UEs shared one test
+  namespace, so their PDN addresses are local interfaces: per-UE EPC traffic is
+  verified, but hostile-tenant L3 isolation is not. Per-UE namespaces/VRFs and a
+  concrete Uu bind address remain future work.
 - **The scale environment is isolated.** A private Open5GS instance in
   `d10epc`, its own mongod database, its own 10.80.0.0/16 pool and `d10tun`, and
-  512 generated test subscribers in the isolated HSS. The shared laboratory EPC
-  is never restarted, reconfigured, stressed or modified; no shared subscriber
-  is touched. Test credentials are mode-600, outside Git and never printed.
-- **The declared resource budget is a gate.** A production Uu/DRB UE measured
-  about 8.6 MiB RSS. The harness estimates the target footprint and stops with
-  `BLOCKED_RESOURCE_LIMIT` before crossing the `MemAvailable` reserve. On the
-  6-core / 7.7 GiB host 256 UEs was the measured maximum; 512 (~4.4 GiB of UE
-  memory plus the reserve and the shared EPC) was not started. Never run 512
+  512 generated test subscribers in the isolated HSS. The real-256 portion used
+  the shared laboratory EPC read-only with the owner-designated subscribers and
+  removed its sessions through the production Detach, leaving the owner's four.
+  Never create, modify or delete a shared subscriber, and never reconfigure the
+  shared EPC. Its own logs show it terminating at 17:38 during the owner's
+  rebuild activity; that is outside this work, it was not restarted here, and a
+  read-only check later found it still down. Test credentials are mode-600,
+  outside Git and never printed.
+- **The declared resource budget is a gate.** The process RSS (about 8.6 MiB
+  per UE) is an observation, not the host cost: the 512-UE sum PSS was 1.77
+  MB/UE and the cumulative MemAvailable increment 1.96 MB/UE. The gate uses a
+  3.0 MB/UE host-increment model, a 512 MB `MemAvailable` floor, material
+  SwapUsed/paging stops and PSI stops, and adopts the measured cumulative
+  estimate only once the fleet is at least 128 UEs (a 100 MB page-cache swing
+  is several MB/UE of noise below that). Never run the fleet into the floor or
   into OOM around the shared EPC, and never substitute a deterministic 512 or
-  an extrapolated count for a production 512.
-- **Failure isolation is per UE.** A `SIGKILL` of one UE left the surviving UE
-  carrying its 1372-byte UDP traffic (10/10). The eNB now creates a fresh SRB
-  after a new RRC connection and releases a stale active access (retaining the
-  EPS session and retiring its old local TEIDs) when the same radio identity
-  reconnects. The same-eNB reattach after an abnormal exit still times out in
-  the bridge/MME stale path; it is PARTIAL. A clean Detach and a fresh eNB work.
+  an extrapolated count for a production 512. Test UEs and long-lived daemons
+  are started with `setsid`; a tool-shell process-group cleanup must not be
+  able to kill them mid-run.
+- **Failure isolation is per UE.** In the 512-UE fleet, a `SIGKILL` of UE 300
+  left UEs 299 and 301 answering their 1372-byte probes with 0 loss. The eNB
+  creates a fresh SRB after a new RRC connection and releases a stale active
+  access (retaining the EPS session and retiring its old local TEIDs) when the
+  same radio identity reconnects. The same-eNB reattach after an abnormal exit
+  still times out waiting for the MME Attach signalling; it is FAILED, not
+  PARTIAL. A clean Detach and a fresh eNB work.
 - **GUTI Reallocation is still a gap.** EMM message type 97 is ignored by the
   production UE; do not claim GUTI handling until it is decoded and completed.
-- **The 512 gates are not pass.** 256 attach/bearer/DRB/IP/per-UE data smoke is
-  measured; 512 attach, 512 data plane, 10-minute 512 retention, 60-second
-  concurrent 8/16/32/64 traffic and a 256-UE production Detach pass are not.
-  `LTE_512_UE_SCALE_ACCEPTED` stays false. The deterministic CI remains the
-  blocking matrix; no hosted runner has the isolated EPC.
+- **The 512 gates are mixed.** 512 attach/bearer/DRB/IP, 1024/1024 UL/DL
+  probes, the 10-minute 512 retention and a 512-UE production Detach are
+  measured and pass. The 60-second concurrent 8/16/32/64 gate is measured and
+  does **not** pass: the un-paced UDP clients overflow the per-UE TUN
+  backpressure (1.51%/0.70%/0.34%/0.004% delivered at 8/16/32/64 UEs), and no
+  paced alternative exists yet. `LTE_512_UE_SCALE_ACCEPTED` stays false until
+  that gate and the same-eNB reattach are pass. The deterministic CI remains
+  the blocking matrix; no hosted runner has the isolated EPC.

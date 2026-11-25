@@ -517,3 +517,13 @@ jobs:
               echo "The privileged TUN integration produced no $log at all." >> "$GITHUB_STEP_SUMMARY"
             fi
           done
+  harness-resource-tests:
+    name: Harness resource and memory model tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Run harness unit tests
+        run: python3 -m unittest discover -s tools/tests -v
