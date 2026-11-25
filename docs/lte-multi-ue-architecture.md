@@ -64,8 +64,9 @@ The D10 EPC runs entirely in its own network namespace, with its own mongod
 database (`xcloud_d10`), its own address plan (127.0.0.x internal, 10.97.0.1
 S1-MME/S1-U), its own `d10tun` and 10.80.0.0/16 pool, and 512 generated test
 subscribers (460029900000001..512). The shared laboratory EPC at 10.10.0.139
-was not restarted, reconfigured or stressed; its baseline session count was
-unchanged. See `docs/lte-512-ue-scale-testing.md`.
+was not restarted, reconfigured or stressed, and D10 created no session on it;
+its MME session gauge was 5 at the audit and 4 at cleanup (the owner's own
+sessions). See `docs/lte-512-ue-scale-testing.md`.
 
 ## 6. Lifecycle and failure isolation
 
