@@ -112,7 +112,10 @@ DrbBearer::DrbBearer(DrbBearerConfig config, rlc::am::EndpointRole role, uint32_
                if (deliverer_)
                    deliverer_(config_.ebi, packet);
            },
-           uu::LogicalChannel::DTCH, [sender = std::move(sender)](const std::vector<uint8_t> &pdu) { sender(pdu); })
+           uu::LogicalChannel::DTCH, [this, sender = std::move(sender)](const std::vector<uint8_t> &pdu) {
+               if (!sender(pdu))
+                   counters_.sendFailures++;
+           })
 {
     config_.am = NormalizeAm(config.am);
     // The PDCP direction is the direction of the traffic, not the local role:
@@ -342,6 +345,14 @@ const DrbBearer *DrbRuntime::Bearer(uint8_t ebi) const
 {
     const auto it = bearers_.find(ebi);
     return it == bearers_.end() ? nullptr : it->second.get();
+}
+
+uint16_t DrbRuntime::MaxOutstandingPdus() const
+{
+    uint16_t outstanding = 0;
+    for (const auto &entry : bearers_)
+        outstanding = std::max(outstanding, entry.second->OutstandingPdus());
+    return outstanding;
 }
 
 bool DrbRuntime::SendPayload(uint8_t kind, uint8_t drbIdentity, const std::vector<uint8_t> &body)

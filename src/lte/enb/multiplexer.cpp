@@ -1072,7 +1072,7 @@ void EnbMultiplexer::onErabSetupRequest(const uint8_t *data, size_t size)
                     drb.drbIdentity = item.erabId;
                     drb.logicalChannelIdentity = nextChannel++;
                     drb.priority = 2;
-                    drb.am = lte::rrc::MapAmRlcConfiguration(2, 7, 14, 5, 1, 1);
+                    drb.am = lte::rrc::MapAmRlcConfiguration(7, 3, 14, 7, 1, 1);
                     drb.am.maxPduBytes = 1700;
                     configuration.drbs.push_back(drb);
                     lte::rrc::DrbBearerConfig bearerConfig;
@@ -1763,11 +1763,24 @@ void EnbMultiplexer::pollUu()
     // lost RLC PDU was never recovered because the DRB entities were not
     // ticked. Drain a bounded batch, then tick the SRB and every DRB entity so
     // STATUS and retransmission timers advance.
-    for (int i = 0; i < 16; ++i)
+    for (int i = 0; i < 64; ++i)
         m_bridge->Pump(0);
     m_bridge->Tick();
-    for (auto &entry : m_drbs)
-        entry.second->Tick();
+    const auto now = std::chrono::steady_clock::now();
+    if (m_drbTickLast == std::chrono::steady_clock::time_point{})
+        m_drbTickLast = now;
+    const auto elapsed = static_cast<int64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - m_drbTickLast).count());
+    if (elapsed > 0)
+    {
+        m_drbTickLast += std::chrono::milliseconds(elapsed);
+        const auto ticks = elapsed > 20 ? 20 : elapsed;
+        for (int64_t i = 0; i < ticks; ++i)
+        {
+            for (auto &entry : m_drbs)
+                entry.second->Tick();
+        }
+    }
     commitPendingIcs();
 }
 
@@ -1881,7 +1894,7 @@ bool EnbMultiplexer::establishUuDrbs(EnbUeEntry &entry, const std::vector<uint8_
         drb.priority = priority++;
         try
         {
-            drb.am = lte::rrc::MapAmRlcConfiguration(2, 7, 14, 5, 1, 1);
+            drb.am = lte::rrc::MapAmRlcConfiguration(7, 3, 14, 7, 1, 1);
         }
         catch (const lte::rrc::Srb1ConfigException &)
         {
@@ -2321,7 +2334,8 @@ void EnbMultiplexer::shutdown()
                             std::to_string(counters.oversizedDrops) + "/" +
                             std::to_string(counters.malformedDrops) + "/" +
                             std::to_string(counters.pdcpFailures) + "/" + std::to_string(counters.rlcFailures) + "/" +
-                            std::to_string(counters.unknownBearerDrops));
+                            std::to_string(counters.unknownBearerDrops) +
+                            " send-failures=" + std::to_string(counters.sendFailures));
         }
         Log("INFO", "User-plane statistics for LTE UE " + std::to_string(entry->radioUeId) +
                         ": radio-ul=" + std::to_string(entry->counters.simulatedUplinkPackets) + "/" +
@@ -2335,7 +2349,8 @@ void EnbMultiplexer::shutdown()
                         " drops(malformed/teid/peer/inactive)=" + std::to_string(entry->counters.malformedDrops) +
                         "/" + std::to_string(entry->counters.invalidTeidDrops) + "/" +
                         std::to_string(entry->counters.unexpectedPeerDrops) + "/" +
-                        std::to_string(entry->counters.bearerInactiveDrops));
+                        std::to_string(entry->counters.bearerInactiveDrops) +
+                        " send-drops=" + std::to_string(entry->counters.s1uSendDrops));
         m_registry.releaseS1(*entry);
     }
     m_drbs.clear();

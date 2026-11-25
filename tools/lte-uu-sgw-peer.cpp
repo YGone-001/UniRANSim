@@ -306,9 +306,11 @@ int main(int argc, char **argv)
             }
 
             InetAddress peer;
-            const int length = gtpu.Receive(buffer, sizeof(buffer), 2, peer);
-            if (length > 0)
+            for (int gtpuBudget = 0; gtpuBudget < 32; ++gtpuBudget)
             {
+                const int length = gtpu.Receive(buffer, sizeof(buffer), gtpuBudget == 0 ? 2 : 0, peer);
+                if (length <= 0)
+                    break;
                 try
                 {
                     const auto decoded = lte::enb::gtpu::Decode(buffer, static_cast<size_t>(length));

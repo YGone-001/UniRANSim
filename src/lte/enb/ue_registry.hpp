@@ -58,6 +58,10 @@ struct UserPlaneCounters
     uint64_t invalidTeidDrops{};
     uint64_t unexpectedPeerDrops{};
     uint64_t bearerInactiveDrops{};
+    // A GTP-U datagram the local socket refused (its send buffer was full).
+    // The packet never left this eNB; it is counted here rather than silently
+    // discarded, and the RLC has already acknowledged what it carried.
+    uint64_t s1uSendDrops{};
 };
 
 class RegistryError : public std::runtime_error

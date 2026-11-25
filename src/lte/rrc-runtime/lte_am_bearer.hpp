@@ -101,6 +101,10 @@ class LteAmBearer
     [[nodiscard]] uint16_t VtA() const;
     [[nodiscard]] uint16_t VtS() const;
     [[nodiscard]] uint16_t VrR() const;
+    // Phase 18-F-B6-D8: PDUs transmitted but not yet acknowledged. The AM
+    // window itself stays the standard 512; this is the value a user-plane
+    // backpressure policy watches.
+    [[nodiscard]] uint16_t OutstandingPdus() const;
     [[nodiscard]] size_t Delivered() const;
     [[nodiscard]] size_t Sent() const
     {
@@ -119,6 +123,26 @@ class LteAmBearer
     [[nodiscard]] size_t DroppedOutOfWindow() const
     {
         return entity_.DroppedOutOfWindow();
+    }
+    [[nodiscard]] size_t StatusSent() const
+    {
+        return entity_.StatusSent();
+    }
+    [[nodiscard]] size_t StatusReceived() const
+    {
+        return entity_.StatusReceived();
+    }
+    [[nodiscard]] size_t PollsSent() const
+    {
+        return entity_.PollsSent();
+    }
+    [[nodiscard]] size_t PollsReceived() const
+    {
+        return entity_.PollsReceived();
+    }
+    [[nodiscard]] uint16_t FailedSn() const
+    {
+        return entity_.FailedSn();
     }
     [[nodiscard]] const Rejections &Refused() const
     {

@@ -467,6 +467,9 @@ class EnbMultiplexer
     // bridge association. Declared after the bridge so it is destroyed first.
     std::map<uint32_t, std::unique_ptr<lte::rrc::DrbRuntime>> m_drbs;
     std::map<uint32_t, lte::rrc::DrbReconfiguration> m_drbConfigs;
+    // DRB RLC timers are counted in milliseconds. `poll` may run far faster
+    // than that, so the entities are ticked on elapsed time, not per call.
+    std::chrono::steady_clock::time_point m_drbTickLast{};
     uint8_t m_uuDrbTransaction{0};
     size_t m_uuDrbConfigurations{0};
     RadioFrameObserver m_radioObserver;

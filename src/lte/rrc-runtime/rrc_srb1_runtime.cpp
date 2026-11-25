@@ -271,7 +271,18 @@ void UeSrb1Runtime::OnRrc(const std::vector<uint8_t> &rrc)
         // owner may establish the bearers. The completion is sent by the owner
         // once the DRBs exist, so a failure never acknowledges a configuration
         // the other side would believe is in force.
-        if (state_ != RrcState::RRC_CONNECTED || !onDrbReconfiguration_)
+        if (state_ != RrcState::RRC_CONNECTED)
+        {
+            if (state_ == RrcState::RRC_CONNECTION_COMPLETE_PENDING && onDrbReconfiguration_ &&
+                !pendingReconfiguration_)
+            {
+                pendingReconfiguration_ = reconfiguration;
+                return;
+            }
+            refused_++;
+            return;
+        }
+        if (!onDrbReconfiguration_)
         {
             refused_++;
             return;
@@ -412,8 +423,24 @@ void UeSrb1Runtime::Tick()
     if (bearer_ != nullptr)
         bearer_->Tick();
 
-    if (state_ == RrcState::RRC_CONNECTION_COMPLETE_PENDING && bearer_ != nullptr && bearer_->VtA() == expectedAck_)
-        state_ = RrcState::RRC_CONNECTED;
+    if (state_ == RrcState::RRC_CONNECTION_COMPLETE_PENDING && bearer_ != nullptr)
+    {
+        // The SetupComplete is acknowledged when VT(A) has passed its SN. Later
+        // uplink PDUs submitted in the same window may push VT(A) past
+        // `expectedAck_`, so equality would leave a UE that is in fact
+        // connected stuck in the pending state.
+        const uint16_t setupSn = static_cast<uint16_t>((expectedAck_ + 1023) % 1024);
+        const int acknowledged = (static_cast<int>(bearer_->VtA()) - static_cast<int>(setupSn) + 1024) % 1024;
+        if (acknowledged > 0 && acknowledged < 512)
+            state_ = RrcState::RRC_CONNECTED;
+    }
+    if (state_ == RrcState::RRC_CONNECTED && pendingReconfiguration_ && onDrbReconfiguration_)
+    {
+        auto pending = std::move(*pendingReconfiguration_);
+        pendingReconfiguration_.reset();
+        evidence_.reconfigurations++;
+        onDrbReconfiguration_(pending);
+    }
 }
 
 void UeSrb1Runtime::Release()

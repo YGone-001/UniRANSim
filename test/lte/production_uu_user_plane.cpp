@@ -810,6 +810,9 @@ TEST_CASE("lte/d7/acceptance: the production ue carries tun ip traffic over drb 
     CHECK(peerFields.U64("service_request_verified") == 1);
     CHECK(peerFields.U64("context_restored") == 1);
     CHECK(peerFields.U64("map_generation") == 2);
+    // D8: the restored DRB RLC must still be ACTIVE after the measured flow.
+    // A failed AM entity is the sustained-stall signature this phase fixed.
+    CHECK(peerFields.U64("rlc_state") == 0);
 
     CHECK(sgwFields.Get("result").value_or("") == "COMPLETE");
     CHECK(sgwFields.U64("map_updates") >= 2);

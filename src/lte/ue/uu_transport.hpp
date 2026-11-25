@@ -98,6 +98,11 @@ class UuNasTransport
     void Pump(int timeoutMs);
     void Tick();
 
+    [[nodiscard]] const rrc::UeSrb1Runtime &Runtime() const
+    {
+        return *runtime_;
+    }
+
     // Told by the NAS layer once NAS security is active, so the next downlink
     // SRB1 PDU is expected to carry the RRC SecurityModeCommand.
     void PrepareAsSecurity(const security::Key256 &kasme, uint32_t ulNasCount, uint64_t nasGeneration);

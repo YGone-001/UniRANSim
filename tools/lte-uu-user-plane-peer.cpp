@@ -31,6 +31,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
@@ -589,11 +590,12 @@ int main(int argc, char **argv)
                                          ":" + std::to_string(options.s1uPort) + "\n");
 
         const auto deadline = Clock::now() + std::chrono::seconds(120);
+        auto drbTraceNext = Clock::now() + std::chrono::seconds(1);
         while (!g_stop && Clock::now() < deadline)
         {
             if (!options.stopPath.empty() && std::ifstream(options.stopPath).good())
                 break;
-            mux.poll(8, 8);
+            mux.poll(16, 16);
             while (!sender.queue.empty())
             {
                 auto pdu = std::move(sender.queue.front());
@@ -619,6 +621,25 @@ int main(int argc, char **argv)
             if (stage == Stage::FAILED)
                 break;
             const auto now = Clock::now();
+            if (std::getenv("UNIRANSIM_DRB_TRACE") != nullptr && now >= drbTraceNext)
+            {
+                drbTraceNext = now + std::chrono::seconds(1);
+                if (const auto *drbs = mux.uuDrbs(46001); drbs != nullptr)
+                {
+                    if (const auto *bearer = drbs->Bearer(options.ebi); bearer != nullptr)
+                    {
+                        const auto &rlc = bearer->Rlc();
+                        std::cout << "DRB trace(enb): state=" << lte::rlc::am::ToString(rlc.State())
+                                  << " sn(vta/vts/vrr)=" << rlc.VtA() << "/" << rlc.VtS() << "/" << rlc.VrR()
+                                  << " outstanding=" << rlc.OutstandingPdus()
+                                  << " tx/retx=" << rlc.Transmissions() << "/" << rlc.Retransmissions()
+                                  << " status-s/r=" << rlc.StatusSent() << "/" << rlc.StatusReceived()
+                                  << " poll-s/r=" << rlc.PollsSent() << "/" << rlc.PollsReceived()
+                                  << " oow=" << rlc.DroppedOutOfWindow()
+                                  << " failed-sn=" << rlc.FailedSn() << std::endl;
+                    }
+                }
+            }
             if (now - lastResult >= std::chrono::milliseconds(200))
             {
                 lastResult = now;

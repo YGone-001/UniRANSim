@@ -299,6 +299,8 @@ void S1uEndpoint::forwardUplink(EnbUeEntry &entry, BearerContext &bearer, const 
         ++entry.counters.s1uUplinkPackets;
         entry.counters.s1uUplinkBytes += size;
     }
+    else
+        ++entry.counters.s1uSendDrops;
 }
 
 InetAddress S1uEndpoint::localAddress() const

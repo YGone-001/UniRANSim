@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <deque>
 #include <chrono>
+#include <cstdlib>
 #include <functional>
 #include <iomanip>
 #include <iostream>
@@ -42,6 +43,14 @@ namespace lte::ue
 {
 namespace
 {
+
+// D8 user-plane backpressure. The LTE AM window stays the standard 512; this
+// application-level watermark keeps the simulated Uu receive queue (about 140
+// frames at the default Linux receive buffer) from being overrun by a burst.
+// The UE pauses its TUN reader at the high mark and resumes at the low mark.
+constexpr uint16_t DrbUplinkHighWatermark = 64;
+constexpr uint16_t DrbUplinkLowWatermark = 16;
+
 void Log(const char *level, const std::string &message)
 {
     std::cout << "[lte-ue] [" << level << "] " << message << std::endl;
@@ -154,6 +163,11 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
     // Packets generated while no usable access transport exists. They are
     // dropped, counted and never buffered and never rerouted to another bearer.
     uint64_t accessUnavailableDrops = 0;
+    // D8 uplink backpressure: the TUN reader pauses while this UE's DRB RLC
+    // entities hold too many unacknowledged PDUs for the simulated Uu queues.
+    bool uuTunCongested = false;
+    uint64_t uuTunPauseEvents = 0;
+    uint64_t uuTunPausedTurns = 0;
     // Unexpected S1-MME association loss bookkeeping. The UE keeps its EPS
     // registration and logical bearers; only access transport is invalidated.
     uint64_t accessLosses = 0;
@@ -961,16 +975,37 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
     auto uuPagingDeadline = std::chrono::steady_clock::time_point::max();
     auto uuDeadline = std::chrono::steady_clock::time_point::max();
     uint8_t buffer[link::MaxDataPduSize + link::HeaderSize];
+    // D8 development trace: one line per second with the AM window and the
+    // poll/STATUS counters, so a stalled flow can be attributed to a direction
+    // instead of guessed at from an iperf summary. Off unless requested.
+    const bool uuDrbTrace = std::getenv("UNIRANSIM_DRB_TRACE") != nullptr;
+    auto uuDrbTraceNext = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    auto uuRlcTickLast = std::chrono::steady_clock::now();
     while (!shutdownRequested && (mobility.emm == EmmState::REGISTERED || std::chrono::steady_clock::now() < deadline))
     {
         const auto now = std::chrono::steady_clock::now();
 
         if (uuTransport)
         {
-            uuTransport->Pump(0);
-            uuTransport->Tick();
-            if (uuDrbs != nullptr)
-                uuDrbs->Tick();
+            // Wait at most 1 ms on the Uu socket so an idle turn still advances
+            // the AM timers once, but a busy turn drains without sleeping. The
+            // RLC entity's timers are tick counts of one millisecond each, so
+            // they are driven on elapsed time below, never once per loop.
+            uuTransport->Pump(1);
+            const auto tickNow = std::chrono::steady_clock::now();
+            const auto elapsedTicks = static_cast<int64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(tickNow - uuRlcTickLast).count());
+            if (elapsedTicks > 0)
+            {
+                uuRlcTickLast += std::chrono::milliseconds(elapsedTicks);
+                const auto ticks = elapsedTicks > 20 ? 20 : elapsedTicks;
+                for (int64_t i = 0; i < ticks; ++i)
+                {
+                    uuTransport->Tick();
+                    if (uuDrbs != nullptr)
+                        uuDrbs->Tick();
+                }
+            }
             if (!initialAttachSent && uuTransport->SendNas(attach))
             {
                 initialAttachSent = true;
@@ -983,6 +1018,41 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
             {
                 lastUuState = uuTransport->State();
                 Log("INFO", std::string("Uu RRC state=") + rrc::ToString(lastUuState));
+            }
+            if (uuDrbTrace && now >= uuDrbTraceNext)
+            {
+                uuDrbTraceNext = now + std::chrono::seconds(1);
+                if (uuDrbs != nullptr)
+                {
+                    if (const auto *bearer = uuDrbs->Bearer(activeEbi); bearer != nullptr)
+                    {
+                    const auto &rlc = bearer->Rlc();
+                    Log("INFO", "DRB trace: state=" + std::string(rlc::am::ToString(rlc.State())) +
+                                    " sn(vta/vts/vrr)=" + std::to_string(rlc.VtA()) + "/" +
+                                    std::to_string(rlc.VtS()) + "/" + std::to_string(rlc.VrR()) +
+                                    " outstanding=" + std::to_string(rlc.OutstandingPdus()) +
+                                    " tx/retx=" + std::to_string(rlc.Transmissions()) + "/" +
+                                    std::to_string(rlc.Retransmissions()) +
+                                    " status-s/r=" + std::to_string(rlc.StatusSent()) + "/" +
+                                    std::to_string(rlc.StatusReceived()) +
+                                    " poll-s/r=" + std::to_string(rlc.PollsSent()) + "/" +
+                                    std::to_string(rlc.PollsReceived()) +
+                                    " oow=" + std::to_string(rlc.DroppedOutOfWindow()) +
+                                    " failed-sn=" + std::to_string(rlc.FailedSn()) +
+                                    " tun-ul=" + std::to_string(tunUplinkPackets) +
+                                    " paused=" + (uuTunCongested ? "1" : "0"));
+                    }
+                }
+                if (const auto *srb = uuTransport->Runtime().Srb1(); srb != nullptr)
+                {
+                    Log("INFO", "SRB trace: state=" + std::string(rrc::ToString(uuTransport->State())) +
+                                    " sn(vta/vts/vrr)=" + std::to_string(srb->VtA()) + "/" +
+                                    std::to_string(srb->VtS()) + "/" + std::to_string(srb->VrR()) +
+                                    " status-s/r=" + std::to_string(srb->StatusSent()) + "/" +
+                                    std::to_string(srb->StatusReceived()) +
+                                    " refused=" + std::to_string(uuTransport->Runtime().RefusedFrames()) +
+                                    " reconfigs=" + std::to_string(uuTransport->Runtime().Evidence().reconfigurations));
+                }
             }
             while (!uuDownlink.empty())
             {
@@ -1400,7 +1470,33 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
         }
 
         bool tunHadUplink = false;
-        if (tun)
+        bool skipTunRead = false;
+        if (uuTransport && uuDrbs != nullptr)
+        {
+            const uint16_t outstanding = uuDrbs->MaxOutstandingPdus();
+            if (uuTunCongested)
+            {
+                if (outstanding <= DrbUplinkLowWatermark)
+                {
+                    uuTunCongested = false;
+                    Log("INFO", "DRB uplink backpressure released at outstanding-pdus=" +
+                                    std::to_string(outstanding));
+                }
+            }
+            else if (outstanding >= DrbUplinkHighWatermark)
+            {
+                uuTunCongested = true;
+                ++uuTunPauseEvents;
+                Log("INFO", "DRB uplink backpressure engaged at outstanding-pdus=" +
+                                std::to_string(outstanding));
+            }
+            if (uuTunCongested)
+            {
+                ++uuTunPausedTurns;
+                skipTunRead = true;
+            }
+        }
+        if (tun && !skipTunRead)
         {
             // Bound each turn so continuous application traffic cannot starve
             // downlink radio-link processing.
@@ -1515,9 +1611,11 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
         // With a Uu transport the legacy socket is polled only to keep its
         // pre-existing paths alive; a short bound keeps RRC and SRB1 timers
         // advancing instead of sleeping inside the legacy receive.
+        // In Uu mode the legacy link is only polled to keep its pre-existing
+        // paths alive; it never blocks the user-plane turn, which already
+        // waited on the Uu socket above.
         const auto radioTimeout = uuTransport
-                                      ? std::min(5, RadioReceiveTimeoutMs(mobility.emm == EmmState::REGISTERED,
-                                                                          tunHadUplink))
+                                      ? 0
                                       : RadioReceiveTimeoutMs(mobility.emm == EmmState::REGISTERED, tunHadUplink);
         int received = socket.Receive(buffer, sizeof(buffer), radioTimeout, peer);
         if (received <= 0)
@@ -2090,7 +2188,14 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
         Log("INFO", "DRB user-plane statistics: ul=" + std::to_string(uuUplinkPackets) + "/" +
                         std::to_string(uuUplinkBytes) + " dl=" + std::to_string(uuDownlinkPackets) + "/" +
                         std::to_string(uuDownlinkBytes) + " configurations=" +
-                        std::to_string(uuDrbConfigurations) + " drops=" + std::to_string(uuDrbDrops));
+                        std::to_string(uuDrbConfigurations) + " drops=" + std::to_string(uuDrbDrops) +
+                        " backpressure-pauses=" + std::to_string(uuTunPauseEvents) +
+                        " paused-turns=" + std::to_string(uuTunPausedTurns));
+    if (uuDrbs != nullptr)
+    {
+        if (const auto *bearer = uuDrbs->Bearer(activeEbi); bearer != nullptr)
+            Log("INFO", "DRB send failures: " + std::to_string(bearer->Counters().sendFailures));
+    }
     if (uuDrbs != nullptr)
     {
         if (const auto *bearer = uuDrbs->Bearer(activeEbi); bearer != nullptr)

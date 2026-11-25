@@ -150,3 +150,13 @@ evidence summary.
 - IPv6/dual-stack, RLC UM, DRX, TAU, Recovery, the standard DRB release RRC
   message and 512-UE/1 Gbps acceptance remain out of scope.
 - The simulator READY/DTCH control messages are not 3GPP RRC or NAS.
+
+## D8 stability follow-up
+
+`docs/lte-user-plane-stability.md` records the D8 root causes and fixes for the
+sustained-flow stall that followed this phase's first second: AM timers ticked
+per loop instead of per millisecond, the RRC connection completion condition,
+the early DRB reconfiguration, the DRB poll configuration, the drain depths and
+TUN-level backpressure. The privileged acceptance in this record now also
+requires the restored DRB RLC to be ACTIVE (`rlc_state == 0`), so the blocking
+CI job fails if the stall signature returns.

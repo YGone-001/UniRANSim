@@ -1648,3 +1648,55 @@ The blocking CI job is `Production UE DRB TUN End-to-End User Plane
 (multi-process, blocking)`; it installs `iproute2`, `tcpdump` and `iperf3`,
 forces the skipped case with `--no-skip`, and requires both sentinels, the pass
 line and the evidence summary.
+
+## LTE production UE user-plane stability (D8)
+
+`docs/lte-user-plane-stability.md` is the record. The sustained UL stall that
+followed D7's first second was reproduced and attributed; these rules keep it
+fixed.
+
+- **AM timers are milliseconds and the caller must tick them that way.** The
+  LTE AM entity has no clock: `t-PollRetransmit`, `t-Reordering` and
+  `t-StatusProhibit` are tick counts of one millisecond. Tick the SRB/DRB
+  entities on elapsed milliseconds with bounded catch-up, never once per
+  main-loop iteration. The UE called `Tick()` more than a million times a
+  second; a 15-tick timer expired in microseconds, repeatedly retransmitted the
+  oldest PDU and failed the entity at `maxRetxThreshold` before any STATUS
+  could return. That was the stall, not the socket queue.
+- **Completion is "VT(A) passed the SetupComplete SN", not equality.** The UE
+  may submit further SRB1 PDUs before the eNB acknowledges the SetupComplete;
+  `VtA() == expectedAck_` then never holds and the UE stays pending, refusing
+  its DRB reconfiguration. A reconfiguration received while
+  `RRC_CONNECTION_COMPLETE_PENDING` is held and delivered on the transition;
+  the application still defers it until the TUN exists.
+- **The DRB RLC configuration is `t-PollRetransmit ms40`, `pollPDU p32`,
+  `pollByte kBinfinity`, `maxRetxThreshold t32`, `t-Reordering ms5`,
+  `t-StatusProhibit ms5`, window 512.** `PollByteCount` stores the kB
+  enumerator's number and the entity uses it as bytes, so a finite pollByte
+  index is effectively a poll on every PDU. Do not use a finite pollByte for
+  the DRB until the table and its historical unit test are corrected together.
+- **Drains are bounded and deeper than one frame.** The eNB Uu path drains 64
+  frames per poll, the UE Uu pump 64 per turn, and the SGW peer 32 GTP-U
+  datagrams per loop. A drain is still bounded, keeps arrival order and never
+  becomes an unbounded queue. The S1-U send is non-blocking; a refused
+  datagram is counted as `s1uSendDrops`/`send-drops=`, never silently lost.
+- **TUN backpressure is the application's.** The UE pauses its TUN reader at
+  64 unacknowledged DRB PDUs and resumes at 16, and it waits on the Uu socket
+  instead of busy-spinning while paused. The RLC window stays the standard 512;
+  do not enlarge it to hide a stall.
+- **Measured baseline, not a first interval.** Three 30 s UL runs (67.4/69.6/
+  70.1 Mbit/s; 241/249/251 MB), three 30 s DL runs (55.9/52.3/51.1 Mbit/s;
+  200/187/183 MB), 60 s UL 62.2 Mbit/s and 60 s DL 52.4 Mbit/s, all with the
+  DRB RLC ACTIVE, application drops 0 and 24-84 backpressure pauses per UL
+  run. A simultaneous UL+DL run completed with UL 58.5 Mbit/s and DL
+  6.5 Mbit/s; the DL portion is starved by the shared path and is not an
+  independent DL rate. The numbers are local application goodput, not a live
+  EPC or GTP-U wire rate, and 1 Gbps stays unclaimed.
+- **Failure injection is evidence, not a recovery promise.** Killing the Uu
+  peer fails the DRB RLC bounded and the UE still shuts down cleanly; deleting
+  the TUN makes the next read fail with EBADFD and the process exits through
+  its failure path; an SGW-U exit is not detectable at the UE. No RRC
+  re-establishment or DRB recovery is implemented after an AM failure.
+- `test/lte/production_uu_user_plane.cpp` (privileged, three processes) now
+  requires the restored DRB `rlc_state == 0`, so the blocking CI job fails if
+  the stall signature returns.

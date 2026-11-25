@@ -50,9 +50,10 @@ void LteAmEntity::Release() noexcept
     receive_.clear();
 }
 
-void LteAmEntity::Fail()
+void LteAmEntity::Fail(uint16_t sn)
 {
     state_ = AmState::FAILED;
+    failedSn_ = sn;
     transmissions_.clear();
 }
 
@@ -71,6 +72,8 @@ void LteAmEntity::SendPdu(uint16_t sn, bool poll, FramingInfo fi, const std::vec
         pdu.so = soRange->first;
         pdu.lsf = soRange->second == SoMax;
     }
+    if (poll)
+        pollsSent_++;
     sender_(EncodeAmd(pdu));
     transmissionsCount_++;
 }
@@ -188,7 +191,7 @@ void LteAmEntity::TransmitStored(StoredSdu &stored, bool poll)
 {
     if (stored.transmissions >= config_.maxRetx)
     {
-        Fail();
+        Fail(stored.sn);
         return;
     }
     stored.transmissions++;
@@ -205,6 +208,7 @@ void LteAmEntity::OnStatusPdu(const std::vector<uint8_t> &pdu)
     std::string why;
     if (!DecodeStatus(pdu.data(), pdu.size(), status, &why))
         return;
+    statusReceived_++;
 
     while (vtA_ != status.ackSn && Distance(vtA_, status.ackSn) < Window)
     {
@@ -234,7 +238,7 @@ void LteAmEntity::OnStatusPdu(const std::vector<uint8_t> &pdu)
         const bool coversEnd = last + 1 == stored.data.size();
         if (stored.transmissions >= config_.maxRetx)
         {
-            Fail();
+            Fail(stored.sn);
             return;
         }
         stored.transmissions++;
@@ -267,6 +271,8 @@ void LteAmEntity::OnPdu(const std::vector<uint8_t> &pdu)
     std::string why;
     if (!DecodeAmd(pdu.data(), pdu.size(), decoded, &why))
         return;
+    if (decoded.poll)
+        pollsReceived_++;
 
     if (Distance(vrR_, decoded.sn) >= Window)
     {
@@ -518,6 +524,7 @@ void LteAmEntity::SendStatus()
         }
     }
 
+    statusSent_++;
     sender_(EncodeStatus(status));
     statusPending_ = false;
     prohibitTimer_ = config_.prohibitTicks;

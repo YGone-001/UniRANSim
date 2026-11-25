@@ -135,7 +135,7 @@ void UuNasTransport::Pump(int timeoutMs)
     // calls drain a burst without sleeping. A single frame per turn let a TCP
     // burst overflow the Uu UDP receive queue.
     runtime_->Pump(timeoutMs);
-    for (int i = 0; i < 15; ++i)
+    for (int i = 0; i < 63; ++i)
         runtime_->Pump(0);
 }
 

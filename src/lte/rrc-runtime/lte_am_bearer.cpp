@@ -179,6 +179,13 @@ uint16_t LteAmBearer::VrR() const
     return entity_.VrR();
 }
 
+uint16_t LteAmBearer::OutstandingPdus() const
+{
+    // The entity's SN space is the LTE AM 1024 modulus; a simple modular
+    // difference is the in-flight count and never exceeds the 512 window.
+    return static_cast<uint16_t>((VtS() + 1024U - VtA()) % 1024U);
+}
+
 size_t LteAmBearer::Delivered() const
 {
     return delivered_;

@@ -214,6 +214,11 @@ class UeSrb1Runtime
     Srb1Evidence evidence_{};
     uint16_t expectedAck_{0};
     size_t refused_{0};
+    // An RRCConnectionReconfiguration can arrive in the same downlink batch as
+    // the PDUs that complete the connection, before this UE's own
+    // SetupComplete was acknowledged. It is held here and delivered by Tick
+    // once RRC_CONNECTED is reached; it is never applied while unconnected.
+    std::optional<DrbReconfiguration> pendingReconfiguration_{};
 
     std::optional<security::AsSecurityContext> asContext_{};
     std::optional<security::UeAsSecurityProcedure> procedure_{};

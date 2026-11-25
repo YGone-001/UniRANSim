@@ -86,6 +86,10 @@ struct DrbCounters
     uint64_t duplicateSetups{};
     uint64_t readySent{};
     uint64_t readyReceived{};
+    // RLC PDUs the simulated Uu refused to carry (a full send buffer). The
+    // peer never saw them; RLC retransmission or a window stall is what the
+    // layer above must show.
+    uint64_t sendFailures{};
 };
 
 class DrbBearer
@@ -122,6 +126,11 @@ class DrbBearer
     [[nodiscard]] const rlc::am::LteAmBearer &Rlc() const
     {
         return rlc_;
+    }
+    // PDUs transmitted but not yet acknowledged on this bearer's uplink.
+    [[nodiscard]] uint16_t OutstandingPdus() const
+    {
+        return rlc_.OutstandingPdus();
     }
 
   private:
@@ -174,6 +183,15 @@ class DrbRuntime
         return counters_;
     }
     [[nodiscard]] const DrbBearer *Bearer(uint8_t ebi) const;
+    // The largest in-flight PDU count over this runtime's bearers. The UE uses
+    // it as the downlink-free uplink backpressure signal: when it is at the
+    // high watermark the TUN reader pauses, and when it falls to the low
+    // watermark it resumes.
+    [[nodiscard]] uint16_t MaxOutstandingPdus() const;
+    [[nodiscard]] bool Congested(uint16_t highWatermark) const
+    {
+        return MaxOutstandingPdus() >= highWatermark;
+    }
 
   private:
     bool SendPayload(uint8_t kind, uint8_t drbIdentity, const std::vector<uint8_t> &body);

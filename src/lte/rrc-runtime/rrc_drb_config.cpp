@@ -110,15 +110,21 @@ RLC_Config_t *BuildRlcConfig()
         std::free(rlc);
         return nullptr;
     }
-    // The same enumerators the SRB1 runtime uses: t-PollRetransmit ms15,
-    // pollPDU pInfinity, pollByte kBinfinity, maxRetxThreshold t8, t-Reordering
-    // ms5 and t-StatusProhibit ms5.
-    rlc->choice.am->ul_AM_RLC.t_PollRetransmit = 2;
-    rlc->choice.am->ul_AM_RLC.pollPDU = 7;
-    rlc->choice.am->ul_AM_RLC.pollByte = 14;
-    rlc->choice.am->ul_AM_RLC.maxRetxThreshold = 5;
-    rlc->choice.am->dl_AM_RLC.t_Reordering = 1;
-    rlc->choice.am->dl_AM_RLC.t_StatusProhibit = 1;
+    // The same enumerators the SRB1 runtime uses for its timers, with a finite
+    // pollPDU: a DRB carries sustained data, and an infinite poll trigger
+    // leaves an in-order receiver with no reason to send a STATUS, so the AM
+    // window can never advance. pollByte stays kBinfinity so a poll is asked
+    // for every 32 PDUs rather than on every PDU, and t-PollRetransmit is
+    // 40 ms with t32 retransmissions so a transient transport backlog does not
+    // turn into a radio-link failure. t-Reordering is 5 ms: user-plane TCP
+    // traffic must not wait for a 35 ms reordering delay before its gap is
+    // reported.
+    rlc->choice.am->ul_AM_RLC.t_PollRetransmit = 7;  // ms40
+    rlc->choice.am->ul_AM_RLC.pollPDU = 3;           // p32
+    rlc->choice.am->ul_AM_RLC.pollByte = 14;         // kBinfinity
+    rlc->choice.am->ul_AM_RLC.maxRetxThreshold = 7;  // t32
+    rlc->choice.am->dl_AM_RLC.t_Reordering = 1;      // ms5
+    rlc->choice.am->dl_AM_RLC.t_StatusProhibit = 1;  // ms5
     return rlc;
 }
 

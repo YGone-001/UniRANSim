@@ -114,6 +114,28 @@ class LteAmEntity
     {
         return droppedOutOfWindow_;
     }
+    [[nodiscard]] size_t StatusSent() const noexcept
+    {
+        return statusSent_;
+    }
+    [[nodiscard]] size_t StatusReceived() const noexcept
+    {
+        return statusReceived_;
+    }
+    [[nodiscard]] size_t PollsSent() const noexcept
+    {
+        return pollsSent_;
+    }
+    [[nodiscard]] size_t PollsReceived() const noexcept
+    {
+        return pollsReceived_;
+    }
+    // The SN whose retransmissions exhausted maxRetx, or 0xFFFF if the entity
+    // did not fail that way. Only meaningful when State() is FAILED.
+    [[nodiscard]] uint16_t FailedSn() const noexcept
+    {
+        return failedSn_;
+    }
 
     void Release() noexcept;
 
@@ -143,7 +165,7 @@ class LteAmEntity
     void TransmitStored(StoredSdu &stored, bool poll);
     void TryDeliverInOrder();
     void SendStatus();
-    void Fail();
+    void Fail(uint16_t sn);
 
     static int Distance(uint16_t from, uint16_t to);
 
@@ -176,6 +198,11 @@ class LteAmEntity
     size_t retransmissions_{0};
     size_t delivered_{0};
     size_t droppedOutOfWindow_{0};
+    size_t statusSent_{0};
+    size_t statusReceived_{0};
+    size_t pollsSent_{0};
+    size_t pollsReceived_{0};
+    uint16_t failedSn_{0xFFFF};
 };
 
 } // namespace lte::rlc::am
