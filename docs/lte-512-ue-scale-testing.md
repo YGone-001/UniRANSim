@@ -100,3 +100,53 @@ seven daemons with those four sessions, during the owner's rebuild activity.
 This work sent no signal to them and did not restart the EPC. A read-only
 check at 21:09 found no MME process, no listener on 36412 and no metrics
 endpoint: the shared EPC remains down after its owner's shutdown.
+
+## 6. R1 follow-up: paced concurrency and failure recovery (2026-11-26)
+
+The D10-512 report's two failed items are addressed in the R1 phase; the D10
+numbers above remain the historical record.
+
+- **Paced lossless concurrency.** `tools/lte-paced-traffic.py` sends at
+  absolute monotonic deadlines with per-UE and aggregate rate limits, a warmup,
+  a 60 s measured window and a bounded drain. The pilot (1/2/4/8 UEs at 50
+  datagrams/s of 1372 B) and the 8-UE 60 s level reported sent == received,
+  zero loss, zero duplicate, zero corrupt and zero out-of-order, with UL and DL
+  goodput equal to the offered rate. The 8/16/32/64 levels run with the full
+  512 UE fleet online; their table is in the R1 final report.
+- **Unpaced stress is not a gate.** The D10 blast is kept as
+  `UNPACED_STRESS` and as queue-loss evidence only.
+- **Same-eNB reattach.** The eNB detects a silent Uu peer after 10 s through the
+  internal keepalive, sends a real S1AP UE Context Release Request
+  (`radioNetwork/radio-connection-with-UE-lost`, 21), releases the access on the
+  MME Command and Complete, and accepts the restarted UE on the same eNB. The
+  MME retains the EPS session in ECM-IDLE; the new Attach replaces it. The 8-UE
+  validation passed three complete rounds with the neighbours unaffected and
+  the reattached UE answering its own UL/DL probe; the 512-UE run repeats it at
+  full scale.
+- **TCP full-duplex and PCAP preflight** are in
+  `docs/lte-multi-ue-user-plane.md`; the failure path is in
+  `docs/lte-multi-ue-failure-isolation.md`.
+- **Resources.** The 3.0 MB/UE host model, the 512 MB floor, the Swap/PSI stops
+  and the 128-UE cumulative calibration are unchanged.
+- The shared EPC is not used in this phase except for the already completed
+  real-256 run recorded in the D10-512 continuation report; it was down after
+  its owner's 17:38 shutdown and this phase does not restore it.
+
+### R1 measured at 512 (2026-11-26)
+
+- 512 attach, 512 EPS bearer/DRB/IP, per-stage 0-loss probes (512 stage
+  1024/1024), 600 s at 512 sessions, a 512-fleet SIGKILL/reattach recovery
+  (10.1 s detection, victim probe 0 loss) and a 512 production Detach to 0
+  sessions all pass. PCAP captures are non-zero with 9,437 Uu frames.
+- The paced 8/16/32/64 lossless gate does not pass at 512: the UE engages the
+  D8 backpressure at outstanding 75 and its TUN reader never resumes
+  (`paused-turns=405583`), so the senders' datagrams are dropped in the kernel
+  TUN queue. The eNB ticks all 512 DRB runtimes and all 512 SRB contexts every
+  elapsed millisecond; that load starves the RLC AM STATUS/ACK path of the few
+  active DRBs, so the outstanding window never falls to the 16-PDU resume
+  watermark. The same profile passes with 8 UEs.
+- `LTE_512_UE_SCALE_ACCEPTED` stays false. The next step is the targeted
+  active-entity tick scheduling (skip idle DRBs/SRBs), with before/after data;
+  no backpressure or window was relaxed to produce a number.
+- The shared EPC is up with the owner's own sessions (`mme_session 4`,
+  `enb_ue 2`); this phase did not touch it.

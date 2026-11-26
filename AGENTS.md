@@ -1812,11 +1812,74 @@ concurrent 8/16/32/64 gate and the same-eNB reattach are not pass.
   PARTIAL. A clean Detach and a fresh eNB work.
 - **GUTI Reallocation is still a gap.** EMM message type 97 is ignored by the
   production UE; do not claim GUTI handling until it is decoded and completed.
-- **The 512 gates are mixed.** 512 attach/bearer/DRB/IP, 1024/1024 UL/DL
-  probes, the 10-minute 512 retention and a 512-UE production Detach are
-  measured and pass. The 60-second concurrent 8/16/32/64 gate is measured and
-  does **not** pass: the un-paced UDP clients overflow the per-UE TUN
-  backpressure (1.51%/0.70%/0.34%/0.004% delivered at 8/16/32/64 UEs), and no
-  paced alternative exists yet. `LTE_512_UE_SCALE_ACCEPTED` stays false until
-  that gate and the same-eNB reattach are pass. The deterministic CI remains
-  the blocking matrix; no hosted runner has the isolated EPC.
+- **The 512 gates are mixed in D10 and are closed by R1.** 512
+  attach/bearer/DRB/IP, 1024/1024 UL/DL probes, the 10-minute 512 retention and
+  a 512-UE production Detach are measured and pass. The D10 60-second
+  concurrent gate failed on an un-paced UDP blast and the same-eNB reattach
+  failed; both are addressed by the R1 section below. `LTE_512_UE_SCALE_ACCEPTED`
+  follows the R1 final report. The deterministic CI remains the blocking
+  matrix; no hosted runner has the isolated EPC.
+
+## LTE multi-UE R1: paced concurrency, peer failure and capture
+
+`docs/lte-multi-ue-user-plane.md`,
+`docs/lte-multi-ue-failure-isolation.md` and
+`docs/lte-512-ue-scale-testing.md` are the records.
+
+- **Three traffic questions, never one.** `UNPACED_STRESS` is a stress study,
+  never a gate. `PACED_LOSSLESS` is the gate: a pilot-calibrated per-UE rate
+  (50 datagrams/s of 1372 B in the R1), absolute monotonic deadlines, a
+  bounded catch-up, a warmup, a 60-second measured window, a bounded drain,
+  and 8/16/32/64 active UEs while the rest of the 512 stay online.
+  `PACED_CAPACITY_SWEEP` is exploratory; loss there is a result, not a gate
+  failure.
+- **A per-UE payload names its sender.** `seq || hash || tag || pattern`; a
+  cross-UE delivery fails the tag check. Loss, duplicate, out-of-order,
+  corruption and RTT are separate fields.
+- **The D8 backpressure stays.** The UE pauses its TUN reader at 64
+  unacknowledged DRB PDUs; no queue is enlarged and no backpressure is removed
+  to make a test pass. The paced gate is below the rate at which the pause is
+  entered.
+- **The echo counter is not UL goodput by itself.** Warmup bytes are
+  subtracted; the DL goodput comes from the senders. Queue evidence has a
+  named observation point (`ip -s link`, the UE DRB counters, the eNB per-UE
+  statistics) and they are not interchangeable.
+- **Every level has a unique echo port and a readiness check.** The D10
+  zero-byte capture came from a previous level still holding the port.
+- **TCP is full-duplex.** The client poll loop sends and receives in chunks,
+  handles partial I/O, half-closes and bounds the timeout; it reports SHA-256
+  on both streams. The old send-all-then-read client must not be used to judge
+  the user plane.
+- **PCAP evidence is refused when empty.** The capture tool checks the tool,
+  disk, namespaces, interfaces, a unique echo port, the representative UEs,
+  and every file's non-zero size and packet count; a zero-byte file is a
+  failure.
+- **Uu peer liveness is simulator-internal.** The production UE sends
+  `uu::LogicalChannel::KEEPALIVE` every second; the eNB releases a silent peer
+  after 10 s with a real S1AP UE Context Release Request (`radioNetwork/
+  radio-connection-with-UE-lost`, 21), through the MME Command and Complete. It
+  is not RRC, not NAS and not 3GPP; only a peer that has sent a keepalive is
+  eligible. The MME keeps the EPS session in ECM-IDLE; the new Attach replaces
+  it. Do not expect the MME session gauge to drop on an S1 release.
+- **A restarted process is a new access baseline.** A generation-0 READY on a
+  new S1 context is adopted as the fresh process's baseline and may restate the
+  new PDN address; a same-process ECM-IDLE restoration must match the advanced
+  generation. A non-fresh mismatch is refused.
+- **No manual core cleanup.** No MME database edit, no session deletion, no
+  EPC restart and no Detach is used to make a reattach pass. The 8-UE
+  validation ran three complete kill/release/reattach rounds; the 512 run
+  repeats it at full scale.
+- **A mass silence is local pressure.** A single silent Uu peer is a dead UE;
+  more than four simultaneously silent eligible peers are the host's own
+  scheduling or transport pressure and release nothing. A 512 run without this
+  guard released 434 live UEs after a keepalive backlog.
+- **The R1 512 result is PARTIAL.** 512 attach/bearer/DRB/IP, the 1024/1024
+  probes, the 10-minute 512 retention, the 512 failure recovery, the 512
+  Detach and the PCAP evidence pass. The paced 8/16/32/64 lossless gate fails
+  at 512: the UE pauses at 75 outstanding DRB PDUs and never resumes because
+  the eNB's per-millisecond tick of all 512 DRB and 512 SRB entities starves
+  the RLC AM STATUS/ACK. `LTE_512_UE_SCALE_ACCEPTED` stays false; the next
+  optimization is active-entity tick scheduling, not a relaxed watermark.
+- **Capabilities are earned.** The R1 final report records each item as
+  PASS/PARTIAL/FAILED; `LTE_512_UE_SCALE_ACCEPTED` follows that report, not a
+  planned result.
