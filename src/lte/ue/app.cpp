@@ -981,6 +981,7 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
     const bool uuDrbTrace = std::getenv("UNIRANSIM_DRB_TRACE") != nullptr;
     auto uuDrbTraceNext = std::chrono::steady_clock::now() + std::chrono::seconds(1);
     auto uuRlcTickLast = std::chrono::steady_clock::now();
+    auto uuKeepaliveLast = std::chrono::steady_clock::now();
     while (!shutdownRequested && (mobility.emm == EmmState::REGISTERED || std::chrono::steady_clock::now() < deadline))
     {
         const auto now = std::chrono::steady_clock::now();
@@ -1005,6 +1006,13 @@ int Run(const Config &config, const std::atomic_bool &shutdownRequested)
                     if (uuDrbs != nullptr)
                         uuDrbs->Tick();
                 }
+            }
+            // Bounded liveness: one internal Uu frame per second while the RRC
+            // connection exists. The eNB releases a silent peer after 5 s.
+            if (tickNow - uuKeepaliveLast >= std::chrono::seconds(1))
+            {
+                uuKeepaliveLast = tickNow;
+                uuTransport->SendKeepalive();
             }
             if (!initialAttachSent && uuTransport->SendNas(attach))
             {

@@ -76,6 +76,22 @@ TEST_CASE("lte/rrc: RRCConnectionRelease round trips and is not confused with NA
     CHECK(lte::rrc::EncodeRrcConnectionRelease(message).empty());
 }
 
+TEST_CASE("lte/uu: the internal keepalive channel round trips without an RRC payload")
+{
+    lte::uu::Frame frame;
+    frame.association = 46002;
+    frame.direction = lte::uu::Direction::UPLINK;
+    frame.channel = lte::uu::LogicalChannel::KEEPALIVE;
+    frame.payload = {};
+    const auto encoded = lte::uu::EncodeFrame(frame);
+    lte::uu::Frame decoded;
+    std::string why;
+    REQUIRE(lte::uu::DecodeFrame(encoded.data(), encoded.size(), decoded, &why));
+    CHECK(decoded.channel == lte::uu::LogicalChannel::KEEPALIVE);
+    CHECK(decoded.association == 46002);
+    CHECK(decoded.payload.empty());
+}
+
 TEST_CASE("lte/uu: the PCCH logical channel carries a Paging frame byte for byte")
 {
     lte::rrc::PagingMessage message;
@@ -97,9 +113,9 @@ TEST_CASE("lte/uu: the PCCH logical channel carries a Paging frame byte for byte
     CHECK(decoded.association == 46001);
     CHECK(decoded.payload == paging);
 
-    // An unknown channel value is still refused. DTCH is the highest channel
-    // this build defines, so the next value has no meaning.
+    // An unknown channel value is still refused. KEEPALIVE is the highest
+    // channel this build defines, so the next value has no meaning.
     auto corrupted = encoded;
-    corrupted[9] = static_cast<uint8_t>(lte::uu::LogicalChannel::DTCH) + 1;
+    corrupted[9] = static_cast<uint8_t>(lte::uu::LogicalChannel::KEEPALIVE) + 1;
     CHECK_FALSE(lte::uu::DecodeFrame(corrupted.data(), corrupted.size(), decoded, &why));
 }

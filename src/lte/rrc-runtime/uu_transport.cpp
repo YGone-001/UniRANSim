@@ -87,7 +87,7 @@ bool DecodeFrame(const uint8_t *data, size_t size, Frame &out, std::string *why)
     }
     const uint8_t direction = data[8];
     const uint8_t channel = data[9];
-    if (direction > static_cast<uint8_t>(Direction::DOWNLINK) || channel > static_cast<uint8_t>(LogicalChannel::DTCH))
+    if (direction > static_cast<uint8_t>(Direction::DOWNLINK) || channel > static_cast<uint8_t>(LogicalChannel::KEEPALIVE))
     {
         if (why)
             *why = "unknown direction or logical channel";

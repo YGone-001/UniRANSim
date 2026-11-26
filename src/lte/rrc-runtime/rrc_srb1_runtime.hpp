@@ -258,6 +258,9 @@ class EnbSrb1Runtime
     using UserPlaneCallback = std::function<void(uint32_t association, const uu::Frame &frame)>;
     // The UE acknowledged the DRB configuration it was sent.
     using DrbCompleteCallback = std::function<void(uint32_t association, uint8_t transactionId)>;
+    // A frame of any channel arrived from this association. The owner uses it
+    // to bound how long a Uu peer may be silent before it is treated as lost.
+    using LivenessCallback = std::function<void(uint32_t association, bool keepalive)>;
 
     EnbSrb1Runtime(uu::Socket &socket, Config config, NasCallback onNas);
 
@@ -329,6 +332,7 @@ class EnbSrb1Runtime
     void SetUplinkNasCallback(UplinkNasCallback callback);
     void SetUserPlaneCallback(UserPlaneCallback callback);
     void SetDrbCompleteCallback(DrbCompleteCallback callback);
+    void SetLivenessCallback(LivenessCallback callback);
 
     void Release(uint32_t association) noexcept;
 
@@ -369,6 +373,7 @@ class EnbSrb1Runtime
     UplinkNasCallback onUplinkNas_;
     UserPlaneCallback onUserPlane_;
     DrbCompleteCallback onDrbComplete_;
+    LivenessCallback onLiveness_;
     rlc::TmEntity srb0_;
     EnbInitialAccess access_{};
     std::map<uint32_t, Context> contexts_{};

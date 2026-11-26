@@ -38,6 +38,11 @@ enum class LogicalChannel : uint8_t
     // begins with the DRB identity, which is this simulator's routing stand-in
     // for MAC LCID demultiplexing; the rest is the RLC PDU byte for byte.
     DTCH = 3,
+    // An internal liveness frame: the production UE sends one periodically and
+    // the eNB uses it to detect a dead Uu peer within a bounded time. It is not
+    // an RRC message, carries no NAS and has an empty payload; the envelope is
+    // simulator routing metadata only.
+    KEEPALIVE = 4,
 };
 
 struct Frame

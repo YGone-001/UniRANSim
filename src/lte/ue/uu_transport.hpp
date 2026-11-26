@@ -82,6 +82,9 @@ class UuNasTransport
     // One uplink DTCH payload (routing header included). Refused unless the RRC
     // connection is established; it never falls back to the legacy link.
     bool SendUserPlane(const std::vector<uint8_t> &payload);
+    // An internal Uu liveness frame. It is not RRC, not NAS and carries no
+    // payload; it only tells the eNB that this peer is still alive.
+    bool SendKeepalive();
     // The DL-DCCH RRCConnectionReconfigurationComplete for a configuration the
     // callback above delivered.
     void SubmitReconfigurationComplete(uint8_t transactionId);

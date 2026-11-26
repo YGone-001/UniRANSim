@@ -483,11 +483,24 @@ void EnbSrb1Runtime::SetDrbCompleteCallback(DrbCompleteCallback callback)
     onDrbComplete_ = std::move(callback);
 }
 
+void EnbSrb1Runtime::SetLivenessCallback(LivenessCallback callback)
+{
+    onLiveness_ = std::move(callback);
+}
+
 void EnbSrb1Runtime::Pump(int timeoutMs)
 {
     uu::Frame frame;
     uint16_t sourcePort = 0;
     if (!socket_.Receive(frame, timeoutMs, nullptr, &sourcePort))
+        return;
+
+    // Any received frame is evidence that this association's peer is alive.
+    // The frame itself is still dispatched below; only KEEPALIVE stops here.
+    if (onLiveness_)
+        onLiveness_(frame.association, frame.channel == uu::LogicalChannel::KEEPALIVE);
+
+    if (frame.channel == uu::LogicalChannel::KEEPALIVE)
         return;
 
     if (frame.channel == uu::LogicalChannel::CCCH)

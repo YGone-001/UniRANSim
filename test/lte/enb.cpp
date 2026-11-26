@@ -243,6 +243,15 @@ TEST_CASE("lte/enb/codec: UE Context Release Request uses procedure 18 and a val
     CHECK_THROWS(lte::enb::s1ap::EncodeUeContextReleaseRequest(0, 1));
 }
 
+TEST_CASE("lte/enb/codec: a lost Uu peer is released with radio-connection-with-UE-lost (21)")
+{
+    auto wire = lte::enb::s1ap::EncodeUeContextReleaseRequest(0x12345678, 0x654321, "radioNetwork", 21);
+    auto decoded = lte::enb::s1ap::DecodeUeContextReleaseRequest(wire.data(), wire.size());
+    CHECK(wire[1] == 18);
+    CHECK(decoded.causeCategory == "radioNetwork");
+    CHECK(decoded.causeValue == 21);
+}
+
 TEST_CASE("lte/enb/config: s1u GTP-U endpoint is configurable and defaults to the concrete S1AP address")
 {
     auto config = lte::enb::ParseConfig(ValidConfig);

@@ -275,7 +275,10 @@ bool DrbRuntime::OnFrame(const uu::Frame &frame)
                 continue;
             uu::Frame rlc = frame;
             rlc.payload.assign(frame.payload.begin() + offset, frame.payload.end());
-            return entry.second->OnRlcFrame(rlc);
+            const bool accepted = entry.second->OnRlcFrame(rlc);
+            if (!accepted)
+                counters_.rlcFailures++;
+            return accepted;
         }
         counters_.unknownBearerDrops++;
         return false;

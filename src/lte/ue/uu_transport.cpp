@@ -187,6 +187,19 @@ bool UuNasTransport::SendUserPlane(const std::vector<uint8_t> &payload)
     return socket_->Send(endpoint_.enbPort, frame, nullptr);
 }
 
+bool UuNasTransport::SendKeepalive()
+{
+    if (released_ || runtime_ == nullptr || socket_ == nullptr)
+        return false;
+    if (runtime_->State() != rrc::RrcState::RRC_CONNECTED)
+        return false;
+    uu::Frame frame;
+    frame.association = config_.association;
+    frame.direction = uu::Direction::UPLINK;
+    frame.channel = uu::LogicalChannel::KEEPALIVE;
+    return socket_->Send(endpoint_.enbPort, frame, nullptr);
+}
+
 void UuNasTransport::SubmitReconfigurationComplete(uint8_t transactionId)
 {
     if (released_ || runtime_ == nullptr)
