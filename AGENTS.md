@@ -1883,3 +1883,45 @@ concurrent 8/16/32/64 gate and the same-eNB reattach are not pass.
 - **Capabilities are earned.** The R1 final report records each item as
   PASS/PARTIAL/FAILED; `LTE_512_UE_SCALE_ACCEPTED` follows that report, not a
   planned result.
+
+## LTE multi-UE R1A: activity-aware RLC scheduling
+
+The audit is `reports/PHASE-18-F-B6-D10-512-R1A-SCHEDULER-AUDIT.md`; the design
+records are `docs/lte-multi-ue-user-plane.md` and
+`docs/lte-512-ue-scale-testing.md`.
+
+- **Idle RLC entities are not ticked.** `LteAmEntity::NextTickIn` returns the
+  nearest running timer in 1 ms ticks, or `NeverTick` when there is no
+  transmission, reordering gap, pending STATUS or timer. An idle entity is not
+  enqueued, and the eNB does not scan all 512 DRB/SRB contexts per millisecond.
+- **Activity and the existing timers decide the schedule.** Every submit,
+  received PDU and received STATUS fires an activity callback; the owning DRB
+  runtime or SRB context re-arms a deadline. The timers are the existing
+  `pollTicks`, `reorderingTicks` and `prohibitTicks`; no protocol timer was
+  added or changed.
+- **The deadline queue carries lifetime identity.** Entries carry id, sub-id,
+  a runtime/context generation and a schedule version; a stale entry is
+  skipped before any entity is touched, so a destroyed or re-created context
+  is never ticked by an old event. DRB runtimes carry a process-unique
+  generation on top of that.
+- **Bounded catch-up, explicit clock.** `LteAmBearer::AdvanceTo` advances at
+  most 20 ticks per call and does not charge an idle interval to work created
+  afterwards. Production passes the monotonic clock; the deterministic SRB
+  tests pass an explicit 1 ms-per-round clock through `EnbSrb1Runtime::Tick(nowMs)`,
+  so the two clocks cannot disagree.
+- **No protocol relaxation.** SN, TX/RX windows, poll, STATUS, ACK,
+  retransmission, reordering, segmentation/reassembly, status prohibit, poll
+  retransmit, maximum retransmissions and the D8 64-PDU backpressure are
+  unchanged. `LTE_512_UE_SCALE_ACCEPTED` still follows the measured R1A report.
+- **Tests.** `test/lte/rlc_activity.cpp` covers idle deadlines, the activity
+  callback, the idle-interval baseline, deadline ordering, 8-of-512 scheduling,
+  all-512 fairness and stale-version rejection. The R1A 8-UE live run passed
+  paced 1/2/4/8 and 8x60 s lossless, TCP 64 KB-4 MB and three recovery rounds.
+- **The 512 sustained gate still fails per UE.** At 512 online UEs the first
+  active UEs' DRB RLC reached FAILED (`tx=435 retx=239 out-of-window=38
+  state=1`) while the eNB reported 132 of 196 uplink packets; 128/256/384/512
+  single probes passed and the 512 attach/stability/recovery/detach/PCAP
+  passed. The eNB-wide tick loop is no longer the candidate; the next
+  investigation is the per-UE RLC/queue, the eNB STATUS delivery to a specific
+  UE and the host CPU with 512 UE processes. `LTE_512_UE_SCALE_ACCEPTED` stays
+  false.

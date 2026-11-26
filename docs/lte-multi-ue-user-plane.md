@@ -139,3 +139,28 @@ load, not a backpressure relaxation candidate: the fix is to tick only
 entities with outstanding PDUs or recent activity, keeping the D8 watermarks
 and RLC windows unchanged. `LTE_512_UE_SCALE_ACCEPTED` stays false until that
 change is measured.
+
+## 8. R1A activity-aware RLC scheduling
+
+The eNB used to run `OnTick` on every DRB and every SRB runtime each elapsed
+millisecond, about 1,024,000 ticks/s at 512 UEs. An idle entity's tick only
+decrements zero timers, so 1,016 idle contexts were consuming the loop that
+must produce the active window's RLC AM STATUS/ACK.
+
+R1A adds `NextTickIn`/`Tick(n)`/activity callbacks to the entity and bearer, and
+a deadline multimap with generation/version lifetime to the eNB DRB scheduler
+and the SRB runtime. Only entities with a finite deadline are enqueued. The
+timers, windows, STATUS/ACK rules and D8 backpressure are unchanged; the
+scheduler chooses when an entity is serviced, not what it does. Production uses
+the monotonic clock; the deterministic tests pass an explicit clock.
+
+Measured in the 8-UE live run: paced 1/2/4/8 and 8x60 s at 50 pps/UE returned
+24,000/24,000 with zero loss/duplicate/corrupt, UL/DL 4.39 Mbit/s, TCP 64 KB to
+4 MB SHA-256 equal, and three kill/release/reattach rounds passed.
+
+At 512 online UEs the paced 8/16/32/64 levels still delivered 0. The first
+active UEs' DRB RLC reached FAILED (`tx=435 retx=239 out-of-window=38 state=1`)
+and their TUN readers stayed paused, while the eNB reported 132 of 196 uplink
+packets and 128/256/384/512 single probes succeeded. The eNB-wide all-context
+tick is gone; the remaining failure is in the per-UE RLC/queue and host path
+under 512 UE processes, and it is the R1A final report's open item.

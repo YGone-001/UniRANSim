@@ -150,3 +150,16 @@ numbers above remain the historical record.
   no backpressure or window was relaxed to produce a number.
 - The shared EPC is up with the owner's own sessions (`mme_session 4`,
   `enb_ue 2`); this phase did not touch it.
+
+### R1A scheduled concurrency (2026-11-26)
+
+The eNB now schedules RLC entities by activity and deadline instead of ticking
+all 512 DRB and 512 SRB contexts every elapsed millisecond (see the scheduler
+audit and `docs/lte-multi-ue-user-plane.md`). The 8-UE live run kept the R1
+lossless profile (50 pps/UE, 60 s, zero loss) and all TCP sizes. At 512 online
+UEs the paced 8/16/32/64 levels still failed: the first active UEs' DRB RLC
+reached FAILED (retx 239, out-of-window 38) with 64 outstanding, while the eNB
+saw 132 of 196 uplink packets and later UEs' single probes passed. The 512
+attach, retention, recovery, Detach and PCAP passed. The open item is the
+per-UE RLC/queue and host path; the details are in
+`reports/PHASE-18-F-B6-D10-512-R1A-FINAL-REPORT.md`.
