@@ -5,6 +5,8 @@
 
 #include "drb_runtime.hpp"
 
+#include <atomic>
+#include <limits>
 #include <utility>
 
 namespace lte::rrc
@@ -199,6 +201,10 @@ void DrbBearer::Release() noexcept
 DrbRuntime::DrbRuntime(rlc::am::EndpointRole role, uint32_t association, Sender sender, Deliverer deliverer)
     : role_(role), association_(association), sender_(std::move(sender)), deliverer_(std::move(deliverer))
 {
+    // A stable generation invalidates the scheduler entries of a runtime that
+    // was destroyed and re-created for the same association.
+    static std::atomic<uint64_t> nextGeneration{1};
+    generation_ = nextGeneration.fetch_add(1, std::memory_order_relaxed);
 }
 
 bool DrbRuntime::AddBearer(const DrbBearerConfig &config)
@@ -227,8 +233,52 @@ bool DrbRuntime::AddBearer(const DrbBearerConfig &config)
             if (deliverer_)
                 deliverer_(ebi, ip);
         });
+    bearer->SetActivityCallback([this, ebi = config.ebi] {
+        if (onActivity_)
+            onActivity_(ebi);
+    });
     bearers_.emplace(config.ebi, std::move(bearer));
     return true;
+}
+
+void DrbRuntime::SetActivityCallback(std::function<void(uint8_t ebi)> callback)
+{
+    onActivity_ = std::move(callback);
+    for (auto &entry : bearers_)
+    {
+        const uint8_t ebi = entry.first;
+        entry.second->SetActivityCallback([this, ebi] {
+            if (onActivity_)
+                onActivity_(ebi);
+        });
+    }
+}
+
+DrbBearer *DrbRuntime::BearerForTick(uint8_t ebi)
+{
+    const auto it = bearers_.find(ebi);
+    return it == bearers_.end() ? nullptr : it->second.get();
+}
+
+int64_t DrbRuntime::NextDeadlineMs() const
+{
+    int64_t best = std::numeric_limits<int64_t>::max();
+    for (const auto &entry : bearers_)
+    {
+        const uint32_t next = entry.second->NextTickIn();
+        if (next == rlc::am::LteAmEntity::NeverTick)
+            continue;
+        const int64_t deadline = entry.second->LastTickMs() + static_cast<int64_t>(next);
+        if (deadline < best)
+            best = deadline;
+    }
+    return best;
+}
+
+void DrbRuntime::AdvanceTo(int64_t nowMs)
+{
+    for (auto &entry : bearers_)
+        entry.second->AdvanceTo(nowMs);
 }
 
 void DrbRuntime::SetReadyHandler(ReadyHandler handler)

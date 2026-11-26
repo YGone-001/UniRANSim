@@ -14,6 +14,7 @@
 #include "runtime_metrics.hpp"
 
 #include <iomanip>
+#include <limits>
 #include <set>
 #include <algorithm>
 #include <functional>
@@ -32,6 +33,13 @@ namespace
 // multiplexer polls without an active AS security procedure, so it cannot hold
 // E-RAB reservations forever.
 constexpr uint32_t kPendingIcsPolls = 2000;
+
+int64_t SteadyNowMs()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
 
 void Log(const char *level, const std::string &message)
 {
@@ -1791,21 +1799,7 @@ void EnbMultiplexer::pollUu()
     for (int i = 0; i < 64; ++i)
         m_bridge->Pump(0);
     m_bridge->Tick();
-    const auto now = std::chrono::steady_clock::now();
-    if (m_drbTickLast == std::chrono::steady_clock::time_point{})
-        m_drbTickLast = now;
-    const auto elapsed = static_cast<int64_t>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(now - m_drbTickLast).count());
-    if (elapsed > 0)
-    {
-        m_drbTickLast += std::chrono::milliseconds(elapsed);
-        const auto ticks = elapsed > 20 ? 20 : elapsed;
-        for (int64_t i = 0; i < ticks; ++i)
-        {
-            for (auto &entry : m_drbs)
-                entry.second->Tick();
-        }
-    }
+    serviceDrbTicks();
     commitPendingIcs();
     // A liveness judgement is only valid when every frame the socket already
     // holds has been dispatched. With 512 UEs a keepalive backlog can outlast
@@ -1818,6 +1812,57 @@ void EnbMultiplexer::pollUu()
             return;
     }
     checkUuLiveness();
+}
+
+uint64_t EnbMultiplexer::srbSchedulerPushes() const
+{
+    return m_bridge == nullptr ? 0 : m_bridge->Runtime().SchedulerPushes();
+}
+
+uint64_t EnbMultiplexer::srbSchedulerTicks() const
+{
+    return m_bridge == nullptr ? 0 : m_bridge->Runtime().SchedulerTicks();
+}
+
+void EnbMultiplexer::scheduleDrb(uint32_t association, uint8_t ebi)
+{
+    const auto it = m_drbs.find(association);
+    if (it == m_drbs.end())
+        return;
+    auto *bearer = it->second->BearerForTick(ebi);
+    if (bearer == nullptr)
+        return;
+    bearer->AdvanceTo(SteadyNowMs());
+    const int64_t deadline = it->second->NextDeadlineMs();
+    if (deadline == std::numeric_limits<int64_t>::max())
+        return;
+    const uint64_t version = ++it->second->ScheduleVersion();
+    ++m_drbSchedulerPushes;
+    m_drbTicks.Push({deadline, association, ebi, it->second->Generation(), version});
+}
+
+void EnbMultiplexer::serviceDrbTicks()
+{
+    const int64_t now = SteadyNowMs();
+    for (int i = 0; i < 128; ++i)
+    {
+        lte::rlc::RlcTickScheduler::Entry entry;
+        if (!m_drbTicks.PopDue(now, entry))
+            break;
+        const auto it = m_drbs.find(entry.id);
+        if (it == m_drbs.end() || it->second->Generation() != entry.generation)
+            continue;
+        if (it->second->ScheduleVersion() != entry.version)
+            continue;
+        ++m_drbSchedulerTicks;
+        it->second->AdvanceTo(now);
+        const int64_t deadline = it->second->NextDeadlineMs();
+        if (deadline == std::numeric_limits<int64_t>::max())
+            continue;
+        const uint64_t version = ++it->second->ScheduleVersion();
+        ++m_drbSchedulerPushes;
+        m_drbTicks.Push({deadline, entry.id, entry.subId, it->second->Generation(), version});
+    }
 }
 
 void EnbMultiplexer::checkUuLiveness()
@@ -2028,6 +2073,8 @@ bool EnbMultiplexer::establishUuDrbs(EnbUeEntry &entry, const std::vector<uint8_
     }
 
     m_drbs[association] = std::move(runtime);
+    m_drbs[association]->SetActivityCallback(
+        [this, association](uint8_t ebi) { scheduleDrb(association, ebi); });
     m_drbConfigs[association] = configuration;
     ++m_uuDrbConfigurations;
     if (!m_bridge->SendDrbConfiguration(association, configuration))

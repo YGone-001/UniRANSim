@@ -106,6 +106,26 @@ class DrbBearer
     DrbBearer &operator=(const DrbBearer &) = delete;
 
     bool SubmitIp(const uint8_t *packet, size_t size);
+    [[nodiscard]] uint32_t NextTickIn() const
+    {
+        return rlc_.NextTickIn();
+    }
+    void AdvanceTo(int64_t nowMs)
+    {
+        rlc_.AdvanceTo(nowMs);
+    }
+    void SetActivityCallback(std::function<void()> callback)
+    {
+        rlc_.SetActivityCallback(std::move(callback));
+    }
+    [[nodiscard]] int64_t LastTickMs() const
+    {
+        return rlc_.LastTickMs();
+    }
+    [[nodiscard]] uint64_t &ScheduleVersion()
+    {
+        return rlc_.ScheduleVersion();
+    }
     // `frame` carries the RLC PDU as its payload and must be on DTCH.
     bool OnRlcFrame(const uu::Frame &frame);
     void Tick();
@@ -161,6 +181,20 @@ class DrbRuntime
     DrbRuntime &operator=(const DrbRuntime &) = delete;
 
     bool AddBearer(const DrbBearerConfig &config);
+    // The owner is told when a bearer's RLC creates work, so an idle runtime
+    // can be scheduled again without polling every runtime every millisecond.
+    void SetActivityCallback(std::function<void(uint8_t ebi)> callback);
+    [[nodiscard]] DrbBearer *BearerForTick(uint8_t ebi);
+    [[nodiscard]] int64_t NextDeadlineMs() const;
+    void AdvanceTo(int64_t nowMs);
+    [[nodiscard]] uint64_t Generation() const
+    {
+        return generation_;
+    }
+    [[nodiscard]] uint64_t &ScheduleVersion()
+    {
+        return scheduleVersion_;
+    }
     void SetReadyHandler(ReadyHandler handler);
     // Uplink IP packet on one EPS bearer. False when the bearer is unknown.
     bool SubmitIp(uint8_t ebi, const uint8_t *packet, size_t size);
@@ -202,6 +236,9 @@ class DrbRuntime
     Deliverer deliverer_{};
     ReadyHandler readyHandler_{};
     std::map<uint8_t, std::unique_ptr<DrbBearer>> bearers_{};
+    std::function<void(uint8_t)> onActivity_{};
+    uint64_t generation_{0};
+    uint64_t scheduleVersion_{0};
     DrbCounters counters_{};
 };
 

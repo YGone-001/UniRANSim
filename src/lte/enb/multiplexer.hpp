@@ -15,6 +15,7 @@
 #include "handover_source_release.hpp"
 
 #include <lte/rrc-runtime/drb_runtime.hpp>
+#include <lte/rrc-runtime/rlc_tick_scheduler.hpp>
 #include "s1u_endpoint.hpp"
 #include "types.hpp"
 #include "ue_registry.hpp"
@@ -382,6 +383,20 @@ class EnbMultiplexer
     };
     void initUuTransport();
     void pollUu();
+    void scheduleDrb(uint32_t association, uint8_t ebi);
+  public:
+    [[nodiscard]] uint64_t drbSchedulerPushes() const
+    {
+        return m_drbSchedulerPushes;
+    }
+    [[nodiscard]] uint64_t drbSchedulerTicks() const
+    {
+        return m_drbSchedulerTicks;
+    }
+    [[nodiscard]] uint64_t srbSchedulerPushes() const;
+    [[nodiscard]] uint64_t srbSchedulerTicks() const;
+  private:
+    void serviceDrbTicks();
     void checkUuLiveness();
     void commitPendingIcs();
     void cancelPendingIcs(uint32_t enbUeS1apId);
@@ -470,7 +485,9 @@ class EnbMultiplexer
     std::map<uint32_t, lte::rrc::DrbReconfiguration> m_drbConfigs;
     // DRB RLC timers are counted in milliseconds. `poll` may run far faster
     // than that, so the entities are ticked on elapsed time, not per call.
-    std::chrono::steady_clock::time_point m_drbTickLast{};
+    lte::rlc::RlcTickScheduler m_drbTicks;
+    uint64_t m_drbSchedulerPushes{0};
+    uint64_t m_drbSchedulerTicks{0};
     std::chrono::steady_clock::time_point m_lastUuLivenessCheck{};
     uint8_t m_uuDrbTransaction{0};
     size_t m_uuDrbConfigurations{0};

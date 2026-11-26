@@ -157,6 +157,47 @@ bool LteAmBearer::OnFrame(const uu::Frame &frame)
 void LteAmBearer::Tick()
 {
     entity_.OnTick();
+    lastKnownNext_ = entity_.NextTickIn();
+}
+
+uint32_t LteAmBearer::NextTickIn() const
+{
+    return entity_.NextTickIn();
+}
+
+void LteAmBearer::SetActivityCallback(std::function<void()> callback)
+{
+    onActivity_ = std::move(callback);
+    entity_.SetActivityCallback([this] {
+        if (onActivity_)
+            onActivity_();
+    });
+}
+
+void LteAmBearer::AdvanceTo(int64_t nowMs)
+{
+    if (lastKnownNext_ == LteAmEntity::NeverTick)
+    {
+        // The bearer was idle. Work created by this activity starts its timers
+        // at now; the idle interval must not be charged to them.
+        lastTickMs_ = nowMs;
+        lastKnownNext_ = entity_.NextTickIn();
+        return;
+    }
+    int64_t elapsed = nowMs - lastTickMs_;
+    if (elapsed <= 0)
+    {
+        if (nowMs < lastTickMs_ + static_cast<int64_t>(lastKnownNext_))
+            return;
+        elapsed = 1;
+    }
+    if (elapsed > 20)
+        elapsed = 20;
+    entity_.Tick(static_cast<uint32_t>(elapsed));
+    lastTickMs_ += elapsed;
+    if (lastTickMs_ > nowMs)
+        lastTickMs_ = nowMs;
+    lastKnownNext_ = entity_.NextTickIn();
 }
 
 AmState LteAmBearer::State() const

@@ -362,6 +362,7 @@ struct Session
     std::unique_ptr<EnbSrb1Runtime> enb{};
     std::vector<RrcConnectionSetupCompleteMessage> delivered{};
     uint32_t association{Assoc};
+    int64_t nowMs{0};
 
     bool Build(uint32_t assoc, bool relayed, const RrcConnectionSetupMessage &setup = Srb1Setup())
     {
@@ -395,6 +396,9 @@ struct Session
         enb = std::make_unique<EnbSrb1Runtime>(
             *enbSocket, config,
             [this](uint32_t, const RrcConnectionSetupCompleteMessage &message) { delivered.push_back(message); });
+        // The deterministic session advances one millisecond per Round. Set the
+        // runtime's activity clock to the same origin before any frame arrives.
+        enb->Tick(0);
         return true;
     }
 
@@ -405,7 +409,7 @@ struct Session
         ue->Pump(0);
         enb->Pump(0);
         ue->Tick();
-        enb->Tick();
+        enb->Tick(++nowMs);
     }
 
     bool RunUntil(const std::function<bool()> &done, int maxRounds)

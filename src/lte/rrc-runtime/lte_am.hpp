@@ -77,6 +77,16 @@ class LteAmEntity
     void OnPdu(const std::vector<uint8_t> &pdu);
     void OnStatusPdu(const std::vector<uint8_t> &pdu);
     void OnTick();
+    // Ticks until the next protocol action (the nearest running timer), or
+    // NeverTick when no timer, transmission or pending STATUS exists. An idle
+    // entity can be skipped entirely.
+    static constexpr uint32_t NeverTick = 0xFFFFFFFFU;
+    [[nodiscard]] uint32_t NextTickIn() const noexcept;
+    // Advances `ticks` 1 ms ticks through the existing timer logic. The caller
+    // bounds the count; no protocol semantics change.
+    void Tick(uint32_t ticks);
+    // Called after every received or submitted event that may create work.
+    void SetActivityCallback(std::function<void()> callback);
 
     [[nodiscard]] AmState State() const noexcept
     {
@@ -180,6 +190,7 @@ class LteAmEntity
     uint16_t vrH_{0};
     uint16_t vrX_{0};
 
+    std::function<void()> onActivity_{};
     uint32_t pollTimer_{0};
     uint32_t reorderTimer_{0};
     uint32_t prohibitTimer_{0};

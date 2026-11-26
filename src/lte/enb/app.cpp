@@ -411,6 +411,11 @@ int Run(const EnbConfig &config, const std::atomic_bool &shutdownRequested)
         multiplexer.shutdown();
         Log("INFO", "LTE eNB shutdown complete");
         LogRecoveryCounters(multiplexer.recoveryCounters());
+        Log("INFO", "RLC scheduler statistics: drb-schedules=" +
+                        std::to_string(multiplexer.drbSchedulerPushes()) +
+                        " drb-ticks=" + std::to_string(multiplexer.drbSchedulerTicks()) +
+                        " srb-schedules=" + std::to_string(multiplexer.srbSchedulerPushes()) +
+                        " srb-ticks=" + std::to_string(multiplexer.srbSchedulerTicks()));
         return 0;
     }
     Log("ERROR", "S1 Setup did not complete after " + std::to_string(config.retry.maxAttempts) + " attempts");

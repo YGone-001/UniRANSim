@@ -5,6 +5,8 @@
 
 #include "rrc_srb1_runtime.hpp"
 
+#include <chrono>
+
 namespace lte::rrc
 {
 
@@ -600,6 +602,8 @@ void EnbSrb1Runtime::OnRequestFrame(uint32_t association, const uu::Frame &frame
     stored.bearer = std::make_unique<LteAmBearer>(
         socket_, sourcePort, EndpointRole::ENB, association, stored.resolved.am,
         [this, association](std::vector<uint8_t> pdu) { OnPdcpPdu(contexts_.at(association), association, pdu); });
+    stored.generation = ++nextGeneration_;
+    stored.bearer->SetActivityCallback([this, association] { OnContextActivity(association); });
 
     uu::Frame reply;
     reply.association = association;
@@ -881,13 +885,64 @@ void EnbSrb1Runtime::StartAsSecurity(uint32_t association, const security::Key25
     context.bearer->SubmitSdu(context.procedure->Command());
 }
 
+namespace
+{
+int64_t SteadyNowMs()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+} // namespace
+
 void EnbSrb1Runtime::Tick()
 {
-    for (auto &entry : contexts_)
+    Tick(SteadyNowMs());
+}
+
+void EnbSrb1Runtime::Tick(int64_t nowMs)
+{
+    // Only contexts whose RLC has a running timer or outstanding work hold a
+    // deadline. Idle SRBs cost nothing; the active few cannot be starved by the
+    // 512 idle contexts.
+    clockMs_ = nowMs;
+    const int64_t now = nowMs;
+    for (int i = 0; i < 64; ++i)
     {
-        if (entry.second.bearer != nullptr)
-            entry.second.bearer->Tick();
+        rlc::RlcTickScheduler::Entry entry;
+        if (!tickScheduler_.PopDue(now, entry))
+            break;
+        const auto it = contexts_.find(entry.id);
+        if (it == contexts_.end() || it->second.generation != entry.generation ||
+            it->second.bearer == nullptr)
+            continue;
+        if (it->second.bearer->ScheduleVersion() != entry.version)
+            continue;
+        ++schedulerTicks_;
+        it->second.bearer->AdvanceTo(now);
+        ScheduleContext(entry.id, it->second);
     }
+}
+
+void EnbSrb1Runtime::OnContextActivity(uint32_t association)
+{
+    const auto it = contexts_.find(association);
+    if (it == contexts_.end() || it->second.bearer == nullptr)
+        return;
+    const int64_t now = clockMs_;
+    it->second.bearer->AdvanceTo(now);
+    ScheduleContext(association, it->second);
+}
+
+void EnbSrb1Runtime::ScheduleContext(uint32_t association, Context &context)
+{
+    const uint32_t next = context.bearer->NextTickIn();
+    if (next == rlc::am::LteAmEntity::NeverTick)
+        return;
+    const int64_t deadline = context.bearer->LastTickMs() + static_cast<int64_t>(next);
+    const uint64_t version = ++context.bearer->ScheduleVersion();
+    ++schedulerPushes_;
+    tickScheduler_.Push({deadline, association, 0, context.generation, version});
 }
 
 bool EnbSrb1Runtime::HasContext(uint32_t association) const

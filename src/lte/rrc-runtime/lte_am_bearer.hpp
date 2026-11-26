@@ -84,6 +84,21 @@ class LteAmBearer
     bool OnFrame(const uu::Frame &frame);
 
     void Tick();
+    // Activity-aware scheduling hooks. A bearer with no timer, transmission or
+    // pending STATUS reports NeverTick and can be skipped entirely.
+    [[nodiscard]] uint32_t NextTickIn() const;
+    // Advances the timers to nowMs with a bounded catch-up. The bearer keeps a
+    // tick base so an idle period is not applied to work created afterwards.
+    void AdvanceTo(int64_t nowMs);
+    void SetActivityCallback(std::function<void()> callback);
+    [[nodiscard]] int64_t LastTickMs() const
+    {
+        return lastTickMs_;
+    }
+    [[nodiscard]] uint64_t &ScheduleVersion()
+    {
+        return scheduleVersion_;
+    }
 
     [[nodiscard]] EndpointRole Role() const
     {
@@ -170,6 +185,10 @@ class LteAmBearer
     uint32_t association_{0};
     uu::LogicalChannel channel_{uu::LogicalChannel::DCCH};
     LteAmEntity entity_{};
+    int64_t lastTickMs_{0};
+    uint32_t lastKnownNext_{LteAmEntity::NeverTick};
+    uint64_t scheduleVersion_{0};
+    std::function<void()> onActivity_{};
     size_t sent_{0};
     size_t delivered_{0};
     Rejections refused_{};

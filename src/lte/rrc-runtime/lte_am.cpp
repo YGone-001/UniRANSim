@@ -10,6 +10,21 @@
 
 namespace lte::rlc::am
 {
+
+namespace
+{
+// Fires the activity callback on every return path of an event method, so an
+// owner that skipped this idle entity is told to schedule it again.
+struct ActivityGuard
+{
+    const std::function<void()> &callback;
+    ~ActivityGuard()
+    {
+        if (callback)
+            callback();
+    }
+};
+} // namespace
 namespace
 {
 
@@ -80,6 +95,7 @@ void LteAmEntity::SendPdu(uint16_t sn, bool poll, FramingInfo fi, const std::vec
 
 void LteAmEntity::SubmitSdu(const std::vector<uint8_t> &sdu)
 {
+    ActivityGuard activityGuard{onActivity_};
     if (state_ != AmState::ACTIVE)
         throw std::logic_error("LTE AM entity is not active");
     if (sdu.empty())
@@ -123,6 +139,7 @@ void LteAmEntity::SubmitSdu(const std::vector<uint8_t> &sdu)
 
 void LteAmEntity::SubmitSdus(const std::vector<std::vector<uint8_t>> &sdus)
 {
+    ActivityGuard activityGuard{onActivity_};
     if (state_ != AmState::ACTIVE)
         throw std::logic_error("LTE AM entity is not active");
     if (sdus.empty())
@@ -201,6 +218,7 @@ void LteAmEntity::TransmitStored(StoredSdu &stored, bool poll)
 
 void LteAmEntity::OnStatusPdu(const std::vector<uint8_t> &pdu)
 {
+    ActivityGuard activityGuard{onActivity_};
     if (state_ != AmState::ACTIVE)
         return;
 
@@ -264,6 +282,7 @@ void LteAmEntity::OnStatusPdu(const std::vector<uint8_t> &pdu)
 
 void LteAmEntity::OnPdu(const std::vector<uint8_t> &pdu)
 {
+    ActivityGuard activityGuard{onActivity_};
     if (state_ != AmState::ACTIVE)
         return;
 
@@ -528,6 +547,37 @@ void LteAmEntity::SendStatus()
     sender_(EncodeStatus(status));
     statusPending_ = false;
     prohibitTimer_ = config_.prohibitTicks;
+}
+
+uint32_t LteAmEntity::NextTickIn() const noexcept
+{
+    if (state_ != AmState::ACTIVE)
+        return NeverTick;
+    uint32_t next = NeverTick;
+    if (statusPending_)
+        next = std::min(next, prohibitTimer_);
+    if (reordering_)
+    {
+        const uint32_t remaining = config_.reorderingTicks > reorderTimer_ ? config_.reorderingTicks - reorderTimer_ : 1U;
+        next = std::min(next, remaining);
+    }
+    if (!transmissions_.empty())
+    {
+        const uint32_t remaining = config_.pollTicks > pollTimer_ ? config_.pollTicks - pollTimer_ : 1U;
+        next = std::min(next, remaining);
+    }
+    return next;
+}
+
+void LteAmEntity::Tick(uint32_t ticks)
+{
+    for (uint32_t i = 0; i < ticks; ++i)
+        OnTick();
+}
+
+void LteAmEntity::SetActivityCallback(std::function<void()> callback)
+{
+    onActivity_ = std::move(callback);
 }
 
 void LteAmEntity::OnTick()

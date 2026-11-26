@@ -18,6 +18,7 @@
 #pragma once
 
 #include "lte_am_bearer.hpp"
+#include "rlc_tick_scheduler.hpp"
 #include "rlc_tm.hpp"
 #include "rrc_connection_release.hpp"
 #include "rrc_connection_setup_complete.hpp"
@@ -266,6 +267,9 @@ class EnbSrb1Runtime
 
     void Pump(int timeoutMs);
     void Tick();
+    // The same service with an explicit clock, so a deterministic test can
+    // advance 1 ms per round without sleeping. Production uses Tick().
+    void Tick(int64_t nowMs);
 
     // DLInformationTransfer carrying an opaque NAS PDU, protected with whatever
     // profile the context is using.
@@ -298,6 +302,14 @@ class EnbSrb1Runtime
     [[nodiscard]] size_t ContextCount() const
     {
         return contexts_.size();
+    }
+    [[nodiscard]] uint64_t SchedulerPushes() const
+    {
+        return schedulerPushes_;
+    }
+    [[nodiscard]] uint64_t SchedulerTicks() const
+    {
+        return schedulerTicks_;
     }
     [[nodiscard]] RrcState StateOf(uint32_t association) const;
     // The radio endpoint this association was learned from, or zero when the
@@ -358,8 +370,11 @@ class EnbSrb1Runtime
         std::optional<security::PdcpSecurityEntity> secureTx{};
         std::optional<security::PdcpSecurityEntity> secureRx{};
         bool secured{false};
+        uint64_t generation{0};
     };
 
+    void OnContextActivity(uint32_t association);
+    void ScheduleContext(uint32_t association, Context &context);
     void OnRequestFrame(uint32_t association, const uu::Frame &frame, uint16_t sourcePort);
     void OnSrb1Frame(uint32_t association, const uu::Frame &frame);
     void OnPdcpPdu(Context &context, uint32_t association, const std::vector<uint8_t> &pdu);
@@ -377,6 +392,14 @@ class EnbSrb1Runtime
     rlc::TmEntity srb0_;
     EnbInitialAccess access_{};
     std::map<uint32_t, Context> contexts_{};
+    rlc::RlcTickScheduler tickScheduler_{};
+    uint64_t nextGeneration_{0};
+    // The clock the activity callback uses: the most recent Tick(nowMs). A
+    // deterministic test advances it explicitly; production Tick() supplies the
+    // monotonic clock.
+    int64_t clockMs_{0};
+    uint64_t schedulerPushes_{0};
+    uint64_t schedulerTicks_{0};
     size_t refused_{0};
     size_t refusedSetupComplete_{0};
     size_t refusedRrc_{0};
