@@ -16,6 +16,7 @@
 
 #include <array>
 #include <cstddef>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -132,6 +133,13 @@ struct EnbUeEntry
     // Simulated paging notifications delivered to this radio endpoint. It
     // counts delivery only; it is not evidence that the page was accepted.
     uint64_t pagingNotifications{};
+    // Last Uu frame seen from this association. A Uu UE sends a periodic
+    // internal keepalive, so a silent peer is detectable within a bounded
+    // time. releaseRequested stops a second S1AP UE Context Release Request
+    // for the same silence.
+    std::chrono::steady_clock::time_point lastUuSeen{};
+    bool keepaliveSeen{};
+    bool releaseRequested{};
 
     [[nodiscard]] bool s1Active() const
     {

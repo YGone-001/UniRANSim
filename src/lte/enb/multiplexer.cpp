@@ -8,6 +8,8 @@
 
 #include "multiplexer.hpp"
 
+#include <poll.h>
+
 #include "codec.hpp"
 #include "runtime_metrics.hpp"
 
@@ -1650,6 +1652,8 @@ void EnbMultiplexer::startInitialUeMessage(EnbUeEntry &entry, std::vector<uint8_
 {
     const uint32_t enbUeId = m_registry.allocateEnbUeS1apId();
     m_registry.bindEnbUeS1apId(entry, enbUeId);
+    entry.releaseRequested = false;
+    entry.lastUuSeen = std::chrono::steady_clock::now();
     entry.s1 = UeS1State::CONTEXT_PENDING;
     auto initial = s1ap::EncodeInitialUeMessage(m_config, enbUeId, nasPdu, sTmsi);
     if (!sendS1ap(SctpStreamForUe(m_outboundStreams, enbUeId), initial))
@@ -1748,6 +1752,8 @@ void EnbMultiplexer::initUuTransport()
                 }
             }
             entry->transport = RadioTransportKind::UuSrb1;
+            entry->lastUuSeen = std::chrono::steady_clock::now();
+            entry->releaseRequested = false;
             m_registry.bindEnbUeS1apId(*entry, enbUeS1apId);
             entry->s1 = UeS1State::CONTEXT_PENDING;
             Log("INFO", "SRB1 UE association " + std::to_string(association) + " bound to eNB-UE-S1AP-ID=" +
@@ -1759,6 +1765,14 @@ void EnbMultiplexer::initUuTransport()
     m_bridge->SetDrbCompleteHandler([](uint32_t association, uint8_t transactionId) {
         Log("INFO", "DRB configuration " + std::to_string(transactionId) + " acknowledged by SRB1 association " +
                         std::to_string(association));
+    });
+    m_bridge->SetLivenessCallback([this](uint32_t association, bool keepalive) {
+        if (auto *entry = m_registry.find(association); entry != nullptr)
+        {
+            entry->lastUuSeen = std::chrono::steady_clock::now();
+            if (keepalive)
+                entry->keepaliveSeen = true;
+        }
     });
     m_s1u.SetUuDownlinkHandler([this](EnbUeEntry &entry, BearerContext &bearer, const uint8_t *packet, size_t size) {
         return onUuDownlink(entry, bearer, packet, size);
@@ -1793,6 +1807,71 @@ void EnbMultiplexer::pollUu()
         }
     }
     commitPendingIcs();
+    // A liveness judgement is only valid when every frame the socket already
+    // holds has been dispatched. With 512 UEs a keepalive backlog can outlast
+    // the bounded 64-frame drain; checking first would release UEs whose
+    // keepalives are queued, not absent.
+    if (m_uuSocket != nullptr)
+    {
+        pollfd readable{m_uuSocket->Fd(), POLLIN, 0};
+        if (::poll(&readable, 1, 0) > 0)
+            return;
+    }
+    checkUuLiveness();
+}
+
+void EnbMultiplexer::checkUuLiveness()
+{
+    // The Uu transport has no retransmission at the socket layer and an idle UE
+    // sends no RLC data, so the eNB cannot infer a dead peer from a quiet
+    // socket. Every production Uu UE sends an internal keepalive; a peer that
+    // has been silent for ten seconds is treated as lost and its S1 context
+    // is released through the real S1AP procedure. This is simulator liveness,
+    // not a 3GPP message and not an RRC or NAS procedure.
+    const auto now = std::chrono::steady_clock::now();
+    if (m_lastUuLivenessCheck != std::chrono::steady_clock::time_point{} &&
+        now - m_lastUuLivenessCheck < std::chrono::seconds(1))
+        return;
+    m_lastUuLivenessCheck = now;
+    std::vector<EnbUeEntry *> silent;
+    for (auto *entry : m_registry.all())
+    {
+        if (entry->transport != RadioTransportKind::UuSrb1 || !entry->s1Active() ||
+            entry->mmeUeS1apId == 0 || entry->releaseRequested || !entry->keepaliveSeen)
+            continue;
+        if (now - entry->lastUuSeen < std::chrono::seconds(10))
+            continue;
+        silent.push_back(entry);
+    }
+    // A single silent peer is a dead UE. Many peers going silent together is
+    // this host's own scheduling or transport pressure (512 UE processes, a
+    // Uu backlog, a slow loop), and releasing them would destroy a live fleet.
+    // Only an isolated silence (at most four UEs) is an individual failure.
+    if (silent.size() > 4)
+    {
+        Log("WARN", "Skipped Uu peer liveness releases for " + std::to_string(silent.size()) +
+                        " simultaneously silent peers; treating it as local scheduling/transport pressure");
+        return;
+    }
+    for (auto *entry : silent)
+    {
+        try
+        {
+            auto request = s1ap::EncodeUeContextReleaseRequest(entry->mmeUeS1apId, entry->enbUeS1apId,
+                                                               "radioNetwork", 21);
+            if (sendS1ap(streamFor(*entry), request))
+            {
+                entry->releaseRequested = true;
+                Log("WARN", "Uu peer of LTE UE " + std::to_string(entry->radioUeId) +
+                                " has been silent for 10s; sent UE Context Release Request "
+                                "(radioNetwork/radio-connection-with-UE-lost)");
+            }
+        }
+        catch (const std::exception &e)
+        {
+            Log("WARN", std::string("UE Context Release Request for a silent Uu peer failed: ") + e.what());
+        }
+    }
 }
 
 size_t EnbMultiplexer::bridgeAssociationCount() const
@@ -1867,17 +1946,33 @@ bool EnbMultiplexer::establishUuDrbs(EnbUeEntry &entry, const std::vector<uint8_
         auto *bearer = m_registry.findBearer(*target, ready.ebi);
         if (bearer == nullptr || !bearer->signalingEstablished() || bearer->active())
             return false;
-        if (ready.generation != target->accessGeneration)
+        // A UE process that was restarted (for example after its peer died)
+        // begins at generation 0 while the retained entry's generation advanced
+        // when the previous access ended. A generation-0 READY on a new S1
+        // context is therefore the fresh process's new-access baseline, not a
+        // stale frame: adopt the new baseline and let the READY restate the
+        // PDN address the network assigned to the new session. A same-process
+        // ECM-IDLE restoration keeps its advanced generation and still has to
+        // match it.
+        const bool freshProcess = ready.generation == 0 && target->accessGeneration != 0;
+        if (ready.generation != target->accessGeneration && !freshProcess)
             return false;
         if (bearer->kind() == BearerKind::DEDICATED && !target->bearer.active())
             return false;
         if (bearer->kind() == BearerKind::DEFAULT)
         {
-            if (bearer->ueIpv4() != std::array<uint8_t, 4>{} && bearer->ueIpv4() != ready.ipv4)
+            if (bearer->ueIpv4() != std::array<uint8_t, 4>{} && bearer->ueIpv4() != ready.ipv4 && !freshProcess)
                 return false;
         }
-        else if (ready.ipv4 != target->bearer.ueIpv4())
+        else if (ready.ipv4 != target->bearer.ueIpv4() && !freshProcess)
             return false;
+        if (freshProcess)
+        {
+            target->accessGeneration = 0;
+            Log("INFO", "Fresh UE process restored its access at generation 0 for LTE UE " +
+                            std::to_string(target->radioUeId) + "; adopting PDN address " +
+                            Ipv4ToString(ready.ipv4));
+        }
         try
         {
             bearer->activateUe(target->radioUeId, ready.ebi, ready.ipv4);
@@ -1960,7 +2055,34 @@ void EnbMultiplexer::onUuUserPlane(uint32_t association, const uu::Frame &frame)
         return;
     }
     if (!it->second->OnFrame(frame))
-        Log("WARN", "Refused a DTCH user-plane frame for SRB1 association " + std::to_string(association));
+    {
+        uint8_t kind = 0;
+        uint8_t drbIdentity = 0;
+        size_t offset = 0;
+        std::string detail = " routing=malformed";
+        if (lte::rrc::DecodeDrbRouting(frame.payload, kind, drbIdentity, offset))
+        {
+            const auto *bearer = it->second->Bearer(drbIdentity);
+            if (bearer == nullptr)
+                detail = " routing=unknown-bearer:" + std::to_string(drbIdentity);
+            else
+            {
+                const auto &refused = bearer->Rlc().Refused();
+                detail = " drb=" + std::to_string(drbIdentity) +
+                         " foreign=" + std::to_string(refused.foreignAssociation) +
+                         " direction=" + std::to_string(refused.wrongDirection) +
+                         " channel=" + std::to_string(refused.wrongChannel) +
+                         " empty=" + std::to_string(refused.emptyPayload) +
+                         " rlc-malformed=" + std::to_string(refused.malformedRlc);
+            }
+        }
+        const auto &counters = it->second->Counters();
+        Log("WARN", "Refused a DTCH user-plane frame for SRB1 association " + std::to_string(association) +
+                        detail + " runtime(wrong=" + std::to_string(counters.wrongFrameDrops) +
+                        " malformed=" + std::to_string(counters.malformedDrops) +
+                        " unknown=" + std::to_string(counters.unknownBearerDrops) +
+                        " rlc=" + std::to_string(counters.rlcFailures) + ")");
+    }
 }
 
 void EnbMultiplexer::onUuUplinkIp(uint32_t association, uint8_t ebi, const std::vector<uint8_t> &packet)

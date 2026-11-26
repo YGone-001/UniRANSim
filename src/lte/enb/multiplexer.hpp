@@ -382,6 +382,7 @@ class EnbMultiplexer
     };
     void initUuTransport();
     void pollUu();
+    void checkUuLiveness();
     void commitPendingIcs();
     void cancelPendingIcs(uint32_t enbUeS1apId);
     // Builds the DRBs of one Uu UE from its established E-RABs, keys them from
@@ -470,6 +471,7 @@ class EnbMultiplexer
     // DRB RLC timers are counted in milliseconds. `poll` may run far faster
     // than that, so the entities are ticked on elapsed time, not per call.
     std::chrono::steady_clock::time_point m_drbTickLast{};
+    std::chrono::steady_clock::time_point m_lastUuLivenessCheck{};
     uint8_t m_uuDrbTransaction{0};
     size_t m_uuDrbConfigurations{0};
     RadioFrameObserver m_radioObserver;

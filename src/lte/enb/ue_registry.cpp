@@ -88,6 +88,7 @@ EnbUeEntry &UeRegistry::registerPeer(uint32_t radioUeId, const InetAddress &peer
     auto entry = std::make_unique<EnbUeEntry>();
     entry->radioUeId = radioUeId;
     entry->peer = peer;
+    entry->lastUuSeen = std::chrono::steady_clock::now();
     EnbUeEntry *pointer = entry.get();
     m_byPeer.emplace(peer.toString(), pointer);
     m_byRadioUeId.emplace(radioUeId, std::move(entry));

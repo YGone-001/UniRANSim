@@ -93,6 +93,7 @@ class EnbRrcBridge
     using UserPlaneHandler = std::function<void(uint32_t association, const uu::Frame &frame)>;
     using DrbCompleteHandler = std::function<void(uint32_t association, uint8_t transactionId)>;
     void SetUserPlaneHandler(UserPlaneHandler handler);
+    void SetLivenessCallback(std::function<void(uint32_t, bool)> callback);
     void SetDrbCompleteHandler(DrbCompleteHandler handler);
 
     // Called by the owner once the E-RABs of a pending Initial Context Setup are

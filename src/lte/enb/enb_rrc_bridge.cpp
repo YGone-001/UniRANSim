@@ -87,6 +87,11 @@ void EnbRrcBridge::Pump(int timeoutMs)
     runtime_.Pump(timeoutMs);
 }
 
+void EnbRrcBridge::SetLivenessCallback(std::function<void(uint32_t, bool)> callback)
+{
+    runtime_.SetLivenessCallback(std::move(callback));
+}
+
 void EnbRrcBridge::Tick()
 {
     runtime_.Tick();
